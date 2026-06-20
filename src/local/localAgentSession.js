@@ -9,6 +9,92 @@ import { readLocalProxySnapshot, staticProxyStatusFn } from "../proxy/snapshot.j
 import { RelayClient } from "../relay/relayClient.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 
+// Stage 8.9: agent.mode.status surface. The available mode lists
+// match the planned Stage 9.0+ vocabulary; 8.9 does not wire any
+// of them (modeControl: "unsupported"). Listed for App-side display
+// only.
+const CLAUDE_AVAILABLE_MODES = Object.freeze([
+  "default",
+  "acceptEdits",
+  "bypassPermissions",
+  "plan",
+]);
+const CODEX_AVAILABLE_MODES = Object.freeze([
+  "default",
+  "read-only",
+  "safe-yolo",
+  "yolo",
+]);
+
+// Build an agent.mode.status event payload. Pure helper; exported
+// for tests via runLocalAgentSession's exports below.
+export function buildModeStatusEvent({
+  sessionId,
+  provider,
+  runtime,
+  availableModes,
+}) {
+  return {
+    type: "agent.mode.status",
+    sessionId,
+    provider,
+    runtime: runtime ?? null,
+    availableModes: Array.isArray(availableModes) ? availableModes.slice() : [],
+    mode: "default",
+    modeControl: "unsupported",
+    reason: "Live mode switching is not wired in Stage 8.9. Display only.",
+  };
+}
+
+// Stage 8.9: extracted handleRemoteEvent so the runtime wiring test
+// (tests/agentInteractionRuntime.test.js) can call it with stub
+// adapter/executor pairs. Production code calls it via the closure
+// inside runLocalAgentSession.
+export function handleRemoteEvent(payload, ctx) {
+  if (!payload || payload.sessionId !== ctx.sessionId) return;
+
+  if (payload.type === "terminal.input") {
+    ctx.executor.write(payload.data || "");
+  }
+  if (payload.type === "terminal.resize") {
+    ctx.executor.resize(payload.cols, payload.rows);
+  }
+  if (payload.type === "terminal.interrupt") {
+    ctx.executor.interrupt();
+  }
+  if (payload.type === "agent.permission.resolve") {
+    if (typeof ctx.adapter.resolvePermission === "function") {
+      ctx.adapter.resolvePermission(payload);
+    } else if (payload.data) {
+      ctx.executor.write(payload.data);
+    }
+  }
+  if (payload.type === "agent.interaction.resolve") {
+    // Stage 8.9: only kind: "permission" is wired for resolve. Other
+    // kinds (raw_terminal, confirm, single_select, multi_select,
+    // free_text) are NOT claimed by 8.9. The data fallback below is
+    // a defensive guard for a future kind with no permission
+    // resolver target; it is NOT a "raw terminal" implementation.
+    // For structured terminal control today, callers should use the
+    // existing `terminal.input` event.
+    if (typeof ctx.adapter.resolvePermission === "function") {
+      ctx.adapter.resolvePermission({
+        callId: payload.callId || payload.interactionId,
+        interactionId: payload.interactionId,
+        decision: payload.decision,
+        reason: payload.reason,
+        data: payload.data,
+        value: payload.value,
+      });
+    } else if (payload.data) {
+      ctx.executor.write(payload.data);
+    }
+  }
+  if (payload.type === "session.stop") {
+    ctx.executor.stop();
+  }
+}
+
 function extractOriginRouterOptions(args) {
   const options = {};
   const passthrough = [];
@@ -163,6 +249,21 @@ export async function runLocalAgentSession(agent, rawArgs) {
     startedBy: "local-wrapper",
   });
 
+  // Stage 8.9: emit agent.mode.status once per session. The local
+  // `agent` command is mapped to the protocol provider string
+  // explicitly; the runtime tag is the same value session.started
+  // already carries. modeControl: "unsupported" — 8.9 supports
+  // viewing mode/status only. Remote mode switching is Stage 9.0+.
+  const modeList = agent === "codex" ? CODEX_AVAILABLE_MODES : CLAUDE_AVAILABLE_MODES;
+  send("agent.event", {
+    event: buildModeStatusEvent({
+      sessionId,
+      provider: agent === "codex" ? "codex" : "claude",
+      runtime,
+      availableModes: modeList,
+    }),
+  });
+
   try {
     appendSessionStart({
       sessionId,
@@ -209,33 +310,13 @@ export async function runLocalAgentSession(agent, rawArgs) {
     });
   });
 
-  const handleRemoteEvent = (payload) => {
-    if (payload.sessionId !== sessionId) return;
-
-    if (payload.type === "terminal.input") {
-      executor.write(payload.data || "");
-    }
-    if (payload.type === "terminal.resize") {
-      executor.resize(payload.cols, payload.rows);
-    }
-    if (payload.type === "terminal.interrupt") {
-      executor.interrupt();
-    }
-    if (payload.type === "agent.permission.resolve") {
-      if (typeof adapter.resolvePermission === "function") {
-        adapter.resolvePermission(payload);
-      } else if (payload.data) {
-        executor.write(payload.data);
-      }
-    }
-    if (payload.type === "session.stop") {
-      executor.stop();
-    }
+  const handleRemoteEventBound = (payload) => {
+    handleRemoteEvent(payload, { sessionId, adapter, executor });
   };
 
   while (!exited) {
     try {
-      await relayClient.connectEvents(handleRemoteEvent);
+      await relayClient.connectEvents(handleRemoteEventBound);
     } catch {
       await new Promise((resolve) => setTimeout(resolve, 1500));
     }

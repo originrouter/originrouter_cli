@@ -2,6 +2,10 @@ import { TerminalAdapter } from "./terminalAdapter.js";
 import { CodexAppServerClient, isCodexAppServerAvailable } from "./codex/appServerClient.js";
 import { mapCodexAppServerEvent, mapCodexApprovalRequest } from "./codex/eventMapper.js";
 import { CODEX_MAIN_ALIAS } from "../config/routes.js";
+import {
+  permissionEventToInteraction,
+  INTERACTION_SOURCES,
+} from "../runtime/agentInteractionContract.js";
 
 // Stage 8.0: detect any of the four forms a user might pass to set the
 // Codex model directly on the CLI: --model X, --model=X, -m X, -m=X.
@@ -18,13 +22,20 @@ function userProvidedModel(args) {
 }
 
 export class CodexAdapter extends TerminalAdapter {
-  constructor({ args = [] }) {
+  constructor({ args = [], appServerClient: appServerClientOverride = null, appServerAvailable: appServerAvailableOverride = null } = {}) {
     super({ command: "codex", args });
     this.kind = "codex";
     this.pendingEvents = [];
     this.pendingApprovals = new Map();
     this.appServerClient = null;
-    this.appServerAvailable = false;
+    // Stage 8.9: test seams. If a caller passes an explicit
+    // appServerAvailable flag, use it and skip the system probe. If
+    // a caller passes a custom appServerClient, use it (the probe is
+    // still performed only to set the boolean — it does not
+    // actually open a process when an override is provided). The
+    // default behaviour (no overrides) is unchanged.
+    this.appServerAvailable = appServerAvailableOverride;
+    this.appServerClientOverride = appServerClientOverride;
   }
 
   describe() {
@@ -75,8 +86,16 @@ export class CodexAdapter extends TerminalAdapter {
     return events;
   }
 
-  async beforeStart({ cwd, env }) {
-    this.appServerAvailable = await isCodexAppServerAvailable();
+  async beforeStart({ sessionId, cwd, env }) {
+    // Stage 8.9: capture sessionId for dual-emit. The Codex event
+    // mapper never sees sessionId; the adapter enriches here.
+    this.sessionId = sessionId ?? null;
+    // Stage 8.9: skip the system probe when the caller passed an
+    // explicit appServerAvailable override (test seam). The
+    // production default still probes via isCodexAppServerAvailable.
+    if (this.appServerAvailable === null) {
+      this.appServerAvailable = await isCodexAppServerAvailable();
+    }
     if (!this.appServerAvailable) {
       this.pendingEvents.push({
         type: "agent.adapter.status",
@@ -87,7 +106,7 @@ export class CodexAdapter extends TerminalAdapter {
       return;
     }
 
-    this.appServerClient = new CodexAppServerClient();
+    this.appServerClient = this.appServerClientOverride || new CodexAppServerClient();
     this.appServerClient.onEvent((event) => {
       // Stage 8.4: when the app-server process exits, deny any UI
       // permission cards that were waiting on its response. The
@@ -112,10 +131,27 @@ export class CodexAdapter extends TerminalAdapter {
       this.pendingEvents.push(...mapCodexAppServerEvent(event));
     });
     this.appServerClient.onApproval((request) => {
-      const event = mapCodexApprovalRequest(request);
-      this.pendingEvents.push(event);
+      const legacy = mapCodexApprovalRequest(request);
+      // Stage 8.9: dual-emit. Legacy first (the relay expects it),
+      // then the new agent.interaction.requested envelope for the
+      // App card model. pendingApprovals is keyed by callId, which
+      // equals interactionId.
+      this.pendingEvents.push(legacy);
+      if (this.sessionId != null) {
+        try {
+          const interaction = permissionEventToInteraction(legacy, {
+            source: INTERACTION_SOURCES.APP_SERVER,
+            runtime: this.appServerAvailable ? "codex-app-server" : null,
+            sessionId: this.sessionId,
+            createdAt: Date.now(),
+          });
+          this.pendingEvents.push(interaction);
+        } catch (err) {
+          console.error(`[codexAdapter] dual-emit failed: ${err.message}`);
+        }
+      }
       return new Promise((resolve) => {
-        this.pendingApprovals.set(event.callId, {
+        this.pendingApprovals.set(legacy.callId, {
           resolve,
           createdAt: Date.now(),
           request,
@@ -134,25 +170,31 @@ export class CodexAdapter extends TerminalAdapter {
     return this.pendingEvents.splice(0);
   }
 
-  resolvePermission({ callId, decision }) {
-    const pending = this.pendingApprovals.get(callId);
+  resolvePermission({ callId, interactionId, decision, reason }) {
+    // Stage 8.9: accept interactionId as an alias for callId so the
+    // new agent.interaction.resolve envelope (which carries
+    // interactionId) flows through the same pendingApprovals map.
+    // The map is keyed by the same string either way.
+    const key = callId || interactionId;
+    const pending = this.pendingApprovals.get(key);
     if (!pending) {
       this.pendingEvents.push({
         type: "agent.permission.resolve.error",
         provider: "codex",
-        callId,
-        message: "No pending Codex approval found for this callId.",
+        callId: key,
+        message: "No pending Codex approval found for this id.",
       });
       return;
     }
 
-    this.pendingApprovals.delete(callId);
+    this.pendingApprovals.delete(key);
     pending.resolve(decision || "denied");
     this.pendingEvents.push({
       type: "agent.permission.resolved",
       provider: "codex",
-      callId,
+      callId: key,
       decision: decision || "denied",
+      reason: reason || undefined,
     });
   }
 

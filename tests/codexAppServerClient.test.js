@@ -14,6 +14,11 @@
 
 import assert from "node:assert/strict";
 import { CodexAppServerClient } from "../src/adapters/codex/appServerClient.js";
+import { mapCodexApprovalRequest } from "../src/adapters/codex/eventMapper.js";
+import {
+  permissionEventToInteraction,
+  INTERACTION_SOURCES,
+} from "../src/runtime/agentInteractionContract.js";
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -651,6 +656,26 @@ async function captureSpawnEnv(env) {
   const env = await captureSpawnEnv({ CODEX_SANDBOX: "seatbelt" });
   assert.equal(env.CODEX_SANDBOX, "seatbelt",
     "caller-supplied CODEX_SANDBOX must be preserved verbatim");
+}
+
+// ---- 35. Stage 8.9: structural round-trip via permissionEventToInteraction ----
+
+{
+  const legacy = mapCodexApprovalRequest({
+    method: "item/commandExecution/requestApproval",
+    callId: "codex-perm-1",
+    params: { command: "ls", cwd: "/tmp/proj" },
+  });
+  const interaction = permissionEventToInteraction(legacy, {
+    source: INTERACTION_SOURCES.APP_SERVER,
+    sessionId: "s-test",
+  });
+  assert.equal(interaction.interactionId, legacy.callId,
+    "new envelope's interactionId equals the legacy callId from the Codex mapper");
+  assert.equal(interaction.kind, "permission");
+  assert.equal(interaction.source, "app-server");
+  assert.equal(interaction.resolution.eventType, "agent.interaction.resolve",
+    "new envelope always carries the new eventType");
 }
 
 console.log("codex app-server client tests ok");

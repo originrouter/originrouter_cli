@@ -153,6 +153,7 @@ All citations point to:
 - **Deferred to Stage 8.2+** (historical, as of end of 8.0A; current status in §11): `cross-spawn` migration, sandbox env, `approved_execpolicy_amendment` decision type, `ABORT_GRACE_MS`, `reconnectAndResumeThread`, process epoch, force-kill timer, replay ring buffer, `agent.sdk.metadata` parity in PTY, SDK/PTY event normalization layer. Process epoch and force-kill were subsequently shipped in Stage 8.4; spawn defaults helper landed in Stage 8.6.
 - **Shipped Stage 8.6**: spawn defaults helper (`src/utils/spawn.js` → `spawnCommand` + `buildSpawnOptions` + `SPAWN_DEFAULTS`); Codex env-contract regression test (cases 31–34 in `tests/codexAppServerClient.test.js`); roadmap reshuffle. Stage 8.6 is a spawn defaults cleanup, not a `cross-spawn` migration.
 - **Contracted Stage 8.7**: Claude SDK/PTY event normalization contract (`src/runtime/claudeEventContract.js` + `docs/agent-protocol.md` §10.13 + `tests/claudeEventContract.test.js` — 11 cases). Stage 8.7 is a design + contract-test stage; production wiring is a Stage 9+ architecture migration.
+- **Contracted Stage 8.8, runtime-wired Stage 8.9**: generalized `agent.interaction.*` blocking-prompt envelope. Stage 8.8 shipped the pure helper (`src/runtime/agentInteractionContract.js` + `tests/agentInteractionContract.test.js` — 10 cases). Stage 8.9 wired the permission kind: dual-emit in `claudeAdapter.js` and `codexAdapter.js`; `handleRemoteEvent` accepts `agent.interaction.resolve`; `localApi.js` exposes `POST /sessions/:id/interaction`; `localAgentSession.js` emits one `agent.mode.status` per `session.started` (read-only); the temporary console renders the new envelope and shows a mode pill. `agent.permission.*` events remain emitted and consumed unchanged. New runtime test: `tests/agentInteractionRuntime.test.js` (8 cases). 8.9 does NOT ship raw terminal / confirm / select / text kinds, does NOT remove the legacy event, does NOT wire remote mode switching, does NOT change the relay protocol.
 - **Dropped from this audit** (out of scope): relay/encryption, mobile clients, happy's PTY path (deprecated upstream).
 
 ## 9. In-tree fixes for 8.0A
@@ -367,6 +368,176 @@ user's framing.
 Line numbers are not pinned. The audit cites files only so
 the trail stays stable across doc/test churn.
 
+## Stage 8.8 interactive blocking prompt contract
+
+Stage 8.8 introduces a generalized blocking-prompt envelope
+(`agent.interaction.requested` and `agent.interaction.resolve`)
+so 9.0+ can add `confirm`, `single_select`, `multi_select`,
+`free_text`, and a labeled `raw_terminal` escape hatch without
+another migration. This stage is **contract-test only** — no
+production wiring, no UI work, no TUI parser, no provider/auth/
+login (those are Stage 9.0).
+
+**What it ships:**
+
+- Pure helper in
+  `src/runtime/agentInteractionContract.js` —
+  `INTERACTION_KINDS`, `INTERACTION_SOURCES`,
+  `permissionEventToInteraction`, `interactionToPermissionEvent`
+  (permission-only), `buildInteractionResolved`,
+  `isInteractionRequest`, `isInteractionResolve`. Not wired
+  into production.
+- `tests/agentInteractionContract.test.js` — 10 cases.
+- `docs/agent-interaction-contract.md` — full contract doc.
+- `docs/agent-protocol.md` §10.14 — wire-protocol entry.
+- This section — audit table + file-level evidence trail.
+
+**What remains deferred (Stage 9.0+):**
+
+- Wiring into `runLocalAgentSession.handleRemoteEvent`,
+  the Claude PTY hook server, the Codex app-server client, the
+  relay, the daemon, and any UI.
+- UI rendering for non-permission kinds
+  (`confirm` / `single_select` / `multi_select` / `free_text` /
+  `raw_terminal`).
+- Payload schemas for `value` / `data` on non-permission kinds.
+- Pending-state machine (caller's job; the helper is pure).
+- `updatedPermissions` echo (already lives in
+  `hookServer.js#decisionToHookJson`).
+- A dedicated `agent.interaction.canceled` event, if the UI
+  ever needs the distinction. In 8.8, cancellation is expressed
+  as `{ type: "agent.interaction.resolve", decision: "abort" }`.
+
+### Audit table (Claude PTY / Happy reference / Codex / Stage 8.8 target)
+
+| Surface | Claude PTY today | Happy reference | Codex today | Stage 8.8 target |
+|---|---|---|---|---|
+| **Pending request map** | `pendingPermissions` Map keyed by callId (in-memory, 55s timeout) | `pendingRequests` Map keyed by `toolUseID` (in-memory, with `abortAll()` and `reset(reason)`) | `pendingApprovals` Map keyed by callId (in-memory, 30s per-request timeout) | **not invented** in 8.8 — adapter-owned today; contract-level pending-tracking is a Stage 9.0+ concern |
+| **Detect event** | `agent.permission.request.detected` (provider=claude, callId, tool, input, permissionSuggestions, resolution.decisions) | `handlePermissionRequest` → `push.sendSessionNotification({ kind: 'permission' })` | `agent.permission.request.detected` (provider=codex, callId, tool, input, resolution.decisions) | `agent.interaction.requested` with `kind: "permission"`, `interactionId`, `source` (hook/app-server), provider, tool, input, permissionSuggestions, resolution |
+| **Resolve event** | `agent.permission.resolve` (callId + decision) | `handlePermissionRequest` response (accept/acceptForSession/decline/cancel) | JSON-RPC response to app-server (`accept`/`acceptForSession`/`decline`/`cancel`) | `agent.interaction.resolve` with `interactionId`, `decision`, optional `value` and `data` |
+| **Tool gating (ExitPlanMode/AskUserQuestion)** | not gated (PTY accepts Claude Code's own UI) | `handleToolCall` short-circuits `AskUserQuestion` → `handlePermissionRequest`; `ExitPlanMode` always requires user approval (`descriptor.exitPlan` check) | n/a (no tool gating in Codex today) | Reserved kinds `confirm` / `single_select` / `multi_select` / `free_text`; 8.8 documents, 9.0+ implements |
+| **Raw fallback** | `terminal.input` via `/client/input` → PTY stdin | Raw terminal bytes via `terminal.input` (Happy retains the same escape hatch) | app-server always structured; no raw fallback | `data` field on `agent.interaction.resolve` (labeled escape hatch); `terminal.input` remains available |
+| **Notification kind taxonomy** | n/a (single permission channel) | `done \| permission \| question` (coarse session notifications) | n/a | Reserved: `permission` (today); `question` (future confirm/select/text); deferred to 9.0+ |
+
+### Evidence trail (file-level, no line numbers pinned)
+
+- `src/adapters/claude/hookServer.js` — Claude PTY
+  `pendingPermissions`, 55s timeout,
+  `buildPermissionRequestEvent` shape, `decisionToHookJson`
+  mapping for `updatedPermissions` echo.
+- `src/adapters/codex/eventMapper.js#mapCodexApprovalRequest` —
+  Codex app-server shape (callId synthesis from
+  `request.callId || params.callId || params.call_id || ...`).
+- `src/adapters/codex/decisionMapping.js#mapDecisionToWire` —
+  Codex decision-to-wire vocabulary
+  (`accept` / `acceptForSession` / `decline` / `cancel`).
+- `src/local/localAgentSession.js` — current `handleRemoteEvent`
+  switch handles only `terminal.input`, `terminal.resize`,
+  `terminal.interrupt`, `agent.permission.resolve`,
+  `session.stop`; no general interaction envelope.
+- `src/runtime/agentInteractionContract.js` — new 8.8 helper
+  (NOT wired into production).
+- `tests/agentInteractionContract.test.js` — 10-case test.
+- `docs/agent-interaction-contract.md` — full contract doc.
+- `docs/agent-protocol.md` §10.14 — wire-protocol entry.
+- `happy-cli/src/utils/BasePermissionHandler.ts` —
+  `pendingRequests` Map, `abortAll()`, `reset(reason)` reference.
+- `happy-cli/src/claude/utils/permissionHandler.ts` —
+  `AskUserQuestion` short-circuit and `ExitPlanMode`
+  always-gated reference.
+- `happy-cli/src/codex/utils/permissionHandler.ts` — Codex
+  subclass of `BasePermissionHandler` (auto-approve allowlist
+  for `change_title`).
+- `happy-cli/src/claude/utils/questionNotification.ts` —
+  `AskUserQuestion` tool-call ID extraction reference.
+- `happy-app/sources/sync/apiTypes.ts` — `done | permission |
+  question` coarse kind taxonomy reference
+  (`ApiEphemeralSessionEventUpdateSchema`).
+
+## Stage 8.9 — runtime wiring
+
+Stage 8.9 is the first runtime-wiring stage. The
+`agent.interaction.*` envelope from Stage 8.8 is dual-emitted
+from the adapter layer, accepted by the local session, and
+exposed to the temporary console. A new local API route
+handles the new envelope. A read-only mode/status surface
+(`agent.mode.status`) is added.
+
+**Scope (narrowly permission-kind):**
+
+- Production imports the helper
+  (`src/runtime/agentInteractionContract.js`).
+- Claude PTY hook and Codex app-server approval push BOTH
+  legacy `agent.permission.request.detected` AND new
+  `agent.interaction.requested` for every permission request.
+- The new envelope's resolve routes to the existing permission
+  resolver. Unknown-id errors continue to use
+  `agent.permission.resolve.error` (compatibility strategy for
+  8.9).
+- `localApi.js` exposes `POST /sessions/:id/interaction`.
+- `localAgentSession.js` emits one `agent.mode.status` per
+  session on `session.started`. **Read-only in 8.9** —
+  `modeControl: "unsupported"`. Remote mode switching is
+  Stage 9.0+.
+- The temporary console renders the new envelope and shows a
+  mode pill. The console does NOT add a per-card raw terminal
+  input (no production emits `kind: "raw_terminal"` in 8.9;
+  raw terminal control today uses the existing standalone
+  `terminal.input` event).
+
+**What 8.9 does NOT claim (to prevent 9.0 miscommunication):**
+
+- 8.9 does NOT support `kind: "raw_terminal"` from production
+  adapters. The console does NOT add a per-card raw input.
+  The `data` field on the resolve envelope is a defensive
+  guard only.
+- 8.9 does NOT support `kind: "confirm"`, `single_select`,
+  `multi_select`, or `free_text` resolve. The renderer skips
+  these with a debug log if a non-permission envelope arrives.
+- 8.9 does NOT support remote mode switching. The mode pill
+  is read-only.
+- 8.9 does NOT replace `terminal.input`. The legacy terminal
+  control path stays exactly as today.
+
+### Audit table delta (Stage 8.9)
+
+| Surface | Stage 8.8 target | Stage 8.9 status |
+|---|---|---|
+| **Dual-emit (Claude PTY)** | documented; not wired | `claudeAdapter.js#onPermissionRequest` pushes both envelopes. `sessionId` enriched from `this.sessionId`. `runtime: null` matches current `session.started` (Stage 8.7 `claude-pty` not back-ported). |
+| **Dual-emit (Codex)** | documented; not wired | `codexAdapter.js#onApproval` pushes both envelopes. `sessionId` enriched; `runtime: "codex-app-server"` when the structured path is active, `null` otherwise. `pendingApprovals` stays keyed by `callId` (which equals `interactionId`). |
+| **Resolve routing** | reserved; resolve-error was silent per Happy pattern | `handleRemoteEvent` accepts `agent.interaction.resolve` and routes to `adapter.resolvePermission`. Codex adapter accepts `interactionId` as alias for `callId`. Unknown-id emits the existing `agent.permission.resolve.error` (re-used for compatibility). |
+| **Mode/status display** | not in scope | `localAgentSession.js` emits `agent.mode.status` once per `session.started`. `provider` mapped from local `agent` command. `runtime` mirrors `session.started`. `availableModes` matches the planned 9.0+ vocabulary. `modeControl: "unsupported"`. |
+| **Live mode switching** | not in scope | Not wired. 8.9 supports viewing only. Switching is Stage 9.0+. |
+| **Raw terminal fallback** | documented as `data` field on resolve envelope | `data` is a defensive fallback only in `handleRemoteEvent`. The console does NOT add a per-card raw input. For raw terminal control today, callers use the existing `terminal.input` event. |
+| **Local API route** | not in scope | `POST /sessions/:id/interaction` accepts `{ interactionId, decision, value?, data?, reason? }`. The legacy `/sessions/:id/permission` is unchanged. |
+| **Console dedup** | not in scope | `renderInteractionRequest` checks `knownCallIds` for `event.interactionId || event.callId`; if a card exists, it updates state in place rather than creating a duplicate. |
+| **Test console UI** | not in scope | `originrouter-test/local-console.html` (outside the CLI repo) adds `renderInteractionRequest`, `renderModeStatus`, `renderResolveError`, and a `Mode:` pill in the top bar. |
+
+### Evidence trail (file-level, no line numbers pinned)
+
+- `src/adapters/claudeAdapter.js` — dual-emit in
+  `onPermissionRequest`; `hookServerFactory` test seam.
+- `src/adapters/codexAdapter.js` — dual-emit in `onApproval`;
+  `appServerClient` / `appServerAvailable` test seams;
+  `resolvePermission` accepts `interactionId` alias.
+- `src/local/localAgentSession.js` — `handleRemoteEvent` extracted
+  to a named exported helper; new `agent.interaction.resolve` arm;
+  `agent.mode.status` emission after `session.started`; new
+  exported `buildModeStatusEvent` helper.
+- `src/local/localApi.js` — new `interaction` branch in
+  `handleSessionControl` and the session-action regex match.
+- `originrouter-test/local-console.html` — `renderInteractionRequest`,
+  `renderModeStatus`, `renderResolveError`; three new event-type
+  arms; `interaction` entry in `localMap` and `relayMap`;
+  `Mode:` pill in the top bar; top-of-file comment updated.
+- `tests/agentInteractionRuntime.test.js` — 8 cases (new).
+- `tests/permissionDecision.test.js` — 1 new round-trip
+  assertion.
+- `tests/codexAppServerClient.test.js` — 1 new round-trip
+  assertion.
+- `package.json` — test chain gains one new suite; suite count
+  bumps to 22.
+
 ## 11. Post-8.6 deferred work
 
 Open items that have not landed in any 8.x stage. Some of these are
@@ -386,6 +557,40 @@ small (sandbox env) and others are full architecture migrations
   `docs/agent-protocol.md` §10.13). Implementation (wiring
   into `runLocalAgentSession` and the SDK runner) remains a
   Stage 9+ architecture migration.
+- **`agent.interaction.*` blocking-prompt envelope** —
+  generalized `agent.interaction.requested` /
+  `agent.interaction.resolve` envelope that supersedes
+  `agent.permission.*` for UI rendering. **Contracted Stage
+  8.8, runtime-wired Stage 8.9** for the permission kind.
+  `src/runtime/agentInteractionContract.js` is now imported
+  by the production adapters (`claudeAdapter.js`,
+  `codexAdapter.js`), the local session
+  (`localAgentSession.js`), and the local API
+  (`localApi.js`). The temporary console renders the new
+  envelope. **Remaining work for Stage 9.0+:** payload
+  schemas for non-permission kinds, a dedicated
+  `agent.interaction.resolve.error` (if a UI needs the
+  distinction from `agent.permission.resolve.error`), and
+  removal of the legacy `agent.permission.*` events.
+- **Live mode switching (Claude + Codex)** — Stage 8.9 ships
+  `agent.mode.status` as **read-only** with
+  `modeControl: "unsupported"`. Live switching requires
+  `--permission-mode` flag parsing in the CLI and Codex
+  `approvalPolicy` overrides in the app-server protocol
+  (neither exists today). Stage 9.0+ concern.
+- **`raw_terminal` interaction kind** — Stage 8.9 reserves
+  the kind but does not emit it from any production adapter
+  and does not render it in the console. The
+  `data` field on the resolve envelope is a defensive
+  fallback only; for raw terminal control today, callers
+  use the existing `terminal.input` event. Stage 9.0+
+  concern.
+- **Non-permission kinds (`confirm`, `single_select`,
+  `multi_select`, `free_text`)** — Stage 8.9 reserves the
+  names but does not emit or render them. If Claude/Codex
+  ever exposes them as structured tool/permission events
+  in the current path, the renderer can light up; otherwise
+  they remain documented targets.
 - **Replay ring buffer** — `recentAppPrompts` 5-minute window
   for app-prompt dedupe.
 
@@ -421,14 +626,16 @@ small (sandbox env) and others are full architecture migrations
 cd /Users/chengaoyan/Desktop/originrouter-cli
 node ./tests/codexDecisionMapping.test.js      # 23 cases green
 node ./tests/codexSemver.test.js               # 15 cases green
-node ./tests/permissionDecision.test.js        # 12 cases green
-node ./tests/codexAppServerClient.test.js      # 34 cases green (17 baseline + 11 Stage 8.4 + 4 Stage 8.6 env contract)
+node ./tests/permissionDecision.test.js        # 13 cases green (12 baseline + 1 Stage 8.9 round-trip)
+node ./tests/codexAppServerClient.test.js      # 35 cases green (34 baseline + 1 Stage 8.9 round-trip)
 node ./tests/codexE2eOffline.test.js           # 12 cases green (Stage 8.3)
 node ./tests/adapters.test.js                  # extended with 5 Stage 8.4 + 2 Stage 8.1 cases
 node ./tests/hookForwarder.test.js             # 10 cases green (Stage 8.5)
 node ./tests/spawnCommand.test.js              # 5 cases green (Stage 8.6)
 node ./tests/claudeEventContract.test.js       # 11 cases green (Stage 8.7)
-npm test                                       # full chain green (20 suites + 2 binary smokes)
+node ./tests/agentInteractionContract.test.js  # 10 cases green (Stage 8.8)
+node ./tests/agentInteractionRuntime.test.js   # 8 cases green (Stage 8.9)
+npm test                                       # full chain green (22 suites + 2 binary smokes)
 ```
 
 ### Manual (CLI)

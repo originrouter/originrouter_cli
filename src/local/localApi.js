@@ -363,8 +363,8 @@ async function dispatch(ctx, req, res) {
       }
     }
 
-    // /sessions/:id/{permission,input,interrupt}
-    const sessionMatch = pathname.match(/^\/sessions\/([^/]+)\/(permission|input|interrupt)$/);
+    // /sessions/:id/{permission,input,interrupt,interaction}
+    const sessionMatch = pathname.match(/^\/sessions\/([^/]+)\/(permission|input|interrupt|interaction)$/);
     if (req.method === "POST" && sessionMatch) {
       const sessionId = decodeURIComponent(sessionMatch[1]);
       const action = sessionMatch[2];
@@ -522,6 +522,29 @@ async function handleSessionControl(ctx, res, sessionId, action, body) {
       callId: body.callId,
       decision: body.decision,
       data: body.data,
+    };
+  } else if (action === "interaction") {
+    // Stage 8.9: agent.interaction.resolve route. Accepts
+    // interactionId + decision (required) and forwards the new
+    // envelope into the local session. The legacy /permission
+    // route above stays unchanged.
+    if (!body.interactionId || typeof body.interactionId !== "string") {
+      return sendError(res, 400, "body.interactionId is required");
+    }
+    if (!body.decision || typeof body.decision !== "string") {
+      return sendError(res, 400, "body.decision is required");
+    }
+    payload = {
+      type: "agent.interaction.resolve",
+      sessionId,
+      interactionId: body.interactionId,
+      // Belt-and-suspenders: callers may pass callId too, but
+      // interactionId is the canonical field for the new envelope.
+      callId: body.callId || body.interactionId,
+      decision: body.decision,
+      value: body.value,
+      data: body.data,
+      reason: body.reason,
     };
   } else {
     return sendError(res, 400, `unknown action '${action}'`);

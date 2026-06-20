@@ -1552,3 +1552,206 @@ Out of scope for Stage 8.7. Documented as "current behavior,
 not migrated". The daemon path will be revisited in a later
 stage; the audit table in
 `docs/agent-runtime-audit.md` covers PTY and SDK only.
+
+### 10.14 Blocking-prompt interaction contract (Stage 8.8)
+
+Stage 8.8 is a **design + contract-test stage**. It does **not**
+refactor the session runners. The contract helper
+(`src/runtime/agentInteractionContract.js`) is a contract source,
+not a production mapper. Production code paths do **not** import
+it. A future wiring stage (9.0+) may replace this module with
+the production mapper or promote it; either way, no production
+code imports it in Stage 8.8.
+
+Stage 8.8 defines **two** events:
+`agent.interaction.requested` and `agent.interaction.resolve`.
+There is no `agent.interaction.canceled` in 8.8 — cancellation
+is expressed by sending
+`{ type: "agent.interaction.resolve", decision: "abort" }`. A
+dedicated canceled event is a future-stage concern if the UI
+ever needs the distinction.
+
+#### 10.14.1 Kinds and sources
+
+The `kind` field distinguishes blocking-prompt flavors:
+
+| `kind`           | Wire status (8.8) | Notes |
+|---|---|---|
+| `permission`     | **implemented**    | Covers all existing `agent.permission.*` events. Maps `hook` / `app-server` sources. Round-trips through the reverse map. |
+| `confirm`        | reserved           | y/N confirmation. Not emitted by any runtime in 8.8. |
+| `single_select`  | reserved           | Enumerated single-choice picker. Not emitted in 8.8. |
+| `multi_select`   | reserved           | Multi-choice picker. Documented target only; payload shape is a 9.0+ decision. |
+| `free_text`      | reserved           | Free-form text answer. Documented target only; payload shape is a 9.0+ decision. |
+| `raw_terminal`   | reserved           | Escape hatch (raw terminal bytes in `data`). 8.8 documents the envelope only. |
+
+The `source` field names the local producer:
+
+| `source`      | Today                                       | Notes |
+|---|---|---|
+| `hook`        | Claude PTY PermissionRequest hook (existing) | Default source for backward-compat permission events. |
+| `jsonl`       | reserved                                    | Future Claude JSONL scanner surface. |
+| `app-server`  | Codex app-server approval (existing)         | `mapCodexApprovalRequest` target. |
+| `pty`         | reserved                                    | Generic PTY fallback (no structured event today). |
+
+Full versions of these tables live in
+[`docs/agent-interaction-contract.md`](agent-interaction-contract.md).
+
+#### 10.14.2 Wire shapes
+
+**`agent.interaction.requested`** (new envelope):
+
+```json
+{
+  "type": "agent.interaction.requested",
+  "provider": "claude | codex | ...",
+  "runtime": "claude-pty | claude-sdk | codex-app-server | null",
+  "sessionId": "...",
+  "interactionId": "...",
+  "callId": "...",
+  "source": "hook | jsonl | app-server | pty",
+  "kind": "permission | confirm | single_select | multi_select | free_text | raw_terminal",
+  "title": "...",
+  "prompt": "...",
+  "tool": "...",
+  "input": { },
+  "options": [ { "id": "approved", "label": "Allow", "value": "approved", "shortcut": "a" } ],
+  "defaultOptionId": "approved",
+  "resolution": {
+    "eventType": "agent.interaction.resolve",
+    "decisions": ["approved", "approved_for_session", "denied", "abort"]
+  },
+  "permissionSuggestions": [ ],
+  "terminalReply": null,
+  "createdAt": 1234567890,
+  "timeoutMs": 55000
+}
+```
+
+**`agent.interaction.resolve`** (new envelope):
+
+```json
+{
+  "type": "agent.interaction.resolve",
+  "sessionId": "...",
+  "interactionId": "...",
+  "decision": "approved | approved_for_session | denied | abort",
+  "value": "...",
+  "data": "..."
+}
+```
+
+**Legacy `agent.permission.request.detected`** (still emitted
+today by the Claude PTY hook server and the Codex app-server
+client; will be a thin alias under `agent.interaction.*` in
+9.0+):
+
+```json
+{
+  "type": "agent.permission.request.detected",
+  "provider": "claude | codex",
+  "callId": "...",
+  "tool": "...",
+  "input": { },
+  "permissionSuggestions": [ ],
+  "resolution": {
+    "eventType": "agent.permission.resolve",
+    "decisions": ["approved", "approved_for_session", "denied", "abort"]
+  }
+}
+```
+
+Envelope rules:
+
+- The new envelope's `resolution.eventType` is **always**
+  `"agent.interaction.resolve"`, even when the input was a
+  legacy `agent.permission.*` event. A 9.0 consumer that
+  matches on the wire type to render the card must never see
+  the legacy eventType on the new envelope.
+- The new resolve envelope uses `resolve` (not `resolved`).
+  It is **not** a rename of the legacy
+  `agent.permission.resolved` emitted by Codex; the new
+  contract uses `resolve` for both the wire type and the
+  helper-built payload.
+- `sessionId`, `interactionId`, and `decision` are required
+  and must be non-empty strings on the resolve envelope.
+- `value` and `data` are emitted only when the caller passes
+  them — the helper does not synthesize either field. Use
+  `value` for structured answers (free-text strings, selected
+  indices); use `data` for raw terminal bytes.
+
+#### 10.14.3 Wire-in rules (forward-looking, not 8.8 scope)
+
+- A structured `agent.interaction.resolve` is only accepted
+  when the local session has a matching pending `interactionId`.
+  Unknown IDs are rejected.
+- The raw terminal fallback (`terminal.input` → PTY stdin)
+  remains a labeled escape hatch. It is always available,
+  regardless of whether a structured interaction is pending.
+- `multi_select` and `free_text` kinds are documented targets
+  only, not solved in 8.8. UI rendering and payload shapes are
+  a 9.0+ concern.
+- A dedicated `agent.interaction.canceled` event is **not**
+  part of 8.8. Cancellation is expressed by sending
+  `agent.interaction.resolve` with `decision: "abort"`. A
+  future stage may introduce a dedicated canceled event if the
+  UI needs the distinction.
+
+See
+[`docs/agent-interaction-contract.md`](agent-interaction-contract.md)
+for the full contract, validation rules, and audit table.
+
+#### 10.14.4 Stage 8.9 wiring notes
+
+Stage 8.9 promotes §10.14 from "contract-only" to
+"production-wired" for the permission kind:
+
+- **Dual-emit.** `claudeAdapter.js` and `codexAdapter.js`
+  push both `agent.permission.request.detected` (legacy,
+  unchanged) and `agent.interaction.requested` (new, wrapped
+  via `permissionEventToInteraction`) for every permission
+  request. Legacy is pushed first.
+- **Resolve path.** `handleRemoteEvent` accepts
+  `agent.interaction.resolve` and routes it to
+  `adapter.resolvePermission`. The Codex adapter accepts
+  `interactionId` as an alias for `callId`; the Claude adapter
+  already reads `payload.callId || payload.id`.
+- **Local API.** `POST /sessions/:id/interaction` (new) accepts
+  `{ interactionId, decision, value?, data?, reason?, callId? }`
+  and forwards `agent.interaction.resolve` to the local session.
+  The legacy `POST /sessions/:id/permission` is unchanged.
+- **Mode/status display (read-only).** `localAgentSession.js`
+  emits one `agent.mode.status` per session on `session.started`:
+  ```json
+  {
+    "type": "agent.mode.status",
+    "sessionId": "...",
+    "provider": "claude | codex",
+    "runtime": "codex-app-server | null",
+    "availableModes": ["default", "acceptEdits", "bypassPermissions", "plan"],
+    "mode": "default",
+    "modeControl": "unsupported",
+    "reason": "Live mode switching is not wired in Stage 8.9. Display only."
+  }
+  ```
+  - `provider` is mapped from the local `agent` command
+    (`agent === "codex" ? "codex" : "claude"`).
+  - `runtime` is the same value `session.started` already carries.
+  - `modeControl: "unsupported"` — 8.9 is display-only.
+  - Codex availableModes: `["default", "read-only", "safe-yolo", "yolo"]`.
+  - **Remote mode switching is Stage 9.0+; 8.9 does not wire it.**
+
+- **Error reuse.** Unknown-id errors continue to use
+  `agent.permission.resolve.error` (the existing type). A
+  future stage may introduce `agent.interaction.resolve.error`
+  if a UI needs the distinction.
+
+- **Field-type contract** (see
+  [`docs/agent-interaction-contract.md` §5.4](agent-interaction-contract.md)
+  for the full table):
+  - `createdAt`: `number` — epoch milliseconds (`Date.now()`).
+  - `value`: opaque; treat as `undefined` for `kind: "permission"`.
+  - `data`: opaque bytes; raw terminal fallback only. Stage 8.9
+    producers do not set it.
+
+See [`docs/agent-interaction-contract.md` §11](agent-interaction-contract.md)
+for the runtime-wiring details.

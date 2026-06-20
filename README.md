@@ -412,6 +412,18 @@ node ./tests/claudeEventContract.test.js    # 11 cases green
 npm test                                   # 20 suites + 2 binary smokes
 ```
 
+**Stage 8.8 — Interactive blocking-prompt contract:** generalizes `agent.permission.*` into an `agent.interaction.*` envelope with kinds `permission | confirm | single_select | multi_select | free_text | raw_terminal` and sources `hook | jsonl | app-server | pty`. The contract helper (`src/runtime/agentInteractionContract.js`) is a pure module — production code does not import it in 8.8. The 10-case test suite (`tests/agentInteractionContract.test.js`) locks the wire shape: forward map (permission → interaction, new `eventType`), reverse map (permission-only, legacy `eventType`), and `buildInteractionResolved` validation (with optional `value` / `data` passthrough). No production refactor; no UI work; no provider/auth/login (those are Stage 9.0). Full contract in [`docs/agent-protocol.md` §10.14](docs/agent-protocol.md) and [`docs/agent-interaction-contract.md`](docs/agent-interaction-contract.md). Verification:
+```bash
+node ./tests/agentInteractionContract.test.js    # 10 cases green
+npm test                                        # 21 suites + 2 binary smokes
+```
+
+**Stage 8.9 — Runtime interaction wiring + temporary console:** promotes the 8.8 helper to production. `claudeAdapter.js` and `codexAdapter.js` dual-emit `agent.permission.request.detected` AND `agent.interaction.requested` for every permission request. `localAgentSession.js#handleRemoteEvent` accepts `agent.interaction.resolve` and routes it to the existing permission resolver. `localApi.js` exposes `POST /sessions/:id/interaction`. The local session emits one `agent.mode.status` per `session.started` (read-only; `modeControl: "unsupported"`; Claude modes `default | acceptEdits | bypassPermissions | plan`, Codex modes `default | read-only | safe-yolo | yolo`). The temporary console (`originrouter-test/local-console.html`, outside the CLI repo) renders the new envelope, deduplicates against the legacy event, and shows a `Mode:` pill. `agent.permission.*` events remain emitted and consumed unchanged. Stage 8.9 does NOT remove the legacy event, does NOT wire remote mode switching, does NOT emit non-permission kinds from production adapters, and does NOT change the relay protocol. The 8-case test suite (`tests/agentInteractionRuntime.test.js`) locks the dual-emit, resolve routing, unknown-id error, raw fallback, and `agent.mode.status` emission. Full contract in [`docs/agent-interaction-contract.md` §11](docs/agent-interaction-contract.md) and [`docs/agent-protocol.md` §10.14.4](docs/agent-protocol.md). Verification:
+```bash
+node ./tests/agentInteractionRuntime.test.js    # 8 cases green
+npm test                                        # 22 suites + 2 binary smokes
+```
+
 Security:
 
 - The routes HTTP API (`GET /routes`, `PUT /routes/{claude,codex}`, `POST /routes/{claude,codex}/{main,small}`, `DELETE /routes/{claude,codex}/{main,small}`) requires the bearer token. `POST /routes/codex/small` returns 400 (Codex 8.0 has no small slot). Only `/catalog/litellm-providers` and `/local/auth/challenge` remain public.

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { decisionToHookJson } from "../src/adapters/claude/hookServer.js";
+import { permissionEventToInteraction } from "../src/runtime/agentInteractionContract.js";
 
 // v1 conservative mapping. `approved_for_session` is intentionally identical
 // to `approved` until the exact `updatedPermissions` wire format is verified
@@ -91,5 +92,30 @@ assert.deepEqual(
   permissionOutput({ behavior: "allow" }),
   "approved (one-shot) must never echo updatedPermissions",
 );
+
+// ---- Stage 8.9: structural round-trip via permissionEventToInteraction ----
+
+{
+  const legacy = {
+    type: "agent.permission.request.detected",
+    provider: "claude",
+    callId: "claude-perm-1",
+    tool: "Bash",
+    input: { command: "npm test" },
+    permissionSuggestions: [],
+    resolution: {
+      eventType: "agent.permission.resolve",
+      decisions: ["approved", "approved_for_session", "denied", "abort"],
+    },
+  };
+  const interaction = permissionEventToInteraction(legacy, {
+    source: "hook",
+    sessionId: "s-test",
+  });
+  assert.equal(interaction.interactionId, legacy.callId,
+    "new envelope's interactionId equals the legacy callId");
+  assert.equal(interaction.resolution.eventType, "agent.interaction.resolve",
+    "new envelope always carries the new eventType");
+}
 
 console.log("permission decision tests ok");
