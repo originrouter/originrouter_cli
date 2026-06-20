@@ -412,7 +412,7 @@ node ./tests/claudeEventContract.test.js    # 11 cases green
 npm test                                   # 20 suites + 2 binary smokes
 ```
 
-**Stage 8.8 — Interactive blocking-prompt contract:** generalizes `agent.permission.*` into an `agent.interaction.*` envelope with kinds `permission | confirm | single_select | multi_select | free_text | raw_terminal` and sources `hook | jsonl | app-server | pty`. The contract helper (`src/runtime/agentInteractionContract.js`) is a pure module — production code does not import it in 8.8. The 10-case test suite (`tests/agentInteractionContract.test.js`) locks the wire shape: forward map (permission → interaction, new `eventType`), reverse map (permission-only, legacy `eventType`), and `buildInteractionResolved` validation (with optional `value` / `data` passthrough). No production refactor; no UI work; no provider/auth/login (those are Stage 9.0). Full contract in [`docs/agent-protocol.md` §10.14](docs/agent-protocol.md) and [`docs/agent-interaction-contract.md`](docs/agent-interaction-contract.md). Verification:
+**Stage 8.8 — Interactive blocking-prompt contract:** generalizes `agent.permission.*` into an `agent.interaction.*` envelope with kinds `permission | confirm | single_select | multi_select | free_text | raw_terminal` and sources `hook | jsonl | app-server | pty`. The contract helper (`src/runtime/agentInteractionContract.js`) is a pure module. Stage 8.8 ships the contract only; **runtime wiring landed in Stage 8.9** (production now imports the helper, see below). The 10-case test suite (`tests/agentInteractionContract.test.js`) locks the wire shape: forward map (permission → interaction, new `eventType`), reverse map (permission-only, legacy `eventType`), and `buildInteractionResolved` validation (with optional `value` / `data` passthrough). No UI work; no provider/auth/login (those are Stage 9.0). Full contract in [`docs/agent-protocol.md` §10.14](docs/agent-protocol.md) and [`docs/agent-interaction-contract.md`](docs/agent-interaction-contract.md). Verification:
 ```bash
 node ./tests/agentInteractionContract.test.js    # 10 cases green
 npm test                                        # 21 suites + 2 binary smokes
@@ -423,6 +423,53 @@ npm test                                        # 21 suites + 2 binary smokes
 node ./tests/agentInteractionRuntime.test.js    # 8 cases green
 npm test                                        # 22 suites + 2 binary smokes
 ```
+
+**Stage 9.0 — App / Provider / Login Credential Architecture:** locks the canonical provider types (`originrouter | proxy | remote`). The legacy `litellm` CLI string is accepted as an input alias and persisted as `proxy(engine=litellm)`. `openai-compatible` is rejected on write. `src/config/providerRoutes.js` is the pure route resolver; originrouter endpoints always include `/coding/...`, proxy uses bare `/v1/...`. The login credential architecture is contracted: `uuid` is NOT a long-term /coding key; the CLI / App hold a `ManagedCodingKey` (30-day default, device-bound, `scope: "coding"`, `source: originrouter_cli|originrouter_app`); the CLI stores it in `<stateDir>/coding-key.json` (mode 0o600). The login-code / device-grant exchange and rotation are 9.1+; 9.0 ships storage + shape helpers + tests + endpoint contract doc. New CLI flags: `--key-ref`, `--engine`, `--device-id`, `--grant-ref`, `--target`. Routes are no longer proxy-only: a route entry can point at originrouter / proxy / remote. The temporary console is **out of scope** for 9.0. Verification:
+```bash
+node ./tests/providerConfigNormalization.test.js    # 13 cases green
+node ./tests/providerRouteResolution.test.js       # 14 cases green
+node ./tests/codingAuthStorage.test.js             # 10 cases green
+npm test                                           # 25 suites + 2 binary smokes
+```
+
+**Stage 9.1A — OriginRouter Login + Device Grant + Managed Coding Key:** turns the 9.0 contract into a real CLI + Backend flow. Five new CLI commands: `originrouter login [--manual-code <code>]` (the required 9.1A completion path; the browser callback is experimental pending Universal_PDF_H5 in 9.1A.1), `logout`, `auth status`, `auth rotate`, `auth device list` (current_device_only). Backend registers the 5 endpoints under `/originrouter/auth/...` — `POST /login-code` (browser uuid auth), `POST /device/exchange` (atomic single transaction), `POST /device/rotate-coding-key`, `POST /device/revoke` (idempotent; returns `already_revoked`), `GET /devices` (returns only the calling device). SQL migration at `ai/server/sql/originrouter_auth.sql` creates three tables (`originrouter_device_grants`, `originrouter_login_codes`, `api_model_key_metadata` — the side-table intentionally has no FK onto `api_model_keys.id`). New modules: `src/auth/originrouterAuthClient.js` (Node 18+ fetch helpers; `requestBrowserLoginCodeForTesting` is exported only for tests), `src/auth/originrouterLogin.js` (callback server + manual-code path + cross-platform `openBrowser` with no `shell: true` on darwin/linux). `isManagedKeyShape` now requires `deviceGrant` + `deviceId`; accepts optional idle/absolute expiries. No new npm / pip deps. Verification:
+```bash
+# CLI
+npm test                                           # 28 suites + 2 binary smokes
+node ./tests/originrouterAuthClient.test.js        # ~8 cases green
+node ./tests/originrouterLogin.test.js             # ~9 cases green
+node ./tests/cliLogin.test.js                      # ~9 cases green
+# Backend
+python3 originrouter_auth_contract_test.py          # 10 cases green (Stage 9.0)
+python3 originrouter_auth_store_test.py            # 9.1A store helpers
+python3 originrouter_auth_route_test.py            # 9.1A Flask test_client route tests
+```
+
+**Stage 9.1B — Runtime Claude/Codex → OriginRouter /coding direct:** the file written by `originrouter login` is now read by `originrouter claude` / `originrouter codex` at runtime. Routes of `type=originrouter` return direct env (`ANTHROPIC_BASE_URL=<base>/coding`, `OPENAI_BASE_URL=<base>/coding/v1`) with the managed coding key injected — no local LiteLLM proxy required. `originrouter env print --agent <claude|codex>` prints `Source: originrouter-coding` on success and an agent-aware `Effective env (what <agent> will see):` header. The Codex branch now lists `OPENAI_*` env vars (previously Claude-only); `OPENAI_API_KEY` is masked. `readManagedCodingKeyForRuntime` rejects malformed `coding-key.json` (missing `deviceGrant`, missing `scopes`, wrong `source`) with a `PROVIDER_UNSUPPORTED` error pointing to `originrouter login --manual-code`. `auth.keyRef` is a local managed-coding-key reference, not a fixed key id — after `originrouter auth rotate`, the new key id differs but the runtime always reads the current `<stateDir>/coding-key.json`. Working example:
+
+```bash
+export ORIGINROUTER_HOME="$(mktemp -d)"
+originrouter login --manual-code <code> --api-base-url <api>
+originrouter provider add official --type originrouter --key-ref current --model claude-sonnet-4-6
+originrouter route set claude.main --provider official
+originrouter env print --agent claude
+# Source: originrouter-coding
+# ANTHROPIC_BASE_URL=https://server.originrouter.com/coding
+# ANTHROPIC_API_KEY=sk-o...ey
+# ANTHROPIC_MODEL=claude-sonnet-4-6
+# ANTHROPIC_SMALL_FAST_MODEL=claude-sonnet-4-6
+
+originrouter route set codex.main --provider official-codex --model gpt-5-codex
+originrouter env print --agent codex
+# Source: originrouter-coding
+# OPENAI_BASE_URL=https://server.originrouter.com/coding/v1
+# OPENAI_API_KEY=sk-o...ey
+# OPENAI_MODEL=gpt-5-codex
+
+cd originrouter-cli && npm test   # expect 29 suites + 2 binary smokes
+```
+
+The proxy branch (`type=proxy`) is unchanged; the 28-suite regression surface stays green. Remote provider (`type=remote`) is still future. No edits under Universal_PDF_H5 / Flutter; no backend route changes; no new npm dependencies.
 
 Security:
 

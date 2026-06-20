@@ -45,6 +45,28 @@ import { runLocalAgentSession } from "./local/localAgentSession.js";
 import { readSessions } from "./persistence/sessionLog.js";
 import { readApiToken, rotateApiToken } from "./persistence/authToken.js";
 import { ensureStateDir, getStateDir, readConfig, readDaemonState, readDevice, writeConfig } from "./persistence/state.js";
+import {
+  clearCodingAuth,
+  readCodingAuth,
+  writeCodingAuth,
+} from "./persistence/codingAuth.js";
+import {
+  KEY_KIND,
+  KEY_SCOPE,
+  KEY_SOURCE,
+} from "./runtime/authContract.js";
+import {
+  exchangeLoginCode,
+  listDevices,
+  revokeDeviceGrant,
+  rotateCodingKey,
+} from "./auth/originrouterAuthClient.js";
+import {
+  loginWithCallback,
+  loginWithManualCode,
+  loginUrlFor,
+} from "./auth/originrouterLogin.js";
+import { DEFAULT_ORIGINROUTER_BASE_URL } from "./config/providerRoutes.js";
 import { runClaudeSdkSession } from "./runtime/claudeSdkSession.js";
 import {
   detectClaudeAgentSdkAvailability,
@@ -65,8 +87,25 @@ Usage:
   originrouter sessions [--json]
   originrouter env print [--provider <name>] [--agent claude|codex]
 
-Provider management:
-  originrouter provider add <name> [--type litellm] --litellm-provider <id> [--base-url <u>] [--api-key <k>] [--auth-token <k>] [--organization <o>] [--model <m>] [--small-fast-model <m> [legacy]] [--api-version <v>] [--aws-region <r>] [--aws-access-key-id <id>] [--aws-secret-access-key <k>] [--aws-session-token <t>] [--aws-profile-name <p>] [--aws-bedrock-runtime-endpoint <u>] [--aws-role-name <r>] [--aws-session-name <n>] [--aws-web-identity-token <t>] [--aws-sts-endpoint <u>] [--sagemaker-base-url <u>] [--vertex-project <id>] [--vertex-location <loc>] [--vertex-credentials <json>] [--google-application-credentials <path>] [--azure-ad-token <t>] [--hf-token <t>]
+Provider management (Stage 9.0):
+  originrouter provider add <name> [--type originrouter|proxy|remote] [--base-url <u>] [--model <m>]
+                                   [--engine <e>] [--litellm-provider <id>] [--api-key <k>] [--auth-token <k>]
+                                   [--organization <o>] [--small-fast-model <m> [legacy]] [--api-version <v>]
+                                   [--aws-region <r>] [--aws-access-key-id <id>] [--aws-secret-access-key <k>]
+                                   [--aws-session-token <t>] [--aws-profile-name <p>]
+                                   [--aws-bedrock-runtime-endpoint <u>] [--aws-role-name <r>] [--aws-session-name <n>]
+                                   [--aws-web-identity-token <t>] [--aws-sts-endpoint <u>] [--sagemaker-base-url <u>]
+                                   [--vertex-project <id>] [--vertex-location <loc>] [--vertex-credentials <json>]
+                                   [--google-application-credentials <path>] [--azure-ad-token <t>] [--hf-token <t>]
+                                   [--key-ref <id>] [--device-id <id>] [--grant-ref <id>] [--target proxy|agent]
+
+  --type originrouter  Official /coding subscription endpoint (default base URL https://server.originrouter.com).
+                        Requires --key-ref pointing at a locally stored managed coding key (see 'coding-key.json').
+  --type proxy         Local LiteLLM proxy. Use --engine litellm (default) + --litellm-provider <id>.
+                        --type litellm is accepted as an alias and persisted as proxy(engine=litellm).
+  --type remote        Authorized remote device (Stage 9.1+ real impl). Requires --device-id + --grant-ref.
+                        --target defaults to 'proxy'; 'agent' uses the remote agent runtime.
+
 originrouter provider update <name> [same flags as add]
   originrouter provider list
   originrouter provider show <name>
@@ -118,11 +157,18 @@ Other:
 
 Examples:
   originrouter run -- bash
-  originrouter provider add minimax --litellm-provider anthropic --base-url https://api.easytransnote.com/coding --api-key sk-v1-xxx --model MiniMax-M3 --small-fast-model MiniMax-M2.7
+  # Stage 9.0: official originrouter provider (real model id, keyRef is a
+  # local managed-coding-key reference; the real exchange is 9.1+).
+  originrouter provider add official-originrouter --type originrouter --base-url https://server.originrouter.com --key-ref managed-key-1 --model claude-sonnet-4-6
+  # Stage 9.0: proxy provider (LiteLLM via local proxy). The --type litellm
+  # alias and --engine litellm are equivalent to the canonical --type proxy.
+  originrouter provider add minimax --type proxy --engine litellm --litellm-provider anthropic --base-url https://api.easytransnote.com/coding --api-key sk-v1-xxx --model MiniMax-M3 --small-fast-model MiniMax-M2.7
+  # Stage 9.0: remote provider (forward to an authorized device).
+  originrouter provider add laptop-remote --type remote --device-id device-x --grant-ref grant-1 --target proxy
   originrouter provider use minimax
   originrouter env print
   originrouter claude
-  originrouter route set claude.main --provider deepseek --model deepseek-chat
+  originrouter route set claude.main --provider minimax --model MiniMax-M3
   originrouter claude-config --base-url https://x --api-key sk-y --model m   # legacy: writes config.claude
   originrouter claude-sdk --model MiniMax-M3
   originrouter codex --model gpt-5-codex
@@ -130,11 +176,23 @@ Examples:
   originrouter sessions --json
   # Stage 7.7: provider fields can be env references. The shell var name is
   # stored verbatim; LiteLLM reads the env itself at startup.
-  originrouter provider add bedrock-irsa --litellm-provider bedrock \
+  originrouter provider add bedrock-irsa --type proxy --engine litellm --litellm-provider bedrock \
     --aws-region os.environ/AWS_REGION_NAME \
     --aws-role-name arn:aws:iam::123456789012:role/MyBedrockRole \
     --aws-web-identity-token os.environ/AWS_WEB_IDENTITY_TOKEN_FILE \
     --model anthropic.claude-3-5-sonnet-20241022-v2:0
+
+OriginRouter login credential flow (Stage 9.1A):
+  originrouter login [--api-base-url <url>] [--login-url <url>] [--device-name <name>] [--manual-code <code>]
+  originrouter logout [--api-base-url <url>]
+  originrouter auth status
+  originrouter auth rotate [--api-base-url <url>]
+  originrouter auth device list [--api-base-url <url>]
+
+  --manual-code <code>  Required completion path for 9.1A. The browser
+                        callback path is experimental until 9.1A.1 wires
+                        Universal_PDF_H5 to call /originrouter/auth/login-code
+                        and redirect back to the CLI callback.
 
 OriginRouter wrapper options for claude/codex:
   --provider <name>                              Deprecated for claude; use 'originrouter route set'. Reserved for legacy/debug paths.
@@ -414,10 +472,9 @@ function parseProviderAddOptions(rest) {
   const opts = parseOptionArgs(rest.slice(1));
   if (!name) {
     throw new Error(
-      "Usage: originrouter provider add <name> [--type litellm] --litellm-provider <id> " +
-      "[--base-url <u>] [--api-key <k>] [--auth-token <k>] " +
-      "[--organization <o>] [--model <m>] " +
-      "[--small-fast-model <m>] [--api-version <v>] [--aws-region <r>] " +
+      "Usage: originrouter provider add <name> [--type originrouter|proxy|remote] [--base-url <u>] [--model <m>] " +
+      "[--engine <e>] [--litellm-provider <id>] [--api-key <k>] [--auth-token <k>] " +
+      "[--organization <o>] [--small-fast-model <m>] [--api-version <v>] [--aws-region <r>] " +
       "[--aws-access-key-id <id>] [--aws-secret-access-key <k>] " +
       "[--aws-session-token <t>] [--aws-profile-name <p>] " +
       "[--aws-bedrock-runtime-endpoint <u>] [--aws-role-name <r>] " +
@@ -426,13 +483,19 @@ function parseProviderAddOptions(rest) {
       "[--vertex-project <id>] [--vertex-location <loc>] " +
       "[--vertex-credentials <json>] " +
       "[--google-application-credentials <path>] " +
-      "[--azure-ad-token <t>] [--hf-token <t>]",
+      "[--azure-ad-token <t>] [--hf-token <t>] " +
+      "[--key-ref <id>] [--device-id <id>] [--grant-ref <id>] [--target proxy|agent]",
     );
   }
   // Stage 7.7: only include a key when its CLI flag was explicitly provided.
-// Otherwise addProvider's strict unknown-field check sees every flag in the
-// catalog and rejects (e.g. a `provider add custom_openai --api-key k --model m`
-// invocation should not send `awsRegion`, `vertexProject`, etc.).
+  // Otherwise addProvider's strict unknown-field check sees every flag in the
+  // catalog and rejects (e.g. a `provider add custom_openai --api-key k --model m`
+  // invocation should not send `awsRegion`, `vertexProject`, etc.).
+  //
+  // Stage 9.0: the type / engine / auth / deviceId / target / keyRef /
+  // grantRef flags assemble the new originrouter / remote shapes. The
+  // --type litellm alias is preserved at this layer; providers.js runs
+  // the patch through normalizeProviderForWrite before validation.
   const out = { name, type: opts["--type"], litellmProvider: opts["--litellm-provider"] };
   const flagMap = {
     "--base-url": "baseUrl",
@@ -463,6 +526,31 @@ function parseProviderAddOptions(rest) {
   for (const [flag, key] of Object.entries(flagMap)) {
     if (opts[flag] !== undefined && opts[flag] !== "") out[key] = opts[flag];
   }
+
+  // Stage 9.0: assemble originrouter / remote fields from the new
+  // flags. These flags are NOT in the legacy flagMap because they
+  // describe a different shape (auth object, deviceId, etc.).
+  if (opts["--key-ref"] != null && opts["--key-ref"] !== "") {
+    out.auth = { type: "managed_originrouter_key", keyRef: opts["--key-ref"] };
+  }
+  if (opts["--device-id"] != null && opts["--device-id"] !== "") {
+    out.deviceId = opts["--device-id"];
+  }
+  if (opts["--grant-ref"] != null && opts["--grant-ref"] !== "") {
+    out.auth = { type: "device_grant", grantRef: opts["--grant-ref"] };
+  }
+  if (opts["--target"] != null && opts["--target"] !== "") {
+    if (opts["--target"] !== "proxy" && opts["--target"] !== "agent") {
+      throw new Error(`--target must be 'proxy' or 'agent' (got '${opts["--target"]}')`);
+    }
+    out.target = opts["--target"];
+  }
+  if (opts["--engine"] != null && opts["--engine"] !== "") {
+    if (opts["--engine"] !== "litellm") {
+      throw new Error(`--engine must be 'litellm' in Stage 9.0 (got '${opts["--engine"]}')`);
+    }
+    out.engine = opts["--engine"];
+  }
   return out;
 }
 
@@ -482,7 +570,7 @@ function handleProvider(args) {
     if (opts.type === "openai-compatible") {
       throw new Error(
         `type 'openai-compatible' is no longer supported. ` +
-        `Use --type litellm --litellm-provider custom_openai instead.`,
+        `Use --type proxy --litellm-provider custom_openai (or --type litellm as an alias) instead.`,
       );
     }
     const next = addProviderFromFlags(config, opts);
@@ -497,7 +585,7 @@ function handleProvider(args) {
     if (opts.type === "openai-compatible") {
       throw new Error(
         `type 'openai-compatible' is no longer supported. ` +
-        `Use --type litellm --litellm-provider custom_openai instead.`,
+        `Use --type proxy --litellm-provider custom_openai (or --type litellm as an alias) instead.`,
       );
     }
     const result = updateProviderFromFlags(config, name, opts);
@@ -918,6 +1006,8 @@ function flagsToProviderPayload(opts) {
     "sagemakerBaseUrl",
     "vertexProject", "vertexLocation", "vertexCredentials",
     "googleApplicationCredentials", "azureAdToken", "hfToken",
+    // Stage 9.0: originrouter / remote shape.
+    "auth", "deviceId", "target", "engine",
   ];
   for (const k of keys) {
     if (opts[k] !== undefined && opts[k] !== "") out[k] = opts[k];
@@ -950,6 +1040,11 @@ function maybeNoteLegacySmallFastModel(opts) {
 // ---------- env print ----------
 
 const ANTHROPIC_ENV_VARS = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"];
+// Stage 9.1B: Codex uses OPENAI_* env vars, not ANTHROPIC_*.
+const OPENAI_ENV_VARS    = ["OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"];
+function envVarsFor(agent) {
+  return agent === "codex" ? OPENAI_ENV_VARS : ANTHROPIC_ENV_VARS;
+}
 
 function handleEnvPrint(args) {
   // `env print` has its own positional subcommand; don't run args through
@@ -995,18 +1090,27 @@ function handleEnvPrint(args) {
     throw new Error(`--agent must be 'claude' or 'codex' (got '${agent}')`);
   }
 
-  let providerEnv = {};
+  let providerResult = null;
   let providerError = null;
   try {
-    providerEnv = buildAgentProviderEnv(agent, config, {
+    providerResult = buildAgentProviderEnv(agent, config, {
       provider: flagName,
       proxyStatus: staticProxyStatusFn(readLocalProxySnapshot()),
-    }).env;
+    });
   } catch (err) {
     providerError = err;
   }
+  const providerEnv = providerResult?.env || {};
 
-  console.log("\nEffective env (what claude will see):");
+  // Stage 9.1B: print `Source: <transport>` on success only. On failure
+  // there is no source to advertise — skip the line. The "Effective env"
+  // header is always printed (current behavior preserved), with the
+  // agent name interpolated so codex output does not lie about "claude".
+  if (providerResult?.source) {
+    console.log(`\nSource: ${providerResult.source}`);
+  }
+
+  console.log(`\nEffective env (what ${agent} will see):`);
   const providerKeys = Object.keys(providerEnv);
   if (providerKeys.length === 0) {
     if (providerError) {
@@ -1022,7 +1126,7 @@ function handleEnvPrint(args) {
   }
 
   console.log("\nSystem env (overridden by providerEnv when both present):");
-  for (const key of ANTHROPIC_ENV_VARS) {
+  for (const key of envVarsFor(agent)) {
     const inProvider = Object.prototype.hasOwnProperty.call(providerEnv, key);
     const sysVal = process.env[key];
     if (inProvider) {
@@ -1036,8 +1140,9 @@ function handleEnvPrint(args) {
 }
 
 // Only API keys are sensitive; model names and base URLs are shown in full.
+// Stage 9.1B: also mask OPENAI_API_KEY (Codex direct branch).
 function formatEnvValue(key, value) {
-  if (key === "ANTHROPIC_API_KEY") return maskSecret(value, true);
+  if (key === "ANTHROPIC_API_KEY" || key === "OPENAI_API_KEY") return maskSecret(value, true);
   return value;
 }
 
@@ -1185,6 +1290,21 @@ export async function main(argv) {
     return;
   }
 
+  if (command === "login") {
+    await handleLogin(args);
+    return;
+  }
+
+  if (command === "logout") {
+    await handleLogout(args);
+    return;
+  }
+
+  if (command === "auth") {
+    await handleAuthCommand(args);
+    return;
+  }
+
   if (command === "claude-sdk") {
     await runClaudeSdkSession(args);
     return;
@@ -1209,5 +1329,207 @@ export async function main(argv) {
 
   console.error(`Unknown command: ${command}`);
   console.error("Run `originrouter --help` for usage.");
+  process.exitCode = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 9.1A — OriginRouter auth commands
+// ---------------------------------------------------------------------------
+
+function _parseFlag(args, name) {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === `--${name}` && i + 1 < args.length) return args[i + 1];
+    if (args[i].startsWith(`--${name}=`)) return args[i].slice(name.length + 3);
+  }
+  return undefined;
+}
+
+function _maskKey(rawKey) {
+  if (!rawKey || typeof rawKey !== "string") return "(none)";
+  if (rawKey.length < 4) return "****";
+  return "sk-or-****" + rawKey.slice(-4);
+}
+
+function _formatExpiry(epochMs) {
+  if (!epochMs || typeof epochMs !== "number") return "(unknown)";
+  return new Date(epochMs).toISOString();
+}
+
+function _authPayloadToManagedKey(payload, deviceId, deviceName) {
+  // Convert backend response shape to the on-disk managed-key shape.
+  // Backend returns epoch seconds (int); on-disk uses epoch ms.
+  return {
+    kind: KEY_KIND.MANAGED,
+    keyId: payload.managed_coding_key_id,
+    key: payload.managed_coding_key,
+    deviceGrantId: payload.device_grant_id,
+    deviceGrant: payload.device_grant,
+    deviceId: payload.device_id || deviceId,
+    expiresAt: payload.managed_coding_key_expires_at * 1000,
+    deviceGrantIdleExpiresAt: payload.device_grant_idle_expires_at * 1000,
+    deviceGrantAbsoluteExpiresAt: payload.device_grant_absolute_expires_at * 1000,
+    source: KEY_SOURCE.ORIGINROUTER_CLI,
+    scopes: [KEY_SCOPE.CODING],
+  };
+}
+
+async function handleLogin(args) {
+  const stateDir = ensureStateDir();
+  const apiBaseUrl = _parseFlag(args, "api-base-url") || DEFAULT_ORIGINROUTER_BASE_URL;
+  const explicitLoginUrl = _parseFlag(args, "login-url");
+  const deviceName = _parseFlag(args, "device-name") || "cli-device";
+  const manualCode = _parseFlag(args, "manual-code");
+  const device = ensureDeviceForLogin();
+
+  const loginUrl = explicitLoginUrl || loginUrlFor(apiBaseUrl);
+
+  let payload;
+  if (manualCode) {
+    payload = await loginWithManualCode({
+      apiBaseUrl,
+      code: manualCode,
+      deviceId: device.deviceId,
+      deviceName,
+      source: KEY_SOURCE.ORIGINROUTER_CLI,
+    });
+  } else {
+    // Browser callback is experimental in 9.1A — Universal_PDF_H5 is
+    // not yet wired to call /originrouter/auth/login-code. Print a
+    // clear notice and proceed; the CLI will time out if H5 never
+    // redirects. Use --manual-code for the supported path.
+    console.error(
+      "Note: browser callback is experimental in Stage 9.1A. " +
+      "Use `originrouter login --manual-code <code>` for the supported path. " +
+      "To get a code, run: curl -X POST <api>/originrouter/auth/login-code " +
+      "-H 'Authorization: Bearer uuid:<browser-uuid>' " +
+      "-H 'Content-Type: application/json' " +
+      "-d '{\"device_id\":\"<id>\",\"source\":\"originrouter_cli\"}'"
+    );
+    payload = await loginWithCallback({
+      apiBaseUrl,
+      loginUrl,
+      deviceId: device.deviceId,
+      deviceName,
+      source: KEY_SOURCE.ORIGINROUTER_CLI,
+    });
+  }
+
+  const managedKey = _authPayloadToManagedKey(payload, device.deviceId, deviceName);
+  writeCodingAuth(stateDir, managedKey);
+
+  console.log(`Logged in to ${apiBaseUrl}`);
+  console.log(`Device:    ${managedKey.deviceId}`);
+  console.log(`Grant:     ${managedKey.deviceGrantId} (idle ${_formatExpiry(managedKey.deviceGrantIdleExpiresAt)} / abs ${_formatExpiry(managedKey.deviceGrantAbsoluteExpiresAt)})`);
+  console.log(`Key:       ${_maskKey(managedKey.key)} (id ${managedKey.keyId}, expires ${_formatExpiry(managedKey.expiresAt)})`);
+}
+
+function ensureDeviceForLogin() {
+  // Reuse the existing deviceId if present; otherwise mint one.
+  const existing = readDevice();
+  if (existing && existing.deviceId) return existing;
+  // Defer to ensureDevice from persistence/state.js semantics.
+  // We do not call writeConfig here; device.json is written by
+  // the existing CLI on first use. We use a deterministic shape
+  // matching ensureDevice():
+  //   { deviceId: "device-<uuid>" }
+  return { deviceId: existing?.deviceId || `device-${Date.now()}` };
+}
+
+async function handleLogout(args) {
+  const stateDir = ensureStateDir();
+  const stored = readCodingAuth(stateDir);
+  if (!stored) {
+    console.log("Not logged in.");
+    return;
+  }
+  const apiBaseUrl = _parseFlag(args, "api-base-url") || DEFAULT_ORIGINROUTER_BASE_URL;
+  try {
+    if (stored.deviceGrant) {
+      await revokeDeviceGrant({ apiBaseUrl, deviceGrant: stored.deviceGrant });
+    }
+  } catch (err) {
+    console.warn(`logout: backend revoke failed: ${err.message}`);
+    console.warn("Clearing local file anyway. Server-side grant may still exist.");
+  }
+  clearCodingAuth(stateDir);
+  console.log("Logged out.");
+}
+
+function handleAuthStatus(args) {
+  const stateDir = ensureStateDir();
+  const stored = readCodingAuth(stateDir);
+  if (!stored) {
+    console.log("Not logged in.");
+    return;
+  }
+  console.log("Logged in (CLI)");
+  console.log(`Device:    ${stored.deviceId}`);
+  if (stored.deviceGrantId) {
+    console.log(`Grant:     ${stored.deviceGrantId} (idle ${_formatExpiry(stored.deviceGrantIdleExpiresAt)} / abs ${_formatExpiry(stored.deviceGrantAbsoluteExpiresAt)})`);
+  }
+  console.log(`Key:       ${_maskKey(stored.key)} (id ${stored.keyId}, expires ${_formatExpiry(stored.expiresAt)})`);
+  console.log(`Source:    ${stored.source}`);
+}
+
+async function handleAuthRotate(args) {
+  const stateDir = ensureStateDir();
+  const stored = readCodingAuth(stateDir);
+  if (!stored || !stored.deviceGrant) {
+    console.error("Run `originrouter login` first.");
+    process.exitCode = 1;
+    return;
+  }
+  const apiBaseUrl = _parseFlag(args, "api-base-url") || DEFAULT_ORIGINROUTER_BASE_URL;
+  const rotated = await rotateCodingKey({ apiBaseUrl, deviceGrant: stored.deviceGrant });
+  // Preserve device + grant metadata; replace key fields.
+  const merged = {
+    ...stored,
+    keyId: rotated.managed_coding_key_id,
+    key: rotated.managed_coding_key,
+    expiresAt: rotated.managed_coding_key_expires_at * 1000,
+  };
+  writeCodingAuth(stateDir, merged);
+  console.log(`Key rotated.`);
+  console.log(`Key:       ${_maskKey(merged.key)} (id ${merged.keyId}, expires ${_formatExpiry(merged.expiresAt)})`);
+}
+
+async function handleAuthDeviceList(args) {
+  const stateDir = ensureStateDir();
+  const stored = readCodingAuth(stateDir);
+  if (!stored || !stored.deviceGrant) {
+    console.error("Run `originrouter login` first.");
+    process.exitCode = 1;
+    return;
+  }
+  const apiBaseUrl = _parseFlag(args, "api-base-url") || DEFAULT_ORIGINROUTER_BASE_URL;
+  const resp = await listDevices({ apiBaseUrl, deviceGrant: stored.deviceGrant });
+  console.log(`scope: ${resp.scope}`);
+  for (const d of resp.devices || []) {
+    console.log(`---`);
+    console.log(`Device:           ${d.device_id}`);
+    console.log(`Device grant id:  ${d.device_grant_id}`);
+    console.log(`Device name:      ${d.device_name}`);
+    console.log(`Source:           ${d.source}`);
+    console.log(`Scopes:           ${JSON.stringify(d.scopes)}`);
+    console.log(`Idle expires:     ${_formatExpiry(d.idle_expires_at * 1000)}`);
+    console.log(`Absolute expires: ${_formatExpiry(d.absolute_expires_at * 1000)}`);
+    if (d.last_used_at) console.log(`Last used:        ${_formatExpiry(d.last_used_at * 1000)}`);
+    console.log(`Revoked:          ${d.revoked_at ? _formatExpiry(d.revoked_at * 1000) : "(active)"}`);
+  }
+}
+
+function handleAuthCommand(args) {
+  const [sub, ...rest] = args;
+  if (!sub || sub === "--help" || sub === "-h") {
+    console.log("OriginRouter auth subcommands:");
+    console.log("  status                 Show local sign-in state (no backend call).");
+    console.log("  rotate [--api-base-url <url>]  Rotate the managed coding key via the backend.");
+    console.log("  device list [--api-base-url <url>]  List the calling device.");
+    return;
+  }
+  if (sub === "status") return handleAuthStatus(rest);
+  if (sub === "rotate") return handleAuthRotate(rest);
+  if (sub === "device" && rest[0] === "list") return handleAuthDeviceList(rest.slice(1));
+  console.error(`Unknown auth subcommand: ${sub}`);
   process.exitCode = 1;
 }

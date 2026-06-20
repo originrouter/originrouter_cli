@@ -12,6 +12,8 @@ import { join } from "node:path";
 import { buildAgentProviderEnv } from "../src/config/claudeConfig.js";
 import { addProvider, setCurrentProvider } from "../src/config/providers.js";
 import { setRoute, clearRoute, CODEX_MAIN_ALIAS, getAllRoutes, hashRoutes, getRoutes, MAIN_ALIAS, SMALL_ALIAS } from "../src/config/routes.js";
+import { writeCodingAuth } from "../src/persistence/codingAuth.js";
+import { KEY_KIND, KEY_SCOPE, KEY_SOURCE } from "../src/runtime/authContract.js";
 
 const home = mkdtempSync(join(tmpdir(), "originrouter-claude-routes-"));
 process.env.ORIGINROUTER_HOME = home;
@@ -196,6 +198,85 @@ try {
       }),
       (err) => err.code === "PROVIDER_UNSUPPORTED",
     );
+  }
+
+  // ---- Stage 9.1B: originrouter direct branch smoke (cases 13-14) ----
+  //
+  // The exhaustive direct-branch coverage lives in
+  // tests/runtimeOriginrouterRoute.test.js. These two cases exist in this
+  // file to lock in the contract alongside the proxy regression: a route
+  // pointing at type=originrouter returns direct env (no proxy required).
+  //
+  // Seed an originrouter provider, write a valid managed coding key via
+  // writeCodingAuth, and assert the env vars are derived from
+  // DEFAULT_ORIGINROUTER_BASE_URL ("https://server.originrouter.com").
+
+  // helper: write a well-formed managed key matching isManagedKeyShape
+  function seedManagedKey(home, overrides = {}) {
+    const key = {
+      kind: KEY_KIND.MANAGED,                 // "managed"
+      keyId: "ok_test_key",
+      key: "sk-or-v1-ok-test-key",
+      deviceGrantId: "og_test_grant_id",
+      deviceGrant: "og_test_grant_token_for_unit_tests_only",
+      deviceId: "device-test-001",
+      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      source: KEY_SOURCE.ORIGINROUTER_CLI,    // "originrouter_cli"
+      scopes: [KEY_SCOPE.CODING],             // ["coding"]
+      ...overrides,
+    };
+    writeCodingAuth(home, key);
+  }
+
+  // ---- (13) claude originrouter direct smoke ----
+  {
+    const official = { name: "official", type: "originrouter",
+      auth: { type: "managed_originrouter_key", keyRef: "current" },
+      model: "claude-sonnet-4-6" };
+    const configWithOfficial = {
+      ...config,
+      providers: { ...(config.providers || {}), official },
+    };
+    // Earlier cases (3, 5) left claude.small pointing at moonshot (litellm).
+    // An originrouter main + non-originrouter small is rejected by the
+    // runtime guard. Clear small before the originrouter direct smoke.
+    const configWithoutSmall = clearRoute(configWithOfficial, "claude", "small");
+    const configRouted = setRoute(configWithoutSmall, "claude", "main",
+      { provider: "official", model: "claude-sonnet-4-6" });
+    seedManagedKey(home);
+    // proxyStatus returning "stopped" must NOT block originrouter direct.
+    const out = buildAgentProviderEnv("claude", configRouted, {
+      proxyStatus: () => ({ state: "stopped" }),
+    });
+    assert.equal(out.source, "originrouter-coding");
+    assert.equal(out.env.ANTHROPIC_BASE_URL, "https://server.originrouter.com/coding");
+    assert.equal(out.env.ANTHROPIC_API_KEY, "sk-or-v1-ok-test-key");
+    assert.equal(out.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
+    // small falls back to main
+    assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, "claude-sonnet-4-6");
+  }
+
+  // ---- (14) codex originrouter direct smoke ----
+  {
+    const officialCodex = { name: "official-codex", type: "originrouter",
+      auth: { type: "managed_originrouter_key", keyRef: "current" },
+      model: "gpt-5-codex",
+      baseUrl: "https://server.originrouter.com" };
+    const configWithOfficialCodex = {
+      ...config,
+      providers: { ...(config.providers || {}), "official-codex": officialCodex },
+    };
+    const codexRouted = setRoute(configWithOfficialCodex, "codex", "main",
+      { provider: "official-codex", model: "gpt-5-codex" });
+    // coding-key.json from case 13 is still on disk; that's fine — both
+    // agents read the same file.
+    const out = buildAgentProviderEnv("codex", codexRouted, {
+      proxyStatus: () => ({ state: "stopped" }),
+    });
+    assert.equal(out.source, "originrouter-coding");
+    assert.equal(out.env.OPENAI_BASE_URL, "https://server.originrouter.com/coding/v1");
+    assert.equal(out.env.OPENAI_API_KEY, "sk-or-v1-ok-test-key");
+    assert.equal(out.env.OPENAI_MODEL, "gpt-5-codex");
   }
 } finally {
   rmSync(home, { recursive: true, force: true });

@@ -293,4 +293,84 @@ try {
   rmSync(home, { recursive: true, force: true });
 }
 
+// ---------- Stage 9.1B: env print Source: originrouter-coding + Codex OPENAI_* + raw-key masking ----------
+
+{
+  const home = mkdtempSync(join(tmpdir(), "originrouter-env-print-91b-"));
+  const env = { ORIGINROUTER_HOME: home };
+
+  try {
+    // Seed providers: an originrouter provider for Claude and Codex.
+    await runCli(["provider", "add", "official",
+      "--type", "originrouter",
+      "--key-ref", "current",
+      "--model", "claude-sonnet-4-6"], { env });
+    await runCli(["provider", "add", "official-codex",
+      "--type", "originrouter",
+      "--key-ref", "current",
+      "--model", "gpt-5-codex"], { env });
+
+    // Write a valid managed coding key directly. The CLI has no `login`
+    // command that can run against a fake backend here, so we use the
+    // same storage helper as the 9.1A smoke test (tests/cliLogin.test.js).
+    const { writeCodingAuth } = await import("../src/persistence/codingAuth.js");
+    const { KEY_KIND, KEY_SCOPE, KEY_SOURCE } = await import("../src/runtime/authContract.js");
+    writeCodingAuth(home, {
+      kind: KEY_KIND.MANAGED,
+      keyId: "ok_test_key",
+      key: "sk-or-v1-ok-test-key",
+      deviceGrantId: "og_test_grant_id",
+      deviceGrant: "og_test_grant_token_for_unit_tests_only",
+      deviceId: "device-test-001",
+      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      source: KEY_SOURCE.ORIGINROUTER_CLI,
+      scopes: [KEY_SCOPE.CODING],
+    });
+
+    // ---- claude env print: Source: originrouter-coding + masked key ----
+    await runCli(["route", "set", "claude.main",
+      "--provider", "official", "--model", "claude-sonnet-4-6"], { env });
+
+    {
+      const r = await runCli(["env", "print", "--agent", "claude"], { env });
+      assert.match(r.stdout, /Source: originrouter-coding/);
+      assert.match(r.stdout, /ANTHROPIC_BASE_URL=https:\/\/server\.originrouter\.com\/coding/);
+      assert.match(r.stdout, /ANTHROPIC_MODEL=claude-sonnet-4-6/);
+      assert.match(r.stdout, /ANTHROPIC_SMALL_FAST_MODEL=claude-sonnet-4-6/);
+      // Raw-key leak check: the masked key form must be present (mask
+      // format is `sk-o...ey`), and the raw key value must never appear
+      // in stdout.
+      assert.match(r.stdout, /ANTHROPIC_API_KEY=sk-o\.\.\.ey/);
+      assert.ok(!r.stdout.includes("sk-or-v1-ok-test-key"),
+        "raw managed key must never appear in env print output");
+      // Agent-aware header
+      assert.match(r.stdout, /Effective env \(what claude will see\):/);
+    }
+
+    // ---- codex env print: Source: originrouter-coding + OPENAI_* + masked key ----
+    await runCli(["route", "set", "codex.main",
+      "--provider", "official-codex", "--model", "gpt-5-codex"], { env });
+
+    {
+      const r = await runCli(["env", "print", "--agent", "codex"], { env });
+      assert.match(r.stdout, /Source: originrouter-coding/);
+      assert.match(r.stdout, /OPENAI_BASE_URL=https:\/\/server\.originrouter\.com\/coding\/v1/);
+      assert.match(r.stdout, /OPENAI_MODEL=gpt-5-codex/);
+      assert.match(r.stdout, /OPENAI_API_KEY=sk-o\.\.\.ey/);
+      assert.ok(!r.stdout.includes("sk-or-v1-ok-test-key"),
+        "raw managed key must never appear in env print output");
+      // Agent-aware header — must NOT say "claude"
+      assert.match(r.stdout, /Effective env \(what codex will see\):/);
+      assert.ok(!/Effective env \(what claude will see\):/.test(r.stdout),
+        "codex env print must not advertise the claude header");
+      // System env block lists OPENAI_* keys (was previously Claude-only)
+      assert.match(r.stdout, /OPENAI_BASE_URL/);
+      assert.match(r.stdout, /OPENAI_API_KEY/);
+      assert.match(r.stdout, /OPENAI_MODEL/);
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
 console.log("cli route tests ok");

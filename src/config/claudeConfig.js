@@ -11,7 +11,15 @@ import {
   getAllRoutes,
   getRoutes,
   hashRoutes,
+  routeProviderForRead,
 } from "./routes.js";
+import {
+  DEFAULT_ORIGINROUTER_BASE_URL,
+  resolveRoute,
+} from "./providerRoutes.js";
+import { readCodingAuth } from "../persistence/codingAuth.js";
+import { isManagedKeyShape } from "../runtime/authContract.js";
+import { getStateDir } from "../persistence/state.js";
 import { NOOP_ANTHROPIC_API_KEY } from "../proxy/litellm.js";
 
 // Stage 8.0: placeholder API key we inject into OPENAI_API_KEY when routing
@@ -64,6 +72,78 @@ export function summarizeClaudeConfig(config = {}) {
   };
 }
 
+function joinUrlPath(baseUrl, path) {
+  const base = String(baseUrl || "").replace(/\/+$/, "");
+  const suffix = String(path || "").replace(/^\/+/, "");
+  return suffix ? `${base}/${suffix}` : base;
+}
+
+function originrouterBaseForRuntime(provider, runtime) {
+  const route = resolveRoute({
+    providerType: "originrouter",
+    runtime,
+    model: provider?.model,
+  });
+  const baseUrl = provider?.baseUrl || DEFAULT_ORIGINROUTER_BASE_URL;
+  if (route.endpoint.endsWith("/v1/messages")) {
+    return joinUrlPath(baseUrl, route.endpoint.slice(0, -"/v1/messages".length));
+  }
+  if (route.endpoint.endsWith("/responses")) {
+    return joinUrlPath(baseUrl, route.endpoint.slice(0, -"/responses".length));
+  }
+  return joinUrlPath(baseUrl, route.endpoint);
+}
+
+function readManagedCodingKeyForRuntime(options = {}) {
+  const stateDir = options.stateDir || getStateDir();
+  const stored = typeof options.readCodingAuth === "function"
+    ? options.readCodingAuth(stateDir)
+    : readCodingAuth(stateDir);
+  // Stage 9.1B: malformed coding-key.json (missing deviceGrant, missing
+  // scopes, wrong source) is rejected before injecting env, so a stale or
+  // hand-edited file produces a clean login prompt rather than a leaked
+  // ANTHROPIC_API_KEY= with an empty value. The shape check is placed
+  // before the expiry check: a malformed file is a setup problem
+  // (login again), not a key-age problem (rotate).
+  if (!stored || !isManagedKeyShape(stored)) {
+    const err = new Error(
+      "OriginRouter provider requires a local managed coding key. " +
+      "Run `originrouter login --manual-code <code>` first.",
+    );
+    err.code = "PROVIDER_UNSUPPORTED";
+    throw err;
+  }
+  if (typeof stored.expiresAt === "number" && stored.expiresAt <= Date.now()) {
+    const err = new Error(
+      "OriginRouter managed coding key has expired. " +
+      "Run `originrouter auth rotate` or `originrouter login --manual-code <code>`.",
+    );
+    err.code = "PROVIDER_UNSUPPORTED";
+    throw err;
+  }
+  return stored;
+}
+
+function routeProvider(config, routeEntry) {
+  if (!routeEntry || !routeEntry.provider) return null;
+  return routeProviderForRead((config.providers || {})[routeEntry.provider]);
+}
+
+function assertClaudeOriginrouterRoutes(config, eff) {
+  const mainProvider = routeProvider(config, eff.main);
+  const smallProvider = eff.small ? routeProvider(config, eff.small) : null;
+  if (!mainProvider || mainProvider.type !== "originrouter") return null;
+  if (smallProvider && smallProvider.type !== "originrouter") {
+    const err = new Error(
+      "Claude originrouter direct routing requires claude.small to use an originrouter provider too. " +
+      "Clear claude.small or point it at an originrouter provider.",
+    );
+    err.code = "PROVIDER_UNSUPPORTED";
+    throw err;
+  }
+  return { mainProvider, smallProvider: smallProvider || mainProvider };
+}
+
 export function setClaudeConfigValue(config, key, value) {
   if (!CLAUDE_CONFIG_KEYS.includes(key)) {
     throw new Error(`Unsupported Claude config key: ${key}`);
@@ -107,6 +187,24 @@ export function buildAgentProviderEnv(agent, config, options = {}) {
     const probe = typeof options.proxyStatus === "function" ? options.proxyStatus() : null;
     const routes = getRoutes(config);
     const eff = effectiveRoutes(routes);
+    const originrouterRoutes = assertClaudeOriginrouterRoutes(config, eff);
+    if (originrouterRoutes) {
+      const managed = readManagedCodingKeyForRuntime(options);
+      const env = {
+        ANTHROPIC_BASE_URL: originrouterBaseForRuntime(originrouterRoutes.mainProvider, "claude"),
+        ANTHROPIC_API_KEY: managed.key,
+        ANTHROPIC_MODEL: eff.main.model || originrouterRoutes.mainProvider.model,
+        ANTHROPIC_SMALL_FAST_MODEL: (eff.small && (eff.small.model || originrouterRoutes.smallProvider.model))
+          || eff.main.model
+          || originrouterRoutes.mainProvider.model,
+      };
+      return {
+        env,
+        routes: eff,
+        provider: originrouterRoutes.mainProvider,
+        source: "originrouter-coding",
+      };
+    }
     // Stage 8.0: hash uses the full all-agent routes object so a Codex-only
     // change also breaks the Claude hash match — correct because any route
     // change requires a proxy restart, and the proxy renders both agents'
@@ -159,6 +257,21 @@ export function buildAgentProviderEnv(agent, config, options = {}) {
       );
       err.code = "PROVIDER_UNSUPPORTED";
       throw err;
+    }
+    const mainProvider = routeProvider(config, codexRoutes.main);
+    if (mainProvider?.type === "originrouter") {
+      const managed = readManagedCodingKeyForRuntime(options);
+      const env = {
+        OPENAI_BASE_URL: originrouterBaseForRuntime(mainProvider, "codex-app-server"),
+        OPENAI_API_KEY: managed.key,
+        OPENAI_MODEL: codexRoutes.main.model || mainProvider.model,
+      };
+      return {
+        env,
+        routes: codexRoutes,
+        provider: mainProvider,
+        source: "originrouter-coding",
+      };
     }
     const currentHash = hashRoutes(getAllRoutes(config));
     const proxyHash = probe && typeof probe.routesHash === "string" ? probe.routesHash : null;

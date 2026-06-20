@@ -149,9 +149,17 @@ try {
     assert.match(r.stdout, /Codex routes:/);
     assert.match(r.stdout, /model\s+originrouter-codex-model\s+->\s+openai_codex\s*\/\s*gpt-5-codex/);
     assert.match(r.stdout, /\(Codex 8\.0 has no small\/fast slot; Codex does not fall back to Claude\.\)/);
-    assert.match(r.stdout, /Effective env \(what claude will see\):/);
+    // Stage 9.1B: env print header is agent-aware. The agent here is
+    // codex, so the header must read "what codex will see" — not "what
+    // claude will see" (that was the pre-9.1B lie).
+    assert.match(r.stdout, /Effective env \(what codex will see\):/);
     assert.match(r.stdout, /OPENAI_BASE_URL=http:\/\/127\.0\.0\.1:40123\/v1/);
-    assert.match(r.stdout, /OPENAI_API_KEY=sk-noop-litellm-passthrough/);
+    // Stage 9.1B: formatEnvValue now masks OPENAI_API_KEY the same way
+    // it masks ANTHROPIC_API_KEY. The full noop key value
+    // `sk-noop-litellm-passthrough` must never appear in stdout.
+    assert.ok(!r.stdout.includes("sk-noop-litellm-passthrough"),
+      "raw proxy noop key must never appear in env print output");
+    assert.match(r.stdout, /OPENAI_API_KEY=sk-n\.\.\.gh/);
     assert.match(r.stdout, /OPENAI_MODEL=originrouter-codex-model/);
   }
 
