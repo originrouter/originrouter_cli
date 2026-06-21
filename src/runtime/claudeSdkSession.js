@@ -3,6 +3,7 @@ import { buildAgentProviderEnv, maskSecret } from "../config/claudeConfig.js";
 import { DEFAULT_DEVICE_ID, DEFAULT_RELAY_URL } from "../constants.js";
 import { readLocalProxySnapshot, staticProxyStatusFn } from "../proxy/snapshot.js";
 import { ensureDevice, ensureStateDir, readConfig } from "../persistence/state.js";
+import { buildRelayClientOptions } from "../relay/relayAuthBootstrap.js";
 import { RelayClient } from "../relay/relayClient.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 import { AsyncMessageQueue } from "./asyncMessageQueue.js";
@@ -114,7 +115,22 @@ export async function runClaudeSdkSession(rawArgs) {
   const device = ensureDevice(options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID);
   const sessionId = options.session || `claude-sdk-${Date.now()}`;
   const cwd = process.cwd();
-  const relayClient = new RelayClient({ relayUrl, deviceId: device.deviceId });
+  // Stage 9.5 — when ORIGINROUTER_RELAY_AUTH=on, acquire a Surety token
+  // and use the effective deviceId (from coding-key.json).
+  let relayClient;
+  let effectiveDeviceId;
+  try {
+    const relayOptions = await buildRelayClientOptions({
+      stateDir: ensureStateDir(),
+      relayUrl,
+      fallbackDeviceId: device.deviceId,
+    });
+    relayClient = new RelayClient(relayOptions);
+    effectiveDeviceId = relayOptions.deviceId;
+  } catch (err) {
+    console.error(`[claude-sdk] relay auth bootstrap failed: code=${err?.code || "unknown"}`);
+    throw err;
+  }
   const localConfig = readConfig();
   // Resolve provider env through the unified entry point. Direct SDK launchers
   // read the persisted local proxy snapshot, same as the PTY path.
@@ -204,6 +220,20 @@ export async function runClaudeSdkSession(rawArgs) {
       try {
         await relayClient.connectEvents(handleRemoteEvent);
       } catch {
+        // Stage 9.5 — re-acquire a fresh token before reconnecting. BOTH
+        // relayClient.deviceId and relayClient.authToken must be updated.
+        try {
+          const relayOptions = await buildRelayClientOptions({
+            stateDir: ensureStateDir(),
+            relayUrl,
+            fallbackDeviceId: device.deviceId,
+          });
+          relayClient.deviceId = relayOptions.deviceId;
+          relayClient.setAuthToken(relayOptions.authToken);
+          effectiveDeviceId = relayOptions.deviceId;
+        } catch (reErr) {
+          console.error(`[claude-sdk] relay auth re-acquire failed: code=${reErr?.code || "unknown"}`);
+        }
         await new Promise((resolve) => setTimeout(resolve, 1500));
       }
     }

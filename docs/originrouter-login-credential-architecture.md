@@ -385,5 +385,5 @@ force-stops the proxy and surfaces a clear error.
 9.2 dev path and tests run with this set. Asymmetric
 configuration (server=on, CLI=off) manifests as silent 401s;
 the README documents this. Production deployments must set
-`on` on both sides, and `ORIGINROUTER_SURETY_URL` to the real
+`on` on both sides, and `SURETY_BASE_URL` to the real
 Surety service.

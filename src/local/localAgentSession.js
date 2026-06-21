@@ -7,6 +7,7 @@ import { appendSessionStart, patchSessionExit } from "../persistence/sessionLog.
 import { ensureDevice, ensureStateDir, readConfig } from "../persistence/state.js";
 import { RemoteCodingProxyManager } from "../proxy/remoteCodingProxyManager.js";
 import { readLocalProxySnapshot, NOOP_REMOTE_CODING_SNAPSHOT, snapshotRemoteCodingStatus, staticProxyStatusFn } from "../proxy/snapshot.js";
+import { buildRelayClientOptions } from "../relay/relayAuthBootstrap.js";
 import { RelayClient } from "../relay/relayClient.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 
@@ -140,7 +141,22 @@ export async function runLocalAgentSession(agent, rawArgs) {
   const device = ensureDevice(options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID);
   const sessionId = options.session || `${agent}-${Date.now()}`;
   const cwd = process.cwd();
-  const relayClient = new RelayClient({ relayUrl, deviceId: device.deviceId });
+  // Stage 9.5 — when ORIGINROUTER_RELAY_AUTH=on, acquire a Surety token
+  // and use the effective deviceId (from coding-key.json) for the relay.
+  let relayClient;
+  let effectiveDeviceId;
+  try {
+    const relayOptions = await buildRelayClientOptions({
+      stateDir: ensureStateDir(),
+      relayUrl,
+      fallbackDeviceId: device.deviceId,
+    });
+    relayClient = new RelayClient(relayOptions);
+    effectiveDeviceId = relayOptions.deviceId;
+  } catch (err) {
+    console.error(`[local-session] relay auth bootstrap failed: code=${err?.code || "unknown"}`);
+    throw err;
+  }
   const adapter = createAdapter({ agent, command: agent, args: passthrough, cwd });
   const executor = createExecutor("pty");
   const localConfig = readConfig();
@@ -159,7 +175,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     remoteCodingProxyManager = new RemoteCodingProxyManager({
       stateDir: ensureStateDir(),
       relayUrl,
-      deviceId: device.deviceId,
+      deviceId: effectiveDeviceId,
     });
     const startResult = await remoteCodingProxyManager.start();
     if (!startResult.ok) {
@@ -298,7 +314,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
   try {
     appendSessionStart({
       sessionId,
-      deviceId: device.deviceId,
+      deviceId: effectiveDeviceId,
       agent,
       command: launch.command,
       args: launch.args,
@@ -349,6 +365,20 @@ export async function runLocalAgentSession(agent, rawArgs) {
     try {
       await relayClient.connectEvents(handleRemoteEventBound);
     } catch {
+      // Stage 9.5 — re-acquire a fresh token before reconnecting. BOTH
+      // relayClient.deviceId and relayClient.authToken must be updated.
+      try {
+        const relayOptions = await buildRelayClientOptions({
+          stateDir: ensureStateDir(),
+          relayUrl,
+          fallbackDeviceId: device.deviceId,
+        });
+        relayClient.deviceId = relayOptions.deviceId;
+        relayClient.setAuthToken(relayOptions.authToken);
+        effectiveDeviceId = relayOptions.deviceId;
+      } catch (reErr) {
+        console.error(`[local-session] relay auth re-acquire failed: code=${reErr?.code || "unknown"}`);
+      }
       await new Promise((resolve) => setTimeout(resolve, 1500));
     }
   }

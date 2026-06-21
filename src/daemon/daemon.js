@@ -4,6 +4,7 @@ import { startLocalApi } from "../local/localApi.js";
 import { ProxyManager } from "../proxy/manager.js";
 import { ensureApiToken } from "../persistence/authToken.js";
 import { ensureDevice, ensureStateDir, readConfig, writeDaemonState } from "../persistence/state.js";
+import { buildRelayClientOptions } from "../relay/relayAuthBootstrap.js";
 import { RelayClient } from "../relay/relayClient.js";
 import { parseOptions } from "../utils/options.js";
 import { SessionManager } from "./sessionManager.js";
@@ -20,7 +21,27 @@ export async function startDaemon(args) {
   const relayUrl = options.relay || process.env.ORIGINROUTER_RELAY || DEFAULT_RELAY_URL;
   const device = ensureDevice(options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID);
   const executor = DEFAULT_EXECUTOR;
-  const relayClient = new RelayClient({ relayUrl, deviceId: device.deviceId });
+
+  // Stage 9.5 — when ORIGINROUTER_RELAY_AUTH=on, acquire a Surety token
+  // at boot using coding-key.json. The token's deviceId may differ from
+  // the constructor deviceId (e.g. when device.json is "local-dev" but
+  // coding-key.json is "prod-originrouter-worker-foo"); the effective
+  // deviceId is the one Surety issued the token for. SessionManager and
+  // all envelope payloads must use the effective deviceId.
+  let relayClient;
+  let effectiveDeviceId;
+  try {
+    const relayOptions = await buildRelayClientOptions({
+      stateDir,
+      relayUrl,
+      fallbackDeviceId: device.deviceId,
+    });
+    relayClient = new RelayClient(relayOptions);
+    effectiveDeviceId = relayOptions.deviceId;
+  } catch (err) {
+    console.error(`[daemon] relay auth bootstrap failed: code=${err?.code || "unknown"}`);
+    throw err;
+  }
 
   // Stage 4: ProxyManager owns the LiteLLM proxy lifecycle. The session
   // manager passes proxy status into buildAgentProviderEnv; the local API
@@ -30,7 +51,7 @@ export async function startDaemon(args) {
   });
   const sessionManager = new SessionManager({
     relayClient,
-    deviceId: device.deviceId,
+    deviceId: effectiveDeviceId,
     defaultExecutor: executor,
     proxyManager,
   });
@@ -47,7 +68,7 @@ export async function startDaemon(args) {
     pid: process.pid,
     version: VERSION,
     relayUrl,
-    deviceId: device.deviceId,
+    deviceId: effectiveDeviceId,
     relayConnected: () => relayConnected,
     getProxyStatus: () => proxyManager.status(),
     startProxy: ({ provider, providerName, mode, port }) => proxyManager.start({ providerName: providerName || provider, mode, port }),
@@ -83,7 +104,7 @@ export async function startDaemon(args) {
   writeDaemonState({
     pid: process.pid,
     relayUrl,
-    deviceId: device.deviceId,
+    deviceId: effectiveDeviceId,
     executor,
     localApiPort: localApi.port,
     version: VERSION,
@@ -92,7 +113,7 @@ export async function startDaemon(args) {
 
   console.log("[daemon] starting");
   console.log(`[daemon] relay: ${relayUrl}`);
-  console.log(`[daemon] device: ${device.deviceId}`);
+  console.log(`[daemon] device: ${effectiveDeviceId}`);
   console.log(`[daemon] executor: ${executor}`);
   console.log(`[daemon] local API: http://127.0.0.1:${localApi.port}`);
   console.log(`[daemon] proxy manager: ${await proxyManager.status().then((s) => `${s.state}${s.port ? ` (port ${s.port})` : ""}`)}`);
@@ -102,14 +123,31 @@ export async function startDaemon(args) {
       await relayClient.connectEvents((payload) => sessionManager.handleEvent(payload));
       relayConnected = true;
       writeDaemonState({
-        pid: process.pid, relayUrl, deviceId: device.deviceId, executor,
+        pid: process.pid, relayUrl, deviceId: effectiveDeviceId, executor,
         localApiPort: localApi.port, version: VERSION, status: "connected",
       });
     } catch (error) {
       relayConnected = false;
       console.error(`[daemon] ${error.message}`);
+      // Stage 9.5 — re-acquire a fresh token before reconnecting. BOTH
+      // relayClient.deviceId and relayClient.authToken must be updated;
+      // updating only the token would leave a stale deviceId and the
+      // relay would return 403 device_mismatch.
+      try {
+        const relayOptions = await buildRelayClientOptions({
+          stateDir,
+          relayUrl,
+          fallbackDeviceId: device.deviceId,
+        });
+        relayClient.deviceId = relayOptions.deviceId;
+        relayClient.setAuthToken(relayOptions.authToken);
+        effectiveDeviceId = relayOptions.deviceId;
+        localApiCtx.deviceId = effectiveDeviceId;
+      } catch (reErr) {
+        console.error(`[daemon] relay auth re-acquire failed: code=${reErr?.code || "unknown"}`);
+      }
       writeDaemonState({
-        pid: process.pid, relayUrl, deviceId: device.deviceId, executor,
+        pid: process.pid, relayUrl, deviceId: effectiveDeviceId, executor,
         localApiPort: localApi.port, version: VERSION,
         status: "reconnecting", error: error.message,
       });

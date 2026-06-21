@@ -10,9 +10,12 @@
 //   - "off" (default): no token acquisition. The proxy is constructed
 //     with `authToken: null` and behaves exactly like 9.2.
 //   - "on": the manager reads `<stateDir>/coding-key.json`, extracts
-//     `deviceGrant` and `deviceId`, calls Surety to exchange for a
-//     `relayAccessToken`, and constructs the proxy with that token.
-//     Refresh is scheduled 60s before `expiresAt`.
+//     `deviceGrant` and `deviceId`, calls Surety at `SURETY_BASE_URL`
+//     to exchange for a `relayAccessToken`, and constructs the proxy
+//     with that token. Refresh is scheduled 60s before `expiresAt`.
+// Stage 9.4 — env var name unified to `SURETY_BASE_URL` (the prior
+// name from 9.3 has been removed entirely from this codebase).
+// Clean break, no fallback.
 
 import { readCodingAuth } from "../persistence/codingAuth.js";
 import { RemoteCodingRelayProxy } from "../runtime/remoteCodingRelayProxy.js";
@@ -35,7 +38,7 @@ export class RemoteCodingProxyManager {
     this.stateDir = stateDir;
     this.relayUrl = relayUrl;
     this.deviceId = deviceId;
-    this.suretyUrl = suretyUrl || process.env.ORIGINROUTER_SURETY_URL || "";
+    this.suretyUrl = suretyUrl || process.env.SURETY_BASE_URL || "";
     this.fetchFn = fetchFn;
     this._proxy = null;
     this._refreshTimer = null;
@@ -91,6 +94,15 @@ export class RemoteCodingProxyManager {
       this._token = authToken;
       this._tokenExpiresAt = result.expiresAt;
       this._authState = "ok";
+      // Stage 9.5 — when auth=on, the token's deviceId comes from
+      // coding-key.json (read inside _acquireToken). The inner proxy must
+      // use the same deviceId or the relay returns 403 device_mismatch.
+      // Override the constructor-supplied deviceId (which is from
+      // ensureDeviceForLogin / device.json) with the stored one.
+      const stored = readCodingAuth(this.stateDir);
+      if (stored && stored.deviceId) {
+        this.deviceId = stored.deviceId;
+      }
       this._scheduleRefresh();
     }
 

@@ -29,14 +29,17 @@ function makeCapture() {
         body,
       });
       if (req.url.startsWith("/device/events")) {
-        // SSE — return a single event then close.
+        // SSE — return a single event then close. The production
+        // relay keeps the stream open, but this unit test only needs
+        // to capture the Authorization header; closing avoids leaving
+        // an active reader that keeps the Node process alive.
         res.writeHead(200, {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
         });
         res.write(`data: ${JSON.stringify({ type: "ping" })}\n\n`);
-        return; // keep open until client closes
+        res.end();
+        return;
       }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
@@ -124,16 +127,13 @@ try {
       deviceId: "d1",
       authToken: "rt_sse",
     });
-    // connectEvents blocks; we only need to capture the request, then
-    // the test ends. The reader promise never resolves here, so we
-    // race it against a timeout.
     const connPromise = c.connectEvents(() => {});
     await delay(150);
     const sseReq = captured.requests.find((r) => r.url.startsWith("/device/events"));
     assert.ok(sseReq, "expected an SSE request to be captured");
     assert.equal(sseReq.headers.authorization, "Bearer rt_sse");
+    await connPromise;
     server.close();
-    connPromise.catch(() => {});
   }
   console.log("[5] connectEvents -> Authorization: Bearer rt_sse ok");
 

@@ -644,9 +644,11 @@ Production sets `on` on both.
 **New env vars:**
 - `ORIGINROUTER_RELAY_AUTH` — `off` (default) or `on`. Asymmetric
   config (server=on, CLI=off) causes silent 401s.
-- `ORIGINROUTER_SURETY_URL` — Surety base URL (e.g.
+- `SURETY_BASE_URL` — Surety base URL (e.g.
   `http://127.0.0.1:9001`). Used by `RemoteCodingProxyManager`
-  and the worker daemon to acquire tokens.
+  and the worker daemon to acquire tokens. Stage 9.4 unified
+  this name across the relay and CLI; the prior 9.3 name has
+  been removed.
 - `ORIGINROUTER_ENV_PRINT_ALLOW_NO_AUTH_FALLBACK` — opt-in escape
   hatch for `env print --route remote` when Surety is unreachable.
   Default is hard fail. When set to `1`, env print falls back to
@@ -675,3 +677,103 @@ insufficient_scope, internal_error).
 See `docs/agent-runtime-audit.md` and
 `docs/originrouter-login-credential-architecture.md` for the
 full Stage 9.3 docs.
+
+## Stage 9.4 — local auth-on acceptance
+
+9.4 verifies the CLI's auth-on chain against a real running Surety
+and a local `originrouter-server` with `ORIGINROUTER_RELAY_AUTH=on`.
+The changes from 9.3 are:
+
+- **Env var name unification.** The CLI's `RemoteCodingProxyManager`
+  now reads `SURETY_BASE_URL`. The relay already read `SURETY_BASE_URL`
+  since 9.3. The prior 9.3 name has been removed entirely from the
+  codebase; the canonical name is `SURETY_BASE_URL` on both sides.
+- **No code change to `acquireRelayAccessToken`**, `readCodingAuth`,
+  or `maskSecret`. The auth flow is byte-for-byte 9.3; only the env
+  var name moved.
+
+**Local acceptance recipe (Mac):**
+
+```bash
+# 1. local relay (in another terminal)
+cd /Users/chengaoyan/Desktop/originrouter-server
+ORIGINROUTER_RELAY_AUTH=on \
+SURETY_BASE_URL=https://surety.easytransnote.com \
+PORT=18787 \
+npm start
+
+# 2. CLI env print — env print only supports --agent claude|codex,
+#    not --route/--target. relayUrl is read from ORIGINROUTER_RELAY
+#    (default http://localhost:8787, which won't match the local relay
+#    on 18787 — set it explicitly).
+cd /Users/chengaoyan/Desktop/originrouter-cli
+ORIGINROUTER_RELAY_AUTH=on \
+ORIGINROUTER_RELAY=http://127.0.0.1:18787 \
+SURETY_BASE_URL=https://surety.easytransnote.com \
+node ./bin/originrouter.js env print --agent claude
+# expect: exit 0, stdout includes ANTHROPIC_BASE_URL=http://127.0.0.1:<port>,
+# no fallback/no-auth/surety_unavailable warning, no plaintext grant/token leak.
+# Do NOT curl /health on the printed port — RemoteCodingRelayProxy has no
+# /health route; any GET is wrapped as remote.coding.request.
+```
+
+## Stage 9.5 — production auth-on worker support
+
+Stage 9.5 wires the worker/control side of the CLI to acquire Surety tokens when `ORIGINROUTER_RELAY_AUTH=on`, and ships the `RemoteCodingProxyManager` fix that makes `env print --agent claude` work in real environments where `device.json.deviceId !== coding-key.json.deviceId`.
+
+### `relayAuthBootstrap` — the worker/control helper
+
+A new module `src/relay/relayAuthBootstrap.js` centralizes the "read coding-key, acquire Surety token, build RelayClient options" pattern. It exports:
+
+- `isRelayAuthOn()` — boolean, mirrors `isAuthOn()` in `RemoteCodingProxyManager`.
+- `buildRelayClientOptions({ stateDir, relayUrl, fallbackDeviceId, fetchFn })` — async, returns `{ relayUrl, deviceId, authToken, authState, tokenExpiresAt }`. On any failure, throws `RelayAuthBootstrapError` with `err.code` set to the mapped Surety error string and `err.message === err.code` exactly (no concatenation, no Surety original message, no deviceGrant, no token).
+
+The caller-side `RemoteCodingProxyManager` already wires this same contract for `env print` and remote-coding; 9.5 applies the same contract to the three worker/control call sites so a worker can actually connect to an `auth=on` relay.
+
+### Three call sites updated
+
+- `src/daemon/daemon.js` — at boot, calls `buildRelayClientOptions(...)` to acquire a token and construct `RelayClient`. The effective `deviceId` (from `coding-key.json` when `auth=on`) is passed to the `SessionManager` constructor. In the SSE reconnect loop, re-acquires via `buildRelayClientOptions` and updates BOTH `relayClient.deviceId` AND `relayClient.authToken` before the next reconnect attempt. On re-acquire failure, logs `code=...` only and backs off 1.5s.
+- `src/local/localAgentSession.js` — same pattern. The `appendSessionStart` deviceId field uses `effectiveDeviceId` so the local session log records the relay-side identity.
+- `src/runtime/claudeSdkSession.js` — same pattern. The SDK session's reconnect loop re-acquires before the next attempt.
+
+### `RemoteCodingProxyManager` deviceId fix (the `env print` fix)
+
+When `auth=on`, the manager now reads `coding-key.json.deviceId` inside `start()` and overrides the constructor-supplied `this.deviceId` (which came from `ensureDeviceForLogin()` via `device.json`) before constructing the inner `RemoteCodingRelayProxy`. Without this, the inner proxy would open its SSE with the wrong deviceId and the relay would return 403 `device_mismatch` even with a fresh token.
+
+The 9.5 test `tests/remoteCodingProxyManagerDeviceId.test.js` asserts this by spying on the manager's `fetchFn` and inspecting the inner proxy's `/device/events?deviceId=...` URL.
+
+### `coding-key.json` shape for prod
+
+The shape MUST satisfy `isManagedKeyShape()` in `src/runtime/authContract.js`. Required fields: `kind` (`"managed"`), `keyId`, `key`, `deviceGrantId`, `deviceGrant`, `deviceId`, `expiresAt` (number, ms), `scopes` (array including `"coding"`), `source` (`"originrouter_cli"`). The `key` field is the per-route API key (a no-op placeholder is fine for the 9.5 smoke). The file is mode `0o600` at the default `stateDir` (`~/.originrouter/coding-key.json` when run as root).
+
+### ESM token smoke (the only one that works)
+
+The CLI does NOT have an `auth print-token` command. The actual operator recipe is ESM:
+
+```bash
+node --input-type=module -e '
+  import fs from "node:fs";
+  import { acquireRelayAccessToken } from "/opt/originrouter-cli/src/auth/suretyTokenClient.js";
+  const k = JSON.parse(fs.readFileSync(process.env.HOME + "/.originrouter/coding-key.json", "utf8"));
+  const r = await acquireRelayAccessToken({
+    suretyUrl: "http://127.0.0.1:9001",
+    deviceId: k.deviceId,
+    deviceGrant: k.deviceGrant,
+  });
+  if (!r.ok) throw new Error(JSON.stringify(r));
+  console.log("token len=" + r.token.length + " ttl=" + Math.floor(r.expiresAt - Date.now() / 1000));
+'
+```
+
+The TTL is computed from `r.expiresAt` (a Unix epoch in seconds), not from a separate `expiresInSec` field.
+
+### Residual risk (documented)
+
+9.5 ships **re-acquire on reconnect only**. A worker that is fully idle (no SSE reconnect, no `connectEvents` re-entry) past the token's `expiresAt` will attempt to reconnect with a stale token; the relay returns 401, the re-acquire path runs, and the worker recovers on the next reconnect tick. 9.5 does not schedule a timer to refresh proactively. A 9.6+ timer refresh (modelled on the proven `REFRESH_LEAD_MS = 60_000` pattern in `RemoteCodingProxyManager`) is the next step.
+
+### Tests added in 9.5
+
+- `tests/relayAuthBootstrap.test.js` — 6 cases (off, on-happy, on-surety-fail, on-surety-5xx, on-no-coding-key, on-no-surety-url). Asserts `err.message === err.code` exactly and no grant/token in `err.message`.
+- `tests/remoteCodingProxyManagerDeviceId.test.js` — asserts the inner proxy's `connectEvents` URL contains the coding-key `deviceId` (NOT the constructor's value).
+
+These are targeted non-GUI tests; the full `npm test` is NOT run end-to-end because the full suite opens browser fixtures.
