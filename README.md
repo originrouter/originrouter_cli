@@ -649,12 +649,6 @@ Production sets `on` on both.
   and the worker daemon to acquire tokens. Stage 9.4 unified
   this name across the relay and CLI; the prior 9.3 name has
   been removed.
-- `ORIGINROUTER_ENV_PRINT_ALLOW_NO_AUTH_FALLBACK` — opt-in escape
-  hatch for `env print --route remote` when Surety is unreachable.
-  Default is hard fail. When set to `1`, env print falls back to
-  no-auth with a loud stderr warning: the printed URL will **not**
-  work against a relay with `auth=on`. Production daemons never
-  honor this fallback.
 
 **Scope name:** `relay.remote_coding` (not `coding`). The local
 managed-key field `KEY_SCOPE.CODING` is a separate concept —
