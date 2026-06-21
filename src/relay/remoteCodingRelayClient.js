@@ -1,24 +1,40 @@
-// Stage 9.2 — Caller-side SSE client for the remote-coding relay.
+// Stage 9.3 — Caller-side SSE client for the remote-coding relay.
 //
 // This is a purpose-built client (NOT a modification of
 // src/relay/relayClient.js, which is on the agent-control hot path).
-// It opens the relay SSE with no auth, filters events to
-// `remote.coding.response.*` and dispatches each by requestId to a
-// waiter kept in a Map. The future security stage will add an
-// optional `authToken` constructor argument; 9.2 does not implement
-// auth and the constructor intentionally leaves the seam open.
+// It opens the relay SSE, filters events to `remote.coding.response.*`
+// and dispatches each by requestId to a waiter kept in a Map.
+//
+// 9.2 had no auth. 9.3 adds an optional `authToken` constructor
+// argument. When set, SSE subscribe and every /device/message POST
+// carry `Authorization: Bearer <authToken>`. When unset, the file
+// is byte-for-byte compatible with 9.2.
 
 import { randomUUID } from "node:crypto";
 
 export class RemoteCodingRelayClient {
-  constructor({ relayUrl, deviceId, fetchFn = globalThis.fetch }) {
+  constructor({ relayUrl, deviceId, authToken = null, fetchFn = globalThis.fetch }) {
     this.relayUrl = relayUrl;
     this.deviceId = deviceId;
+    this.authToken = authToken;
     this.fetchFn = fetchFn;
     this._waiters = new Map();
     this._abortController = null;
     this._reader = null;
     this._closed = false;
+  }
+
+  /**
+   * Update the bearer used for subsequent calls. If the SSE is
+   * currently open, close it so the next `subscribe()` re-opens
+   * with the new header.
+   */
+  setAuthToken(token) {
+    this.authToken = token;
+    if (this._abortController) {
+      try { this._abortController.abort(); } catch {}
+      this._abortController = null;
+    }
   }
 
   /**
@@ -30,11 +46,13 @@ export class RemoteCodingRelayClient {
     const ac = new AbortController();
     this._abortController = ac;
     const url = `${this.relayUrl}/device/events?deviceId=${encodeURIComponent(this.deviceId)}`;
+    const headers = {};
+    if (this.authToken) {
+      headers.Authorization = `Bearer ${this.authToken}`;
+    }
     let response;
     try {
-      // No Authorization header in 9.2. Future security stage will add
-      // `headers: { Authorization: "Bearer <relayAccessToken>" }`.
-      response = await this.fetchFn(url, { signal: ac.signal });
+      response = await this.fetchFn(url, { signal: ac.signal, headers });
     } catch (err) {
       // Connection error → reject all in-flight waiters with relay_disconnected.
       this._failAllWaiters(err);
@@ -118,9 +136,13 @@ export class RemoteCodingRelayClient {
   async publishRequest(envelope) {
     if (this._closed) throw new Error("client closed");
     const url = `${this.relayUrl}/device/message`;
+    const headers = { "Content-Type": "application/json" };
+    if (this.authToken) {
+      headers.Authorization = `Bearer ${this.authToken}`;
+    }
     const response = await this.fetchFn(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(envelope),
     });
     let body = {};
@@ -136,9 +158,13 @@ export class RemoteCodingRelayClient {
   async publishCancel(requestId) {
     if (this._closed) return;
     const url = `${this.relayUrl}/device/message`;
+    const headers = { "Content-Type": "application/json" };
+    if (this.authToken) {
+      headers.Authorization = `Bearer ${this.authToken}`;
+    }
     return this.fetchFn(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({
         type: "remote.coding.request.cancel",
         requestId,

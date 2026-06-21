@@ -26,7 +26,12 @@ function startRelay() {
       ["../originrouter-server/src/server.js"],
       {
         cwd: new URL("..", import.meta.url).pathname,
-        env: { ...process.env, PORT: String(RELAY_PORT), REMOTE_CODING_TIMEOUT_MS },
+        env: {
+          ...process.env,
+          PORT: String(RELAY_PORT),
+          REMOTE_CODING_TIMEOUT_MS,
+          ORIGINROUTER_RELAY_AUTH: "off",
+        },
         stdio: ["ignore", "pipe", "pipe"],
       }
     );

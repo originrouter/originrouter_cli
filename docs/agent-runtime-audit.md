@@ -995,3 +995,114 @@ abort; Group E concurrent in-flight).
 - WebRTC/P2P / E2EE between caller and worker (the relay
   genuinely cannot read the body only with these).
 - Real auth on the relay (surety v2 / `relayAccessToken`).
+
+## Stage 9.3 — Surety v2 + Relay Auth + Python Service Stabilization
+
+Shipped in this commit.
+
+**Scope boundary (locked):** 9.3 touches **only** `surety/surety`,
+`originrouter-server`, and `originrouter-cli`. No `UPT_back_end` changes.
+No Flutter/H5. No Java surety edits. Java stays as fallback.
+
+### What landed
+
+**Surety (`/Users/chengaoyan/Desktop/surety/surety/`):**
+- `create_app()` factory. Production loads `app:app` via Gunicorn.
+- v1 routes preserved byte-for-byte (same `{code, msg, data}` shape).
+- v1 logic files no longer hardcode credentials; DB timeouts via `with_conn`.
+- `/healthz` (no DB, ≤ 100ms target) + `/readyz` (DB-aware).
+- v2 endpoints: `POST /api/relay/token`, `POST /api/relay/verify`,
+  `POST /api/relay/devices/seed` (admin-only).
+- File-based store with `fcntl.flock` (cross-worker safe),
+  `sha256(SURETY_TOKEN_PEPPER + plaintext)` keys, 0600/0700 permissions.
+- `gunicorn.conf.py` (4 workers, 16 threads, max-requests 2000).
+- `deploy/surety.service` + daily restart timer (insurance only).
+- `requirements.txt` + `.env.example` + `README.md`.
+- 11-case `tests/test_relay_token.py` covering happy + every error
+  code + the disk-scrub invariant.
+
+**originrouter-server (`/Users/chengaoyan/Desktop/originrouter-server/`):**
+- `src/relayAuth.js` — typed `verifyRelayToken` + `RelayAuthError`.
+- `src/server.js` — `GET /device/events` and `POST /device/message`
+  enforce `Authorization: Bearer <relayAccessToken>` when
+  `ORIGINROUTER_RELAY_AUTH=on`. Envelope-type-aware: `remote.coding.*`
+  requires the bearer to match the envelope's `sourceDeviceId` (caller)
+  or `remoteRequests[requestId].targetDeviceId` (worker). `device.connected`
+  / `device.disconnected` / `device.heartbeat` via `/device/message` are
+  rejected with HTTP 400 + `control_plane_not_allowed_via_message`.
+- `ORIGINROUTER_RELAY_AUTH` defaults to `off` on both sides so the 9.2
+  dev path and tests stay green out of the box. Production sets `on`.
+- `tests/relayAuth.test.js` (12 cases) + `tests/e2eSurety.test.js`
+  (real Gunicorn + relay) + `tests/negativeSurety.test.js` (7 cases).
+
+**originrouter-cli (`/Users/chengaoyan/Desktop/originrouter-cli/`):**
+- `src/auth/suretyTokenClient.js` — `acquireRelayAccessToken`.
+- `src/relay/relayClient.js` — additive `authToken` constructor field.
+  When set, every `postJson` and `connectEvents` carries
+  `Authorization: Bearer <token>`. When null, byte-for-byte 9.2
+  compatible.
+- `src/relay/remoteCodingRelayClient.js` — same seam on the caller side
+  + `setAuthToken()` for the in-place refresh path.
+- `src/runtime/remoteCodingRelayProxy.js` — `setAuthToken` passthrough.
+- `src/proxy/remoteCodingProxyManager.js` — when `auth=on`, reads
+  `<stateDir>/coding-key.json`, calls Surety to exchange `deviceGrant`
+  for `relayAccessToken`, schedules a refresh 60s before `expiresAt`.
+- 36 CLI suites green (was 34). 5 server suites green (was 2).
+
+### Measured results (real smoke runs)
+
+- **Surety /healthz:** 200 in 1-3ms (no DB).
+- **Surety /readyz:** 503 + `{failing: [identification, object, object_strong]}`
+  when MySQL is unreachable; would be 200 + `db:"ok"` against a live DB.
+- **Surety v2 happy path:** seed grant (POST /api/relay/devices/seed with
+  `X-Surety-Admin`) → issue token (POST /api/relay/token, returns
+  `rt_<32B-base64url>`, `tk_<16B>` token-id, `expires-at`,
+  `scopes: ["relay.remote_coding"]`) → verify (POST /api/relay/verify
+  with `body.v="v1"`) returns `{device-id, scopes, expires-at, token-id}`.
+- **Disk-scrub:** plaintext grant and token never appear in
+  `${SURETY_DATA_DIR}/relay_state.json`; only sha256 hashes as keys.
+  File mode 0600, dir mode 0700.
+- **Cross-worker safety:** real Gunicorn 4 workers + a `seed → issue`
+  round-trip succeeded in 1.0–1.3ms. Without `fcntl.flock` this would
+  have failed with `FileNotFoundError: relay_state.tmp` under the same
+  4-worker Gunicorn (caught and fixed during e2e testing).
+- **originrouter-server /device/events:**
+  - no Authorization → 401
+  - bad token → 401
+  - deviceId mismatch → 403
+  - scope mismatch → 403
+  - valid token → 200 + SSE
+  - control-plane via /device/message → 400
+- **originrouter-server negative Surety modes:**
+  - 503 from Surety → 502 to caller
+  - Surety slow (>SURETY_VERIFY_TIMEOUT_MS=500ms) → 504 to caller
+  - expired/revoked token code (-5/-6) → 401
+  - device_mismatch/insufficient_scope (-7/-8) → 403
+  - internal_error (-9) → 502
+
+### Files added in 9.3
+
+- `surety/surety/surety/{config,db,errors,security,logging}.py`
+- `surety/surety/surety/health/routes.py`
+- `surety/surety/surety/v1/{identification,object,object_strong}.py`
+- `surety/surety/surety/v2/{devices,relay}.py`
+- `surety/surety/app.py` (Gunicorn entrypoint)
+- `surety/surety/gunicorn.conf.py`
+- `surety/surety/requirements.txt`
+- `surety/surety/.env.example`
+- `surety/surety/deploy/{surety.service,surety-restart.service,surety-restart.timer}`
+- `surety/surety/tests/{runner.py,test_relay_token.py}`
+- `originrouter-server/src/relayAuth.js`
+- `originrouter-server/tests/{relayAuth,e2eSurety,negativeSurety}.test.js`
+- `originrouter-cli/src/auth/suretyTokenClient.js`
+- `originrouter-cli/tests/{suretyTokenClient,relayClientAuth}.test.js`
+
+### Known follow-ups (out of 9.3)
+
+- Surety v2 storage is file-based; replace with MySQL or Redis once
+  traffic justifies it.
+- Surety v2 token format is `rt_<base64url>`; switch to a signed JWT
+  (JWKS) to skip the synchronous verify call from the relay.
+- `device register/rotate/revoke` admin endpoints (only `seed` ships in 9.3).
+- `UPT_back_end/ai/server` thin middleware to accept the same
+  `relayAccessToken` (Stage 9.3C).

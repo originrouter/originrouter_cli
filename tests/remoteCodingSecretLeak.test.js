@@ -32,7 +32,7 @@ const serverProcess = spawn(
   ["../originrouter-server/src/server.js"],
   {
     cwd: new URL("..", import.meta.url).pathname,
-    env: { ...process.env, PORT: String(PORT) },
+    env: { ...process.env, PORT: String(PORT), ORIGINROUTER_RELAY_AUTH: "off" },
     stdio: ["ignore", "pipe", "pipe"],
   }
 );

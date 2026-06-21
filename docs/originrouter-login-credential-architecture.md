@@ -274,3 +274,116 @@ place to put a real auth check.
 
 Stage 9.2 supports only `target=proxy`. `target=agent` (run the
 worker's own Claude/Codex) and WebRTC/P2P are deferred to 9.3+.
+
+## Stage 9.3 — relay access tokens (Surety v2)
+
+9.3 introduces a second credential layer above the managed coding
+key, scoped to the relay transport only. The managed coding key
+stays the LLM-side credential (it authenticates the CLI to
+`https://server.originrouter.com/coding/v1/messages`); the relay
+access token authenticates the CLI to the worker-side relay.
+
+### Two-token model
+
+| Token | Owner | Lifetime | Scope |
+|---|---|---|---|
+| `deviceGrant` | CLI (long-lived) | until revoke | managed-coding-key + relay auth |
+| `relayAccessToken` | Surety (short-lived) | 10 min (`RELAY_TOKEN_TTL_SECONDS=600`) | relay.remote_coding |
+
+The CLI reads `deviceGrant` from `<stateDir>/coding-key.json`
+(Stage 9.1A) and on every remote route startup calls Surety's
+`/api/relay/token` to exchange it for a fresh `relayAccessToken`.
+The `relayAccessToken` is what the CLI sends to the relay as
+`Authorization: Bearer <relayAccessToken>`.
+
+The LLM API key is **never** touched by Surety or the relay. It
+goes from the CLI directly to the model endpoint. The internal
+auth credentials (`deviceGrant`, `relayAccessToken`) and the LLM
+credential are completely separated.
+
+### Wire protocol
+
+Surety endpoints use the existing Surety style (no `/v2/...` prefix):
+
+- `POST /api/relay/token` — body `{v:"v1", device-id, device-grant}`
+  returns `{code:0, data:{relay-access-token, expires-at, token-id, scopes:["relay.remote_coding"]}}`.
+- `POST /api/relay/verify` — body `{v:"v1", relay-access-token, device-id, scope}`
+  returns `{code:0, data:{device-id, scopes, expires-at, token-id}}`.
+- `POST /api/relay/devices/seed` — admin-only (`X-Surety-Admin` header).
+  Seeds a `deviceGrant` for testing.
+
+Error codes (negative; non-zero on failure):
+`-1 invalid_grant`, `-2 revoked_grant`, `-3 expired_grant`,
+`-4 invalid_token`, `-5 expired_token`, `-6 revoked_token`,
+`-7 device_mismatch`, `-8 insufficient_scope`, `-9 internal_error`,
+`-10 admin_unauthorized` (HTTP 401), `-11 invalid params`,
+`-12 wrong content type`, `-13 payload too large`.
+
+### Why the wire version is `v1`, not `v2`
+
+The Surety project convention uses `body.v` as a per-module protocol
+version. `/api/object/encode` uses `body.v = "v1"`,
+`/api/object_strong/*` uses `body.v = "v1"`. The new relay auth
+endpoints follow the same convention: `body.v = "v1"`. The stage
+name "Surety v2" refers to the API generation, not the wire
+version. If the relay token format ever changes in a way that's
+not backward-compatible, that change will introduce
+`body.v = "v2"` for `/api/relay/*` only — other modules keep
+their own `v`.
+
+### Why the scope is `relay.remote_coding`, not `coding`
+
+`KEY_SCOPE.CODING` is the local managed-key field (Stage 9.1A) that
+identifies what the managed key unlocks on the LLM side. The
+relay token scope is a separate string — `relay.remote_coding` —
+that identifies what the bearer is allowed to do on the relay
+transport. Using the same string for both would conflate the
+two security models.
+
+### Relay-side auth rules
+
+When `ORIGINROUTER_RELAY_AUTH=on` (the production default once
+9.3 ships), the relay enforces the bearer on:
+
+- `GET /device/events?deviceId=X` — bearer must verify with
+  `deviceId = X` and scope `relay.remote_coding`.
+- `POST /device/message` — envelope-type-aware:
+  - `remote.coding.request` → verify against `envelope.sourceDeviceId`
+  - `remote.coding.response.*` → verify against
+    `remoteRequests[requestId].targetDeviceId` (the worker side
+    is identified by lookup, because response envelopes don't
+    carry the target deviceId).
+  - `remote.coding.request.cancel` → verify against
+    `envelope.deviceId`.
+  - `device.connected` / `device.disconnected` / `device.heartbeat`
+    via `/device/message` → **rejected with HTTP 400 +
+    `control_plane_not_allowed_via_message`**. These types are
+    emitted only by the relay itself, on `/device/events` and the
+    close-handler. This makes "clients cannot forge
+    `device.connected`" a server-enforced invariant, not a soft
+    convention.
+  - Generic broadcast (any other envelope) → bearer required; if
+    the envelope has a body `deviceId`, the token's deviceId must
+    match it.
+
+`/health` and `/debug/events` stay open (no auth). The
+`/debug/events` ring still masks `headers` and `body` for any
+`remote.coding.*` event (`{ "<masked>": true }` + `null`), so a
+compromised token still cannot exfiltrate prompts or LLM API
+keys through the debug ring.
+
+### Refresh path
+
+The CLI's `RemoteCodingProxyManager` schedules a refresh 60s
+before `expiresAt` (default TTL 10 min, so refresh every ~9 min).
+If Surety returns 401/403 during the refresh, the manager
+force-stops the proxy and surfaces a clear error.
+
+### Dev / local bypass
+
+`ORIGINROUTER_RELAY_AUTH=off` on **both** server and CLI. The
+9.2 dev path and tests run with this set. Asymmetric
+configuration (server=on, CLI=off) manifests as silent 401s;
+the README documents this. Production deployments must set
+`on` on both sides, and `ORIGINROUTER_SURETY_URL` to the real
+Surety service.

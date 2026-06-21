@@ -31,11 +31,11 @@ function translateErrorToHttp(evt) {
 }
 
 export class RemoteCodingRelayProxy {
-  constructor({ relayUrl, deviceId, fetchFn = globalThis.fetch }) {
+  constructor({ relayUrl, deviceId, authToken = null, fetchFn = globalThis.fetch }) {
     this.relayUrl = relayUrl;
     this.deviceId = deviceId;
     this.fetchFn = fetchFn;
-    this._client = new RemoteCodingRelayClient({ relayUrl, deviceId, fetchFn });
+    this._client = new RemoteCodingRelayClient({ relayUrl, deviceId, authToken, fetchFn });
     this._server = null;
     this._port = null;
     // Stage 9.2.1: track in-flight sockets so stop() can destroy them
@@ -43,6 +43,14 @@ export class RemoteCodingRelayProxy {
     // bridge can hang on caller-side abort tests where the response
     // socket stays open.
     this._sockets = new Set();
+  }
+
+  /**
+   * Stage 9.3 — pass through to the underlying client. The SSE is
+   * closed and re-opened on the next subscribe.
+   */
+  setAuthToken(token) {
+    this._client.setAuthToken(token);
   }
 
   /**

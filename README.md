@@ -625,3 +625,53 @@ authorization value ever appears in `/debug/events`).
 Test count: 31 → 34 CLI suites + 2 binary smokes; server
 unchanged. See `docs/agent-runtime-audit.md` for the full
 Stage 9.2.1 note with measured numbers.
+
+## Stage 9.3 — Surety v2 + Relay Auth
+
+9.3 promotes the 9.2 no-auth relay to a real auth-backed service.
+The CLI now acquires a short-lived `relayAccessToken` from Surety
+v2 (using the long-lived `deviceGrant` already stored in
+`<stateDir>/coding-key.json`) and sends it to the relay as
+`Authorization: Bearer <relayAccessToken>` on every
+`/device/events` and `/device/message` call. The LLM API key is
+never touched by Surety or the relay — the two credentials are
+fully separated.
+
+**Dev / local bypass:** set `ORIGINROUTER_RELAY_AUTH=off` on **both**
+the server and the CLI to run the 9.2 dev path with no Surety.
+Production sets `on` on both.
+
+**New env vars:**
+- `ORIGINROUTER_RELAY_AUTH` — `off` (default) or `on`. Asymmetric
+  config (server=on, CLI=off) causes silent 401s.
+- `ORIGINROUTER_SURETY_URL` — Surety base URL (e.g.
+  `http://127.0.0.1:9001`). Used by `RemoteCodingProxyManager`
+  and the worker daemon to acquire tokens.
+- `ORIGINROUTER_ENV_PRINT_ALLOW_NO_AUTH_FALLBACK` — opt-in escape
+  hatch for `env print --route remote` when Surety is unreachable.
+  Default is hard fail. When set to `1`, env print falls back to
+  no-auth with a loud stderr warning: the printed URL will **not**
+  work against a relay with `auth=on`. Production daemons never
+  honor this fallback.
+
+**Scope name:** `relay.remote_coding` (not `coding`). The local
+managed-key field `KEY_SCOPE.CODING` is a separate concept —
+identifies what the LLM-side key unlocks, not what the relay
+bearer authorizes.
+
+**Wire protocol:** `body.v = "v1"`. Stage 9.3 is the "Surety v2"
+API generation; the wire version follows the existing Surety
+convention where `v` is per-module (`/api/object/encode` uses
+`v1`, `/api/object_strong` uses `v1`).
+
+**Test count:** 34 → 36 CLI suites; 2 → 5 server suites; 0 → 1
+Surety `pytest` suite (11 cases). All green. Multi-process
+`e2eSurety.test.js` proves real Gunicorn 4 workers + relay
+auth + real Surety verify round-trip works. Negative
+`negativeSurety.test.js` covers all 7 Surety failure modes
+(503, slow, expired, revoked, device_mismatch,
+insufficient_scope, internal_error).
+
+See `docs/agent-runtime-audit.md` and
+`docs/originrouter-login-credential-architecture.md` for the
+full Stage 9.3 docs.
