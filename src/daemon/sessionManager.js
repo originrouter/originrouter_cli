@@ -5,6 +5,7 @@ import { staticProxyStatusFn } from "../proxy/snapshot.js";
 import { appendSessionStart, patchSessionExit } from "../persistence/sessionLog.js";
 import { readConfig } from "../persistence/state.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
+import { handleRemoteCodingRequest } from "./remoteCodingServer.js";
 
 export class SessionManager {
   constructor({ relayClient, deviceId, defaultExecutor, proxyManager = null }) {
@@ -13,6 +14,41 @@ export class SessionManager {
     this.defaultExecutor = defaultExecutor;
     this.proxyManager = proxyManager;
     this.sessions = new Map();
+    // Stage 9.2: per-requestId abort controllers for in-flight remote
+    // coding fetches. The cancel event aborts the underlying fetch so
+    // the worker's local proxy can clean up.
+    this.activeRemoteRequests = new Map();
+  }
+
+  async resolveLocalProxyUrl() {
+    if (!this.proxyManager) return null;
+    const status = await this.proxyManager.status();
+    if (status && status.state === "running" && status.port) {
+      return `http://${status.host || "127.0.0.1"}:${status.port}`;
+    }
+    return null;
+  }
+
+  async handleRemoteCodingEvent(envelope) {
+    const controller = new AbortController();
+    this.activeRemoteRequests.set(envelope.requestId, controller);
+    try {
+      await handleRemoteCodingRequest(envelope, {
+        relayClient: this.relayClient,
+        localProxyUrl: await this.resolveLocalProxyUrl(),
+        signal: controller.signal,
+      });
+    } finally {
+      this.activeRemoteRequests.delete(envelope.requestId);
+    }
+  }
+
+  cancelRemoteCodingRequest(requestId) {
+    const controller = this.activeRemoteRequests.get(requestId);
+    if (controller) {
+      try { controller.abort(); } catch {}
+      this.activeRemoteRequests.delete(requestId);
+    }
   }
 
   async startSession(payload) {
@@ -187,6 +223,18 @@ export class SessionManager {
   handleEvent(payload) {
     if (payload.type === "session.start") {
       this.startSession(payload);
+      return;
+    }
+
+    // Stage 9.2: worker-side remote coding routing. These events do not
+    // carry a sessionId and are routed by requestId to a per-request
+    // fetch to the worker's local proxy.
+    if (payload.type === "remote.coding.request") {
+      this.handleRemoteCodingEvent(payload);
+      return;
+    }
+    if (payload.type === "remote.coding.request.cancel") {
+      this.cancelRemoteCodingRequest(payload.requestId);
       return;
     }
 

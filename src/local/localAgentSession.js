@@ -1,11 +1,12 @@
 import process from "node:process";
 import { createAdapter } from "../adapters/createAdapter.js";
-import { buildAgentProviderEnv } from "../config/claudeConfig.js";
+import { buildAgentProviderEnv, willRouteRemoteCoding } from "../config/claudeConfig.js";
 import { DEFAULT_DEVICE_ID, DEFAULT_RELAY_URL } from "../constants.js";
 import { createExecutor } from "../executors/createExecutor.js";
 import { appendSessionStart, patchSessionExit } from "../persistence/sessionLog.js";
 import { ensureDevice, ensureStateDir, readConfig } from "../persistence/state.js";
-import { readLocalProxySnapshot, staticProxyStatusFn } from "../proxy/snapshot.js";
+import { RemoteCodingProxyManager } from "../proxy/remoteCodingProxyManager.js";
+import { readLocalProxySnapshot, NOOP_REMOTE_CODING_SNAPSHOT, snapshotRemoteCodingStatus, staticProxyStatusFn } from "../proxy/snapshot.js";
 import { RelayClient } from "../relay/relayClient.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 
@@ -147,6 +148,28 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // When LiteLLM is running for the selected openai-compatible provider,
   // buildAgentProviderEnv routes Claude Code through it.
   const proxyStatus = staticProxyStatusFn(readLocalProxySnapshot());
+
+  // Stage 9.2: when the resolved route is type=remote, target=proxy, the
+  // local wrapper owns the caller-side `RemoteCodingRelayProxy`. We
+  // start it lazily so the env builder can read the bound port through
+  // a frozen sync snapshot — the same pattern as the LiteLLM proxy.
+  let remoteCodingProxyManager = null;
+  let remoteCodingStatus = staticProxyStatusFn(NOOP_REMOTE_CODING_SNAPSHOT);
+  if (willRouteRemoteCoding(localConfig, agent)) {
+    remoteCodingProxyManager = new RemoteCodingProxyManager({
+      stateDir: ensureStateDir(),
+      relayUrl,
+      deviceId: device.deviceId,
+    });
+    const startResult = await remoteCodingProxyManager.start();
+    if (!startResult.ok) {
+      throw new Error(`Failed to start remote-coding relay proxy: ${startResult.error}`);
+    }
+    remoteCodingStatus = staticProxyStatusFn(
+      await snapshotRemoteCodingStatus(remoteCodingProxyManager)
+    );
+  }
+
   // buildAgentProviderEnv throws PROVIDER_UNSUPPORTED if --provider or
   // currentProvider[agent] points to an openai-compatible profile AND the
   // proxy is not running for it. Stage 4 routes through the proxy when the
@@ -154,6 +177,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
   const providerResult = buildAgentProviderEnv(agent, localConfig, {
     provider: options.provider,
     proxyStatus,
+    remoteCodingStatus,
   });
   const providerEnv = providerResult.env;
   const resolvedProvider = providerResult.provider;
@@ -182,6 +206,13 @@ export async function runLocalAgentSession(agent, rawArgs) {
       process.stdin.setRawMode(false);
     }
     process.stdin.pause();
+    // Stage 9.2: tear down the caller-side relay proxy through the
+    // wrapper's existing cleanup path. No new process.once signal
+    // handlers — see the plan §C.7 for why this is the right seam.
+    if (remoteCodingProxyManager) {
+      remoteCodingProxyManager.stop().catch(() => {});
+      remoteCodingProxyManager = null;
+    }
   };
 
   if (typeof adapter.beforeStart === "function") {

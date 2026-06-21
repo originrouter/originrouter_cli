@@ -1755,3 +1755,44 @@ Stage 8.9 promotes §10.14 from "contract-only" to
 
 See [`docs/agent-interaction-contract.md` §11](agent-interaction-contract.md)
 for the runtime-wiring details.
+
+## 10.15 Stage 9.0 — provider / source / auth
+
+Stage 9.0 ships the canonical provider types and the login
+credential architecture as a **contract** (no live wire
+changes for `agent.*` events). The CLI runtime does not yet
+consume the new contract; the in-tree `claudeAdapter.js` /
+`codexAdapter.js` continue to use the existing
+`agent.permission.*` / `agent.interaction.*` event surface.
+
+The cross-references for the Stage 9.0 contract:
+
+- [`docs/originrouter-login-credential-architecture.md`](originrouter-login-credential-architecture.md) —
+  the `LoginCode` / `DeviceGrant` / `ManagedCodingKey`
+  shapes, the lifetime table, the rejection of `uuid` as a
+  long-term /coding key, and the local storage expectations
+  on the CLI side (`<stateDir>/coding-key.json`, mode 0o600)
+  and the App side (OS keychain, 9.1+).
+- [`docs/provider-route-resolution.md`](provider-route-resolution.md) —
+  the three provider types (`originrouter | proxy | remote`),
+  the runtime → endpoint table, the Codex endpoint default
+  (`/v1/responses` on the local proxy, `/coding/v1/responses`
+  on the official endpoint), and `DEFAULT_ORIGINROUTER_BASE_URL`.
+
+The CLI-side implementations are:
+
+- `src/runtime/authContract.js` — pure lifetime constants
+  and shape helpers.
+- `src/persistence/codingAuth.js` — IO layer for
+  `<stateDir>/coding-key.json`.
+- `src/config/providerRoutes.js` — pure route resolver.
+- `src/config/providers.js` — `PROVIDER_TYPES` = 3 canonical
+  types; legacy strings are read-projected to
+  `proxy(engine=litellm)`.
+- `src/config/routes.js` — `routeProviderForRead` updated
+  in lockstep; `validateRouteEntry` accepts the 3 types.
+
+The 9.0 implementation does NOT introduce a new `agent.*`
+event for credential rotation, login, or device pairing. The
+runtime is intentionally un-changed on this front. 9.1+ will
+extend the event surface if needed.

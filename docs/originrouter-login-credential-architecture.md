@@ -247,3 +247,30 @@ also rejects malformed `coding-key.json` (missing `deviceGrant`,
 missing `scopes`, wrong `source`) before injecting env, so a
 stale or hand-edited file produces a clean login prompt rather
 than a leaked `ANTHROPIC_API_KEY=` with an empty value.
+
+## Remote provider runtime wiring (Stage 9.2)
+
+A route of `type=remote, target=proxy` makes the caller's local
+Claude/Codex talk to a worker device's local proxy through
+`originrouter-server` as a typed relay. The runtime env points at a
+caller-side `RemoteCodingRelayProxy` on `127.0.0.1:<port>`, owned
+by the local `originrouter claude` / `originrouter codex` wrapper
+process (not the long-running daemon). The relay proxy bridges HTTP
+↔ SSE `remote.coding.*` events to the relay. The worker-side daemon
+receives `remote.coding.request`, strips caller credential/transport
+headers (`authorization`, `x-api-key`, `host`, `content-length`,
+`connection`, `transfer-encoding`), and forwards the request to the
+worker's local LiteLLM proxy, streaming the response back.
+
+The relay forwards the request and response bodies opaquely — it
+does not parse them, does not log them, does not write them to disk,
+and replaces `headers` and `body` with placeholders in its debug
+ring. End-to-end confidentiality (so the relay genuinely cannot
+read the body) requires WebRTC / E2EE and is a later stage. 9.2
+ships no formal auth — `remote.coding.*` is routed by `deviceId`
+alone. A future "9.x security" stage will add `relayAccessToken`
+signed by the worker's `deviceGrant`; that stage is the only correct
+place to put a real auth check.
+
+Stage 9.2 supports only `target=proxy`. `target=agent` (run the
+worker's own Claude/Codex) and WebRTC/P2P are deferred to 9.3+.

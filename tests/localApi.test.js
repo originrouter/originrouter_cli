@@ -186,7 +186,11 @@ try {
     const { status, body } = await getJson("/providers/minimax");
     assert.equal(status, 200);
     assert.equal(body.provider.name, "minimax");
-    assert.equal(body.provider.type, "litellm");
+    // Stage 9.0: persisted type is "proxy", engine is "litellm". The
+    // API projects the legacy "litellm" wire type for backward compat
+    // with existing API consumers.
+    assert.equal(body.provider.type, "proxy");
+    assert.equal(body.provider.engine, "litellm");
     assert.equal(body.provider.litellmProvider, "anthropic");
   }
   {
@@ -350,7 +354,9 @@ try {
     assert.match(body.provider.apiKey, /sk-n/);
     const cfg = readConfig();
     assert.equal(cfg.providers.newhire.apiKey, "sk-newhire-1234567890", "raw key must persist on disk");
-    assert.equal(cfg.providers.newhire.type, "litellm");
+    // Stage 9.0: persisted on disk is type=proxy, engine=litellm.
+    assert.equal(cfg.providers.newhire.type, "proxy");
+    assert.equal(cfg.providers.newhire.engine, "litellm");
     assert.equal(cfg.providers.newhire.litellmProvider, "anthropic");
   }
   {
@@ -458,12 +464,21 @@ try {
     assert.match(body.error, /unknown provider 'ghost'/);
   }
   {
-    // PUT with explicit type=anthropic is rejected.
+    // Stage 9.0: PUT with explicit type=anthropic is accepted as an
+    // alias and normalized to proxy(engine=litellm, litellmProvider=anthropic).
+    // The persisted record carries the canonical shape; the API response
+    // is the projected record.
     const { status, body } = await putJson("/providers/minimax", {
-      type: "anthropic", baseUrl: "https://x", model: "m",
+      type: "anthropic", baseUrl: "https://x", model: "m-anthropic",
     });
-    assert.equal(status, 400);
-    assert.match(body.error, /type 'anthropic' is no longer supported/);
+    assert.equal(status, 200, `update failed: ${JSON.stringify(body)}`);
+    assert.equal(body.provider.type, "proxy");
+    assert.equal(body.provider.engine, "litellm");
+    assert.equal(body.provider.litellmProvider, "anthropic");
+    const cfg = readConfig();
+    assert.equal(cfg.providers.minimax.type, "proxy");
+    assert.equal(cfg.providers.minimax.engine, "litellm");
+    assert.equal(cfg.providers.minimax.model, "m-anthropic");
   }
   {
     // apiKey wrong type (number) -> 400 (with type=litellm).
@@ -903,12 +918,15 @@ try {
       baseUrl: "https://api.deepseek.com/v2",
     });
     assert.equal(status, 200);
-    assert.equal(body.provider.type, "litellm");
+    // Stage 9.0: API response carries the canonical projected shape.
+    assert.equal(body.provider.type, "proxy");
+    assert.equal(body.provider.engine, "litellm");
     assert.equal(body.provider.litellmProvider, "custom_openai");
     assert.equal(body.provider.baseUrl, "https://api.deepseek.com/v2");
     // Disk shape now migrated.
     const reread = readConfig();
-    assert.equal(reread.providers.deepseek.type, "litellm");
+    assert.equal(reread.providers.deepseek.type, "proxy");
+    assert.equal(reread.providers.deepseek.engine, "litellm");
     assert.equal(reread.providers.deepseek.litellmProvider, "custom_openai");
   }
   {

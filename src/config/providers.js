@@ -3,15 +3,19 @@
 // receive a new config back. See docs/agent-protocol.md and the Stage 1 plan
 // in the plan file for the full picture.
 //
-// Two-type model in Stage 7:
-//   - "anthropic"        -> direct path; generates ANTHROPIC_* env.
-//   - "litellm"          -> routes through the LiteLLM proxy.
-//   The catalog of litellm sub-types lives in src/proxy/litellmCatalog.js.
+// Stage 7 model (historical): two wire types — "anthropic" and "litellm".
+// Stage 9.0 model (current): three canonical wire types —
+//   - "originrouter"  -> official /coding/... subscription endpoint
+//   - "proxy"         -> local LiteLLM proxy (engine="litellm" in 9.0)
+//   - "remote"        -> authorized remote device (9.1+ real impl)
+// The catalog of litellm sub-types lives in src/proxy/litellmCatalog.js.
 //
-// Legacy "openai-compatible" is still readable but no longer writable:
-// addProvider rejects it outright. applyProviderUpdate on a legacy record
-// auto-normalizes to litellm/custom_openai unless the patch carries
-// type=openai-compatible explicitly.
+// The legacy strings "litellm" / "anthropic" / "openai-compatible" remain
+// accepted at the CLI INPUT boundary as compatibility aliases. "litellm"
+// is normalized to "proxy" + engine="litellm" on write. "anthropic" and
+// "openai-compatible" are still auto-migrated on update to keep existing
+// configs readable. "openai-compatible" is the only string REJECTED on
+// explicit write (addProvider throws).
 //
 // The provider resolver does NOT filter by type. Type compatibility with the
 // calling agent is enforced by buildAgentProviderEnv() (claudeConfig.js), which
@@ -28,11 +32,22 @@ import {
 import { ENV_REF_RE } from "../proxy/litellm.js";
 import { setRoute } from "./routes.js";
 
-export const PROVIDER_TYPES = Object.freeze(["litellm"]);
+// Stage 9.0: three canonical wire types. New writes only ever produce
+// one of these three. "litellm" is a CLI-input compatibility alias that
+// is normalized to "proxy" + engine="litellm" via
+// `normalizeProviderForWrite` before validation.
+export const PROVIDER_TYPES = Object.freeze(["originrouter", "proxy", "remote"]);
+export const PROVIDER_TYPE = Object.freeze({
+  ORIGINROUTER: "originrouter",
+  PROXY: "proxy",
+  REMOTE: "remote",
+});
 
-// Legacy types kept only for migration detection.
+// Legacy strings kept only for read-side projection / migration detection.
 export const LEGACY_PROVIDER_TYPE = "openai-compatible";
-export const LEGACY_PROVIDER_TYPES = Object.freeze(["anthropic", "openai-compatible"]);
+// "litellm" is a Stage 9.0 alias for "proxy(engine=litellm)" on the write
+// side; the other two are still migration-only.
+export const LEGACY_PROVIDER_TYPES = Object.freeze(["litellm", "anthropic", "openai-compatible"]);
 
 // Stage 7.7: keys that may appear on a provider record but are not catalog
 // field keys. addProvider / applyProviderUpdate use this list to decide
@@ -40,10 +55,17 @@ export const LEGACY_PROVIDER_TYPES = Object.freeze(["anthropic", "openai-compati
 // - name, type, litellmProvider, model, smallFastModel: meta
 // - _legacy, _legacyType, migratedFrom: read-side projection; stripped on save
 // - inlineCreds: UI-only state; stripped on save (never persisted)
+// Stage 9.0 additions:
+//   - engine:      proxy.engine = "litellm"
+//   - auth:        originrouter.auth / remote.auth (typed object)
+//   - deviceId:    remote.deviceId
+//   - target:      remote.target = "proxy" | "agent"
+//   - baseUrl:     originrouter.baseUrl (optional; default applied at resolve time)
 export const KNOWN_PROVIDER_META_KEYS = Object.freeze(new Set([
   "name", "type", "litellmProvider", "model", "smallFastModel",
   "_legacy", "_legacyType", "migratedFrom",
   "inlineCreds",
+  "engine", "auth", "deviceId", "target", "baseUrl",
 ]));
 
 // Stage 7.7: env-reference syntax. Re-exported here for callers that import
@@ -105,18 +127,65 @@ function isEnvRef(value) {
 
 // ---------- read-side migration projection ----------
 
-// Stage 7.6 read projection: legacy "anthropic" and "openai-compatible"
-// records are returned as { type: "litellm", litellmProvider: <anthropic|custom_openai>, _legacyType: <...> }
-// so the UI and catalog lookup see the new shape. The disk record is NOT
-// modified. `_legacyType` is a read-side hint for the UI; it is never
-// written to disk.
+// Stage 7.6 + Stage 9.0 read projection: legacy "litellm" / "anthropic" /
+// "openai-compatible" records are returned as
+//   { type: "proxy", engine: "litellm", litellmProvider: <id>, _legacyType: <...> }
+// so the UI and catalog lookup see the new shape. The disk record is
+// NOT modified. `_legacyType` is a read-side hint for the UI; it is
+// never written to disk. Records that are already on a canonical 9.0
+// shape (originrouter / proxy / remote) pass through unchanged.
 export function normalizeProviderForRead(p) {
   if (!p) return p;
+  if (p.type === "litellm") {
+    return { ...p, type: "proxy", engine: "litellm", _legacyType: "litellm" };
+  }
   if (p.type === "anthropic") {
-    return { ...p, type: "litellm", litellmProvider: "anthropic", _legacyType: "anthropic" };
+    return {
+      ...p,
+      type: "proxy",
+      engine: "litellm",
+      litellmProvider: "anthropic",
+      _legacyType: "anthropic",
+    };
   }
   if (p.type === LEGACY_PROVIDER_TYPE) {
-    return { ...p, type: "litellm", litellmProvider: "custom_openai", _legacyType: LEGACY_PROVIDER_TYPE };
+    return {
+      ...p,
+      type: "proxy",
+      engine: "litellm",
+      litellmProvider: "custom_openai",
+      _legacyType: LEGACY_PROVIDER_TYPE,
+    };
+  }
+  return p;
+}
+
+// ---------- write-side normalization ----------
+
+// Stage 9.0: the CLI accepts the legacy strings "litellm" and
+// "anthropic" as input compatibility aliases. addProvider /
+// applyProviderUpdate run the patch through this helper before
+// validation so a caller passing `type: "litellm"` persists as
+// `type: "proxy" + engine: "litellm"`, and a caller passing
+// `type: "anthropic"` persists as
+// `type: "proxy" + engine: "litellm" + litellmProvider: "anthropic"`.
+// "openai-compatible" is the only string that remains rejected on
+// write (see addProvider).
+//
+// Records that are already on a canonical 9.0 shape pass through
+// unchanged. The function is pure and non-mutating.
+export function normalizeProviderForWrite(p) {
+  if (!p) return p;
+  if (p.type === "litellm") {
+    return { ...p, type: "proxy", engine: "litellm" };
+  }
+  if (p.type === "anthropic") {
+    return {
+      ...p,
+      type: "proxy",
+      engine: "litellm",
+      litellmProvider: p.litellmProvider || "anthropic",
+    };
   }
   return p;
 }
@@ -187,6 +256,67 @@ function validateLitellmRecord(p, { name }) {
   if (!p.model) throw new Error(`provider '${name}' model is required`);
 }
 
+// Stage 9.0: originrouter record. baseUrl is OPTIONAL (default applied
+// at resolve time via providerRoutes.js). model is the real model id.
+function validateOriginrouterRecord(p, { name }) {
+  if (p.baseUrl != null && !/^https?:\/\//.test(p.baseUrl)) {
+    throw new Error(
+      `provider '${name}' baseUrl must start with http:// or https:// (got '${p.baseUrl}')`
+    );
+  }
+  if (!p.auth || typeof p.auth !== "object" || p.auth.type !== "managed_originrouter_key") {
+    throw new Error(
+      `provider '${name}' (type=originrouter) requires auth.type='managed_originrouter_key' ` +
+      `with a keyRef pointing at a local managed coding API key.`
+    );
+  }
+  if (!p.auth.keyRef || typeof p.auth.keyRef !== "string") {
+    throw new Error(`provider '${name}' (type=originrouter) auth.keyRef is required`);
+  }
+  if (!p.model || typeof p.model !== "string") {
+    throw new Error(
+      `provider '${name}' model is required (real model id, e.g. 'claude-sonnet-4-6')`
+    );
+  }
+}
+
+// Stage 9.0: remote record. deviceId is the target device. target
+// defaults to "proxy" if absent.
+function validateRemoteRecord(p, { name }) {
+  if (!p.deviceId || typeof p.deviceId !== "string") {
+    throw new Error(`provider '${name}' (type=remote) deviceId is required`);
+  }
+  if (!p.auth || typeof p.auth !== "object" || p.auth.type !== "device_grant") {
+    throw new Error(
+      `provider '${name}' (type=remote) requires auth.type='device_grant' with a grantRef.`
+    );
+  }
+  if (!p.auth.grantRef || typeof p.auth.grantRef !== "string") {
+    throw new Error(`provider '${name}' (type=remote) auth.grantRef is required`);
+  }
+  if (p.target != null && p.target !== "proxy" && p.target !== "agent") {
+    throw new Error(
+      `provider '${name}' (type=remote) target must be 'proxy' or 'agent' (got '${p.target}')`
+    );
+  }
+}
+
+// Stage 9.0: proxy record. The only supported engine in 9.0 is
+// "litellm". We delegate the litellm shape validation to
+// validateLitellmRecord (the Stage 7.x path) but FIRST strip `engine`
+// because validateLitellmRecord / litellmParams rendering do not know
+// about it and would flag it as an unknown field.
+function validateProxyRecord(p, { name }) {
+  if (p.engine !== "litellm") {
+    throw new Error(
+      `provider '${name}' (type=proxy) engine must be 'litellm' (got '${p.engine}')`
+    );
+  }
+  const legacy = { ...p, type: "litellm" };
+  delete legacy.engine;
+  validateLitellmRecord(legacy, { name });
+}
+
 function validateRecord(p) {
   const name = requireName(p);
   const type = String(p.type || "").trim();
@@ -195,8 +325,9 @@ function validateRecord(p) {
       `provider '${name}' has invalid type '${p.type}'. Must be one of: ${PROVIDER_TYPES.join(", ")}`,
     );
   }
-  if (type === "anthropic") validateAnthropicRecord(p, { name });
-  if (type === "litellm")   validateLitellmRecord(p, { name });
+  if (type === "originrouter") validateOriginrouterRecord(p, { name });
+  if (type === "proxy")        validateProxyRecord(p, { name });
+  if (type === "remote")       validateRemoteRecord(p, { name });
   return { name, type };
 }
 
@@ -214,31 +345,47 @@ export function addProvider(config, provider) {
     throw new Error("provider must be an object");
   }
 
-  // Stage 7.6: --type is optional. Default to 'litellm' so the user can
-  // write `provider add deepseek --litellm-provider deepseek ...` without
-  // an explicit --type.
-  const effectiveType = provider.type == null || provider.type === ""
-    ? "litellm"
+  // Stage 9.0: --type is optional. Default to 'proxy' (engine=litellm)
+  // so the user can write
+  //   provider add deepseek --litellm-provider deepseek ...
+  // without an explicit --type, and have it persist as
+  //   { type: "proxy", engine: "litellm", litellmProvider: "deepseek", ... }.
+  // This replaces the Stage 7.6 default-to-litellm behavior.
+  const explicitType = provider.type == null || provider.type === ""
+    ? null
     : provider.type;
 
-  // Reject legacy types outright on add. Migration is for update only.
-  if (effectiveType === "anthropic") {
-    throw new Error(
-      `type 'anthropic' is no longer supported. ` +
-      `Use --type litellm --litellm-provider anthropic instead. ` +
-      `(Set --base-url for Anthropic-compatible endpoints like MiniMax.)`,
-    );
-  }
-  if (effectiveType === LEGACY_PROVIDER_TYPE) {
+  // Stage 9.0: the legacy strings "litellm" / "anthropic" are accepted
+  // as INPUT ALIASES. "openai-compatible" remains the only string
+  // rejected on write. The other two are normalized via
+  // normalizeProviderForWrite, which maps "litellm" -> "proxy" and
+  // "anthropic" -> "proxy(engine=litellm, litellmProvider=anthropic)".
+  if (explicitType === LEGACY_PROVIDER_TYPE) {
     throw new Error(
       `type '${LEGACY_PROVIDER_TYPE}' is no longer supported. ` +
-      `Use --type litellm --litellm-provider custom_openai instead.`,
+      `Use --type proxy --litellm-provider custom_openai instead.`,
     );
   }
 
-  const normalized = effectiveType === "litellm"
-    ? { ...provider, type: effectiveType, ...pickLitellmProvider(provider) }
-    : { ...provider, type: effectiveType };
+  // Run the patch through the write-side normalizer so caller-supplied
+  // "litellm" / "anthropic" get the right canonical shape before
+  // validation.
+  const writeNormalized = normalizeProviderForWrite(provider);
+  // Default type only fires AFTER the write-normalize so an omitted
+  // --type falls into the "proxy" default cleanly.
+  const normalized = explicitType == null
+    ? (writeNormalized.type ? writeNormalized : { ...writeNormalized, type: "proxy", engine: "litellm" })
+    : writeNormalized.type
+      ? writeNormalized
+      : { ...writeNormalized, type: explicitType };
+
+  // When the type is `proxy` and the caller did not specify `engine`,
+  // default to "litellm" so downstream rendering does not need a
+  // conditional on missing-engine.
+  if (normalized.type === "proxy" && normalized.engine == null) {
+    normalized.engine = "litellm";
+  }
+
   // Stage 7.7: validate env-ref shape across the whole payload up front.
   validateAllEnvRefShapes(normalized);
   // Stage 7.7: strip UI-only state BEFORE the strict unknown-field check so
@@ -246,10 +393,13 @@ export function addProvider(config, provider) {
   delete normalized.inlineCreds;
   const { name, type } = validateRecord(normalized);
 
-  // Stage 7.7: strict unknown-field rejection on add. After validation the
-  // litellmProvider is known; any payload key not in the catalog or in
-  // KNOWN_PROVIDER_META_KEYS is rejected.
-  if (type === "litellm") {
+  // Stage 7.7 + Stage 9.0: strict unknown-field rejection on add for
+  // proxy (the only type that still has a catalog lookup). For
+  // originrouter and remote, the strict check is bypassed — the
+  // dedicated validators own the field shape and the meta keys
+  // (auth, deviceId, target, baseUrl) are already in
+  // KNOWN_PROVIDER_META_KEYS.
+  if (type === "proxy") {
     assertNoUnknownProviderFields(normalized, normalized.litellmProvider, { where: "add" });
   }
 
@@ -266,7 +416,12 @@ export function addProvider(config, provider) {
   // no longer seeds routes.claude.small — that slot is owned by the
   // routes layer (POST /routes/claude/small or `originrouter route set
   // claude.small --provider <name>`).
+  // Stage 9.0: smallFastModel is a proxy(engine=litellm) field.
   const stored = { name, type, ...normalized };
+  // Re-assert engine on proxy — never persist a proxy record without it.
+  if (stored.type === "proxy" && stored.engine == null) {
+    stored.engine = "litellm";
+  }
   delete stored._legacy;
   delete stored._legacyType;
   delete stored.inlineCreds;
@@ -309,40 +464,62 @@ export function applyProviderUpdate(config, name, patch) {
   let workingPatch = patch;
   let migratedFrom = null;
 
-  // Legacy migration: type=openai-compatible → type=litellm, litellmProvider=custom_openai
+  // Stage 9.0: legacy migration on update.
+  //   - "openai-compatible" -> "proxy"(engine=litellm, litellmProvider=custom_openai)
+  //   - "anthropic"         -> "proxy"(engine=litellm, litellmProvider=anthropic)
+  // The migration fires when the existing record is legacy AND the
+  // patch does not carry an explicit legacy type. After migration,
+  // the merged record is re-projected through normalizeProviderForRead
+  // so the on-disk shape is always the canonical 9.0 one.
   if (existing.type === LEGACY_PROVIDER_TYPE && patch.type !== LEGACY_PROVIDER_TYPE) {
-    workingPatch = { ...patch, type: "litellm", litellmProvider: "custom_openai" };
+    workingPatch = { ...workingPatch, type: "proxy", engine: "litellm", litellmProvider: "custom_openai" };
     migratedFrom = LEGACY_PROVIDER_TYPE;
-  }
-  // Legacy migration: type=anthropic → type=litellm, litellmProvider=anthropic
-  if (existing.type === "anthropic" && patch.type !== "anthropic") {
-    workingPatch = { ...workingPatch, type: "litellm", litellmProvider: "anthropic" };
+  } else if (existing.type === "anthropic" && patch.type !== "anthropic") {
+    workingPatch = { ...workingPatch, type: "proxy", engine: "litellm", litellmProvider: "anthropic" };
     migratedFrom = "anthropic";
+  } else if (existing.type === "litellm" && patch.type !== "litellm") {
+    // Existing on the old single-type wire shape; migrate to
+    // proxy(engine=litellm) and keep the litellmProvider.
+    workingPatch = { ...workingPatch, type: "proxy", engine: "litellm" };
+    migratedFrom = "litellm";
   }
 
-  // Explicit legacy type on the patch is rejected.
+  // Stage 9.0: explicit legacy type on the patch is rejected. Only
+  // "openai-compatible" is rejected outright on write; "litellm" and
+  // "anthropic" are accepted via the write-normalize below.
   if (workingPatch.type === LEGACY_PROVIDER_TYPE) {
     throw new Error(
       `type '${LEGACY_PROVIDER_TYPE}' is no longer supported. ` +
-      `Use type='litellm' litellmProvider='custom_openai' instead.`,
+      `Use --type proxy --litellm-provider custom_openai instead.`,
     );
   }
-  if (workingPatch.type === "anthropic") {
-    throw new Error(
-      `type 'anthropic' is no longer supported. ` +
-      `Use type='litellm' litellmProvider='anthropic' instead.`,
-    );
-  }
+
+  // Run the patch through the write-side normalizer. A caller
+  // passing `type: "litellm"` becomes `type: "proxy" + engine:
+  // "litellm"` here, before the strict unknown-field check.
+  workingPatch = normalizeProviderForWrite(workingPatch);
 
   // Resolve the litellmProvider we'll validate against. After legacy
   // migration it is forced to the corresponding catalog profile.
   const effectiveLitellmProvider = workingPatch.litellmProvider || existing.litellmProvider;
 
-  // Stage 7.7: strict unknown-field rejection on the patch (after legacy
-  // migration has rewritten type/litellmProvider, if applicable). The
-  // existing record's unknown keys are preserved by the merge step below;
-  // we only reject NEW unknown keys introduced by the patch.
-  assertNoUnknownProviderFields(workingPatch, effectiveLitellmProvider, { where: "update" });
+  // Stage 7.7 + Stage 9.0: strict unknown-field rejection on the
+  // patch (after legacy migration has rewritten type/litellmProvider,
+  // if applicable). The strict check only runs for type=proxy —
+  // originrouter / remote are validated by their dedicated validators
+  // and the meta keys (auth / deviceId / target / baseUrl) are
+  // already in KNOWN_PROVIDER_META_KEYS.
+  //
+  // The gate is the resolved record type (existing.type after
+  // legacy migration), NOT workingPatch.type. A patch that omits
+  // `type` inherits the existing record's type, and the strict
+  // check must still fire on that path.
+  const resolvedType = workingPatch.type
+    || (existing.type === "litellm" || existing.type === "anthropic" || existing.type === LEGACY_PROVIDER_TYPE
+        ? "proxy" : existing.type);
+  if (resolvedType === "proxy") {
+    assertNoUnknownProviderFields(workingPatch, effectiveLitellmProvider, { where: "update" });
+  }
 
   // Stage 7.7: env-reference shape validation across the patch. We do this
   // before merge so the user sees the error pointing at the right key.
@@ -403,9 +580,16 @@ export function applyProviderUpdate(config, name, patch) {
   }
 
   // Stage 7.7: huggingface uses apiKey directly; no hfToken mirror.
-  const mirrored = pickLitellmProvider(merged);
+  // Stage 9.0: pickLitellmProvider is only meaningful for proxy(engine=litellm).
+  // For originrouter / remote, the merged record already has the right
+  // shape; `mirrored` is empty.
+  const mirrored = type === "proxy" ? pickLitellmProvider(merged) : {};
 
   const stored = { name: vName, type, ...merged, ...mirrored };
+  // Re-assert engine on proxy — never persist a proxy record without it.
+  if (stored.type === "proxy" && stored.engine == null) {
+    stored.engine = "litellm";
+  }
   // Strip read-side projection fields. They are never written to disk.
   delete stored._legacy;
   delete stored._legacyType;
@@ -466,10 +650,12 @@ function summarizeProvider(provider) {
   // in summarize output without explicit allowlist maintenance.
   const dynamic = {};
   try {
-    const profile = getLitellmProfile(norm.litellmProvider);
-    for (const f of profile.fields) {
-      if (outFields.has(f.key)) continue; // already in the static set below
-      dynamic[f.key] = maskIfSecret(f.key, norm[f.key]);
+    if (norm.type === "proxy") {
+      const profile = getLitellmProfile(norm.litellmProvider);
+      for (const f of profile.fields) {
+        if (outFields.has(f.key)) continue; // already in the static set below
+        dynamic[f.key] = maskIfSecret(f.key, norm[f.key]);
+      }
     }
   } catch {
     // unknown litellmProvider → leave dynamic empty
@@ -478,6 +664,8 @@ function summarizeProvider(provider) {
     name: norm.name,
     type: norm.type,
     litellmProvider: norm.litellmProvider || null,
+    // Stage 9.0: surface the engine sub-type on proxy records.
+    engine: norm.type === "proxy" ? (norm.engine || "litellm") : null,
     baseUrl: norm.baseUrl || "(unset)",
     apiKey: maskSecret(norm.apiKey), // kept for backward-compat with existing tests
     model: norm.model || "(unset)",
@@ -502,6 +690,10 @@ function summarizeProvider(provider) {
     sagemakerBaseUrl: norm.sagemakerBaseUrl || null,
     vertexCredentials: maskSecret(norm.vertexCredentials),
     organization: norm.organization || null,
+    // Stage 9.0: originrouter and remote fields.
+    auth: norm.auth || null,
+    deviceId: norm.deviceId || null,
+    target: norm.target || null,
     ...dynamic,
   };
   if (norm._legacy) out._legacy = true;
@@ -518,6 +710,8 @@ const outFields = new Set([
   "awsWebIdentityToken", "awsBedrockRuntimeEndpoint", "awsRoleName",
   "awsSessionName", "awsStsEndpoint", "sagemakerBaseUrl",
   "vertexCredentials", "organization",
+  // Stage 9.0 additions.
+  "auth", "deviceId", "target", "engine",
 ]);
 
 // ---------- resolution + env ----------
@@ -598,13 +792,21 @@ export function doctorProvider(provider) {
     errors.push(`type '${norm.type}' must be one of: ${PROVIDER_TYPES.join(", ")}`);
   }
 
-  if (norm.type === "anthropic") {
-    if (!norm.baseUrl || !/^https?:\/\//.test(norm.baseUrl)) {
+  if (norm.type === "originrouter") {
+    if (norm.baseUrl != null && !/^https?:\/\//.test(norm.baseUrl)) {
       errors.push("baseUrl must start with http:// or https://");
     }
-    if (!norm.apiKey) errors.push("apiKey is missing");
-    if (!norm.model) errors.push("model is missing");
-  } else if (norm.type === "litellm") {
+    if (!norm.auth || norm.auth.type !== "managed_originrouter_key") {
+      errors.push("auth.type must be 'managed_originrouter_key'");
+    }
+    if (norm.auth && !norm.auth.keyRef) {
+      errors.push("auth.keyRef is required");
+    }
+    if (!norm.model) errors.push("model is missing (real model id, e.g. 'claude-sonnet-4-6')");
+  } else if (norm.type === "proxy") {
+    if (norm.engine !== "litellm") {
+      errors.push(`engine must be 'litellm' (got '${norm.engine}')`);
+    }
     try {
       const profile = getLitellmProfile(norm.litellmProvider);
       for (const f of profile.fields) {
@@ -639,6 +841,24 @@ export function doctorProvider(provider) {
       errors.push(`unknown litellmProvider '${norm.litellmProvider}'`);
     }
     if (!norm.model) errors.push("model is missing");
+  } else if (norm.type === "remote") {
+    if (!norm.deviceId) errors.push("deviceId is required");
+    if (!norm.auth || norm.auth.type !== "device_grant") {
+      errors.push("auth.type must be 'device_grant'");
+    }
+    if (norm.auth && !norm.auth.grantRef) {
+      errors.push("auth.grantRef is required");
+    }
+    if (norm.target != null && norm.target !== "proxy" && norm.target !== "agent") {
+      errors.push(`target must be 'proxy' or 'agent' (got '${norm.target}')`);
+    }
+  } else if (norm.type === "anthropic") {
+    // Legacy fallback: still used by the legacy `claude` block in resolveProvider.
+    if (!norm.baseUrl || !/^https?:\/\//.test(norm.baseUrl)) {
+      errors.push("baseUrl must start with http:// or https://");
+    }
+    if (!norm.apiKey) errors.push("apiKey is missing");
+    if (!norm.model) errors.push("model is missing");
   }
 
   // Soft warnings.
@@ -650,14 +870,14 @@ export function doctorProvider(provider) {
   if (norm.type === "anthropic" && norm.apiKey && !norm.apiKey.startsWith(ANTHROPIC_KEY_PREFIX_HINT)) {
     warnings.push(`apiKey does not start with '${ANTHROPIC_KEY_PREFIX_HINT}' — verify this is an Anthropic-compatible key`);
   }
-  // Stage 7.6: smallFastModel on litellm is allowed (it seeds
+  // Stage 7.6: smallFastModel on proxy is allowed (it seeds
   // routes.claude.small on provider use). No doctor warning.
-  if (norm.type === "litellm" && norm.smallFastModel) {
+  if (norm.type === "proxy" && norm.smallFastModel) {
     // Informational only — not a warning.
   }
   // Legacy hint.
   if (norm._legacy) {
-    warnings.push("This record is on the legacy openai-compatible shape; it will be auto-migrated to type=litellm on next edit.");
+    warnings.push(`This record is on the legacy ${norm._legacyType} shape; it will be auto-migrated to type=proxy on next edit.`);
   }
 
   return { ok: errors.length === 0, errors, warnings };

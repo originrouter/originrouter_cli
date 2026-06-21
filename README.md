@@ -565,3 +565,63 @@ Open the temporary test page:
 - Add Codex app-server adapter.
 - Add relay client.
 - Harden optional tmux executor.
+
+## Stage 9.2 — Remote Provider (target=proxy) — local PoC, no auth
+
+A route of `type=remote, target=proxy` makes the caller's local
+Claude/Codex talk to a worker device's local LiteLLM proxy through
+`originrouter-server` as a typed relay. The worker does not need a
+public IP — it just opens an SSE connection to the relay and waits
+for `remote.coding.request` events.
+
+```
+# Worker device (with a real local LiteLLM proxy running on port 40123):
+originrouter provider add office --type proxy --litellm-provider openai \
+  --api-key sk-... --model gpt-5-codex
+originrouter route set codex.main --provider office
+originrouter proxy start --port 40123
+originrouter daemon                        # worker daemon listens for remote.coding.request
+
+# Caller device (anywhere reachable to the worker via originrouter-server):
+originrouter provider add laptop-remote \
+  --type remote --device-id office --grant-ref current --target proxy
+originrouter route set codex.main --provider laptop-remote --model gpt-5-codex
+originrouter env print --agent codex       # starts a temporary relay proxy in this process,
+                                          # prints the real port, then tears it down
+# Source: remote-coding
+# OPENAI_BASE_URL=http://127.0.0.1:<ephemeral-port>/v1
+# OPENAI_API_KEY=sk-n...gh                  # masked
+# OPENAI_MODEL=gpt-5-codex
+originrouter codex                         # local wrapper starts the relay proxy for real,
+                                          # spawns Codex, tears the proxy down on exit
+```
+
+**No auth in 9.2.** The relay is a pure message broker: it routes
+`remote.coding.*` events by `deviceId` alone, with no `Authorization`
+header. A future "9.x security" stage will add a `relayAccessToken`
+signed by the worker's `deviceGrant`; 9.2 deliberately leaves the seam
+clear. The relay also masks `headers` and `body` in its debug ring so
+keys and prompts never appear there. The worker strips caller-supplied
+`authorization` / `x-api-key` / `host` / `content-length` / `connection`
+/ `transfer-encoding` headers before forwarding to its local proxy —
+the caller's noop key never reaches the model API; the worker's local
+proxy authenticates using its own config.
+
+**Only `target=proxy` is supported.** `target=agent` (run the worker's
+own Claude/Codex) and WebRTC/P2P are deferred to a later stage.
+
+## Stage 9.2.1 — Remote Relay Runtime Smoke & Hardening
+
+9.2.1 hardened the runtime with five negative smokes (worker
+offline, worker 5xx, worker timeout, caller abort, relay
+disconnect), a 3-process happy-path smoke against the real
+spawned `originrouter-server`, a process cleanup audit (clean
+exit + SIGINT + SIGTERM + uncaught exception all close the
+ephemeral port and reap the pid), a concurrent-in-flight test
+(two simultaneous requests on the same bridge, no cross-talk),
+and a secret-leak audit (no prompt / body / `x-api-key` /
+authorization value ever appears in `/debug/events`).
+
+Test count: 31 → 34 CLI suites + 2 binary smokes; server
+unchanged. See `docs/agent-runtime-audit.md` for the full
+Stage 9.2.1 note with measured numbers.

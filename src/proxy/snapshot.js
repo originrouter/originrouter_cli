@@ -82,3 +82,34 @@ export async function snapshotProxyStatus(proxyManager) {
     return NOOP_PROXY_SNAPSHOT;
   }
 }
+
+// Stage 9.2 — Remote-coding relay proxy. Same pattern as the LiteLLM
+// proxy snapshot above: the local wrapper / env print resolves it
+// once at startup and passes the resulting frozen object to
+// `buildAgentProviderEnv` as `options.remoteCodingStatus`.
+//
+// `runtime: "remote-coding"` lets the env builder distinguish this
+// snapshot from a real LiteLLM proxy snapshot — the build path in
+// claudeConfig.js uses it to know it's the relay case.
+export const NOOP_REMOTE_CODING_SNAPSHOT = Object.freeze({
+  state: "not-installed",
+  port: null,
+  host: null,
+  pid: null,
+  runtime: "remote-coding",
+});
+
+export async function snapshotRemoteCodingStatus(manager) {
+  if (!manager || typeof manager.status !== "function") {
+    return NOOP_REMOTE_CODING_SNAPSHOT;
+  }
+  try {
+    const snap = await manager.status();
+    return Object.freeze({
+      ...snap,
+      runtime: snap.runtime || "remote-coding",
+    });
+  } catch {
+    return NOOP_REMOTE_CODING_SNAPSHOT;
+  }
+}

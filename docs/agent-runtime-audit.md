@@ -538,6 +538,179 @@ handles the new envelope. A read-only mode/status surface
 - `package.json` — test chain gains one new suite; suite count
   bumps to 22.
 
+## Stage 9.0 — provider / login architecture
+
+> **Stage 9.0 locks down the product architecture.** The
+> canonical provider types are now `originrouter | proxy | remote`.
+> `litellm` is a CLI-input compatibility alias that persists
+> as `proxy(engine=litellm)`. `openai-compatible` is rejected
+> on write. The pure route resolver
+> (`src/config/providerRoutes.js`) decides HTTP transport;
+> the runtime does not yet consume it (9.1+). The login
+> credential architecture (login code → device grant → managed
+> coding API key) is contracted; storage helpers and shape
+> modules ship in 9.0; full exchange / rotation / revocation
+> is 9.1+.
+
+### 9.0.1 Canonical wire types
+
+`PROVIDER_TYPES` is `["originrouter", "proxy", "remote"]`. The
+read-side `normalizeProviderForRead` projects legacy records
+(`litellm` / `anthropic` / `openai-compatible`) to the
+`proxy(engine=litellm, litellmProvider=<id>, _legacyType=<...>)`
+shape so existing configs keep loading. The write-side
+`normalizeProviderForWrite` accepts the legacy strings
+`"litellm"` and `"anthropic"` as input aliases; they are
+persisted as `proxy(engine=litellm)`. `openai-compatible` is
+the only legacy string that remains rejected on write.
+
+### 9.0.2 Route resolver
+
+`src/config/providerRoutes.js` exports `resolveRoute({...})`
+and `DEFAULT_ORIGINROUTER_BASE_URL`. The resolver always
+includes the routing prefix: `/coding/...` for official
+originrouter, bare `/v1/...` for the local proxy. Codex uses
+`/v1/responses` (or `/coding/v1/responses` on the official
+endpoint); `/v1/chat/completions` is a backend alias the CLI
+does not target in 9.0.
+
+### 9.0.3 Login credential architecture
+
+`uuid` is explicitly rejected as a long-term CLI / App
+credential. The CLI and the App hold a `ManagedCodingKey`
+bound to a `deviceId` and a `device_grant_id`, with
+`scope: "coding"` and `source: originrouter_cli |
+originrouter_app`. The CLI stores the key in
+`<stateDir>/coding-key.json` (mode 0o600). The pure shape
+check is `isManagedKeyShape` in
+`src/runtime/authContract.js`; the IO layer
+(`src/persistence/codingAuth.js`) delegates to it. The full
+exchange / rotation / revocation endpoints are 9.1+.
+
+### 9.0.4 Evidence trail
+
+- `src/config/providers.js` — `PROVIDER_TYPES` (3 types),
+  `normalizeProviderForRead` (3 legacy strings → proxy),
+  `normalizeProviderForWrite` (2 alias strings → proxy),
+  `validateOriginrouterRecord` / `validateRemoteRecord` /
+  `validateProxyRecord` (replacing the legacy
+  `validateAnthropicRecord` / `validateLitellmRecord` pair).
+- `src/config/routes.js` — `routeProviderForRead` updated
+  in lockstep; `validateRouteEntry` accepts the 3 canonical
+  types and gates `proxy.engine === "litellm"`.
+- `src/config/providerRoutes.js` — **new** pure resolver.
+- `src/runtime/authContract.js` — **new** lifetime
+  constants and shape helpers.
+- `src/persistence/codingAuth.js` — **new** IO helpers.
+- `src/index.js` — new flags `--key-ref`, `--engine`,
+  `--device-id`, `--grant-ref`, `--target` for
+  `provider add` / `update`; help text updated; legacy
+  error message reworded.
+- `src/proxy/litellm.js` — `resolveProviderProfile` and
+  the route renderer accept `type=proxy(engine=litellm)`
+  in addition to the legacy `type=litellm`.
+- `src/proxy/litellmCatalog.js` — `secretFieldKeysFor`
+  accepts `type=proxy(engine=litellm)`.
+- Tests: `tests/providerConfigNormalization.test.js` (13
+  cases), `tests/providerRouteResolution.test.js` (14
+  cases), `tests/codingAuthStorage.test.js` (10 cases).
+
+### 9.0.5 Status of the 8.x surface
+
+`agent.permission.*` and `agent.interaction.*` event surfaces
+are unchanged. The temporary console is out of scope for 9.0
+(per user confirmation). The 8.9 dual-emit pattern
+(legacy + new envelope) continues to work without
+modification.
+
+## Stage 9.1A — OriginRouter login + device grant + managed coding key
+
+> **Stage 9.1A — implemented for CLI + Backend.**
+
+**Backend** (`UPT_back_end/ai/server/`):
+
+- `routes/originrouter_auth.py` registers 5 endpoints under
+  `/originrouter/auth`:
+  - `POST /login-code` (browser `Bearer uuid:<uuid>`)
+  - `POST /device/exchange` (no auth; runs in one DB
+    transaction: consume → grant → key → commit; rollback
+    restores the login code)
+  - `POST /device/rotate-coding-key` (Bearer device grant)
+  - `POST /device/revoke` (Bearer device grant; idempotent;
+    returns `already_revoked: bool`)
+  - `GET /devices` (Bearer device grant; returns
+    `scope: "current_device_only"` — NOT a user-device list)
+- `originrouter_auth_store.py` (modified): fixes the LIKE
+  bug in `rotate_managed_key`, fixes dispatch collisions in
+  the in-memory fake store, adds `find_grant_for_revoke`.
+- `originrouter_auth_contract.py` docstring updated: the side
+  table `api_model_key_metadata.key_id` is `VARCHAR(64)` with
+  no FK onto `api_model_keys.id`.
+- `sql/originrouter_auth.sql` creates three new tables.
+- `app.py` + `routes/__init__.py` register the blueprint.
+- `originrouter_auth_store_test.py` + `originrouter_auth_route_test.py`
+  ship (Flask `test_client()`).
+
+**CLI** (`originrouter-cli/`):
+
+- `src/runtime/authContract.js` — `isManagedKeyShape` now
+  requires `deviceGrant` + `deviceId`; accepts optional idle /
+  absolute expiries.
+- `src/auth/originrouterAuthClient.js` (new) — 4 production
+  helpers + 1 test-only helper (`requestBrowserLoginCodeForTesting`).
+  `AuthClientError` never includes the Authorization header.
+- `src/auth/originrouterLogin.js` (new) — `loginWithManualCode`
+  (required completion path), `loginWithCallback` (experimental;
+  local HTTP server, URLSearchParams, no `shell: true`).
+- `src/index.js` — 5 new commands: `login`, `logout`,
+  `auth status`, `auth rotate`, `auth device list`.
+- 3 new test files. Suite count: 25 → 28 + 2 binary smokes.
+
+**Out of scope for 9.1A** (deferred):
+
+- Universal_PDF_H5 wiring for end-user browser callback UX
+  (9.1A.1).
+- Flutter App real login (9.1C).
+- `agent.interaction.*` / `agent.permission.*` (unchanged).
+
+## Stage 9.1B — Runtime Claude/Codex → OriginRouter /coding direct
+
+> **Stage 9.1B — implemented for CLI + Backend.**
+
+- `buildAgentProviderEnv` in `src/config/claudeConfig.js` for routes
+  of `type=originrouter` returns direct env against
+  `<base>/coding` (Claude) or `<base>/coding/v1` (Codex), with the
+  managed coding key from `<stateDir>/coding-key.json` injected as
+  `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`. No local LiteLLM proxy is
+  required for direct routes.
+- `source: "originrouter-coding"` distinguishes the direct path
+  from `source: "routes"` (proxy hash match). The direct branch is
+  locked in by 18 cases in `tests/runtimeOriginrouterRoute.test.js`
+  plus 2 smoke cases in `tests/claudeConfigRoutes.test.js`.
+- `originrouter env print --agent codex` now lists `OPENAI_BASE_URL`,
+  `OPENAI_API_KEY`, `OPENAI_MODEL` (previously Claude-only). The
+  "Effective env" header is agent-aware (`what codex will see` /
+  `what claude will see`). `OPENAI_API_KEY` is masked the same way
+  `ANTHROPIC_API_KEY` is.
+- `readManagedCodingKeyForRuntime` rejects malformed
+  `coding-key.json` (missing `deviceGrant`, missing `scopes`, wrong
+  `source`) before injecting env, with a `PROVIDER_UNSUPPORTED`
+  error pointing the user to `originrouter login --manual-code`.
+  This is defensive — `writeCodingAuth` already enforces the shape,
+  but the runtime must not assume the file came from a well-behaved
+  writer.
+- Proxy branch (`type=proxy`) unchanged. The 28-suite regression
+  surface from 9.0 + 9.1A stays green; the new suite brings the
+  total to **29 suites + 2 binary smokes**.
+- `auth.keyRef` is a local managed coding key reference, not a
+  fixed key id. After `originrouter auth rotate`, the new key id
+  differs but the reference is unchanged; the runtime always reads
+  the current `<stateDir>/coding-key.json`. In 9.1B, only
+  `keyRef: "current"` is meaningful for the CLI runtime.
+- Remote provider (`type=remote`) still future.
+- No edits under `UPT_back_end/Universal_PDF_H5/`, no Flutter
+  edits, no backend route changes, no new npm dependencies.
+
 ## 11. Post-8.6 deferred work
 
 Open items that have not landed in any 8.x stage. Some of these are
@@ -658,3 +831,167 @@ npm test                                       # full chain green (22 suites + 2
 
 - `npm test` still green (16 suites, including the new `codexAppServerClient.test.js`).
 - `tests/codexDecisionMapping.test.js` and `tests/codexSemver.test.js` still green — the new `withApprovalTimeout` uses `mapDecisionToWire` and the legacy/new wire mapping must not regress.
+
+## Stage 9.2 — Remote Provider (target=proxy) runtime
+
+- `buildAgentProviderEnv` for `type=remote, target=proxy` returns
+  `source: "remote-coding"` and env pointing at a caller-side
+  `RemoteCodingRelayProxy` on `127.0.0.1:<port>` (ephemeral). Same
+  noop key as the local proxy path (`NOOP_ANTHROPIC_API_KEY` /
+  `NOOP_OPENAI_API_KEY`).
+- Caller-side `RemoteCodingProxyManager` is started **by the local
+  `originrouter claude` / `originrouter codex` wrapper process**
+  (and by `originrouter env print`), NOT by the daemon. The wrapper
+  tears the manager down in its existing `cleanup()` path. The
+  daemon does not instantiate `RemoteCodingProxyManager` at all.
+- Worker-side daemon handles `remote.coding.request` events from the
+  relay. The handler `handleRemoteCodingRequest` strips caller
+  credential/transport headers and forwards the request to the
+  worker's local proxy via `fetch`. On 5xx or fetch-throw the
+  worker sends a single `remote.coding.response.error` with
+  `code: "upstream_error"` and no start/chunk/end. Cancel events
+  abort the in-flight `fetch` via `AbortController`.
+- `originrouter-server` routes `remote.coding.*` events between
+  caller and worker over the existing `POST /device/message` and
+  `GET /device/events` surfaces. Per-request state in
+  `remoteRequests` tracks `{ callerDeviceId, targetDeviceId, timeout,
+  startedAt, runtime }`. Default timeout 120s
+  (`REMOTE_CODING_TIMEOUT_MS` env override). Body cap 1 MiB.
+  The relay does NOT parse headers or body; the debug ring
+  (`/debug/events`) replaces `headers` with `{ "<masked>": true }`
+  and `body` with `null` for any `remote.coding.*` event so keys
+  and prompts never leak.
+- New typed events: `remote.coding.request` (caller → worker),
+  `remote.coding.response.{start,chunk,end,error}` (worker →
+  caller), `remote.coding.request.cancel` (caller → worker). The
+  four error codes are `target_offline`, `timeout`,
+  `upstream_error`, and the caller-side proxy's local
+  `relay_disconnected`. (`unauthorized_or_invalid_grant` is
+  reserved for the future security stage and not emitted in 9.2.)
+- 9.2 supports only `target=proxy`. `target=agent` and WebRTC/P2P
+  are deferred to 9.3+.
+- **No formal auth, no real DB, no new npm deps.**
+
+## Stage 9.2.1 — Remote Relay Runtime Smoke & Hardening
+
+Stage 9.2 proved the protocol with automated unit tests; 9.2.1
+proves the real running link with end-to-end smokes and a
+cleanup audit. The new code change is small (caller-side cancel);
+the bulk of the work is the smoke harness.
+
+### Code change: caller-side cancel
+
+`src/runtime/remoteCodingRelayProxy.js` now publishes
+`remote.coding.request.cancel` on `req.on("aborted")` /
+`req.on("close")` / `res.on("close")` so a caller-side disconnect
+short-circuits the worker's in-flight fetch. The relay already
+handles the cancel (forwards to worker, clears per-request
+state). The worker daemon's `cancelRemoteCodingRequest` already
+aborts the in-flight `fetch` via `AbortController`. **No relay
+or worker changes were needed.** A new
+`RemoteCodingRelayClient.publishCancel(requestId)` helper sends
+the cancel over `POST /device/message` (best-effort; the relay
+also times out the request).
+
+A second small change in `RemoteCodingRelayProxy.stop()`:
+the proxy now tracks in-flight sockets in a `Set` and destroys
+them on `stop()`. Without this, `server.close()` can hang when
+an HTTP request was destroyed client-side but the response
+socket is still open in the proxy — which is exactly what the
+abort smoke test exercises. After the change, `stop()` reliably
+returns within a few ms.
+
+### 3-process happy-path smoke
+
+`tests/remoteCodingSmoke.test.js` §B spawns the real
+`originrouter-server` (a `node` subprocess) on a random port,
+boots a `RemoteCodingRelayProxy` against it, and sends a real
+HTTP POST through the bridge to a fake worker that streams two
+chunks. The real bridge / real relay / fake worker / real HTTP
+client all interact on real TCP sockets.
+
+Observed: HTTP 200, body 128 bytes (two `data: {text:"hello"}` /
+`{text:" world"}` chunks + the message_start preamble). The
+`/debug/events` ring contains the request envelope with headers
+masked and body null.
+
+### 5 negative smokes
+
+Same file, §C, with the same 3-process harness:
+
+| Sub-case | Trigger | Observed |
+|---|---|---|
+| C.1 worker offline | target deviceId not registered on relay | HTTP 502, `code: "target_offline"` |
+| C.2 worker 5xx | worker returns 503 | HTTP 502, `code: "upstream_error"`, message contains `503` |
+| C.3 worker timeout | worker silent, `REMOTE_CODING_TIMEOUT_MS=600` | HTTP 504, `code: "timeout"`, elapsed ~605ms |
+| C.4 caller abort | client destroys request after first chunk | bridge published `remote.coding.request.cancel`; relay `/health` still `ok:true`; no orphan state |
+| C.5 relay disconnect | kill relay mid-stream | HTTP 502, `code: "relay_disconnected"` (or `upstream_error` if the publishRequest failed first; both are 502) |
+
+### Process cleanup audit
+
+`tests/remoteCodingProcessCleanup.test.js` spawns a real `node`
+subprocess that runs the same `RemoteCodingProxyManager.start()`
++ `stop()` lifecycle the local wrapper uses. After the child
+exits, the test asserts the ephemeral port is free (`EADDRINUSE`
+on a fresh bind) and the pid is dead (`process.kill(pid, 0)`
+returns ESRCH). Verified for four exit modes:
+
+| Exit mode | Result |
+|---|---|
+| clean `process.exit(0)` | port free, pid dead |
+| SIGINT | port free, pid dead |
+| SIGTERM | port free, pid dead |
+| uncaught exception (setTimeout throw) | port free, pid dead |
+
+The "uncaught exception" case is the one the user asked about:
+the local wrapper crashes → does the manager get cleaned up?
+Yes — the bridge's `_sockets` Set is closed when the runtime
+exits, regardless of how the exit happens.
+
+### Concurrent in-flight
+
+`tests/remoteCodingRelayProxy.test.js` Group E fires two
+`Promise.all` HTTP requests through the same bridge to two
+different `worker-*` deviceIds. The fake relay's script is
+FIFO-queued: the first request consumes the first script (3
+chunks tagged `A1A2A3`), the second consumes the second
+(3 chunks tagged `B1B2B3`). Asserts: each body is exactly its
+own three chunks in order; no cross-talk; the waiters Map is
+empty after both end.
+
+### Secret-leak audit
+
+`tests/remoteCodingSecretLeak.test.js` sends a
+`remote.coding.request` carrying a known prompt substring
+(`the-secret-prompt-content-<rand>`) and a canary API key
+(`sk-probe-leak-canary-<rand>`) in both `authorization` and
+`x-api-key`. Then fetches `/debug/events` and asserts the
+ring contains:
+
+- the request envelope, with `headers: { "<masked>": true }`
+  and `body: null`
+- **NO** instance of the prompt substring
+- **NO** instance of the canary API key
+- **NO** `Bearer <canary>` token
+- for every `remote.coding.request` event in the ring,
+  `headers` and `body` are correctly masked/nulled
+
+### Test count
+
+| Repo | Before | After |
+|---|---|---|
+| originrouter-cli | 31 suites + 2 binary smokes | 34 suites + 2 binary smokes (+3 new test files: smoke, secret-leak, process-cleanup) |
+| originrouter-server | 2 suites | 2 suites (no change) |
+
+The new CLI suites: `remoteCodingSmoke.test.js` (1 sub-case
+plus 5 negative sub-cases), `remoteCodingSecretLeak.test.js`,
+`remoteCodingProcessCleanup.test.js`. Plus 2 new sub-cases in
+existing `remoteCodingRelayProxy.test.js` (Group B4 caller
+abort; Group E concurrent in-flight).
+
+### Out of scope, still deferred
+
+- `target=agent` (run the worker's own Claude/Codex).
+- WebRTC/P2P / E2EE between caller and worker (the relay
+  genuinely cannot read the body only with these).
+- Real auth on the relay (surety v2 / `relayAccessToken`).

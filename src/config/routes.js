@@ -63,15 +63,32 @@ export const CODEX_MAIN_ALIAS = "originrouter-codex-model";
 export const ROUTE_SLOTS  = Object.freeze(["main", "small"]);
 
 // Stage 8.0: exported so the renderer can apply the same read-projection
-// the validator applies. Legacy type=anthropic / type=openai-compatible
-// records get projected to type=litellm + litellmProvider=<id>.
+// the validator applies. Stage 9.0: legacy records project to
+//   { type: "proxy", engine: "litellm", litellmProvider: <id>, _legacyType: <...> }.
+// The renderer (litellm.js) consumes the projected shape; it does not
+// see the on-disk wire type.
 export function routeProviderForRead(provider) {
   if (!provider) return provider;
+  if (provider.type === "litellm") {
+    return { ...provider, type: "proxy", engine: "litellm", _legacyType: "litellm" };
+  }
   if (provider.type === "anthropic") {
-    return { ...provider, type: "litellm", litellmProvider: "anthropic", _legacyType: "anthropic" };
+    return {
+      ...provider,
+      type: "proxy",
+      engine: "litellm",
+      litellmProvider: "anthropic",
+      _legacyType: "anthropic",
+    };
   }
   if (provider.type === "openai-compatible") {
-    return { ...provider, type: "litellm", litellmProvider: "custom_openai", _legacyType: "openai-compatible" };
+    return {
+      ...provider,
+      type: "proxy",
+      engine: "litellm",
+      litellmProvider: "custom_openai",
+      _legacyType: "openai-compatible",
+    };
   }
   return provider;
 }
@@ -133,11 +150,15 @@ export function validateRouteEntry(entry, providers) {
   if (!provider) {
     throw new Error(`route entry.provider '${entry.provider}' is not a known provider`);
   }
-  if (provider.type !== "litellm") {
+  // Stage 9.0: routes accept any of the three canonical wire types
+  // (originrouter / proxy / remote). The renderer in
+  // src/proxy/litellm.js is what makes a record renderable; that
+  // is the gate, not this validator. For proxy, the engine must be
+  // "litellm" (the only supported value in 9.0).
+  if (provider.type === "proxy" && provider.engine !== "litellm") {
     throw new Error(
-      `route entry.provider '${entry.provider}' is type='${provider.type}'. ` +
-      `routes only accept LiteLLM-renderable providers. Re-save it with ` +
-      `type=litellm + litellmProvider=<id>.`
+      `route entry.provider '${entry.provider}' is type='proxy' with engine='${provider.engine}'. ` +
+      `Only engine='litellm' is supported in Stage 9.0.`
     );
   }
   if (entry.model != null && (typeof entry.model !== "string" || entry.model.trim() === "")) {

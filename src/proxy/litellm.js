@@ -82,11 +82,19 @@ export const litellmModuleArgs = litellmArgs;
 function resolveProviderProfile(provider) {
   if (!provider) throw new Error("renderLitellmConfigYaml: provider required");
   if (provider.type === "openai-compatible") return getLitellmProfile("custom_openai"); // legacy
+  // Stage 9.0: the canonical LiteLLM-renderable shape is
+  // type="proxy" + engine="litellm". The legacy type="litellm" is
+  // accepted as an alias here because the renderer can be called
+  // with a record that hasn't gone through normalizeProviderForRead
+  // (e.g. unit tests that construct minimal records).
   if (provider.type === "litellm")           return getLitellmProfile(provider.litellmProvider);
+  if (provider.type === "proxy" && provider.engine === "litellm") {
+    return getLitellmProfile(provider.litellmProvider);
+  }
   throw new Error(
     `renderLitellmConfigYaml: unsupported provider type '${provider.type}'. ` +
     `type=anthropic is the direct path and does not route through LiteLLM; ` +
-    `use type=litellm + litellmProvider=<id> to route through the proxy.`
+    `use type=proxy + engine=litellm + litellmProvider=<id> to route through the proxy.`
   );
 }
 
@@ -243,10 +251,15 @@ export function renderLitellmRoutesConfigYaml(allRoutes, providers) {
         throw new Error(`routes.${agent}.${slot} references a provider that no longer exists`);
       }
       const provider = routeProviderForRead(rawProvider);
-      if (provider.type !== "litellm") {
+      // Stage 9.0: route-renderable records are type=proxy+engine=litellm.
+      // The legacy type=litellm is also accepted (in case routeProviderForRead
+      // didn't project — e.g. a future profile with engine=direct_anthropic).
+      const isLitellm = provider.type === "litellm"
+        || (provider.type === "proxy" && provider.engine === "litellm");
+      if (!isLitellm) {
         throw new Error(
-          `routes.${agent}.${slot} points at provider type='${provider.type}'. ` +
-          `routes only accept type=litellm providers; re-save the route via 'route set'.`
+          `routes.${agent}.${slot} points at provider type='${provider.type}' engine='${provider.engine}'. ` +
+          `routes only accept type=litellm or type=proxy(engine=litellm) providers; re-save the route via 'route set'.`
         );
       }
       const profile = getLitellmProfile(provider.litellmProvider);

@@ -10,6 +10,7 @@ import {
   setClaudeConfigValue,
   summarizeClaudeConfig,
   unsetClaudeConfigValue,
+  willRouteRemoteCoding,
 } from "./config/claudeConfig.js";
 import {
   addProvider,
@@ -40,7 +41,8 @@ import {
 } from "./config/routes.js";
 import { LITELLM_VERSION } from "./proxy/litellm.js";
 import { ProxyManager } from "./proxy/manager.js";
-import { readLocalProxySnapshot, staticProxyStatusFn } from "./proxy/snapshot.js";
+import { readLocalProxySnapshot, NOOP_REMOTE_CODING_SNAPSHOT, snapshotRemoteCodingStatus, staticProxyStatusFn } from "./proxy/snapshot.js";
+import { RemoteCodingProxyManager } from "./proxy/remoteCodingProxyManager.js";
 import { runLocalAgentSession } from "./local/localAgentSession.js";
 import { readSessions } from "./persistence/sessionLog.js";
 import { readApiToken, rotateApiToken } from "./persistence/authToken.js";
@@ -1046,7 +1048,7 @@ function envVarsFor(agent) {
   return agent === "codex" ? OPENAI_ENV_VARS : ANTHROPIC_ENV_VARS;
 }
 
-function handleEnvPrint(args) {
+async function handleEnvPrint(args) {
   // `env print` has its own positional subcommand; don't run args through
   // parseOptionArgs which expects `--flag value` pairs exclusively.
   const [subcommand, ...flagArgs] = args;
@@ -1092,13 +1094,63 @@ function handleEnvPrint(args) {
 
   let providerResult = null;
   let providerError = null;
+  // Stage 9.2: when the resolved route is type=remote, target=proxy,
+  // env print starts a temporary RemoteCodingProxyManager in this
+  // process so the printed ANTHROPIC_BASE_URL / OPENAI_BASE_URL shows
+  // the real ephemeral port the runtime would use. The manager is
+  // torn down before this function returns. This matches the
+  // `localAgentSession.js` lifecycle exactly so the env print and
+  // the runtime see the same `Source: remote-coding` and the same port.
+  let remoteCodingProxyManager = null;
+  let remoteCodingStatus = staticProxyStatusFn(NOOP_REMOTE_CODING_SNAPSHOT);
+  if (willRouteRemoteCoding(config, agent)) {
+    try {
+      const stateDir = (() => {
+        try { return ensureStateDir(); }
+        catch { return null; }
+      })();
+      const device = (() => {
+        try { return ensureDeviceForLogin(); }
+        catch { return { deviceId: DEFAULT_DEVICE_ID }; }
+      })();
+      const relayUrl = process.env.ORIGINROUTER_RELAY || DEFAULT_RELAY_URL;
+      if (stateDir) {
+        remoteCodingProxyManager = new RemoteCodingProxyManager({
+          stateDir,
+          relayUrl,
+          deviceId: device.deviceId,
+        });
+        const startResult = await remoteCodingProxyManager.start();
+        if (startResult.ok) {
+          const snap = await snapshotRemoteCodingStatus(remoteCodingProxyManager);
+          remoteCodingStatus = staticProxyStatusFn(snap);
+        } else {
+          remoteCodingProxyManager = null;
+        }
+      }
+    } catch (err) {
+      // Best-effort: if we can't start the manager, the env builder
+      // will throw PROVIDER_UNSUPPORTED with a clear message, which
+      // the existing error path below handles.
+      if (remoteCodingProxyManager) {
+        try { await remoteCodingProxyManager.stop(); } catch {}
+        remoteCodingProxyManager = null;
+      }
+    }
+  }
   try {
     providerResult = buildAgentProviderEnv(agent, config, {
       provider: flagName,
       proxyStatus: staticProxyStatusFn(readLocalProxySnapshot()),
+      remoteCodingStatus,
     });
   } catch (err) {
     providerError = err;
+  } finally {
+    if (remoteCodingProxyManager) {
+      try { await remoteCodingProxyManager.stop(); } catch {}
+      remoteCodingProxyManager = null;
+    }
   }
   const providerEnv = providerResult?.env || {};
 

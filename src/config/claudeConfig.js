@@ -144,6 +144,65 @@ function assertClaudeOriginrouterRoutes(config, eff) {
   return { mainProvider, smallProvider: smallProvider || mainProvider };
 }
 
+// Stage 9.2: validate the type=remote branch on Claude routes. Returns
+// the mainProvider + smallProvider if the route is remote, target=proxy,
+// and the caller-side relay proxy is up. Returns null otherwise so the
+// caller falls through to the originrouter / proxy paths. Throws
+// PROVIDER_UNSUPPORTED on misconfiguration (target=agent, mixed routing,
+// relay proxy not running).
+function assertClaudeRemoteRoutes(config, eff, remoteCodingProbe) {
+  const mainProvider = routeProvider(config, eff.main);
+  if (!mainProvider || mainProvider.type !== "remote") return null;
+  if (mainProvider.target === "agent") {
+    const err = new Error(
+      "Remote target=agent is not supported in Stage 9.2. Use --target proxy.",
+    );
+    err.code = "PROVIDER_UNSUPPORTED";
+    throw err;
+  }
+  if (!mainProvider.deviceId) {
+    const err = new Error(
+      `Remote provider '${mainProvider.name}' requires a deviceId.`,
+    );
+    err.code = "PROVIDER_UNSUPPORTED";
+    throw err;
+  }
+  const smallProvider = eff.small ? routeProvider(config, eff.small) : null;
+  if (smallProvider && smallProvider.type !== "remote") {
+    const err = new Error(
+      "Claude remote routing requires claude.small to use a remote provider too. " +
+      "Clear claude.small or point it at a remote provider.",
+    );
+    err.code = "PROVIDER_UNSUPPORTED";
+    throw err;
+  }
+  if (!remoteCodingProbe || remoteCodingProbe.state !== "running") {
+    const err = new Error(
+      "Remote-coding relay proxy is not running. The local wrapper or " +
+      "`originrouter env print` will start it automatically; if you see this " +
+      "in another context, ensure `RemoteCodingProxyManager.start()` ran.",
+    );
+    err.code = "PROVIDER_UNSUPPORTED";
+    throw err;
+  }
+  return { mainProvider, smallProvider: smallProvider || mainProvider };
+}
+
+// Stage 9.2: pure helper used by the local wrapper and env print to
+// decide whether to start a `RemoteCodingProxyManager` before resolving
+// the env. Returns true when the resolved `routes[agent].main.provider`
+// is a record of `type: "remote"` AND `target === "proxy"` (the only
+// supported remote target in 9.2).
+export function willRouteRemoteCoding(config, agent) {
+  const routes = getRoutes(config);
+  const agentRoutes = agent === "codex" ? getAgentRoutes(config, "codex") : effectiveRoutes(routes);
+  const mainEntry = agentRoutes && agentRoutes.main;
+  if (!mainEntry || !mainEntry.provider) return false;
+  const provider = routeProvider(config, mainEntry);
+  if (!provider) return false;
+  return provider.type === "remote" && (provider.target || "proxy") === "proxy";
+}
+
 export function setClaudeConfigValue(config, key, value) {
   if (!CLAUDE_CONFIG_KEYS.includes(key)) {
     throw new Error(`Unsupported Claude config key: ${key}`);
@@ -185,8 +244,31 @@ export function unsetClaudeConfigValue(config, key) {
 export function buildAgentProviderEnv(agent, config, options = {}) {
   if (agent === "claude") {
     const probe = typeof options.proxyStatus === "function" ? options.proxyStatus() : null;
+    const remoteCodingProbe = typeof options.remoteCodingStatus === "function"
+      ? options.remoteCodingStatus()
+      : null;
     const routes = getRoutes(config);
     const eff = effectiveRoutes(routes);
+    // Stage 9.2: a route of type=remote, target=proxy is the third transport.
+    // The runtime env points at a caller-side `RemoteCodingRelayProxy` on
+    // 127.0.0.1:<port>; the proxy bridges to the worker over the relay.
+    const remoteRoutes = assertClaudeRemoteRoutes(config, eff, remoteCodingProbe);
+    if (remoteRoutes) {
+      const env = {
+        ANTHROPIC_BASE_URL: `http://${remoteCodingProbe.host || "127.0.0.1"}:${remoteCodingProbe.port}`,
+        ANTHROPIC_API_KEY: NOOP_ANTHROPIC_API_KEY,
+        ANTHROPIC_MODEL: eff.main.model || remoteRoutes.mainProvider.model,
+        ANTHROPIC_SMALL_FAST_MODEL: (eff.small && (eff.small.model || remoteRoutes.smallProvider.model))
+          || eff.main.model
+          || remoteRoutes.mainProvider.model,
+      };
+      return {
+        env,
+        routes: eff,
+        provider: remoteRoutes.mainProvider,
+        source: "remote-coding",
+      };
+    }
     const originrouterRoutes = assertClaudeOriginrouterRoutes(config, eff);
     if (originrouterRoutes) {
       const managed = readManagedCodingKeyForRuntime(options);
@@ -249,6 +331,9 @@ export function buildAgentProviderEnv(agent, config, options = {}) {
   // but ignored by `originrouter codex`.
   if (agent === "codex") {
     const probe = typeof options.proxyStatus === "function" ? options.proxyStatus() : null;
+    const remoteCodingProbe = typeof options.remoteCodingStatus === "function"
+      ? options.remoteCodingStatus()
+      : null;
     const codexRoutes = getAgentRoutes(config, "codex");
     if (!codexRoutes.main) {
       const err = new Error(
@@ -259,6 +344,42 @@ export function buildAgentProviderEnv(agent, config, options = {}) {
       throw err;
     }
     const mainProvider = routeProvider(config, codexRoutes.main);
+    // Stage 9.2: remote provider, target=proxy. Codex has no small slot.
+    if (mainProvider?.type === "remote") {
+      if (mainProvider.target === "agent") {
+        const err = new Error(
+          "Remote target=agent is not supported in Stage 9.2. Use --target proxy.",
+        );
+        err.code = "PROVIDER_UNSUPPORTED";
+        throw err;
+      }
+      if (!mainProvider.deviceId) {
+        const err = new Error(
+          `Remote provider '${mainProvider.name}' requires a deviceId.`,
+        );
+        err.code = "PROVIDER_UNSUPPORTED";
+        throw err;
+      }
+      if (!remoteCodingProbe || remoteCodingProbe.state !== "running") {
+        const err = new Error(
+          "Remote-coding relay proxy is not running. The local wrapper or " +
+          "`originrouter env print` will start it automatically.",
+        );
+        err.code = "PROVIDER_UNSUPPORTED";
+        throw err;
+      }
+      const env = {
+        OPENAI_BASE_URL: `http://${remoteCodingProbe.host || "127.0.0.1"}:${remoteCodingProbe.port}/v1`,
+        OPENAI_API_KEY: NOOP_OPENAI_API_KEY,
+        OPENAI_MODEL: codexRoutes.main.model || mainProvider.model,
+      };
+      return {
+        env,
+        routes: codexRoutes,
+        provider: mainProvider,
+        source: "remote-coding",
+      };
+    }
     if (mainProvider?.type === "originrouter") {
       const managed = readManagedCodingKeyForRuntime(options);
       const env = {

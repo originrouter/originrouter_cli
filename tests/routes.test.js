@@ -259,9 +259,13 @@ assert.throws(
   const out = resolveAgentRoutes(cfg, "claude");
   assert.equal(out[MAIN_ALIAS].provider,  "deepseek");
   assert.equal(out[MAIN_ALIAS].model,     "deepseek-chat");
-  assert.equal(out[MAIN_ALIAS].providerRecord.type, "litellm");
+  // Stage 9.0: routeProviderForRead projects legacy type=litellm to
+  // proxy(engine=litellm). The providerRecord carries the projected shape.
+  assert.equal(out[MAIN_ALIAS].providerRecord.type, "proxy");
+  assert.equal(out[MAIN_ALIAS].providerRecord.engine, "litellm");
   assert.equal(out[SMALL_ALIAS].provider, "moonshot");
-  assert.equal(out[SMALL_ALIAS].providerRecord.type, "litellm");
+  assert.equal(out[SMALL_ALIAS].providerRecord.type, "proxy");
+  assert.equal(out[SMALL_ALIAS].providerRecord.engine, "litellm");
 }
 
 // Legacy provider records are projected for render-time providerRecord use.
@@ -272,7 +276,8 @@ assert.throws(
   };
   const out = resolveAgentRoutes(cfg, "claude");
   assert.equal(out[MAIN_ALIAS].provider, "minimax");
-  assert.equal(out[MAIN_ALIAS].providerRecord.type, "litellm");
+  assert.equal(out[MAIN_ALIAS].providerRecord.type, "proxy");
+  assert.equal(out[MAIN_ALIAS].providerRecord.engine, "litellm");
   assert.equal(out[MAIN_ALIAS].providerRecord.litellmProvider, "anthropic");
 }
 

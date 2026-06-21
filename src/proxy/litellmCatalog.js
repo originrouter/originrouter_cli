@@ -743,7 +743,14 @@ export function hasFlag(id, flag) {
 // Returns an empty set when the provider record is missing, non-litellm, or
 // references an unknown litellmProvider (e.g. mid-migration legacy record).
 export function secretFieldKeysFor(provider) {
-  if (!provider || provider.type !== "litellm" || !provider.litellmProvider) return new Set();
+  // Stage 9.0: proxy(engine=litellm) is the new wire shape for LiteLLM
+  // records; legacy type="litellm" is also accepted (for callers
+  // passing un-projected records). Anything else is non-LiteLLM and
+  // has no catalog-derived secrets.
+  if (!provider || !provider.litellmProvider) return new Set();
+  const isLitellm = provider.type === "litellm"
+    || (provider.type === "proxy" && provider.engine === "litellm");
+  if (!isLitellm) return new Set();
   let profile;
   try { profile = getLitellmProfile(provider.litellmProvider); }
   catch { return new Set(); }

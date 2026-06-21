@@ -1,4 +1,10 @@
 // Stage 1 provider tests + Stage 7 catalog and migration tests.
+// Stage 9.0: wire types are originrouter | proxy | remote. The legacy
+// string "litellm" is accepted as a CLI input alias and persisted as
+// proxy(engine=litellm). All persisted records on the proxy path are
+// type="proxy", engine="litellm"; the test asserts this canonical
+// shape. The read-side normalizeProviderForRead is also updated to
+// project legacy strings to proxy(engine=litellm, ...).
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -32,14 +38,20 @@ import { readConfig, writeConfig } from "../src/persistence/state.js";
 const home = mkdtempSync(join(tmpdir(), "originrouter-provider-test-"));
 process.env.ORIGINROUTER_HOME = home;
 
+// Stage 9.0: helper for the canonical proxy(engine=litellm) shape.
+function assertProxyLitellm(p) {
+  assert.equal(p.type, "proxy", `expected type=proxy, got ${p.type}`);
+  assert.equal(p.engine, "litellm", `expected engine=litellm, got ${p.engine}`);
+}
+
 try {
-  // ---------------- PROVIDER_TYPES (Stage 7.6: litellm only) ----------------
-  assert.deepEqual(PROVIDER_TYPES, ["litellm"]);
+  // ---------------- PROVIDER_TYPES (Stage 9.0: 3 canonical wire types) ----------------
+  assert.deepEqual(PROVIDER_TYPES, ["originrouter", "proxy", "remote"]);
 
   // ---------------- addProvider happy path ----------------
-  // Stage 7.6: --type is optional. The default is "litellm". The new
-  // canonical shape for an Anthropic-compatible endpoint is
-  // type=litellm, litellmProvider=anthropic, baseUrl=<url>.
+  // Stage 9.0: --type is optional. The default is "proxy"(engine=litellm).
+  // A caller can pass the legacy alias "litellm" and it is normalized to
+  // the canonical shape. The on-disk record is type="proxy", engine="litellm".
   let cfg = {};
   cfg = addProvider(cfg, {
     name: "minimax",
@@ -50,11 +62,11 @@ try {
     model: "MiniMax-M3",
     smallFastModel: "MiniMax-M2.7",
   });
-  assert.equal(cfg.providers.minimax.type, "litellm");
+  assertProxyLitellm(cfg.providers.minimax);
   assert.equal(cfg.providers.minimax.litellmProvider, "anthropic");
   assert.equal(cfg.providers.minimax.smallFastModel, "MiniMax-M2.7");
 
-  // --type omitted → defaults to litellm.
+  // --type omitted → defaults to proxy(engine=litellm).
   cfg = addProvider(cfg, {
     name: "deepseek",
     litellmProvider: "custom_openai",
@@ -62,25 +74,19 @@ try {
     apiKey: "sk-ds-1234567890",
     model: "deepseek-chat",
   });
-  assert.equal(cfg.providers.deepseek.type, "litellm");
+  assertProxyLitellm(cfg.providers.deepseek);
   assert.equal(cfg.providers.deepseek.litellmProvider, "custom_openai");
 
   // ---------------- addProvider rejections ----------------
-  assert.throws(() => addProvider(cfg, { name: "minimax", type: "litellm", litellmProvider: "anthropic", baseUrl: "https://x", apiKey: "sk", model: "m" }), /already exists/);
-  assert.throws(() => addProvider(cfg, { name: "BadName!", type: "litellm", litellmProvider: "anthropic", baseUrl: "https://x", apiKey: "sk", model: "m" }), /provider name must match/);
+  assert.throws(() => addProvider(cfg, { name: "minimax", type: "proxy", engine: "litellm", litellmProvider: "anthropic", baseUrl: "https://x", apiKey: "sk", model: "m" }), /already exists/);
+  assert.throws(() => addProvider(cfg, { name: "BadName!", type: "proxy", engine: "litellm", litellmProvider: "anthropic", baseUrl: "https://x", apiKey: "sk", model: "m" }), /provider name must match/);
   assert.throws(() => addProvider(cfg, { name: "x", type: "wrong", baseUrl: "https://x", apiKey: "sk", model: "m" }), /invalid type/);
 
-  // Legacy type=anthropic on add is rejected outright.
-  assert.throws(
-    () => addProvider(cfg, {
-      name: "old-anthropic",
-      type: "anthropic",
-      baseUrl: "https://x",
-      apiKey: "sk",
-      model: "m",
-    }),
-    /type 'anthropic' is no longer supported/,
-  );
+  // Legacy type=anthropic is accepted via the write-normalize (the
+  // legacy CLI flag --type anthropic still works) and persisted as
+  // proxy(engine=litellm, litellmProvider=anthropic). It is NOT
+  // rejected outright on add in Stage 9.0 (it is in update only).
+  // Re-confirmed: Stage 9.0 only rejects "openai-compatible" on write.
 
   // Legacy type on add is rejected outright.
   assert.throws(
@@ -95,10 +101,11 @@ try {
     /openai-compatible.*no longer supported/,
   );
 
-  // ---------------- addProvider litellm happy paths ----------------
+  // ---------------- addProvider proxy happy paths ----------------
   cfg = addProvider(cfg, {
     name: "ds-litellm",
-    type: "litellm",
+    type: "proxy",
+    engine: "litellm",
     litellmProvider: "deepseek",
     apiKey: "sk-ds",
     model: "deepseek-chat",
@@ -106,7 +113,8 @@ try {
 
   cfg = addProvider(cfg, {
     name: "az",
-    type: "litellm",
+    type: "proxy",
+    engine: "litellm",
     litellmProvider: "azure",
     apiKey: "azure-key",
     baseUrl: "https://x.openai.azure.com/",
@@ -116,7 +124,8 @@ try {
 
   cfg = addProvider(cfg, {
     name: "br",
-    type: "litellm",
+    type: "proxy",
+    engine: "litellm",
     litellmProvider: "bedrock",
     awsRegion: "us-east-1",
     model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
@@ -124,7 +133,8 @@ try {
 
   cfg = addProvider(cfg, {
     name: "vx",
-    type: "litellm",
+    type: "proxy",
+    engine: "litellm",
     litellmProvider: "vertex_ai",
     vertexProject: "p",
     vertexLocation: "us-central1",
@@ -134,7 +144,8 @@ try {
   // hfToken case (Stage 7.7: HF uses apiKey; hfToken is now an unknown field)
   assert.throws(() => addProvider({}, {
     name: "hf",
-    type: "litellm",
+    type: "proxy",
+    engine: "litellm",
     litellmProvider: "huggingface",
     hfToken: "hf_xxx",
     model: "meta-llama/Meta-Llama-3-8B-Instruct",
@@ -143,25 +154,26 @@ try {
   // apiKey is the canonical field for huggingface.
   cfg = addProvider(cfg, {
     name: "hf",
-    type: "litellm",
+    type: "proxy",
+    engine: "litellm",
     litellmProvider: "huggingface",
     apiKey: "hf_xxx",
     model: "meta-llama/Meta-Llama-3-8B-Instruct",
   });
   assert.equal(cfg.providers.hf.apiKey, "hf_xxx");
 
-  // ---------------- addProvider litellm rejections ----------------
+  // ---------------- addProvider proxy rejections ----------------
   assert.throws(() => addProvider({}, {
-    name: "x", type: "litellm", litellmProvider: "ghost", apiKey: "k", model: "m",
+    name: "x", type: "proxy", engine: "litellm", litellmProvider: "ghost", apiKey: "k", model: "m",
   }), /not a known LiteLLM adapter/);
   assert.throws(() => addProvider({}, {
-    name: "x", type: "litellm", apiKey: "k", model: "m",
+    name: "x", type: "proxy", engine: "litellm", apiKey: "k", model: "m",
   }), /requires litellmProvider/);
   // Stage 7.7: bedrock awsRegion is runtimeRequired (not required), so save
   // succeeds without it. Doctor warns. proxy-start surfaces the hint.
   {
     const cfg = addProvider({}, {
-      name: "br", type: "litellm", litellmProvider: "bedrock", model: "m",
+      name: "br", type: "proxy", engine: "litellm", litellmProvider: "bedrock", model: "m",
     });
     assert.equal(cfg.providers.br.awsRegion, undefined);
     const doc = doctorProvider(cfg.providers.br);
@@ -173,7 +185,7 @@ try {
   // Save succeeds without apiVersion; doctor warns about runtime need.
   {
     const cfg = addProvider({}, {
-      name: "az", type: "litellm", litellmProvider: "azure",
+      name: "az", type: "proxy", engine: "litellm", litellmProvider: "azure",
       baseUrl: "https://x.openai.azure.com/", model: "m",
     });
     assert.equal(cfg.providers.az.apiVersion, undefined);
@@ -185,7 +197,7 @@ try {
   // Save succeeds without them; doctor warns.
   {
     const cfg = addProvider({}, {
-      name: "vx", type: "litellm", litellmProvider: "vertex_ai", model: "m",
+      name: "vx", type: "proxy", engine: "litellm", litellmProvider: "vertex_ai", model: "m",
     });
     const doc = doctorProvider(cfg.providers.vx);
     assert.ok(doc.warnings.some((w) => /vertexProject/.test(w)),
@@ -235,15 +247,15 @@ try {
 
   // ---------------- buildProviderEnv (legacy direct path helper) ----------------
   // Stage 7.6: buildProviderEnv is used for codex and other agents only.
-  // The claude agent no longer uses direct provider env. type=litellm
-  // returns {}; type=anthropic on a legacy record still produces the
-  // direct env (the read-side normalizeProviderForRead does not rewrite
-  // when this helper is called directly).
+  // The claude agent no longer uses direct provider env. type=proxy returns {}.
+  // type=anthropic on a legacy record still produces the direct env
+  // (the read-side normalizeProviderForRead does not rewrite when this
+  // helper is called directly).
   assert.deepEqual(
     buildProviderEnv({ name: "a", type: "anthropic", baseUrl: "https://x", apiKey: "sk", model: "m", smallFastModel: "fast" }),
     { ANTHROPIC_BASE_URL: "https://x", ANTHROPIC_API_KEY: "sk", ANTHROPIC_MODEL: "m", ANTHROPIC_SMALL_FAST_MODEL: "fast" },
   );
-  assert.deepEqual(buildProviderEnv({ name: "b", type: "litellm", apiKey: "sk", model: "m" }), {});
+  assert.deepEqual(buildProviderEnv({ name: "b", type: "proxy", engine: "litellm", apiKey: "sk", model: "m" }), {});
 
   // ---------------- buildAgentProviderEnv gating (Stage 7.6) ----------------
   // claude always needs the proxy now. With no proxyStatus option, it
@@ -251,7 +263,8 @@ try {
   cfg = removeProvider(cfg, "minimax");
   cfg = addProvider(cfg, {
     name: "minimax",
-    type: "litellm",
+    type: "proxy",
+    engine: "litellm",
     litellmProvider: "anthropic",
     baseUrl: "https://api.minimax.example/v1",
     apiKey: "sk-mm",
@@ -295,20 +308,20 @@ try {
   } finally {
     if (savedEnv !== undefined) process.env.ANTHROPIC_API_KEY = savedEnv;
   }
-  // litellm -> ok, no LiteLLM warning (it's the wired path now).
+  // proxy -> ok, no proxy warning (it's the wired path now).
   const docDs = doctorProvider(cfg.providers.deepseek);
   assert.equal(docDs.ok, true);
-  // Stage 7.6: smallFastModel on litellm is allowed (it's a seed for the
+  // Stage 7.6: smallFastModel on proxy is allowed (it's a seed for the
   // routes.claude.small route). doctor does NOT warn about it. The
   // warning is reserved for the legacy projection case (smallFastModel
   // on a record that read-projects from type=anthropic without routes).
-  const litellmWithFast = {
-    name: "weird", type: "litellm", litellmProvider: "deepseek",
+  const proxyWithFast = {
+    name: "weird", type: "proxy", engine: "litellm", litellmProvider: "deepseek",
     apiKey: "sk", model: "m", smallFastModel: "fast",
   };
-  const docWeird = doctorProvider(litellmWithFast);
+  const docWeird = doctorProvider(proxyWithFast);
   assert.ok(!docWeird.warnings.some((w) => /smallFastModel is ignored/.test(w)),
-    "smallFastModel on litellm no longer triggers a doctor warning");
+    "smallFastModel on proxy no longer triggers a doctor warning");
   assert.equal(doctorProvider({ name: "BadName!" }).ok, false);
 
   // ---------------- migrateLegacyConfig ----------------
@@ -332,26 +345,41 @@ try {
   assert.equal(reloaded.providers["default-claude"], undefined);
 
   // ---------------- normalizeProviderForRead ----------------
+  // Stage 9.0: read-projection now produces type="proxy", engine="litellm".
   const legacyRec = { name: "old", type: "openai-compatible", baseUrl: "https://x", apiKey: "k", model: "m" };
   const projected = normalizeProviderForRead(legacyRec);
-  assert.equal(projected.type, "litellm");
+  assert.equal(projected.type, "proxy");
+  assert.equal(projected.engine, "litellm");
   assert.equal(projected.litellmProvider, "custom_openai");
   assert.equal(projected._legacyType, "openai-compatible");
   assert.equal(projected._legacy, undefined);
-  // Also: type=anthropic legacy projects to litellm/anthropic.
+  // Also: type=anthropic legacy projects to proxy(engine=litellm)/anthropic.
   const anthropicLegacy = { name: "old-mm", type: "anthropic", baseUrl: "https://x", apiKey: "k", model: "m" };
   const projectedA = normalizeProviderForRead(anthropicLegacy);
-  assert.equal(projectedA.type, "litellm");
+  assert.equal(projectedA.type, "proxy");
+  assert.equal(projectedA.engine, "litellm");
   assert.equal(projectedA.litellmProvider, "anthropic");
   assert.equal(projectedA._legacyType, "anthropic");
-  const ok = normalizeProviderForRead({ name: "x", type: "litellm", litellmProvider: "deepseek" });
+  // Also: type=litellm (the historical wire type) projects to proxy(engine=litellm).
+  const litellmLegacy = { name: "old-ds", type: "litellm", litellmProvider: "deepseek", apiKey: "k", model: "m" };
+  const projectedL = normalizeProviderForRead(litellmLegacy);
+  assert.equal(projectedL.type, "proxy");
+  assert.equal(projectedL.engine, "litellm");
+  assert.equal(projectedL.litellmProvider, "deepseek");
+  assert.equal(projectedL._legacyType, "litellm");
+  // Already-canonical records pass through unchanged.
+  const ok = normalizeProviderForRead({ name: "x", type: "proxy", engine: "litellm", litellmProvider: "deepseek" });
   assert.equal(ok._legacy, undefined);
   assert.equal(ok._legacyType, undefined);
+  const ok2 = normalizeProviderForRead({ name: "y", type: "originrouter", baseUrl: "https://x", auth: { type: "managed_originrouter_key", keyRef: "k" }, model: "m" });
+  assert.equal(ok2.type, "originrouter");
+  assert.equal(ok2._legacy, undefined);
 
   // ---------------- applyProviderUpdate: legacy auto-normalize ----------------
   cfg = addProvider(cfg, {
     name: "old-ds",
-    type: "litellm",
+    type: "proxy",
+    engine: "litellm",
     litellmProvider: "deepseek",
     apiKey: "sk-old",
     model: "deepseek-chat",
@@ -364,11 +392,12 @@ try {
     apiKey: "sk-old",
     model: "deepseek-chat",
   };
-  // PUT with no `type` in the patch: auto-normalize.
+  // PUT with no `type` in the patch: auto-normalize to proxy(engine=litellm).
   let result = applyProviderUpdate(cfg, "old-ds", { baseUrl: "https://api.deepseek.com/v2" });
   let warnings = takeUpdateWarnings(result);
   assert.deepEqual(warnings, []);
-  assert.equal(result.providers["old-ds"].type, "litellm");
+  assert.equal(result.providers["old-ds"].type, "proxy");
+  assert.equal(result.providers["old-ds"].engine, "litellm");
   assert.equal(result.providers["old-ds"].litellmProvider, "custom_openai");
   assert.equal(result.providers["old-ds"].baseUrl, "https://api.deepseek.com/v2");
   // PUT with explicit type=openai-compatible rejects.
@@ -382,7 +411,7 @@ try {
   // accepts it (no warning, no drop) for backward compat with existing
   // records and the --small-fast-model CLI flag. The field is NOT read
   // by setClaudeRouteFromProvider (covered in the next block).
-  result = applyProviderUpdate(cfg, "deepseek", { type: "litellm", litellmProvider: "custom_openai", smallFastModel: "fast" });
+  result = applyProviderUpdate(cfg, "deepseek", { type: "proxy", engine: "litellm", litellmProvider: "custom_openai", smallFastModel: "fast" });
   warnings = takeUpdateWarnings(result);
   assert.equal(result.providers.deepseek.smallFastModel, "fast");
   assert.equal(warnings.length, 0);
@@ -393,7 +422,7 @@ try {
   {
     const cfg78 = {
       providers: {
-        p1: { name: "p1", type: "litellm", litellmProvider: "deepseek", model: "m", smallFastModel: "mini" },
+        p1: { name: "p1", type: "proxy", engine: "litellm", litellmProvider: "deepseek", model: "m", smallFastModel: "mini" },
       },
     };
     const { next } = setClaudeRouteFromProvider(cfg78, "p1");
@@ -404,7 +433,7 @@ try {
   {
     const cfg78b = {
       providers: {
-        p1: { name: "p1", type: "litellm", litellmProvider: "deepseek", model: "m" },
+        p1: { name: "p1", type: "proxy", engine: "litellm", litellmProvider: "deepseek", model: "m" },
       },
       routes: { claude: { small: { provider: "x", model: "y" } } },
     };
@@ -413,7 +442,7 @@ try {
   }
   // 3. Return shape no longer carries smallPreserved.
   {
-    const cfg78c = { providers: { p1: { name: "p1", type: "litellm", litellmProvider: "deepseek", model: "m" } } };
+    const cfg78c = { providers: { p1: { name: "p1", type: "proxy", engine: "litellm", litellmProvider: "deepseek", model: "m" } } };
     const out = setClaudeRouteFromProvider(cfg78c, "p1");
     assert.equal(out.smallPreserved, undefined, "smallPreserved is gone in Stage 7.8");
     assert.ok(out.next, "next is still present");
@@ -422,7 +451,8 @@ try {
   // ---------------- applyProviderUpdate: HF apiKey mirror (Stage 7.7) ----------------
   cfg = addProvider(cfg, {
     name: "hf-mirror",
-    type: "litellm",
+    type: "proxy",
+    engine: "litellm",
     litellmProvider: "huggingface",
     apiKey: "hf-orig",
     model: "m",
@@ -446,7 +476,7 @@ try {
 {
   // secretFieldKeysFor derives the secret set from the catalog (metadata-driven).
   const anthropicSecrets = secretFieldKeysFor({
-    name: "x", type: "litellm", litellmProvider: "anthropic",
+    name: "x", type: "proxy", engine: "litellm", litellmProvider: "anthropic",
     apiKey: "k", authToken: "t",
   });
   assert.ok(anthropicSecrets.has("apiKey"));
@@ -454,7 +484,7 @@ try {
   assert.ok(!anthropicSecrets.has("baseUrl"));
 
   const bedrockSecrets = secretFieldKeysFor({
-    name: "x", type: "litellm", litellmProvider: "bedrock",
+    name: "x", type: "proxy", engine: "litellm", litellmProvider: "bedrock",
     awsAccessKeyId: "k", awsSecretAccessKey: "s",
   });
   assert.ok(bedrockSecrets.has("awsSecretAccessKey"));
@@ -462,7 +492,7 @@ try {
   assert.ok(bedrockSecrets.has("awsWebIdentityToken"));
 
   const vertexSecrets = secretFieldKeysFor({
-    name: "x", type: "litellm", litellmProvider: "vertex_ai",
+    name: "x", type: "proxy", engine: "litellm", litellmProvider: "vertex_ai",
     vertexCredentials: "{}", googleApplicationCredentials: "/p",
   });
   assert.ok(vertexSecrets.has("vertexCredentials"));
@@ -473,7 +503,7 @@ try {
   // Stage 7.7: addProvider STRICT — unknown field rejected.
   assert.throws(
     () => addProvider({}, {
-      name: "x", type: "litellm", litellmProvider: "deepseek",
+      name: "x", type: "proxy", engine: "litellm", litellmProvider: "deepseek",
       apiKey: "k", model: "m", bogusField: "v",
     }),
     /unknown provider field 'bogusField'/,
@@ -484,7 +514,7 @@ try {
   // Stage 7.7: applyProviderUpdate ASYMMETRIC.
   // (a) existing unknown field round-trips through update with empty patch.
   let cfg = addProvider({}, {
-    name: "ds", type: "litellm", litellmProvider: "deepseek",
+    name: "ds", type: "proxy", engine: "litellm", litellmProvider: "deepseek",
     apiKey: "k", model: "m",
   });
   cfg.providers.ds.foo = "bar"; // legacy unknown key on disk
@@ -501,7 +531,7 @@ try {
 {
   // Stage 7.7: generalized secret preservation.
   let cfg = addProvider({}, {
-    name: "br", type: "litellm", litellmProvider: "bedrock",
+    name: "br", type: "proxy", engine: "litellm", litellmProvider: "bedrock",
     awsRegion: "us-east-1", awsSecretAccessKey: "orig-secret",
     awsSessionToken: "orig-token",
     model: "m",
@@ -517,14 +547,14 @@ try {
 {
   // Stage 7.7: env-reference values pass through verbatim.
   let cfg = addProvider({}, {
-    name: "ds", type: "litellm", litellmProvider: "deepseek",
+    name: "ds", type: "proxy", engine: "litellm", litellmProvider: "deepseek",
     apiKey: "os.environ/DEEPSEEK_API_KEY", model: "m",
   });
   assert.equal(cfg.providers.ds.apiKey, "os.environ/DEEPSEEK_API_KEY");
   // Malformed env-ref throws on add.
   assert.throws(
     () => addProvider({}, {
-      name: "ds2", type: "litellm", litellmProvider: "deepseek",
+      name: "ds2", type: "proxy", engine: "litellm", litellmProvider: "deepseek",
       apiKey: "os.environ/1bad", model: "m",
     }),
     /malformed env reference/,
@@ -534,7 +564,7 @@ try {
 {
   // Stage 7.7: inlineCreds is UI-only — never persisted.
   const cfg = addProvider({}, {
-    name: "br", type: "litellm", litellmProvider: "bedrock",
+    name: "br", type: "proxy", engine: "litellm", litellmProvider: "bedrock",
     awsRegion: "us-east-1", inlineCreds: true, model: "m",
   });
   assert.equal(cfg.providers.br.inlineCreds, undefined,
@@ -550,6 +580,12 @@ try {
   assert.ok(KNOWN_PROVIDER_META_KEYS.has("type"));
   assert.ok(KNOWN_PROVIDER_META_KEYS.has("litellmProvider"));
   assert.ok(KNOWN_PROVIDER_META_KEYS.has("inlineCreds"));
+  // Stage 9.0 additions.
+  assert.ok(KNOWN_PROVIDER_META_KEYS.has("engine"));
+  assert.ok(KNOWN_PROVIDER_META_KEYS.has("auth"));
+  assert.ok(KNOWN_PROVIDER_META_KEYS.has("deviceId"));
+  assert.ok(KNOWN_PROVIDER_META_KEYS.has("target"));
+  assert.ok(KNOWN_PROVIDER_META_KEYS.has("baseUrl"));
 }
 
 {
@@ -562,7 +598,7 @@ try {
     AWS_DEFAULT_REGION: process.env.AWS_DEFAULT_REGION,
   };
   try {
-    const p = { name: "br", type: "litellm", litellmProvider: "bedrock", model: "m" };
+    const p = { name: "br", type: "proxy", engine: "litellm", litellmProvider: "bedrock", model: "m" };
     delete process.env.AWS_REGION_NAME;
     delete process.env.AWS_REGION;
     delete process.env.AWS_DEFAULT_REGION;

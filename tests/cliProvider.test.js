@@ -39,11 +39,17 @@ try {
   ]);
   assert.equal(addOutput.code, 0, `add failed: ${addOutput.stderr}`);
   assert.match(addOutput.stdout, /Provider: deepseek/);
+  // Stage 9.0: the user input --type litellm is accepted as an alias and
+  // persisted as type=proxy, engine=litellm. The CLI echoes both so the
+  // operator sees the persisted shape, not the input alias.
+  assert.match(addOutput.stdout, /proxy/);
   assert.match(addOutput.stdout, /litellm/);
 
   const listOutput = run(["provider", "list"]);
   assert.match(listOutput.stdout, /deepseek/);
-  assert.match(listOutput.stdout, /litellm/);
+  // Stage 9.0: the TYPE column now prints the canonical wire type "proxy"
+  // (not the legacy "litellm" literal).
+  assert.match(listOutput.stdout, /proxy/);
   assert.doesNotMatch(listOutput.stdout, /sk-test-deepseek/);
 
   // Stage 7: provider update — change a single field, preserve the rest.
