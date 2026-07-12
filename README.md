@@ -232,23 +232,104 @@ Notes:
 
 ## Local Console (Stage 5)
 
-`originrouter daemon` starts a 127.0.0.1-only HTTP API. The browser control surface in `originrouter-test/local-console.html` discovers it via the `?daemon=127.0.0.1:<port>` query param:
+`originrouter daemon` starts a local-first HTTP API. It does not require
+`originrouter login`: the daemon can run as a local service and expose provider,
+route, proxy, and session controls to the desktop app. If the user later runs
+`originrouter login`, the already-running daemon notices the new credentials on
+its next relay retry and connects the account-authorized remote bridge.
+
+By default the Local API binds `127.0.0.1` and first tries port `7437`; if that
+port is already in use, it falls back to an OS-assigned port. The browser control
+surface in `originrouter-test/local-console.html` discovers it via the
+`?daemon=127.0.0.1:<port>` query param:
 
 ```bash
 originrouter daemon
-# [daemon] local API: http://127.0.0.1:40123
-# Open: file:///path/to/originrouter-test/local-console.html?daemon=127.0.0.1:40123
+# [daemon] local API: http://127.0.0.1:7437
+# Open: file:///path/to/originrouter-test/local-console.html?daemon=127.0.0.1:7437
 ```
+
+`GET /local/status` reports both local daemon state and relay state. A healthy
+local daemon can show `relay.connected=false` when the user is not logged in or
+the remote bridge is temporarily unavailable.
+
+To run the daemon as a user-level background service:
+
+```bash
+originrouter service install
+originrouter service start
+originrouter service status
+```
+
+`service start` and `service restart` wait until the Local API responds, so a
+successful command prints the URL and is ready for immediate App / curl tests:
+
+```bash
+originrouter service restart
+# OriginRouter service stopped. Autostart file remains installed.
+# OriginRouter service started: http://127.0.0.1:7437
+
+curl -fsS http://127.0.0.1:7437/local/status
+# {"ok":true,"daemon":{"port":7437,...},"relay":{"connected":false},...}
+```
+
+The service manager is platform-specific behind one CLI:
+
+- macOS: `launchd` LaunchAgent in `~/Library/LaunchAgents/com.originrouter.daemon.plist`
+- Linux: `systemd --user` unit in `~/.config/systemd/user/originrouter.service`
+- Windows: Task Scheduler task named `OriginRouterDaemon`
+
+The service starts on user login and is configured to recover after crashes.
+Use `originrouter service stop` to stop the current daemon while keeping
+autostart installed, and `originrouter service uninstall` to remove autostart.
+Logs are written to `~/.originrouter/logs/daemon.out.log` and
+`~/.originrouter/logs/daemon.err.log`.
+
+macOS local service smoke test used during development:
+
+```bash
+originrouter local config set --port 7437 --bind 127.0.0.1 --allow-lan off
+originrouter service install
+originrouter service start
+originrouter service status
+originrouter service restart
+curl -fsS http://127.0.0.1:7437/local/status
+tail -80 ~/.originrouter/logs/daemon.out.log
+tail -80 ~/.originrouter/logs/daemon.err.log
+```
+
+Expected results:
+
+- `service status` shows `state = running` on macOS and `Local API: http://127.0.0.1:7437`.
+- `/local/status` returns `ok: true`, `daemon.port: 7437`, and `proxy.state`.
+- `relay.connected` can be `false` when the CLI is not logged in or the server rejects the relay websocket; local control should still work.
+- `daemon.err.log` may show relay retry errors such as `Unexpected server response: 403`; those are remote bridge/auth issues, not Local API failures.
 
 The page adds / edits / removes providers, starts / stops / restarts the LiteLLM proxy, and shows live provider + proxy state. The "Usable for Claude" badge on each provider is derived from `provider.type` + the live proxy status: `anthropic` is always available; `openai-compatible` is only available when the proxy is running for that exact provider.
 
 - **Routes tab (Stage 7.9 + Stage 8.2)** — full-screen editor for `originrouter-claude-model`, `originrouter-claude-fast-model`, and `originrouter-codex-model`. Pick a LiteLLM provider per slot and click Save. Codex has no fast route and does not fall back to Claude. The left Routes sidebar shows compact `claude main / claude small / codex main` rows (grouped under section labels) with one clear button per set slot.
 
-Provider CRUD is browser-only — it requires the daemon's local API. The page falls back to the relay control path (Stage 2 mock + session control) when no daemon is reachable. The full wire shape is in [`docs/agent-protocol.md` §7](docs/agent-protocol.md#7-daemon-local-api-stage-3).
+Provider CRUD exists in the CLI local API, browser local console, and Flutter
+App Local Control page. The App prefers direct local control at
+`127.0.0.1:7437`, so provider inventory, LiteLLM proxy state, route state, and
+Claude main provider assignment can work without signing in to the App. When
+the user is signed in and the local daemon is unavailable, the App can fall back
+to the account-authorized bridge for supported snapshot / route / restart
+actions. Provider writes over the direct Local API require the local key shown
+by `originrouter local key show`. The full wire shape is in
+[`docs/agent-protocol.md` §7](docs/agent-protocol.md#7-daemon-local-api-stage-3).
+
+When signed in, `originrouter daemon` also posts a display-safe Local Control
+heartbeat to `/cli/v1/local-control/runtime` every 20 seconds and immediately
+after the relay WebSocket opens. The heartbeat contains only daemon version,
+uptime, proxy running state, and proxy base URL. It does not include provider
+records or upstream API keys. The App bridge snapshot treats this heartbeat as
+the remote online signal; stale heartbeats are shown as offline even if an old
+device grant still exists.
 
 ## Local API authentication (Stage 6)
 
-The local HTTP API (bound to 127.0.0.1) requires a bearer token on all write endpoints — provider CRUD, proxy start/stop/restart, session input/permission/interrupt. The token is auto-generated on first daemon start and stored in `~/.originrouter/local-api.token` (mode 0o600).
+The default local HTTP API is bound to `127.0.0.1`; loopback requests from the same machine do not require a bearer token. If you enable LAN control with a non-loopback bind address, write endpoints — provider CRUD, proxy start/stop/restart, session input/permission/interrupt — require `Authorization: Bearer <local-api.token>`. The token is auto-generated on first daemon start and stored in `~/.originrouter/local-api.token` (mode 0o600).
 
 ```bash
 # Mint or rotate the token (also prints the new browser URL).
@@ -257,13 +338,33 @@ originrouter token rotate
 # Print the current URL without rotating.
 originrouter token show
 
-# Print the daemon's local API URL alone.
-originrouter daemon print-url
+# Print the running daemon's local API URL alone.
+originrouter daemon-port
 ```
 
 The browser console (`local-console.html`) reads the token from the `?daemon=127.0.0.1:<port>&token=<token>` URL query param on first visit, then stores it in `localStorage` so subsequent visits don't need the query param. If you rotate the token, re-open the URL the daemon prints and click "Save token" in the topbar.
 
-**The token grants write access to the local API; anyone who can read it can mutate your providers and the proxy.** Don't share screens with `?token=` visible. The full wire shape, the `WWW-Authenticate` header contract, and the Flutter discovery recipe are in [`docs/agent-protocol.md` §7.1 and §7.2](docs/agent-protocol.md#7-daemon-local-api-stage-3).
+**In LAN mode, the token grants write access to the local API; anyone who can read it can mutate your providers and the proxy.** Don't share screens with `?token=` visible. The full wire shape, the `WWW-Authenticate` header contract, and the Flutter discovery recipe are in [`docs/agent-protocol.md` §7.1 and §7.2](docs/agent-protocol.md#7-daemon-local-api-stage-3).
+
+### LAN control mode
+
+Direct LAN control is an advanced mode and is off by default. To expose the local API beyond loopback, the daemon must be started with both a non-loopback bind address and `--allow-lan`:
+
+```bash
+originrouter daemon --bind 0.0.0.0 --allow-lan --local-port 7437
+originrouter local key show
+```
+
+All non-loopback write endpoints still require `Authorization: Bearer <local-api.token>`. The account-authorized bridge/relay path remains the recommended production path for mobile and cross-network control.
+
+Persist the local API bind/port defaults with:
+
+```bash
+originrouter local config set --port 7437 --bind 127.0.0.1 --allow-lan off
+originrouter local config show
+```
+
+These settings live in `~/.originrouter/local-api.json`. The access key lives separately in `~/.originrouter/local-api.token` and can be shown or rotated with `originrouter local key show|rotate`. The live daemon writes its actual bound address and port to `~/.originrouter/daemon.state.json`.
 
 ## LiteLLM provider catalog (Stage 7)
 
@@ -432,7 +533,7 @@ node ./tests/codingAuthStorage.test.js             # 10 cases green
 npm test                                           # 25 suites + 2 binary smokes
 ```
 
-**Stage 9.1A — OriginRouter Login + Device Grant + Managed Coding Key:** turns the 9.0 contract into a real CLI + Backend flow. Five new CLI commands: `originrouter login [--manual-code <code>]` (the required 9.1A completion path; the browser callback is experimental pending Universal_PDF_H5 in 9.1A.1), `logout`, `auth status`, `auth rotate`, `auth device list` (current_device_only). Backend registers the 5 endpoints under `/originrouter/auth/...` — `POST /login-code` (browser uuid auth), `POST /device/exchange` (atomic single transaction), `POST /device/rotate-coding-key`, `POST /device/revoke` (idempotent; returns `already_revoked`), `GET /devices` (returns only the calling device). SQL migration at `ai/server/sql/originrouter_auth.sql` creates three tables (`originrouter_device_grants`, `originrouter_login_codes`, `api_model_key_metadata` — the side-table intentionally has no FK onto `api_model_keys.id`). New modules: `src/auth/originrouterAuthClient.js` (Node 18+ fetch helpers; `requestBrowserLoginCodeForTesting` is exported only for tests), `src/auth/originrouterLogin.js` (callback server + manual-code path + cross-platform `openBrowser` with no `shell: true` on darwin/linux). `isManagedKeyShape` now requires `deviceGrant` + `deviceId`; accepts optional idle/absolute expiries. No new npm / pip deps. Verification:
+**Stage 9.1A — OriginRouter Login + Device Grant + Managed Coding Key:** turns the 9.0 contract into a real CLI + Backend flow. Five new CLI commands: `originrouter login [--manual-code <code>]` (the required 9.1A completion path; the browser callback is experimental pending Universal_PDF_H5 in 9.1A.1), `logout`, `auth status`, `auth rotate`, `auth device list` (current_device_only). Backend registers the 5 endpoints under `/originrouter/cli/auth/...` — `POST /login-code` (browser uuid auth), `POST /device/exchange` (atomic single transaction), `POST /device/rotate-coding-key`, `POST /device/revoke` (idempotent; returns `already_revoked`), `GET /devices` (returns only the calling device). SQL migration at `ai/server/sql/originrouter_auth.sql` creates three tables (`originrouter_device_grants`, `originrouter_login_codes`, `api_model_key_metadata` — the side-table intentionally has no FK onto `api_model_keys.id`). New modules: `src/auth/originrouterAuthClient.js` (Node 18+ fetch helpers; `requestBrowserLoginCodeForTesting` is exported only for tests), `src/auth/originrouterLogin.js` (callback server + manual-code path + cross-platform `openBrowser` with no `shell: true` on darwin/linux). `isManagedKeyShape` now requires `deviceGrant` + `deviceId`; accepts optional idle/absolute expiries. No new npm / pip deps. Verification:
 ```bash
 # CLI
 npm test                                           # 28 suites + 2 binary smokes
@@ -454,7 +555,7 @@ originrouter provider add official --type originrouter --key-ref current --model
 originrouter route set claude.main --provider official
 originrouter env print --agent claude
 # Source: originrouter-coding
-# ANTHROPIC_BASE_URL=https://server.originrouter.com/coding
+# ANTHROPIC_BASE_URL=https://server.easytransnote.com/coding
 # ANTHROPIC_API_KEY=sk-o...ey
 # ANTHROPIC_MODEL=claude-sonnet-4-6
 # ANTHROPIC_SMALL_FAST_MODEL=claude-sonnet-4-6
@@ -462,7 +563,7 @@ originrouter env print --agent claude
 originrouter route set codex.main --provider official-codex --model gpt-5-codex
 originrouter env print --agent codex
 # Source: originrouter-coding
-# OPENAI_BASE_URL=https://server.originrouter.com/coding/v1
+# OPENAI_BASE_URL=https://server.easytransnote.com/coding/v1
 # OPENAI_API_KEY=sk-o...ey
 # OPENAI_MODEL=gpt-5-codex
 
@@ -633,7 +734,7 @@ The CLI now acquires a short-lived `relayAccessToken` from Surety
 v2 (using the long-lived `deviceGrant` already stored in
 `<stateDir>/coding-key.json`) and sends it to the relay as
 `Authorization: Bearer <relayAccessToken>` on every
-`/device/events` and `/device/message` call. The LLM API key is
+`/relay/v1/devices/{device_id}/ws` and `/relay/v1/messages` call. The LLM API key is
 never touched by Surety or the relay — the two credentials are
 fully separated.
 
@@ -734,7 +835,7 @@ The caller-side `RemoteCodingProxyManager` already wires this same contract for 
 
 When `auth=on`, the manager now reads `coding-key.json.deviceId` inside `start()` and overrides the constructor-supplied `this.deviceId` (which came from `ensureDeviceForLogin()` via `device.json`) before constructing the inner `RemoteCodingRelayProxy`. Without this, the inner proxy would open its SSE with the wrong deviceId and the relay would return 403 `device_mismatch` even with a fresh token.
 
-The 9.5 test `tests/remoteCodingProxyManagerDeviceId.test.js` asserts this by spying on the manager's `fetchFn` and inspecting the inner proxy's `/device/events?deviceId=...` URL.
+The 9.5 test `tests/remoteCodingProxyManagerDeviceId.test.js` asserts this by spying on the manager's `fetchFn` and inspecting the inner proxy's `/relay/v1/devices/{deviceId}/ws` URL.
 
 ### `coding-key.json` shape for prod
 
@@ -771,3 +872,113 @@ The TTL is computed from `r.expiresAt` (a Unix epoch in seconds), not from a sep
 - `tests/remoteCodingProxyManagerDeviceId.test.js` — asserts the inner proxy's `connectEvents` URL contains the coding-key `deviceId` (NOT the constructor's value).
 
 These are targeted non-GUI tests; the full `npm test` is NOT run end-to-end because the full suite opens browser fixtures.
+
+## Stage 9.6/9.7 — OriginRouter Login (RFC 8628 Device Flow)
+
+Stage 9.6 introduced the browser-callback login flow (dev-mint +
+local HTTP server). Stage 9.7 replaced it with the standard
+**OAuth 2.0 Device Authorization Grant (RFC 8628)**: the CLI
+prints an 8-character user code + verification URL, optionally
+opens the browser, then polls the backend until the user
+approves on the H5 page. No local HTTP server, no dev-only
+backend routes, no Surety stub. Works for SSH / Docker / CI
+out of the box.
+
+### Login flow
+
+The default `originrouter login` uses device flow. There is
+**only one path now** — `--device-flow` was the 9.6 opt-in
+flag and was promoted to default in 9.7.
+
+**Default (desktop, opens the browser):**
+
+```bash
+originrouter login
+# ! To complete login, visit:
+# !   https://originrouter.com/cli/authorize
+# ! and enter this code:
+# !   ABCDEFGH
+# ! Or open the URL directly (code is pre-filled):
+# !   https://originrouter.com/cli/authorize?user_code=ABCDEFGH
+# ! Waiting for authorization (expires in 600s)...
+# (browser opens; user clicks Authorize; CLI prints ✓ Authorization received.)
+# Logged in to https://originrouter.com
+# Device:    device-...
+# Grant:     og_... (idle 89d / abs 364d)
+# Key:       sk-or-****abcd (id ok_..., expires 30d)
+```
+
+**Headless (SSH / Docker / CI, no browser):**
+
+```bash
+originrouter login --no-browser
+# Same URL + code printout, no browser launch. Suitable when
+# the CLI runs on a machine without a GUI session or browser.
+```
+
+### What the 9.6 paths became
+
+| 9.6 path | Status in 9.7 |
+|---|---|
+| `originrouter login --manual-code <code>` | **Removed.** Manual code copy-paste is gone — device flow is always available and works without a browser. |
+| `loginWithDevMintCallback` (browser callback flow) | **Removed.** Required a local HTTP server on 127.0.0.1 to receive the H5 redirect; replaced by device flow's polling loop. |
+| `/login-code/dev-mint` (backend) | **Removed.** The dev-mode Surety bypass is gone; production wire-up is the only path. |
+| `/device/approve` (backend, dev) | **Removed.** Surety uuid auth will gate the production `/device/approve` when Surety v2 lands; the dev stub is no longer needed. |
+| `ORIGINROUTER_CLI_DEV_MINT=1` (backend env) | **Removed.** No dev-mode flag — the backend serves the same routes in dev and prod. |
+
+### CLI flags for `originrouter login`
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--api-base-url <url>` | `process.env.ORIGINROUTER_API_BASE_URL` or `https://server.easytransnote.com` | OriginRouter auth gateway base URL (where `/device/code` and `/device/token` live). |
+| `--device-name <name>` | `<username>'s CLI` | Friendly device name shown on the H5 approve page. Derived from `os.userInfo().username` so it reads naturally (e.g. `chengaoyan's CLI`). Override with this flag for a custom label. |
+| `--no-browser` | browser opens | Don't auto-open the browser; only print URL + code. Use in SSH / Docker / CI. |
+| `--login-url <url>` | `process.env.ORIGINROUTER_LOGIN_URL` or `https://originrouter.com` | H5 authorize page base URL. The API gateway and the H5 page are on **different domains** in production. |
+
+### Env vars
+
+| Var | Default | Notes |
+|---|---|---|
+| `ORIGINROUTER_API_BASE_URL` | `https://server.easytransnote.com` | Backend base URL for the auth gateway. Honored when `--api-base-url` is omitted. |
+| `ORIGINROUTER_LOGIN_URL` | `https://originrouter.com` | H5 authorize page base URL. Honored when `--login-url` is omitted. |
+| `ORIGINROUTER_CLI_H5_BASE_URL` (backend) | `https://originrouter.com` | H5 base URL returned in `/device/code`'s `verification_uri`. Set on the gateway side. |
+
+### `coding-key.json` shape
+
+The on-disk shape is written by `persistExchangeResponse()` and must satisfy `isManagedKeyShape()`:
+
+```jsonc
+{
+  "kind": "managed",
+  "source": "originrouter_cli",
+  "keyId": "ok_x",
+  "key": "sk-or-x",
+  "deviceGrantId": "og_x",
+  "deviceGrant": "<raw-grant>",
+  "deviceId": "smoke",
+  "expiresAt": 1700000000000,
+  "scopes": ["coding"],
+  "deviceGrantIdleExpiresAt": 1702592000000,    // optional
+  "deviceGrantAbsoluteExpiresAt": 1731456000000 // optional
+}
+```
+
+Stage 9.5's `relayAuthBootstrap` reads this file directly via `readCodingAuth()`; no further conversion needed.
+
+### No secret in log
+
+Errors from `originrouterAuthClient.js` throw `AuthClientError` whose `body` is `null` and whose `message` contains only an error code or the missing-field name — never the raw `deviceGrant`, `managed_coding_key`, or login code. The CLI's post-login print shows `deviceId` + `deviceGrantId` (opaque `og_<token>`) + masked key. A `grep -iE "deviceGrant|sk-or-[a-zA-Z0-9]+"` on the operator's terminal finds only the masked form `sk-or-****abcd`.
+
+### Targeted tests (9 + 1 e2e)
+
+```bash
+node ./tests/cliLogin.test.js                  # 4 cases (status, help, rotate, --device-flow e2e)
+node ./tests/originrouterAuthClient.test.js    # exchangeResponseToManagedKeyShape + helpers
+node ./tests/originrouterLogin.test.js         # 11 cases (loginUrlFor, callback, device flow unit)
+node ./tests/codingAuthStorage.test.js         # isManagedKeyShape + TTL bounds
+node ./tests/relayAuthBootstrap.test.js        # 9.5 bootstrap reads coding-key.json
+node ./tests/remoteCodingProxyManagerDeviceId.test.js
+node ./tests/suretyTokenClient.test.js
+node ./tests/relayClientAuth.test.js
+node ./tests/9.6-e2e.test.js                   # 9.6 Loop B end-to-end (legacy shape; still green)
+```

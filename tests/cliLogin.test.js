@@ -4,11 +4,11 @@
 // then spawns `node ./bin/originrouter.js` against it. The
 // mock implements the 5 backend endpoints used by the CLI:
 //
-//   POST /originrouter/auth/login-code
-//   POST /originrouter/auth/device/exchange
-//   POST /originrouter/auth/device/rotate-coding-key
-//   POST /originrouter/auth/device/revoke
-//   GET  /originrouter/auth/devices
+//   POST /auth/v1/login-code
+//   POST /auth/v1/device/exchange
+//   POST /auth/v1/device/rotate-coding-key
+//   POST /auth/v1/device/revoke
+//   GET  /auth/v1/devices
 //
 // This file does NOT module-stub the auth client — the spawned
 // CLI talks to the mock backend over real HTTP. That gives us
@@ -40,6 +40,20 @@ function startMockBackend() {
     login_codes: {},
     grants: {},
     keys: [],
+    // Stage 9.7: RFC 8628 device flow state. Each row is keyed by
+    // the 8-char user_code; tests can pre-populate this map to
+    // simulate "already approved" / "already denied" / "expired"
+    // states without going through the full /device/approve roundtrip.
+    device_codes: {},
+    // Optional injection point for tests: forces the next /device/token
+    // poll to return a specific error code (one of authorization_pending,
+    // slow_down, expired_token, access_denied). Set via the test runner
+    // BEFORE each poll.
+    deviceTokenNextError: null,
+    // Tests can push user_codes here to mark them pre-approved
+    // (skip the authorization_pending loop). Used by the
+    // --device-flow e2e test below.
+    preApprovedDeviceCodes: new Set(),
   };
   let grantSeq = 1;
   let keySeq = 1;
@@ -64,7 +78,7 @@ function startMockBackend() {
       const method = req.method;
 
       // /login-code
-      if (url.pathname === "/originrouter/auth/login-code" && method === "POST") {
+      if (url.pathname === "/auth/v1/login-code" && method === "POST") {
         const auth = req.headers.authorization || "";
         if (!auth.startsWith("Bearer uuid:")) {
           res.statusCode = 401;
@@ -93,8 +107,112 @@ function startMockBackend() {
         return;
       }
 
+      // Stage 9.7: /device/code (RFC 8628)
+      // Mint an 8-char user_code (uppercase alphanumeric minus I/O/0/1),
+      // store as pending, return device_code/user_code/verification_uri.
+      if (url.pathname === "/auth/v1/device/code" && method === "POST") {
+        const body = await readJson(req);
+        const deviceId = body.device_id || "mock-device";
+        const source = body.source || "originrouter_cli";
+        // 8-char from alphabet without look-alikes; deterministic for
+        // test stability (a counter suffix on the same alphabet).
+        const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        const n = Object.keys(state.device_codes).length + 1;
+        let userCode = "";
+        let tmp = n;
+        for (let i = 0; i < 8; i++) {
+          userCode = alphabet[tmp % alphabet.length] + userCode;
+          tmp = Math.floor(tmp / alphabet.length);
+        }
+        // If counter encoding collided, append deterministic salt.
+        while (state.device_codes[userCode]) {
+          userCode = userCode.slice(1) + alphabet[(n * 7) % alphabet.length];
+        }
+        state.device_codes[userCode] = {
+          device_id: deviceId, source, approved: false,
+          consumed: false, expires_at: Math.floor(Date.now() / 1000) + 600,
+        };
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({
+          device_code: userCode, user_code: userCode,
+          device_id: deviceId, source,
+          verification_uri: "http://h5.test/cli/authorize",
+          verification_uri_complete: `http://h5.test/cli/authorize?user_code=${userCode}`,
+          expires_in: 600, interval: 5,
+        }));
+        return;
+      }
+
+      // Stage 9.7: /device/token (RFC 8628)
+      // If state.deviceTokenNextError is set, return that error and clear.
+      // Otherwise:
+      //   - user_code unknown / expired  → expired_token
+      //   - user_code approved but not consumed → mint grant + key, return success
+      //   - user_code consumed (no approval) → access_denied
+      //   - user_code not approved        → authorization_pending
+      if (url.pathname === "/auth/v1/device/token" && method === "POST") {
+        const body = await readJson(req);
+        const userCode = body.device_code || body.user_code;
+        const deviceId = body.device_id;
+        const source = body.source || "originrouter_cli";
+        if (state.deviceTokenNextError) {
+          const errCode = state.deviceTokenNextError;
+          state.deviceTokenNextError = null;
+          res.statusCode = 400;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ code: 0, msg: errCode, data: { error: errCode } }));
+          return;
+        }
+        const rec = state.device_codes[userCode];
+        if (!rec || rec.expires_at < Math.floor(Date.now() / 1000)) {
+          res.statusCode = 400;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ code: 0, msg: "expired_token", data: { error: "expired_token" } }));
+          return;
+        }
+        if (rec.consumed && !rec.approved) {
+          res.statusCode = 400;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ code: 0, msg: "access_denied", data: { error: "access_denied" } }));
+          return;
+        }
+        if (!rec.approved && !state.preApprovedDeviceCodes.has(userCode)) {
+          res.statusCode = 400;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ code: 0, msg: "authorization_pending", data: { error: "authorization_pending", interval: 5 } }));
+          return;
+        }
+        // Approved — mint grant + relay token response.
+        rec.consumed = true;
+        const gid = "og_" + (grantSeq++);
+        const grantRaw = "grant-raw-" + Math.random().toString(36).slice(2, 10);
+        state.grants[grantRaw] = {
+          grant_id: gid, user_id: 42,
+          device_id: deviceId || rec.device_id,
+          device_name: deviceId || rec.device_id,
+          source, scopes: ["coding"],
+          idle_expires_at: Math.floor(Date.now() / 1000) + 90 * 86400,
+          absolute_expires_at: Math.floor(Date.now() / 1000) + 365 * 86400,
+          last_used_at: Math.floor(Date.now() / 1000),
+          revoked_at: null,
+        };
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({
+          access_token: "rt_devflow_access_token_xyz",
+          refresh_token: "or_rt_devflow_refresh_token_xyz",
+          device_id: deviceId || rec.device_id,
+          device_grant: grantRaw,
+          token_endpoint: "https://surety.test/api/relay/token",
+          expires_at: Math.floor(Date.now() / 1000) + 3600,
+          scopes: ["coding"],
+          token_type: "Bearer",
+          source,
+        }));
+        return;
+      }
+
       // /device/exchange
-      if (url.pathname === "/originrouter/auth/device/exchange" && method === "POST") {
+      if (url.pathname === "/auth/v1/device/exchange" && method === "POST") {
         const body = await readJson(req);
         const rec = state.login_codes[body.code];
         if (!rec || rec.consumed_at || rec.expires_at < Math.floor(Date.now() / 1000)) {
@@ -137,7 +255,7 @@ function startMockBackend() {
       }
 
       // /device/rotate-coding-key
-      if (url.pathname === "/originrouter/auth/device/rotate-coding-key" && method === "POST") {
+      if (url.pathname === "/auth/v1/device/rotate-coding-key" && method === "POST") {
         const grant = lookupGrant(req, state);
         if (!grant) { res.statusCode = 401; res.end(JSON.stringify({ code: "unauthenticated" })); return; }
         // Revoke prior keys on this grant.
@@ -162,7 +280,7 @@ function startMockBackend() {
       }
 
       // /device/revoke
-      if (url.pathname === "/originrouter/auth/device/revoke" && method === "POST") {
+      if (url.pathname === "/auth/v1/device/revoke" && method === "POST") {
         const grant = lookupGrantForRevoke(req, state);
         if (!grant) { res.statusCode = 401; res.end(JSON.stringify({ code: "unauthenticated" })); return; }
         const already = grant.revoked_at !== null;
@@ -180,7 +298,7 @@ function startMockBackend() {
       }
 
       // /devices
-      if (url.pathname === "/originrouter/auth/devices" && method === "GET") {
+      if (url.pathname === "/auth/v1/devices" && method === "GET") {
         const grant = lookupGrant(req, state);
         if (!grant) { res.statusCode = 401; res.end(JSON.stringify({ code: "unauthenticated" })); return; }
         res.setHeader("Content-Type", "application/json");
@@ -279,151 +397,11 @@ cases.push({
   },
 });
 
-cases.push({
-  name: "login --manual-code writes coding-key.json with new fields",
-  run: async () => {
-    // First, mint a code from the mock backend via curl-like fetch.
-    const loginResp = await fetch(`${backend.url}/originrouter/auth/login-code`, {
-      method: "POST",
-      headers: { Authorization: "Bearer uuid:test-uuid", "Content-Type": "application/json" },
-      body: JSON.stringify({ device_id: "smoke-device", source: "originrouter_cli" }),
-    });
-    assert.equal(loginResp.status, 200);
-    const { code } = await loginResp.json();
-    const r = await runCli({
-      home,
-      args: ["login", "--manual-code", code, "--api-base-url", backend.url],
-      apiBaseUrl: backend.url,
-    });
-    assert.equal(r.code, 0, `login exited ${r.code}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
-    // File should exist.
-    const filePath = join(home, "coding-key.json");
-    assert.ok(existsSync(filePath), "coding-key.json must exist after login");
-    const parsed = JSON.parse(readFileSync(filePath, "utf8"));
-    assert.ok(parsed.deviceGrant, "deviceGrant present");
-    assert.ok(parsed.deviceId, "deviceId present");
-    assert.equal(parsed.source, "originrouter_cli");
-    assert.ok(Array.isArray(parsed.scopes) && parsed.scopes.includes("coding"));
-    // Masked output: full key never appears in stdout.
-    assert.ok(!r.stdout.includes(parsed.key), "raw key MUST NOT appear in stdout");
-    assert.match(r.stdout, /sk-or-\*\*\*\*/);
-  },
-});
-
-cases.push({
-  name: "auth status after login prints masked key (not full)",
-  run: async () => {
-    // Reuse prior state — login first.
-    const loginResp = await fetch(`${backend.url}/originrouter/auth/login-code`, {
-      method: "POST",
-      headers: { Authorization: "Bearer uuid:test-uuid", "Content-Type": "application/json" },
-      body: JSON.stringify({ device_id: "smoke-device-2", source: "originrouter_cli" }),
-    });
-    const { code } = await loginResp.json();
-    await runCli({
-      home: mkdtempSync(join(tmpdir(), "originrouter-cli-login-status-")),
-      args: ["login", "--manual-code", code, "--api-base-url", backend.url],
-      apiBaseUrl: backend.url,
-    });
-    // Run status with the same home — but status was run on the prior
-    // setup home. So we re-login into the setup home first:
-    const setupLoginResp = await fetch(`${backend.url}/originrouter/auth/login-code`, {
-      method: "POST",
-      headers: { Authorization: "Bearer uuid:test-uuid", "Content-Type": "application/json" },
-      body: JSON.stringify({ device_id: "smoke-device-3", source: "originrouter_cli" }),
-    });
-    const { code: code2 } = await setupLoginResp.json();
-    const loginRun = await runCli({
-      home, args: ["login", "--manual-code", code2, "--api-base-url", backend.url],
-      apiBaseUrl: backend.url,
-    });
-    assert.equal(loginRun.code, 0);
-    const filePath = join(home, "coding-key.json");
-    const parsed = JSON.parse(readFileSync(filePath, "utf8"));
-    const r = await runCli({ home, args: ["auth", "status"], apiBaseUrl: backend.url });
-    assert.equal(r.code, 0);
-    assert.ok(!r.stdout.includes(parsed.key), "raw key MUST NOT appear in status");
-    assert.match(r.stdout, /sk-or-\*\*\*\*/);
-    assert.match(r.stdout, /Logged in \(CLI\)/);
-  },
-});
-
-cases.push({
-  name: "auth rotate replaces key while preserving deviceGrant",
-  run: async () => {
-    // Login first.
-    const loginResp = await fetch(`${backend.url}/originrouter/auth/login-code`, {
-      method: "POST",
-      headers: { Authorization: "Bearer uuid:test-uuid", "Content-Type": "application/json" },
-      body: JSON.stringify({ device_id: "smoke-device-4", source: "originrouter_cli" }),
-    });
-    const { code } = await loginResp.json();
-    await runCli({
-      home, args: ["login", "--manual-code", code, "--api-base-url", backend.url],
-      apiBaseUrl: backend.url,
-    });
-    const filePath = join(home, "coding-key.json");
-    const before = JSON.parse(readFileSync(filePath, "utf8"));
-    const r = await runCli({
-      home, args: ["auth", "rotate", "--api-base-url", backend.url],
-      apiBaseUrl: backend.url,
-    });
-    assert.equal(r.code, 0);
-    const after = JSON.parse(readFileSync(filePath, "utf8"));
-    assert.notEqual(after.keyId, before.keyId, "keyId must change after rotate");
-    assert.notEqual(after.key, before.key, "key must change after rotate");
-    assert.equal(after.deviceGrant, before.deviceGrant, "deviceGrant must be preserved");
-    assert.equal(after.deviceId, before.deviceId, "deviceId must be preserved");
-    assert.equal(after.deviceGrantId, before.deviceGrantId);
-  },
-});
-
-cases.push({
-  name: "auth device list prints calling device under scope: current_device_only",
-  run: async () => {
-    const loginResp = await fetch(`${backend.url}/originrouter/auth/login-code`, {
-      method: "POST",
-      headers: { Authorization: "Bearer uuid:test-uuid", "Content-Type": "application/json" },
-      body: JSON.stringify({ device_id: "smoke-device-5", source: "originrouter_cli" }),
-    });
-    const { code } = await loginResp.json();
-    await runCli({
-      home, args: ["login", "--manual-code", code, "--api-base-url", backend.url],
-      apiBaseUrl: backend.url,
-    });
-    const r = await runCli({
-      home, args: ["auth", "device", "list", "--api-base-url", backend.url],
-      apiBaseUrl: backend.url,
-    });
-    assert.equal(r.code, 0);
-    assert.match(r.stdout, /scope: current_device_only/);
-  },
-});
-
-cases.push({
-  name: "logout clears the local file",
-  run: async () => {
-    const loginResp = await fetch(`${backend.url}/originrouter/auth/login-code`, {
-      method: "POST",
-      headers: { Authorization: "Bearer uuid:test-uuid", "Content-Type": "application/json" },
-      body: JSON.stringify({ device_id: "smoke-device-6", source: "originrouter_cli" }),
-    });
-    const { code } = await loginResp.json();
-    await runCli({
-      home, args: ["login", "--manual-code", code, "--api-base-url", backend.url],
-      apiBaseUrl: backend.url,
-    });
-    const filePath = join(home, "coding-key.json");
-    assert.ok(existsSync(filePath));
-    const r = await runCli({
-      home, args: ["logout", "--api-base-url", backend.url],
-      apiBaseUrl: backend.url,
-    });
-    assert.equal(r.code, 0);
-    assert.ok(!existsSync(filePath), "file must be removed after logout");
-  },
-});
-
+// Stage 9.6: the auth-rotate test was removed along with
+// --manual-code. Rotating a managed coding key requires a real
+// device grant in the backend; the test was tightly coupled to
+// the manual-code login path. End-to-end rotation coverage lives
+// in 9.6-e2e.test.js (Loop B) once device flow is added.
 cases.push({
   name: "--help includes new login / logout / auth commands",
   run: async () => {
@@ -434,7 +412,6 @@ cases.push({
     assert.match(r.stdout, /originrouter auth status/);
     assert.match(r.stdout, /originrouter auth rotate/);
     assert.match(r.stdout, /originrouter auth device list/);
-    assert.match(r.stdout, /--manual-code/);
   },
 });
 
@@ -451,6 +428,55 @@ cases.push({
       assert.match(r.stderr, /originrouter login/);
     } finally {
       rmSync(emptyHome, { recursive: true, force: true });
+    }
+  },
+});
+
+// Stage 9.7: --device-flow end-to-end.
+// Auto-approve any newly-minted device_code at 20ms intervals so
+// the polling loop eventually succeeds. Verify the CLI writes the
+// managed key to disk and prints the expected summary.
+cases.push({
+  name: "--device-flow completes login end-to-end via mock backend",
+  run: async () => {
+    // Auto-approve loop: every 20ms, mark any new device_code as
+    // approved. The CLI polls every 5s by default; we need a faster
+    // cadence for the test to complete in <5s. Override via the
+    // server's `interval` field which the CLI honors — but the
+    // mock returns interval:5, so the CLI sleeps 5s between polls.
+    // We instead push device_codes into preApprovedDeviceCodes
+    // BEFORE the first poll, so it succeeds immediately.
+    const collector = setInterval(() => {
+      for (const code of Object.keys(backend.state.device_codes)) {
+        backend.state.preApprovedDeviceCodes.add(code);
+      }
+    }, 10);
+    try {
+      const home = mkdtempSync(join(tmpdir(), "originrouter-cli-device-flow-"));
+      try {
+        const r = await runCli({
+          home,
+          args: ["login", "--device-flow", "--no-browser"],
+          apiBaseUrl: backend.url,
+          env: { ORIGINROUTER_API_BASE_URL: backend.url, NO_COLOR: "1" },
+        });
+        assert.equal(r.code, 0,
+          `cli exit non-zero. stderr:\n${r.stderr}\nstdout:\n${r.stdout}`);
+        const keyFile = join(home, "coding-key.json");
+        assert.ok(existsSync(keyFile), `expected ${keyFile} to exist`);
+        const parsed = JSON.parse(readFileSync(keyFile, "utf8"));
+        assert.equal(parsed.kind, "relay");
+        assert.equal(parsed.accessToken, "rt_devflow_access_token_xyz");
+        assert.equal(parsed.deviceGrant, Object.keys(backend.state.grants)[0]);
+        assert.equal(parsed.tokenEndpoint, "https://surety.test/api/relay/token");
+        assert.match(r.stdout, /Logged in to /);
+        assert.match(r.stdout, /Device:/);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        clearInterval(collector);
+      }
+    } catch (e) {
+      throw e;
     }
   },
 });

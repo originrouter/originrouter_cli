@@ -1,159 +1,41 @@
-// Stage 9.1A: OriginRouter login flow.
+// Stage 9.8: OriginRouter login flow.
 //
-// Two orchestrators:
-//   - loginWithManualCode(...) — the required 9.1A completion
-//     path. The user pastes a one-time code obtained from the
-//     backend (e.g. via curl against the test backend).
-//   - loginWithCallback(...) — experimental. Starts a local
-//     HTTP server on 127.0.0.1, opens the browser, waits for
-//     the callback. End-to-end UX requires Universal_PDF_H5 to
-//     call /originrouter/auth/login-code and redirect to the
-//     callback URL; that wiring is 9.1A.1. The CLI shape is
-//     correct so 9.1A.1 does NOT need to change the CLI.
+// One orchestrator:
+//   - loginWithDeviceFlow(...) — RFC 8628 device authorization grant.
+//     Calls /device/code, prints the 8-char user_code +
+//     verification_uri, opens the browser (optional), then
+//     polls /device/token at the recommended interval. No
+//     local HTTP callback server needed. Suitable for SSH,
+//     Docker, CI, or any environment where the CLI cannot
+//     receive a browser redirect.
+//
+// Stage 9.8: the /device/token success response is now an OAuth 2.0
+// (access_token, refresh_token) pair (RFC 6749 §5.1), NOT a long-
+// lived managed key. The CLI stores the refresh_token; the
+// access_token is silently rotated via /device/refresh when it
+// approaches expiry. See `oauthTokenRefresher.js` for the
+// silent-refresh logic.
+//
+// The Stage 9.6 browser-callback orchestrator
+// (loginWithDevMintCallback) was retired in Stage 9.7 along
+// with the backend's /login-code/dev-mint + /device/approve
+// routes — see `README.md` for the migration notes.
 //
 // `openBrowser(url)` dispatches per-platform WITHOUT
 // `shell: true` on darwin / linux to avoid shell-injection
 // risks on URLs with special characters.
 
-import http from "node:http";
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
 
-import { exchangeLoginCode } from "./originrouterAuthClient.js";
-
-function generateState() {
-  // 16-byte url-safe token; defeats CSRF on the local callback.
-  return randomBytes(16).toString("base64url");
-}
+import { writeCodingAuth } from "../persistence/codingAuth.js";
+import {
+  AuthClientError,
+  pollDeviceToken,
+  requestDeviceCode,
+} from "./originrouterAuthClient.js";
 
 function loginUrlFor(apiBaseUrl) {
-  return `${apiBaseUrl.replace(/\/+$/, "")}/originrouter/login`;
-}
-
-// ---------------------------------------------------------------------------
-// Required 9.1A completion path
-// ---------------------------------------------------------------------------
-
-export async function loginWithManualCode({ apiBaseUrl, code, deviceId, deviceName, source }) {
-  if (!code) throw new Error("loginWithManualCode: code is required");
-  if (!apiBaseUrl) throw new Error("loginWithManualCode: apiBaseUrl is required");
-  const payload = await exchangeLoginCode({
-    apiBaseUrl,
-    code,
-    deviceId,
-    deviceName,
-    source,
-  });
-  return payload;
-}
-
-// ---------------------------------------------------------------------------
-// Experimental browser callback path (9.1A.1 follow-up)
-// ---------------------------------------------------------------------------
-
-async function _startCallbackServer({ expectedState, timeoutMs, onListening }) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let timer;
-    const settle = (fn, value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try { server.close(); } catch {}
-      fn(value);
-    };
-    const server = http.createServer((req, res) => {
-      const url = new URL(req.url, "http://127.0.0.1");
-      if (url.pathname !== "/originrouter/login/callback") {
-        res.statusCode = 404;
-        res.end("not found");
-        return;
-      }
-      const code = url.searchParams.get("code");
-      const state = url.searchParams.get("state");
-      if (!code) {
-        res.statusCode = 400;
-        res.end("missing code");
-        settle(reject, new Error("callback missing code"));
-        return;
-      }
-      if (state !== expectedState) {
-        res.statusCode = 400;
-        res.end("state mismatch");
-        settle(reject, new Error("callback state mismatch"));
-        return;
-      }
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "text/plain");
-      res.end("OK — you can close this window.");
-      settle(resolve, code);
-    });
-    server.on("error", (err) => settle(reject, err));
-    server.listen(0, "127.0.0.1", () => {
-      const addr = server.address();
-      if (!addr || typeof addr === "string") {
-        settle(reject, new Error("failed to bind local callback server"));
-        return;
-      }
-      if (typeof onListening === "function") {
-        try {
-          onListening(addr.port);
-        } catch (err) {
-          settle(reject, err);
-          return;
-        }
-      }
-      timer = setTimeout(() => settle(reject, new Error("callback timed out")), timeoutMs);
-    });
-  });
-}
-
-export async function loginWithCallback({
-  apiBaseUrl,
-  loginUrl,
-  deviceId,
-  deviceName,
-  source,
-  timeoutMs = 300_000,
-  openBrowserFn = openBrowser,
-}) {
-  if (!apiBaseUrl) throw new Error("loginWithCallback: apiBaseUrl is required");
-  if (!loginUrl) loginUrl = loginUrlFor(apiBaseUrl);
-
-  const state = generateState();
-
-  let opened = false;
-  const codeReceived = _startCallbackServer({
-    expectedState: state,
-    timeoutMs,
-    onListening: (port) => {
-      // Build the URL via URLSearchParams (NOT string concat).
-      const redirect_uri = `http://127.0.0.1:${port}/originrouter/login/callback`;
-      const params = new URLSearchParams({
-        originrouter_cli: "1",
-        device_id: deviceId,
-        device_name: deviceName,
-        source,
-        redirect_uri,
-        state,
-      });
-      const target = `${loginUrl}?${params.toString()}`;
-
-      // Open the browser — fire and forget.
-      opened = true;
-      openBrowserFn(target).catch(() => { /* logged in openBrowser */ });
-    },
-  });
-  if (!opened) {
-    // onListening runs asynchronously after bind; this branch is
-    // intentionally empty, but keeping the flag prevents accidental
-    // removal of the callback in future edits.
-  }
-
-  const code = await codeReceived;
-
-  // Now exchange the code.
-  return exchangeLoginCode({ apiBaseUrl, code, deviceId, deviceName, source });
+  return `${apiBaseUrl.replace(/\/+$/, "")}/cli/authorize`;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,4 +80,199 @@ export async function openBrowser(url) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Stage 9.8: persist the OAuth 2.0 token response (RFC 6749 §5.1).
+// ---------------------------------------------------------------------------
+//
+// The /device/token success payload carries (Stage 9.9):
+//   access_token             rt_<base64url>        (1h, surety relay)
+//   device_grant             <secrets.token_urlsafe(48)>  (长期凭证)
+//   token_endpoint           surety /api/relay/token URL
+//   device_id                "device-<fingerprint>"
+//   expires_at               unix seconds (access_token 过期时间)
+//   scopes                   ["coding"]
+//   source                   "originrouter_cli"
+//   token_type               "Bearer"
+//
+// This helper converts the response to the on-disk relay
+// shape (see isRelayShape) and writes it to
+// `<stateDir>/coding-key.json`. The device_grant is the durable
+// credential the CLI keeps; the access_token is the short-lived
+// Bearer the env builder uses for LLM calls.
+
+import { KEY_KIND, KEY_SCOPE, KEY_SOURCE } from "../runtime/authContract.js";
+
+export function relayResponseToShape(relayResponse) {
+  if (!relayResponse || typeof relayResponse !== "object") {
+    throw new AuthClientError({
+      status: 0, body: null, message: "relayResponse is required",
+    });
+  }
+  const required = [
+    "access_token", "device_grant", "token_endpoint",
+    "device_id", "expires_at",
+  ];
+  for (const f of required) {
+    if (!relayResponse[f]) {
+      throw new AuthClientError({
+        status: 0, body: null,
+        message: `relayResponse missing field: ${f}`,
+      });
+    }
+  }
+  if (typeof relayResponse.access_token !== "string" || !relayResponse.access_token.startsWith("rt_")) {
+    throw new AuthClientError({ status: 0, body: null, message: "access_token must start with rt_" });
+  }
+  return {
+    kind: KEY_KIND.RELAY,
+    accessToken: relayResponse.access_token,
+    accessTokenExpiresAt: Number(relayResponse.expires_at) * 1000,
+    deviceGrant: relayResponse.device_grant,
+    tokenEndpoint: relayResponse.token_endpoint,
+    deviceId: relayResponse.device_id,
+    scopes: Array.isArray(relayResponse.scopes)
+      ? relayResponse.scopes
+      : [KEY_SCOPE.CODING],
+    source: KEY_SOURCE.ORIGINROUTER_CLI,
+  };
+}
+
+export function persistRelayTokens({ stateDir, relayResponse }) {
+  const shape = relayResponseToShape(relayResponse);
+  writeCodingAuth(stateDir, shape);
+  return shape;
+}
+
+// Stage 9.9: 登录成功后调用 persistRelayTokens 写入 coding-key.json
+
+// ---------------------------------------------------------------------------
+// Stage 9.7/9.8 — RFC 8628 device-flow orchestrator.
+//
+// The CLI:
+//   1. POSTs to /device/code with its local device_id → receives a
+//      user_code + verification_uri_complete + expires_in + interval.
+//   2. Prints the URL + the 8-char user_code for the user.
+//   3. (Optional) opens the verification_uri_complete in the local
+//      browser if `openBrowserFn` is provided and `noBrowser` is false.
+//   4. Polls /device/token at `interval` seconds. On
+//      `authorization_pending` it keeps polling; on `slow_down` it
+//      backs off (RFC 8628 §4.1.2: double interval, +5s floor);
+//      on any other error it rejects.
+//   5. On success, the response carries an OAuth 2.0 token pair
+//      (access_token + refresh_token). The caller pipes it
+//      through `persistOAuthTokens(...)` to write coding-key.json.
+// ---------------------------------------------------------------------------
+
+function _sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+export async function loginWithDeviceFlow({
+  apiBaseUrl,
+  h5BaseUrl,
+  deviceId,
+  deviceName,
+  source,
+  timeoutMs = 600_000,        // 10 minutes — matches server expires_in
+  initialIntervalMs = 5_000,  // RFC 8628 §4.1.2 default
+  noBrowser = false,
+  openBrowserFn = openBrowser,
+  // Test seam: lets unit tests inject a deterministic sleep.
+  sleepFn = _sleep,
+  // Test seam: lets unit tests capture the printed URL/code.
+  printFn = (line) => process.stderr.write(line + "\n"),
+}) {
+  if (!apiBaseUrl) throw new Error("loginWithDeviceFlow: apiBaseUrl is required");
+  if (!h5BaseUrl) throw new Error("loginWithDeviceFlow: h5BaseUrl is required");
+  if (!deviceId) throw new Error("loginWithDeviceFlow: deviceId is required");
+
+  // Step 1: mint the user_code.
+  const codeResp = await requestDeviceCode({
+    apiBaseUrl,
+    deviceId,
+    deviceName: deviceName || deviceId,
+    source: source || "originrouter_cli",
+  });
+  if (!codeResp || typeof codeResp.user_code !== "string" || !codeResp.user_code) {
+    throw new AuthClientError({
+      status: 0, body: null, message: "device_code_invalid_response",
+    });
+  }
+
+  const userCode = codeResp.user_code;
+  const verificationUri = codeResp.verification_uri;
+  const verificationUriComplete =
+    codeResp.verification_uri_complete || `${verificationUri}?user_code=${userCode}`;
+  // Server-provided interval wins (gateway is the source of truth);
+  // the constructor default is the floor.
+  const baseIntervalMs = (codeResp.interval ? codeResp.interval * 1000 : initialIntervalMs);
+
+  // Step 2: print the URL (code is embedded in the link).
+  printFn(`! To complete login, open this URL and click Authorize:`);
+  printFn(`!   ${verificationUriComplete}`);
+  printFn(`! Your code: ${userCode}`);
+  printFn(`! Waiting for authorization (expires in ${Math.floor(timeoutMs / 1000)}s)...`);
+
+  // Step 3: optionally open the browser.
+  if (!noBrowser && typeof openBrowserFn === "function") {
+    try {
+      await openBrowserFn(verificationUriComplete);
+    } catch { /* logged in openBrowser */ }
+  }
+
+  // Step 4: poll /device/token.
+  const deadline = Date.now() + timeoutMs;
+  let intervalMs = baseIntervalMs;
+  let lastErrorCode = null;
+  while (Date.now() < deadline) {
+    await sleepFn(intervalMs);
+    try {
+      const result = await pollDeviceToken({
+        apiBaseUrl,
+        deviceCode: userCode,
+        deviceId,
+        source: source || "originrouter_cli",
+      });
+      // Success — `result` is the OAuth 2.0 token response
+      // (access_token + refresh_token + expires_in + ...).
+      printFn("✓ Authorization received.");
+      return result;
+    } catch (e) {
+      const code = (e && (e.code || e.message)) || "device_flow_error";
+      lastErrorCode = code;
+      if (code === "authorization_pending") {
+        continue;
+      }
+      if (code === "slow_down") {
+        // RFC 8628 §4.1.2: client MUST increase the polling interval
+        // by 5 seconds for this request and subsequent requests.
+        intervalMs += 5_000;
+        continue;
+      }
+      if (code === "expired_token") {
+        throw new AuthClientError({
+          status: 0, body: null, message: "device_flow_expired",
+        });
+      }
+      if (code === "access_denied") {
+        throw new AuthClientError({
+          status: 0, body: null, message: "device_flow_denied",
+        });
+      }
+      // invalid_grant + anything else: hard fail.
+      throw new AuthClientError({
+        status: e.status || 0, body: null,
+        message: `device_flow_${code}`,
+      });
+    }
+  }
+  throw new AuthClientError({
+    status: 0, body: null,
+    message: lastErrorCode
+      ? `device_flow_timeout_after_${lastErrorCode}`
+      : "device_flow_timeout",
+  });
+}
+
 export { loginUrlFor };
+

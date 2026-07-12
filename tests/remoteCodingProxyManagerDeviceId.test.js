@@ -3,20 +3,20 @@
 // When ORIGINROUTER_RELAY_AUTH=on, the manager must construct the inner
 // RemoteCodingRelayProxy with the deviceId from coding-key.json, not the
 // deviceId passed to the constructor. The inner proxy's
-// RemoteCodingRelayClient uses that deviceId in the SSE URL:
-//   GET <relayUrl>/device/events?deviceId=<deviceId>
+// RemoteCodingRelayClient uses that deviceId in the WebSocket URL:
+//   WS <relayUrl>/relay/v1/devices/<deviceId>/ws
 //
-// We assert the SSE URL by spying on the fetchFn passed to the manager
-// (which is forwarded to the inner client). The fake fetchFn captures
-// every URL the inner client requests.
+// We assert the WebSocket URL by capturing the fake relay upgrade request.
 //
 // We do NOT assert .status().deviceId because RemoteCodingProxyManager
 // does not expose deviceId in its status object.
 
 import assert from "node:assert/strict";
+import http from "node:http";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { WebSocketServer } from "ws";
 
 import { RemoteCodingProxyManager } from "../src/proxy/remoteCodingProxyManager.js";
 
@@ -37,20 +37,24 @@ try {
     scopes: ["coding"],
   }, null, 2));
 
-  // Spy fetchFn: capture every URL the inner client requests.
-  // For the SSE GET, return a never-ending body so the proxy stays open
-  // but we can immediately stop the manager and inspect what was captured.
-  const sseBody = new ReadableStream({
-    start(controller) {
-      controller.enqueue(new TextEncoder().encode("data: {\"type\":\"device.connected\",\"deviceId\":\"\"}\n\n"));
-    },
-    cancel() {},
-  });
   const captured = [];
+  const relay = await new Promise((resolve) => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false }));
+    });
+    const wss = new WebSocketServer({ noServer: true });
+    server.on("upgrade", (req, socket, head) => {
+      captured.push(String(req.url || ""));
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        ws.send(JSON.stringify({ type: "device.connected" }));
+      });
+    });
+    server.listen(0, "127.0.0.1", () => {
+      resolve({ server, wss, port: server.address().port });
+    });
+  });
   const fetchFn = async (url, opts = {}) => {
-    captured.push(String(url));
-    // First call: SSE GET. Return a 200 with a never-ending body.
-    // Subsequent calls: token POST. Return a Surety 200/0.
     if (String(url).includes("/api/relay/token")) {
       return new Response(JSON.stringify({
         code: 0,
@@ -58,7 +62,7 @@ try {
         data: { "relay-access-token": "test-token", "expires-at": Math.floor(Date.now()/1000) + 3600, "token-id": "tid", scopes: ["relay.remote_coding"] },
       }), { status: 200, headers: { "content-type": "application/json" } });
     }
-    return new Response(sseBody, { status: 200, headers: { "content-type": "text/event-stream" } });
+    throw new Error(`unexpected fetch URL: ${url}`);
   };
 
   const prevAuth = process.env.ORIGINROUTER_RELAY_AUTH;
@@ -68,24 +72,25 @@ try {
   try {
     const mgr = new RemoteCodingProxyManager({
       stateDir: tmpStateDir,
-      relayUrl: "http://127.0.0.1:9999",
+      relayUrl: `http://127.0.0.1:${relay.port}`,
       deviceId: "WRONG-CONSTRUCTOR-DEVICE-ID", // intentionally wrong
       fetchFn,
     });
     const r = await mgr.start();
     assert.equal(r.ok, true, `start failed: ${JSON.stringify(r)}`);
+    await new Promise((resolve) => setTimeout(resolve, 80));
 
-    // The SSE URL the inner client connected to must use the coding-key
+    // The WebSocket URL the inner client connected to must use the coding-key
     // deviceId, not the constructor's WRONG-... value.
-    const sseCall = captured.find((u) => u.includes("/device/events"));
-    assert.ok(sseCall, `no SSE call captured; got: ${JSON.stringify(captured)}`);
+    const wsCall = captured.find((u) => u.includes("/relay/v1/devices/"));
+    assert.ok(wsCall, `no WebSocket call captured; got: ${JSON.stringify(captured)}`);
     assert.ok(
-      sseCall.includes("deviceId=prod-X-from-coding-key"),
-      `SSE URL did not use coding-key deviceId: ${sseCall}`,
+      wsCall.includes("/relay/v1/devices/prod-X-from-coding-key/ws"),
+      `WebSocket URL did not use coding-key deviceId: ${wsCall}`,
     );
     assert.ok(
-      !sseCall.includes("WRONG-CONSTRUCTOR-DEVICE-ID"),
-      `SSE URL still uses constructor deviceId: ${sseCall}`,
+      !wsCall.includes("WRONG-CONSTRUCTOR-DEVICE-ID"),
+      `WebSocket URL still uses constructor deviceId: ${wsCall}`,
     );
 
     await mgr.stop();
@@ -94,6 +99,8 @@ try {
     else process.env.ORIGINROUTER_RELAY_AUTH = prevAuth;
     if (prevSurety === undefined) delete process.env.SURETY_BASE_URL;
     else process.env.SURETY_BASE_URL = prevSurety;
+    relay.wss.close();
+    relay.server.close();
   }
 } finally {
   rmSync(tmpStateDir, { recursive: true, force: true });

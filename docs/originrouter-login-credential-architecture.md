@@ -387,3 +387,61 @@ configuration (server=on, CLI=off) manifests as silent 401s;
 the README documents this. Production deployments must set
 `on` on both sides, and `SURETY_BASE_URL` to the real
 Surety service.
+
+---
+
+## Stage 9.9 — Surety Relay 认证架构
+
+Stage 9.9 将 CLI 认证从本地 OAuth token（`or_at_` / `or_rt_`）迁移到 surety relay 模式。密钥签发和校验全部由 surety 服务负责，网关（ai/server）不再直接查 token 表。
+
+### 新的 Token 类型
+
+| Token | 格式 | 生命周期 | 存储位置 |
+|-------|------|----------|----------|
+| device_grant | `<secrets.token_urlsafe(48)>` | 无过期（随 relay_device_grants 表） | CLI 本地 `coding-key.json` |
+| access_token | `rt_<32B-base64url>` | 1 小时 | CLI 内存 + 磁盘缓存 |
+
+### 流程
+
+```
+登录（一次性）：
+  CLI → originrouter_cli /device/code
+  用户 → H5 授权页
+  CLI → originrouter_cli /device/token
+    内部：查 users.outerId → 调 surety /api/relay/devices/seed 注册
+         → 调 surety /api/relay/token 签首个 access_token
+    返回给 CLI: {device_grant, access_token, token_endpoint, expires_at, device_id}
+
+刷新（CLI 直达 surety，用户无感知）：
+  CLI → surety /api/relay/token (用 device_grant + device_id)
+    返回: {relay-access-token, expires-at}
+
+LLM 请求：
+  CLI → ai/server (Authorization: Bearer rt_<token>)
+    ai/server → surety /api/relay/verify
+      返回: {outer-user-id, device-id, scopes}
+    ai/server 用 outer_user_id 查 users 表 → 放行
+```
+
+### On-disk Shape (coding-key.json)
+
+```ts
+type RelayCredential = {
+  kind: "relay";
+  deviceGrant: string;           // 长期凭证，调 surety 签发 token 用
+  deviceId: string;              // device-<sha256-fingerprint>
+  tokenEndpoint: string;         // surety /api/relay/token URL
+  accessToken: string;           // rt_<base64url>，1h 过期
+  accessTokenExpiresAt: number;  // epoch ms
+  scopes: ["coding"];
+  source: "originrouter_cli";
+  writtenAt?: number;            // epoch ms
+};
+```
+
+### 关键文件
+
+- `se/authContract.js` — `KEY_KIND.RELAY`, `isRelayShape()`
+- `src/runtime/relayTokenRefresher.js` — 静默刷新逻辑
+- `src/config/claudeConfig.js` — `readManagedCodingKeyForRuntime()` 调 refresher
+- `src/persistence/codingAuth.js` — 磁盘读写

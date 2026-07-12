@@ -1,4 +1,9 @@
 import process from "node:process";
+import {
+  buildRuntimeEventEnvelope,
+  reportRuntimeEvent,
+  startApprovalDecisionPolling,
+} from "../agent/bridgeReporter.js";
 import { buildAgentProviderEnv, maskSecret } from "../config/claudeConfig.js";
 import { DEFAULT_DEVICE_ID, DEFAULT_RELAY_URL } from "../constants.js";
 import { readLocalProxySnapshot, staticProxyStatusFn } from "../proxy/snapshot.js";
@@ -134,7 +139,7 @@ export async function runClaudeSdkSession(rawArgs) {
   const localConfig = readConfig();
   // Resolve provider env through the unified entry point. Direct SDK launchers
   // read the persisted local proxy snapshot, same as the PTY path.
-  const providerResult = buildAgentProviderEnv("claude", localConfig, {
+  const providerResult = await buildAgentProviderEnv("claude", localConfig, {
     provider: options.provider,
     proxyStatus: staticProxyStatusFn(readLocalProxySnapshot()),
   });
@@ -145,6 +150,7 @@ export async function runClaudeSdkSession(rawArgs) {
   const pendingPermissions = new Map();
   const abortController = new AbortController();
   let stopped = false;
+  let stopApprovalPolling = () => {};
 
   const send = (type, extra = {}) => {
     relayClient.send(type, {
@@ -153,9 +159,24 @@ export async function runClaudeSdkSession(rawArgs) {
       ...extra,
     }).catch(() => {});
   };
+  const report = (type, extra = {}) => {
+    if (type !== "session.started" && type !== "session.exited" && type !== "session.error" && type !== "agent.event") {
+      return;
+    }
+    const payload = buildRuntimeEventEnvelope({
+      sessionId,
+      agentType: "claude",
+      title: "claude-sdk session",
+      deviceName: device.host,
+      eventType: type,
+      event: type === "agent.event" ? extra.event : extra,
+    });
+    reportRuntimeEvent(payload, { stateDir: ensureStateDir() }).catch(() => {});
+  };
 
   function sendAgentEvent(event) {
     send("agent.event", { event });
+    report("agent.event", { event });
   }
 
   function resolvePermission(payload) {
@@ -205,6 +226,8 @@ export async function runClaudeSdkSession(rawArgs) {
 
     if (payload.type === "terminal.interrupt" || payload.type === "session.stop") {
       stopped = true;
+      stopApprovalPolling();
+      stopApprovalPolling = () => {};
       abortController.abort();
       messageQueue.close();
       for (const [callId, pending] of pendingPermissions) {
@@ -212,6 +235,7 @@ export async function runClaudeSdkSession(rawArgs) {
         pendingPermissions.delete(callId);
       }
       send("session.exited", { code: 0, signal: payload.type === "terminal.interrupt" ? "SIGINT" : null });
+      report("session.exited", { code: 0, signal: payload.type === "terminal.interrupt" ? "SIGINT" : null });
     }
   }
 
@@ -240,6 +264,12 @@ export async function runClaudeSdkSession(rawArgs) {
   };
   eventLoop();
 
+  stopApprovalPolling = startApprovalDecisionPolling({
+    sessionId,
+    stateDir: ensureStateDir(),
+    onDecision: handleRemoteEvent,
+  });
+
   const { query } = await loadClaudeAgentSdk();
 
   send("session.started", {
@@ -255,6 +285,10 @@ export async function runClaudeSdkSession(rawArgs) {
       adapter: "claude-sdk",
       structuredSources: ["claude-agent-sdk"],
     },
+  });
+  report("session.started", {
+    runtime: "claude-sdk",
+    executor: "sdk",
   });
   sendAgentEvent({
     type: "agent.ready",
@@ -324,14 +358,21 @@ export async function runClaudeSdkSession(rawArgs) {
 
     if (!stopped) {
       stopped = true;
+      stopApprovalPolling();
+      stopApprovalPolling = () => {};
       send("session.exited", { code: 0, signal: null });
+      report("session.exited", { code: 0, signal: null });
     }
   } catch (error) {
     if (stopped) return;
     if (!stopped) {
       stopped = true;
+      stopApprovalPolling();
+      stopApprovalPolling = () => {};
       send("session.error", { message: error instanceof Error ? error.message : String(error) });
+      report("session.error", { message: error instanceof Error ? error.message : String(error) });
       send("session.exited", { code: 1, signal: null });
+      report("session.exited", { code: 1, signal: null });
     }
     throw error;
   }

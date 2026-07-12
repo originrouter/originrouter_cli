@@ -1,29 +1,28 @@
-// Stage 9.0: minimal persistent storage for the managed coding
-// API key. The file holds the key id, the key value (mode 0o600),
-// the device grant id, the source, the scopes, and the absolute
-// expiry. Rotation helpers overwrite the file in place. logout
-// deletes it.
+// Stage 9.9: persistent storage for the OriginRouter auth credential.
+// The on-disk shape is now a surety relay record. The file holds the
+// device_grant (long-lived), the cached access_token (short-lived,
+// ~1h, format rt_<base64url>, silently re-signed by surety), the
+// token_endpoint (surety URL), the device_id, and the scopes.
+// Mode 0o600.
 //
-// This module is IO only — no I/O happens at import time.
-// The CLI never auto-issues a key. Stage 9.0 does not implement
-// the exchange / rotation / revocation endpoints; it ships the
-// storage shape and a few IO helpers. The exchange flow is
-// Stage 9.1+.
+// Pre-9.9 files with the legacy managed-key shape (sk-or-... long-
+// lived key) are still readable for the transition window via
+// `isAnyManagedCredentialShape` (see runtime/authContract.js).
+// New writes always use the relay shape.
 
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { isManagedKeyShape, KEY_KIND, KEY_SCOPE, KEY_SOURCE } from "../runtime/authContract.js";
+import {
+  isAnyManagedCredentialShape,
+  isManagedKeyShape,
+  isRelayShape,
+  KEY_KIND,
+  KEY_SCOPE,
+  KEY_SOURCE,
+} from "../runtime/authContract.js";
 
 const FILE_MODE = 0o600;
 
-// Stage 9.0: KEY_KIND is a thin storage-local re-export. The
-// canonical shape definitions (and any future shapes like
-// KEY_SCOPE / KEY_SOURCE) live in src/runtime/authContract.js.
-// codingAuth.js re-exports KEY_KIND so callers of the storage
-// layer do not have to import from authContract.js just to
-// type-check the kind field. If the two ever drift, the
-// authContract.js value wins — codingAuth.js is updated in
-// the same patch.
 export { KEY_KIND };
 
 export function codingAuthPath(stateDir) {
@@ -40,25 +39,14 @@ export function readCodingAuth(stateDir) {
   }
 }
 
-// Stage 9.0: the IO layer and the pure shape layer share one
-// definition of "valid managed key". writeCodingAuth delegates
-// the structural check to isManagedKeyShape so the storage and
-// runtime agree on what counts as a well-formed key.
 export function writeCodingAuth(stateDir, payload) {
   if (!payload || typeof payload !== "object") {
     throw new Error("writeCodingAuth: payload is required");
   }
-  // Stage 9.0: the error message is intentionally NOT asserted
-  // on a per-field basis. The test suite asserts that
-  // writeCodingAuth throws on a malformed payload; it does not
-  // pin the message text.
-  if (!isManagedKeyShape(payload)) {
+  if (!isAnyManagedCredentialShape(payload)) {
     throw new Error(
-      `writeCodingAuth: payload is not a well-formed managed key (see isManagedKeyShape)`,
+      `writeCodingAuth: payload is not a well-formed relay or managed key shape`,
     );
-  }
-  if (payload.kind !== KEY_KIND.MANAGED) {
-    throw new Error(`writeCodingAuth: kind must be '${KEY_KIND.MANAGED}' (got '${payload.kind}')`);
   }
   if (payload.source !== KEY_SOURCE.ORIGINROUTER_CLI) {
     throw new Error(
@@ -87,3 +75,5 @@ export function clearCodingAuth(stateDir) {
     try { unlinkSync(p); } catch {}
   }
 }
+
+export { isManagedKeyShape, isRelayShape };

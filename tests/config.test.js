@@ -47,7 +47,7 @@ try {
   // The legacy `config.claude` block and `currentProvider.claude` are no
   // longer consulted for claude. Without a running route-mode proxy,
   // buildAgentProviderEnv throws.
-  assert.throws(
+  await assert.rejects(
     () => buildAgentProviderEnv("claude", config),
     (err) => err.code === "PROVIDER_UNSUPPORTED",
     "legacy block alone no longer drives the claude env",
@@ -65,7 +65,7 @@ try {
   });
   config = setCurrentProvider(config, "claude", "minimax");
   // Still throws — no proxy in the test fixture.
-  assert.throws(
+  await assert.rejects(
     () => buildAgentProviderEnv("claude", config),
     (err) => err.code === "PROVIDER_UNSUPPORTED",
   );
@@ -81,7 +81,7 @@ try {
   });
   // Stage 7.6: --provider is also ignored for claude. Without a running
   // route-mode proxy, buildAgentProviderEnv throws.
-  assert.throws(
+  await assert.rejects(
     () => buildAgentProviderEnv("claude", config, { provider: "alt" }),
     (err) => err.code === "PROVIDER_UNSUPPORTED",
   );
@@ -94,7 +94,7 @@ try {
     apiKey: "sk-ds-1234567890",
     model: "deepseek-chat",
   });
-  assert.throws(
+  await assert.rejects(
     () => buildAgentProviderEnv("claude", config, { provider: "deepseek" }),
     (err) => err.code === "PROVIDER_UNSUPPORTED",
     "litellm provider without proxy must throw PROVIDER_UNSUPPORTED for claude",
@@ -114,7 +114,7 @@ try {
     routesHash: hashRoutes(getAllRoutes(config)),
     aliases: [MAIN_ALIAS, SMALL_ALIAS],
   };
-  const routed = buildAgentProviderEnv("claude", config, {
+  const routed = await buildAgentProviderEnv("claude", config, {
     provider: "deepseek",
     proxyStatus: () => runningRouteProbe,
   });
@@ -127,7 +127,7 @@ try {
   assert.equal(routed.env.ANTHROPIC_BASE_URL.includes("sk-ds-"), false);
 
   // (b) Proxy stopped -> still throws PROVIDER_UNSUPPORTED.
-  assert.throws(
+  await assert.rejects(
     () => buildAgentProviderEnv("claude", config, {
       provider: "deepseek",
       proxyStatus: () => ({ state: "stopped", currentProvider: "deepseek", port: null }),
@@ -137,7 +137,7 @@ try {
   );
 
   // (c) Proxy running but for a DIFFERENT provider -> throws (wrong provider).
-  assert.throws(
+  await assert.rejects(
     () => buildAgentProviderEnv("claude", config, {
       provider: "deepseek",
       proxyStatus: () => ({ state: "running", currentProvider: "other-provider", port: 40123, host: "127.0.0.1" }),
@@ -147,7 +147,7 @@ try {
   );
 
   // (d) No proxyStatus option at all -> legacy behavior (throw).
-  assert.throws(
+  await assert.rejects(
     () => buildAgentProviderEnv("claude", config, { provider: "deepseek" }),
     (err) => err.code === "PROVIDER_UNSUPPORTED",
   );
@@ -159,7 +159,7 @@ try {
   // contains the fixed SMALL_ALIAS even though the provider has
   // smallFastModel set.
   config.providers.deepseek.smallFastModel = "deepseek-chat-small";
-  const routedFast = buildAgentProviderEnv("claude", config, {
+  const routedFast = await buildAgentProviderEnv("claude", config, {
     provider: "deepseek",
     proxyStatus: () => runningRouteProbe,
   });

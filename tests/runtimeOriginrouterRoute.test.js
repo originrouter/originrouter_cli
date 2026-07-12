@@ -90,12 +90,12 @@ const cases = [];
 
 cases.push({
   name: "claude originrouter direct: returns source + four env vars",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     seedManagedKey(home);
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
-    const out = buildAgentProviderEnv("claude", cfg, {
+    const out = await buildAgentProviderEnv("claude", cfg, {
       proxyStatus: () => ({ state: "stopped" }), // proxy must NOT block direct
     });
     assert.equal(out.source, "originrouter-coding");
@@ -110,13 +110,13 @@ cases.push({
 
 cases.push({
   name: "claude originrouter direct: provider.baseUrl override",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     seedManagedKey(home);
     const cfg = { providers: { "official-baseurl": officialClaudeWithBaseUrl } };
     const routed = setRoute(cfg, "claude", "main",
       { provider: "official-baseurl", model: "claude-sonnet-4-6" });
-    const out = buildAgentProviderEnv("claude", routed, {
+    const out = await buildAgentProviderEnv("claude", routed, {
       proxyStatus: () => ({ state: "stopped" }),
     });
     assert.equal(out.env.ANTHROPIC_BASE_URL, "https://alt.originrouter.example/coding");
@@ -125,7 +125,7 @@ cases.push({
 
 cases.push({
   name: "claude originrouter direct: explicit small route model wins over main",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     seedManagedKey(home);
     const cfg = { providers: { official: officialClaude, "fast-orig": fastOrig } };
@@ -133,7 +133,7 @@ cases.push({
       { provider: "official", model: "claude-sonnet-4-6" });
     const routed2 = setRoute(routed, "claude", "small",
       { provider: "fast-orig", model: "claude-haiku-4-5" });
-    const out = buildAgentProviderEnv("claude", routed2, {
+    const out = await buildAgentProviderEnv("claude", routed2, {
       proxyStatus: () => ({ state: "stopped" }),
     });
     assert.equal(out.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
@@ -143,13 +143,13 @@ cases.push({
 
 cases.push({
   name: "claude originrouter direct: small route model missing → fallback to main",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     seedManagedKey(home);
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
     // explicitly no small slot
-    const out = buildAgentProviderEnv("claude", cfg, {
+    const out = await buildAgentProviderEnv("claude", cfg, {
       proxyStatus: () => ({ state: "stopped" }),
     });
     assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, "claude-sonnet-4-6");
@@ -158,7 +158,7 @@ cases.push({
 
 cases.push({
   name: "claude originrouter direct: mixed provider (main=originrouter small=proxy) throws",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     seedManagedKey(home);
     const cfg = { providers: { official: officialClaude, "moonshot-proxy": moonshotProxy } };
@@ -166,7 +166,7 @@ cases.push({
       { provider: "official", model: "claude-sonnet-4-6" });
     const routed2 = setRoute(routed, "claude", "small",
       { provider: "moonshot-proxy", model: "moonshot-v1-8k" });
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", routed2, {
         proxyStatus: () => ({ state: "stopped" }),
       }),
@@ -178,13 +178,13 @@ cases.push({
 
 cases.push({
   name: "claude originrouter direct: no local proxy required",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     seedManagedKey(home);
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
     // proxyStatus returning not-installed must not block the direct branch
-    const out = buildAgentProviderEnv("claude", cfg, {
+    const out = await buildAgentProviderEnv("claude", cfg, {
       proxyStatus: () => ({ state: "not-installed" }),
     });
     assert.equal(out.source, "originrouter-coding");
@@ -193,33 +193,33 @@ cases.push({
 
 cases.push({
   name: "claude originrouter direct: missing coding-key.json throws login hint",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", cfg, {
         proxyStatus: () => ({ state: "stopped" }),
       }),
       (err) => err.code === "PROVIDER_UNSUPPORTED"
-        && /originrouter login --manual-code/.test(err.message),
+        && /originrouter login/.test(err.message),
     );
   },
 });
 
 cases.push({
   name: "claude originrouter direct: expired coding key throws rotate hint",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     seedManagedKey(home, { expiresAt: Date.now() - 60 * 1000 });
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", cfg, {
         proxyStatus: () => ({ state: "stopped" }),
       }),
       (err) => err.code === "PROVIDER_UNSUPPORTED"
-        && /auth rotate/.test(err.message),
+        && /originrouter login/.test(err.message),
     );
   },
 });
@@ -228,7 +228,7 @@ cases.push({
 
 cases.push({
   name: "claude originrouter direct: malformed key missing deviceGrant throws login hint",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     const goodKey = {
       kind: KEY_KIND.MANAGED,
@@ -246,19 +246,19 @@ cases.push({
     writeRawJsonKey(home, bad);
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", cfg, {
         proxyStatus: () => ({ state: "stopped" }),
       }),
       (err) => err.code === "PROVIDER_UNSUPPORTED"
-        && /originrouter login --manual-code/.test(err.message),
+        && /originrouter login/.test(err.message),
     );
   },
 });
 
 cases.push({
   name: "claude originrouter direct: malformed key missing scopes throws login hint",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     const goodKey = {
       kind: KEY_KIND.MANAGED,
@@ -276,19 +276,19 @@ cases.push({
     writeRawJsonKey(home, bad);
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", cfg, {
         proxyStatus: () => ({ state: "stopped" }),
       }),
       (err) => err.code === "PROVIDER_UNSUPPORTED"
-        && /originrouter login --manual-code/.test(err.message),
+        && /originrouter login/.test(err.message),
     );
   },
 });
 
 cases.push({
   name: "claude originrouter direct: scopes not including 'coding' throws login hint",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     const goodKey = {
       kind: KEY_KIND.MANAGED,
@@ -304,19 +304,19 @@ cases.push({
     writeRawJsonKey(home, goodKey);
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", cfg, {
         proxyStatus: () => ({ state: "stopped" }),
       }),
       (err) => err.code === "PROVIDER_UNSUPPORTED"
-        && /originrouter login --manual-code/.test(err.message),
+        && /originrouter login/.test(err.message),
     );
   },
 });
 
 cases.push({
   name: "claude originrouter direct: wrong source throws login hint",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     // isManagedKeyShape accepts originrouter_cli AND originrouter_app; a
     // source outside that set is rejected by the shape guard.
@@ -334,12 +334,12 @@ cases.push({
     writeRawJsonKey(home, goodKey);
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", cfg, {
         proxyStatus: () => ({ state: "stopped" }),
       }),
       (err) => err.code === "PROVIDER_UNSUPPORTED"
-        && /originrouter login --manual-code/.test(err.message),
+        && /originrouter login/.test(err.message),
     );
   },
 });
@@ -348,13 +348,13 @@ cases.push({
 
 cases.push({
   name: "codex originrouter direct: returns source + three env vars",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     seedManagedKey(home);
     const cfg = { providers: { "official-codex": officialCodex } };
     const routed = setRoute(cfg, "codex", "main",
       { provider: "official-codex", model: "gpt-5-codex" });
-    const out = buildAgentProviderEnv("codex", routed, {
+    const out = await buildAgentProviderEnv("codex", routed, {
       proxyStatus: () => ({ state: "stopped" }),
     });
     assert.equal(out.source, "originrouter-coding");
@@ -366,13 +366,13 @@ cases.push({
 
 cases.push({
   name: "codex originrouter direct: provider.baseUrl falls back when null",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     seedManagedKey(home);
     const cfg = { providers: { "official": { ...officialClaude, model: "gpt-5-codex" } } };
     const routed = setRoute(cfg, "codex", "main",
       { provider: "official", model: "gpt-5-codex" });
-    const out = buildAgentProviderEnv("codex", routed, {
+    const out = await buildAgentProviderEnv("codex", routed, {
       proxyStatus: () => ({ state: "stopped" }),
     });
     assert.equal(out.env.OPENAI_BASE_URL,
@@ -382,13 +382,13 @@ cases.push({
 
 cases.push({
   name: "codex originrouter direct: no local proxy required",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     seedManagedKey(home);
     const cfg = { providers: { "official-codex": officialCodex } };
     const routed = setRoute(cfg, "codex", "main",
       { provider: "official-codex", model: "gpt-5-codex" });
-    const out = buildAgentProviderEnv("codex", routed, {
+    const out = await buildAgentProviderEnv("codex", routed, {
       proxyStatus: () => ({ state: "not-installed" }),
     });
     assert.equal(out.source, "originrouter-coding");
@@ -399,12 +399,12 @@ cases.push({
 
 cases.push({
   name: "proxy route + matching hash returns source=routes and proxy env (regression)",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     const cfg = { providers: { "moonshot-proxy": moonshotProxy } };
     const routed = setRoute(cfg, "claude", "main",
       { provider: "moonshot-proxy", model: "moonshot-v1-8k" });
-    const out = buildAgentProviderEnv("claude", routed, {
+    const out = await buildAgentProviderEnv("claude", routed, {
       proxyStatus: () => ({
         state: "running",
         port: 40123,
@@ -424,12 +424,12 @@ cases.push({
 
 cases.push({
   name: "proxy route + missing proxy throws install/start hint (regression)",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     const cfg = { providers: { "moonshot-proxy": moonshotProxy } };
     const routed = setRoute(cfg, "claude", "main",
       { provider: "moonshot-proxy", model: "moonshot-v1-8k" });
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", routed, {
         proxyStatus: () => ({ state: "not-installed" }),
       }),
@@ -440,12 +440,12 @@ cases.push({
 
 cases.push({
   name: "proxy route + stale hash throws PROVIDER_UNSUPPORTED (regression)",
-  run: () => {
+  run: async () => {
     clearCodingKeyFile(home);
     const cfg = { providers: { "moonshot-proxy": moonshotProxy } };
     const routed = setRoute(cfg, "claude", "main",
       { provider: "moonshot-proxy", model: "moonshot-v1-8k" });
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", routed, {
         proxyStatus: () => ({
           state: "running",
@@ -466,7 +466,7 @@ cases.push({
 let failures = 0;
 for (const c of cases) {
   try {
-    c.run();
+    await c.run();
     console.log(`  ok: ${c.name}`);
   } catch (e) {
     failures++;

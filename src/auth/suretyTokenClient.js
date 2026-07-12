@@ -6,8 +6,8 @@
 //
 // Exchanges a long-lived `deviceGrant` for a short-lived
 // `relayAccessToken`. The token is then attached as
-// `Authorization: Bearer <relay-access-token>` to the relay's
-// `/device/events` and `/device/message` calls.
+// `Authorization: Bearer <relay-access-token>` to the unified relay
+// WebSocket and fallback message calls.
 //
 // Wire protocol: see surety/surety/surety/v2/relay.py
 //   - body.v = "v1"

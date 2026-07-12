@@ -49,7 +49,7 @@ try {
 
   // ---- (1) No routes, no proxy → throws ----
   {
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", config, {
         proxyStatus: () => ({ state: "stopped" }),
       }),
@@ -60,7 +60,7 @@ try {
   // ---- (2) Routes set, route-mode proxy running with matching hash: four fixed env vars ----
   {
     config = setRoute(config, "claude", "main", { provider: "deepseek", model: "deepseek-chat" });
-    const out = buildAgentProviderEnv("claude", config, {
+    const out = await buildAgentProviderEnv("claude", config, {
       proxyStatus: () => routeProbe(config),
     });
     assert.equal(out.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:40123");
@@ -72,7 +72,7 @@ try {
   // ---- (3) Routes set, main + small: both fixed aliases (small explicit) ----
   {
     config = setRoute(config, "claude", "small", { provider: "moonshot", model: "moonshot-v1-8k" });
-    const out = buildAgentProviderEnv("claude", config, {
+    const out = await buildAgentProviderEnv("claude", config, {
       proxyStatus: () => routeProbe(config),
     });
     assert.equal(out.env.ANTHROPIC_MODEL, MAIN_ALIAS);
@@ -82,7 +82,7 @@ try {
   // ---- (4) Routes set, only main: small falls back to main; both aliases still present ----
   {
     const cfg2 = clearRoute(config, "claude", "small");
-    const out = buildAgentProviderEnv("claude", cfg2, {
+    const out = await buildAgentProviderEnv("claude", cfg2, {
       proxyStatus: () => routeProbe(cfg2),
     });
     assert.equal(out.env.ANTHROPIC_MODEL, MAIN_ALIAS);
@@ -94,7 +94,7 @@ try {
   {
     config = setCurrentProvider(config, "claude", "minimax");
     // Note: routes still point at deepseek.
-    const out = buildAgentProviderEnv("claude", config, {
+    const out = await buildAgentProviderEnv("claude", config, {
       proxyStatus: () => routeProbe(config),
     });
     assert.equal(out.env.ANTHROPIC_MODEL, MAIN_ALIAS);
@@ -103,7 +103,7 @@ try {
 
   // ---- (6) Provider mode (legacy) proxy is rejected: Claude requires route mode. ----
   {
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", config, {
         proxyStatus: () => ({
           state: "running",
@@ -119,7 +119,7 @@ try {
 
   // ---- (7) Route-mode proxy running but routes hash is stale → throws. ----
   {
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", config, {
         proxyStatus: () => ({
           state: "running",
@@ -136,7 +136,7 @@ try {
 
   // ---- (8) Proxy not installed → throws with the "install" hint. ----
   {
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", config, {
         proxyStatus: () => ({ state: "not-installed" }),
       }),
@@ -146,7 +146,7 @@ try {
 
   // ---- (9) Proxy stopped → throws with the "start" hint. ----
   {
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("claude", config, {
         proxyStatus: () => ({ state: "stopped" }),
       }),
@@ -157,7 +157,7 @@ try {
   // ---- (10) codex: route-mode only (Stage 8.0). No routes.codex.main →
   // PROVIDER_UNSUPPORTED. No legacy currentProvider.codex fallback. ----
   {
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("codex", config),
       (err) => err.code === "PROVIDER_UNSUPPORTED" && /routes\.codex\.main/.test(err.message),
     );
@@ -167,7 +167,7 @@ try {
   {
     const codexConfig = setRoute(config, "codex", "main",
       { provider: "deepseek", model: "deepseek-chat" });
-    const out = buildAgentProviderEnv("codex", codexConfig, {
+    const out = await buildAgentProviderEnv("codex", codexConfig, {
       proxyStatus: () => ({
         state: "running",
         port: 40123,
@@ -186,7 +186,7 @@ try {
   {
     const codexConfig = setRoute(config, "codex", "main",
       { provider: "deepseek", model: "deepseek-chat" });
-    assert.throws(
+    await assert.rejects(
       () => buildAgentProviderEnv("codex", codexConfig, {
         proxyStatus: () => ({
           state: "running",
@@ -209,7 +209,7 @@ try {
   //
   // Seed an originrouter provider, write a valid managed coding key via
   // writeCodingAuth, and assert the env vars are derived from
-  // DEFAULT_ORIGINROUTER_BASE_URL ("https://server.originrouter.com").
+  // DEFAULT_ORIGINROUTER_BASE_URL ("https://server.easytransnote.com").
 
   // helper: write a well-formed managed key matching isManagedKeyShape
   function seedManagedKey(home, overrides = {}) {
@@ -245,11 +245,11 @@ try {
       { provider: "official", model: "claude-sonnet-4-6" });
     seedManagedKey(home);
     // proxyStatus returning "stopped" must NOT block originrouter direct.
-    const out = buildAgentProviderEnv("claude", configRouted, {
+    const out = await buildAgentProviderEnv("claude", configRouted, {
       proxyStatus: () => ({ state: "stopped" }),
     });
     assert.equal(out.source, "originrouter-coding");
-    assert.equal(out.env.ANTHROPIC_BASE_URL, "https://server.originrouter.com/coding");
+    assert.equal(out.env.ANTHROPIC_BASE_URL, "https://server.easytransnote.com/coding");
     assert.equal(out.env.ANTHROPIC_API_KEY, "sk-or-v1-ok-test-key");
     assert.equal(out.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
     // small falls back to main
@@ -270,7 +270,7 @@ try {
       { provider: "official-codex", model: "gpt-5-codex" });
     // coding-key.json from case 13 is still on disk; that's fine — both
     // agents read the same file.
-    const out = buildAgentProviderEnv("codex", codexRouted, {
+    const out = await buildAgentProviderEnv("codex", codexRouted, {
       proxyStatus: () => ({ state: "stopped" }),
     });
     assert.equal(out.source, "originrouter-coding");

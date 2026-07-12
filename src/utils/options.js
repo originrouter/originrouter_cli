@@ -29,6 +29,15 @@ export function parseOptions(args) {
       index += 1;
       continue;
     }
+    if (item === "--bind") {
+      options.bind = args[index + 1];
+      index += 1;
+      continue;
+    }
+    if (item === "--allow-lan") {
+      options.allowLan = true;
+      continue;
+    }
     rest.push(item);
   }
 

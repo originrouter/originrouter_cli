@@ -49,10 +49,29 @@ const ALIASES = Object.freeze({
   "codex":       "originrouter-codex-model",
 });
 
-// Stage 9.0: the official originrouter server. Used when a
-// provider record's `baseUrl` is null/undefined. Exported so the
-// resolver and the env builder share one source of truth.
-export const DEFAULT_ORIGINROUTER_BASE_URL = "https://server.originrouter.com";
+// Stage 9.0/9.7: the official originrouter coding API gateway.
+// Used when a provider record's `baseUrl` is null/undefined.
+//
+// Stage 9.7 deployment reality: the API gateway and the H5
+// authorize page live on DIFFERENT domains. The API gateway
+// runs on `server.easytransnote.com` (this URL); the H5 page
+// runs on `originrouter.com` (configured separately via
+// `DEFAULT_ORIGINROUTER_H5_BASE_URL` below + the
+// `--login-url` / `ORIGINROUTER_LOGIN_URL` overrides).
+//
+export const DEFAULT_ORIGINROUTER_BASE_URL = "https://server.easytransnote.com";
+
+// Stage 10: the unified App/CLI control plane. Keep this separate
+// from DEFAULT_ORIGINROUTER_BASE_URL so auth/control migration does
+// not accidentally move /coding/v1 model traffic.
+export const DEFAULT_ORIGINROUTER_CONTROL_BASE_URL = "https://app.easytransnote.com";
+
+// Stage 9.7: the H5 device-authorize page. The CLI opens this
+// URL in the user's browser during `originrouter login` so the
+// user can review + approve the device. Independent from the
+// API gateway (different host). Override via --login-url or
+// ORIGINROUTER_LOGIN_URL.
+export const DEFAULT_ORIGINROUTER_H5_BASE_URL = "https://originrouter.com";
 
 /**
  * Pure: given a provider type, runtime, and (optional) explicit

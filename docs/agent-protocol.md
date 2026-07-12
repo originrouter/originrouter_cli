@@ -608,15 +608,15 @@ The event names in §2.3 are stable in v1. Renames (e.g. `agent.permission.reque
 
 ## 7. Daemon local API (Stage 3)
 
-`originrouter daemon` runs an HTTP API bound to **127.0.0.1 only**. This is the same-process control surface for the local OriginRouter daemon — what Flutter App / browser test pages consume when running on the same machine as the daemon.
+`originrouter daemon` runs an HTTP API bound to **127.0.0.1 by default**. This is the same-process control surface for the local OriginRouter daemon — what Flutter App / browser test pages consume when running on the same machine as the daemon.
 
-The API binds 127.0.0.1 (no LAN exposure). CORS is permissive (`Access-Control-Allow-Origin: *`). All of this is acceptable for the local-only deployment; production-grade security is Stage 6.
+The default path is local-only. Loopback requests are trusted as same-machine control and do not require the bearer token. LAN exposure requires the operator to pass a non-loopback `--bind` value plus `--allow-lan`. CORS is permissive (`Access-Control-Allow-Origin: *`), so non-loopback sensitive writes are protected by the bearer-token gate below.
 
 > **apiKey rule (Stage 5).** `PUT /providers/:name` accepts an empty `apiKey` to mean "keep the current key". There is no way to clear a key in v1 other than delete + re-add. The server never returns the raw key — only the masked form from `summarizeProvider()`.
 
 ### 7.1 Local API authentication (Stage 6)
 
-All write endpoints require a bearer token. Read endpoints (`GET /local/status`, `GET /health/liveliness`, `GET /local/auth/challenge`) are public. **`GET /proxy/logs` is also authenticated** because the log file may contain user PII / API keys.
+Loopback write endpoints do not require a bearer token. Non-loopback write endpoints require a bearer token. Read endpoints (`GET /local/status`, `GET /health/liveliness`, `GET /local/auth/challenge`) are public. **`GET /proxy/logs` is also bearer-protected for non-loopback requests** because the log file may contain user PII / API keys.
 
 **Token file**: `~/.originrouter/local-api.token` (mode 0o600). Contains a single 64-hex-char string. Auto-generated on first daemon start. Rotate with `originrouter token rotate`.
 
@@ -626,6 +626,7 @@ All write endpoints require a bearer token. Read endpoints (`GET /local/status`,
 - `GET /local/auth/challenge` (public) returns `{ ok, authRequired, tokenFile }`. Used by the browser to detect "no-daemon" vs "token-mismatch" without leaking the token.
 - `originrouter daemon print-url` prints the full URL with the token inlined.
 - `originrouter token rotate` mints a new token and prints the new full URL.
+- `originrouter local key show` is an alias for `originrouter token show`; `originrouter local key rotate` is an alias for `originrouter token rotate`.
 
 **Error responses**:
 | Status | Body | When |
@@ -646,11 +647,12 @@ All 401/403 responses include `WWW-Authenticate: Bearer realm="originrouter-loca
 A Flutter client running on the same machine as the daemon discovers the local API via this exact sequence:
 
 1. Read `~/.originrouter/daemon.state.json` to get `localApiPort`.
-2. Read `~/.originrouter/local-api.token` (mode 0o600) to get the token.
-3. Read `~/.originrouter/device.json` to get `deviceId`.
-4. Read `~/.originrouter/daemon.state.json.relayUrl` for the relay URL.
-5. Construct the API base: `http://127.0.0.1:<localApiPort>`.
-6. Send `Authorization: Bearer <token>` on every write.
+2. Read `~/.originrouter/device.json` to get `deviceId`.
+3. Read `~/.originrouter/daemon.state.json.relayUrl` for the relay URL.
+4. Construct the API base: `http://127.0.0.1:<localApiPort>`.
+5. For loopback control, send writes without a bearer token. For LAN control, read `~/.originrouter/local-api.token` (mode 0o600) and send `Authorization: Bearer <token>`.
+
+`daemon.state.json` also includes `localApiBindAddress`, `localApiBaseUrl`, `localApiTokenPath`, `localApiAuthMode`, `localApiLanEnabled`, and `localApiDefaultPort` so native clients do not need to guess the port or bind mode.
 
 The `deviceId` and `relayUrl` are also reported in `GET /local/status` (`daemon.deviceId`, `relay.url`), so a client that already has a working token can refresh them from the API.
 
@@ -672,31 +674,33 @@ The `lastExitReason` field on `GET /proxy/status` is one of `"crashed"` / `"stop
 | GET | `/local/status` | `{ ok, daemon: { pid, version, deviceId, startedAt, uptimeSeconds, port }, relay: { url, connected }, proxy: { state, port, version, pid, currentProvider, startedAt, configPath, logPath, lastExitReason, lastExitCode, lastExitSignal, lastExitAt, note? } } | Public. The nested `proxy` field is the real `ctx.getProxyStatus()` shape (Stage 4+). |
 | GET | `/local/auth/challenge` | `{ ok: true, authRequired: true, tokenFile: string }` | **Stage 6.** Public probe. Returns 200 with the token file path so a client can detect "no-daemon" vs "token-mismatch" without leaking secrets. |
 | GET | `/catalog/litellm-providers` | `{ ok, providers: LiteLLMProfile[] }` | **Stage 7.** Public. Returns the static 34-entry catalog (id, label, prefix, modelPlaceholder, litellmParams, fields[], flags?, help?). Documented exception to Stage 6 deny-by-default; see §9.5. |
-| GET | `/proxy/logs?tail=200` | `{ ok, path, lines, content }` | **Stage 6.** Returns the last N lines of the proxy log. `tail` defaults to 200, max 2000. 1 MiB read cap (last 1 MiB if the file is larger). 404 if no `logPath` in `proxy.state.json`. 400 if `tail` is not a positive integer. **Requires bearer token** (logs may contain PII). |
+| GET | `/proxy/logs?tail=200` | `{ ok, path, lines, content }` | **Stage 6.** Returns the last N lines of the proxy log. `tail` defaults to 200, max 2000. 1 MiB read cap (last 1 MiB if the file is larger). 404 if no `logPath` in `proxy.state.json`. 400 if `tail` is not a positive integer. **Requires bearer token for non-loopback requests** (logs may contain PII). |
 | GET | `/providers` | `{ ok, providers: ProviderSummary[] }` | List all providers with masked apiKey. Each entry has a `current: { claude, codex }` map. |
 | GET | `/providers/:name` | `{ ok, provider: ProviderSummary }` | Single provider. 404 if not found. |
-| POST | `/providers` | `{ ok, provider: ProviderSummary, warnings?: Warning[] }` | **Stage 5.** Body: `{ name, type, baseUrl, apiKey, model, smallFastModel?, litellmProvider?, apiVersion?, awsRegion?, awsAccessKeyId?, awsSecretAccessKey?, awsSessionToken?, awsProfileName?, vertexProject?, vertexLocation?, googleApplicationCredentials?, hfToken? }`. `type` must be `anthropic` or `litellm`. **Stage 7:** `type=openai-compatible` returns 400 with migration message. 400 on validation, 409 on duplicate name, 500 on read/write failure. **Stage 6: requires bearer token.** |
-| PUT | `/providers/:name` | `{ ok, provider: ProviderSummary, warnings?: Warning[] }` | **Stage 5.** Same body shape as POST, all fields optional. `apiKey: ""` keeps current. **Stage 7:** legacy `openai-compatible` records auto-migrate to `litellm/custom_openai` unless the patch carries `type=openai-compatible` explicitly. `smallFastModel` on a litellm record is dropped and emitted as a `warnings[]` entry. **Stage 6: requires bearer token.** |
-| DELETE | `/providers/:name` | `{ ok, removed: string }` | **Stage 5.** 404 if name missing. **Stage 6: requires bearer token.** |
-| POST | `/providers/use` | `{ ok, current, setProvider, setAgent, forced }` | Body: `{ name, agent, force? }`. 409 if openai-compatible + claude without force. **Stage 6: requires bearer token.** |
+| POST | `/providers` | `{ ok, provider: ProviderSummary, warnings?: Warning[] }` | **Stage 5.** Body: `{ name, type, baseUrl, apiKey, model, smallFastModel?, litellmProvider?, apiVersion?, awsRegion?, awsAccessKeyId?, awsSecretAccessKey?, awsSessionToken?, awsProfileName?, vertexProject?, vertexLocation?, googleApplicationCredentials?, hfToken? }`. `type` must be `anthropic` or `litellm`. **Stage 7:** `type=openai-compatible` returns 400 with migration message. 400 on validation, 409 on duplicate name, 500 on read/write failure. **Stage 6: requires bearer token for non-loopback requests.** |
+| PUT | `/providers/:name` | `{ ok, provider: ProviderSummary, warnings?: Warning[] }` | **Stage 5.** Same body shape as POST, all fields optional. `apiKey: ""` keeps current. **Stage 7:** legacy `openai-compatible` records auto-migrate to `litellm/custom_openai` unless the patch carries `type=openai-compatible` explicitly. `smallFastModel` on a litellm record is dropped and emitted as a `warnings[]` entry. **Stage 6: requires bearer token for non-loopback requests.** |
+| DELETE | `/providers/:name` | `{ ok, removed: string }` | **Stage 5.** 404 if name missing. **Stage 6: requires bearer token for non-loopback requests.** |
+| POST | `/providers/use` | `{ ok, current, setProvider, setAgent, forced }` | Body: `{ name, agent, force? }`. 409 if openai-compatible + claude without force. **Stage 6: requires bearer token for non-loopback requests.** |
 | GET | `/proxy/status` | `{ state, port, version, pid, currentProvider, startedAt, configPath, logPath, lastExitReason, lastExitCode, lastExitSignal, lastExitAt, note? }` | **Stage 4 + Stage 6.** Public. `lastExitReason` is `"crashed"` / `"stopped"` / `null`. |
-| POST | `/proxy/start` | `{ ok, state: "running", port, pid, provider, version, configPath, logPath }` | **Stage 4.** Body: `{ provider, port }`. 400 on bad input, 409 if already running, 409 if not installed. **Stage 6: requires bearer token.** |
-| POST | `/proxy/stop` | `{ ok, state: "stopped", pid }` | **Stage 4.** Idempotent. **Stage 6: requires bearer token.** |
-| POST | `/proxy/restart` | `{ ok, state: "running", ... }` | **Stage 4.** **Stage 6: requires bearer token.** |
+| POST | `/proxy/start` | `{ ok, state: "running", port, pid, provider, version, configPath, logPath }` | **Stage 4.** Body: `{ provider, port }`. 400 on bad input, 409 if already running, 409 if not installed. **Stage 6: requires bearer token for non-loopback requests.** |
+| POST | `/proxy/stop` | `{ ok, state: "stopped", pid }` | **Stage 4.** Idempotent. **Stage 6: requires bearer token for non-loopback requests.** |
+| POST | `/proxy/restart` | `{ ok, state: "running", ... }` | **Stage 4.** **Stage 6: requires bearer token for non-loopback requests.** |
 | GET | `/sessions` | `{ ok, sessions: SessionView[] }` | Public. Live sessions from `SessionManager.sessions`. |
-| POST | `/sessions/:id/input` | `{ ok, sessionId, action: "input" }` | Body: `{ data: string }`. **Stage 6: requires bearer token.** |
-| POST | `/sessions/:id/interrupt` | `{ ok, sessionId, action: "interrupt" }` | **Stage 6: requires bearer token.** |
-| POST | `/sessions/:id/permission` | `{ ok, sessionId, action: "permission" }` | Body: `{ callId, decision, data? }`. **Stage 6: requires bearer token.** |
+| POST | `/sessions/:id/input` | `{ ok, sessionId, action: "input" }` | Body: `{ data: string }`. **Stage 6: requires bearer token for non-loopback requests.** |
+| POST | `/sessions/:id/interrupt` | `{ ok, sessionId, action: "interrupt" }` | **Stage 6: requires bearer token for non-loopback requests.** |
+| POST | `/sessions/:id/permission` | `{ ok, sessionId, action: "permission" }` | Body: `{ callId, decision, data? }`. **Stage 6: requires bearer token for non-loopback requests.** |
 
 All write endpoints (`/sessions/:id/{input,interrupt,permission}`) call **`sessionManager.handleEvent(payload)` directly** — the same entry point the daemon uses when handling events from the relay. They do NOT route through `relayClient.send()`. The local API runs in the same process as the session manager; routing through the relay would loop back through `connectEvents` SSE and cost a round trip for nothing.
 
 ### Discovery
 
-`originrouter daemon` writes `localApiPort` to `~/.originrouter/daemon.state.json`. The CLI command `originrouter daemon-port` reads the file and prints `http://127.0.0.1:<port>`. Browser clients accept the URL as `?daemon=127.0.0.1:<port>` query param. The local API port is OS-assigned by default; pin it with `--local-port <p>` on the daemon command line.
+`originrouter daemon` writes `localApiPort` to `~/.originrouter/daemon.state.json`. The CLI command `originrouter daemon-port` reads the file and prints `http://<host>:<port>`. Browser clients accept the URL as `?daemon=127.0.0.1:<port>` query param. The local API tries port `7437` by default and falls back to an OS-assigned port when that default is busy. Pin it with `--local-port <p>` on the daemon command line.
+
+Persisted local defaults live in `~/.originrouter/local-api.json` and can be changed with `originrouter local config set --port 7437 --bind 127.0.0.1 --allow-lan off`. The access key is intentionally stored separately in `~/.originrouter/local-api.token`.
 
 ### Bind safety
 
-`startLocalApi()` rejects any `bindAddress` not in `{127.0.0.1, ::1, localhost}` BEFORE attempting to listen. This guard exists so a future internal caller cannot accidentally open the daemon to the LAN. Tests assert that `0.0.0.0`, `192.168.x.x`, etc. all throw.
+`startLocalApi()` rejects any `bindAddress` not in `{127.0.0.1, ::1, localhost}` BEFORE attempting to listen unless the caller explicitly opts into LAN control. `originrouter daemon --bind 0.0.0.0 --allow-lan` is the intended advanced LAN mode. Non-loopback mode never disables bearer-token authentication; direct public-internet exposure is not recommended. Account-authorized bridge/relay remains the production path for remote control.
 
 ### CORS
 

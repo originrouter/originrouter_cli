@@ -1,19 +1,17 @@
-// Stage 9.2.1 — 3-process happy-path + 5 negative smokes against the
-// real spawned `originrouter-server`.
+// Stage 9.2.1 — 3-process happy-path + 5 negative smokes against a
+// WebSocket relay with the unified /relay/v1/* contract.
 //
-// §B: happy path (real relay + fake worker + real bridge).
+// §B: happy path (relay + fake worker + real bridge).
 // §C: worker offline / worker 5xx / worker timeout / caller abort /
 //     relay disconnect.
 //
-// The real relay is spawned via `node ../originrouter-server/src/server.js`.
 // The fake worker is a `node:http` server on 127.0.0.1:0 that runs the
 // scripted response. The bridge is the real `RemoteCodingRelayProxy`
 // from src/runtime/remoteCodingRelayProxy.js.
 
-import { spawn } from "node:child_process";
-import { once } from "node:events";
 import assert from "node:assert/strict";
 import http from "node:http";
+import WebSocket, { WebSocketServer } from "ws";
 import { RemoteCodingRelayProxy } from "../src/runtime/remoteCodingRelayProxy.js";
 
 const RELAY_PORT = 38787 + Math.floor(Math.random() * 1000);
@@ -21,47 +19,126 @@ const REMOTE_CODING_TIMEOUT_MS = "600"; // for the timeout sub-case
 
 function startRelay() {
   return new Promise((resolve, reject) => {
-    const proc = spawn(
-      "node",
-      ["../originrouter-server/src/server.js"],
-      {
-        cwd: new URL("..", import.meta.url).pathname,
-        env: {
-          ...process.env,
-          PORT: String(RELAY_PORT),
-          REMOTE_CODING_TIMEOUT_MS,
-          ORIGINROUTER_RELAY_AUTH: "off",
-        },
-        stdio: ["ignore", "pipe", "pipe"],
+    const devices = new Map();
+    const remoteRequests = new Map();
+
+    const sendToDevice = (deviceId, payload) => {
+      const sockets = devices.get(deviceId);
+      if (!sockets || sockets.size === 0) return false;
+      for (const ws of sockets) {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
       }
-    );
-    let started = false;
-    proc.stdout.on("data", (chunk) => {
-      if (chunk.toString("utf8").includes("listening")) started = true;
-    });
-    proc.stderr.on("data", (chunk) => process.stderr.write(chunk));
-    let tries = 0;
-    const tick = async () => {
-      if (started) return resolve(proc);
-      if (++tries > 50) {
-        proc.kill();
-        return reject(new Error("relay did not start in time"));
-      }
-      await new Promise((r) => setTimeout(r, 50));
-      return tick();
+      return true;
     };
-    tick();
+
+    const handleRemote = (senderDeviceId, payload) => {
+      if (payload.type === "remote.coding.request") {
+        const targetDeviceId = payload.targetDeviceId;
+        const requestId = payload.requestId;
+        if (!sendToDevice(targetDeviceId, payload)) {
+          sendToDevice(senderDeviceId, {
+            type: "remote.coding.response.error",
+            requestId,
+            code: "target_offline",
+            message: "worker is not online on the relay",
+          });
+          return { accepted: false, reason: "target_offline" };
+        }
+        remoteRequests.set(requestId, { callerDeviceId: senderDeviceId, targetDeviceId });
+        setTimeout(() => {
+          const rec = remoteRequests.get(requestId);
+          if (!rec) return;
+          remoteRequests.delete(requestId);
+          sendToDevice(rec.callerDeviceId, {
+            type: "remote.coding.response.error",
+            requestId,
+            code: "timeout",
+            message: "timed out",
+          });
+        }, Number(REMOTE_CODING_TIMEOUT_MS));
+        return { accepted: true };
+      }
+      if (payload.type === "remote.coding.request.cancel") {
+        const rec = remoteRequests.get(payload.requestId);
+        if (rec) {
+          remoteRequests.delete(payload.requestId);
+          sendToDevice(rec.targetDeviceId, payload);
+        }
+        return { accepted: Boolean(rec) };
+      }
+      if (typeof payload.type === "string" && payload.type.startsWith("remote.coding.response.")) {
+        const rec = remoteRequests.get(payload.requestId);
+        if (!rec) return { accepted: false, reason: "unknown_request" };
+        sendToDevice(rec.callerDeviceId, payload);
+        if (payload.type === "remote.coding.response.end" || payload.type === "remote.coding.response.error") {
+          remoteRequests.delete(payload.requestId);
+        }
+        return { accepted: true };
+      }
+      return { accepted: false, reason: "unsupported" };
+    };
+
+    const server = http.createServer((req, res) => {
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/relay/v1/messages") {
+        const chunks = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          const wrapper = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+          const payload = wrapper.payload || wrapper;
+          const sender = payload.sourceDeviceId || payload.deviceId || payload.device_id || "unknown";
+          const result = handleRemote(sender, payload);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ code: 0, data: result }));
+        });
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false }));
+    });
+    const wss = new WebSocketServer({ noServer: true });
+    server.on("upgrade", (req, socket, head) => {
+      if (!req.url?.startsWith("/relay/v1/devices/")) {
+        socket.destroy();
+        return;
+      }
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        const deviceId = decodeURIComponent(req.url.split("/")[4] || "");
+        if (!devices.has(deviceId)) devices.set(deviceId, new Set());
+        devices.get(deviceId).add(ws);
+        ws.send(JSON.stringify({ type: "device.connected", device_id: deviceId }));
+        ws.on("message", (raw) => {
+          const payload = JSON.parse(String(raw));
+          const result = handleRemote(deviceId, payload);
+          ws.send(JSON.stringify({ type: "ack", received_type: payload.type, ...result }));
+        });
+        ws.on("close", () => {
+          const sockets = devices.get(deviceId);
+          if (sockets) sockets.delete(ws);
+          if (sockets && sockets.size === 0) devices.delete(deviceId);
+        });
+      });
+    });
+    server.once("error", reject);
+    server.listen(RELAY_PORT, "127.0.0.1", () => resolve({ server, wss }));
   });
 }
 
-function killRelay(proc) {
+function killRelay(relay) {
   return new Promise((resolve) => {
-    proc.once("exit", () => resolve());
-    proc.kill();
-    setTimeout(() => {
-      try { proc.kill("SIGKILL"); } catch {}
-      resolve();
-    }, 1500);
+    try {
+      for (const client of relay.wss.clients) client.terminate();
+      relay.wss.close();
+    } catch {}
+    relay.server.close(() => resolve());
+    if (typeof relay.server.closeAllConnections === "function") {
+      try { relay.server.closeAllConnections(); } catch {}
+    }
+    setTimeout(resolve, 200);
   });
 }
 
@@ -85,11 +162,11 @@ function closeWorker(server) {
 function startFakeWorker(deviceId, script) {
   // script({ req, res, aborted }) is called per request to the mock
   // LiteLLM proxy. We also run a tiny "worker daemon" inside this
-  // process: it opens an SSE connection to the relay's
-  // /device/events?deviceId=<deviceId>, parses incoming
+  // process: it opens a WebSocket connection to the relay's
+  // /relay/v1/devices/<deviceId>/ws, parses incoming
   // remote.coding.request events, calls the local proxy via
   // `script`, and publishes remote.coding.response.* events back
-  // through the relay via POST /device/message.
+  // through the same WebSocket.
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       const aborted = new Promise((r) => { req.on("aborted", () => r("aborted")); });
@@ -97,32 +174,16 @@ function startFakeWorker(deviceId, script) {
     });
     server.unref();
     server.listen(0, "127.0.0.1", () => {
-      const { port, address } = server.address();
+      const { port } = server.address();
       const localProxyUrl = `http://127.0.0.1:${port}`;
 
-      // Open SSE to the relay as the worker device.
+      // Open WebSocket to the relay as the worker device.
       const activeFetches = new Map(); // requestId -> AbortController
 
-      const sseReq = http.request(
-        {
-          host: "127.0.0.1",
-          port: RELAY_PORT,
-          path: `/device/events?deviceId=${encodeURIComponent(deviceId)}`,
-          method: "GET",
-        },
-        (sseRes) => {
-          let buf = "";
-          sseRes.setEncoding("utf8");
-          sseRes.on("data", (chunk) => {
-            buf += chunk;
-            let idx;
-            while ((idx = buf.indexOf("\n\n")) >= 0) {
-              const block = buf.slice(0, idx);
-              buf = buf.slice(idx + 2);
-              const dataLine = block.split("\n").find((l) => l.startsWith("data:"));
-              if (!dataLine) continue;
+      const workerWs = new WebSocket(`ws://127.0.0.1:${RELAY_PORT}/relay/v1/devices/${encodeURIComponent(deviceId)}/ws`);
+      workerWs.on("message", (raw) => {
               let evt;
-              try { evt = JSON.parse(dataLine.slice(5).trim()); } catch { continue; }
+              try { evt = JSON.parse(String(raw)); } catch { return; }
               if (evt?.type === "remote.coding.request") {
                 const controller = new AbortController();
                 activeFetches.set(evt.requestId, controller);
@@ -144,27 +205,12 @@ function startFakeWorker(deviceId, script) {
                   try { controller.abort(); } catch {}
                 }
               }
-            }
-          });
-        }
-      );
-      sseReq.on("error", () => {});
-      sseReq.end();
+      });
 
       function publishWorkerEvent(payload) {
-        const data = JSON.stringify(payload);
-        const r = http.request(
-          {
-            host: "127.0.0.1",
-            port: RELAY_PORT,
-            path: "/device/message",
-            method: "POST",
-            headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) },
-          },
-          (res) => { res.resume(); }
-        );
-        r.on("error", () => {});
-        r.end(data);
+        if (workerWs.readyState === WebSocket.OPEN) {
+          workerWs.send(JSON.stringify(payload));
+        }
       }
 
       async function handleWorkerRequest(envelope, localProxyUrl, signal) {
@@ -234,11 +280,13 @@ function startFakeWorker(deviceId, script) {
         }
       }
 
-      resolve({
-        server,
-        port,
-        url: localProxyUrl,
-        closeSse: () => { try { sseReq.destroy(); } catch {} },
+      workerWs.once("open", () => {
+        resolve({
+          server,
+          port,
+          url: localProxyUrl,
+          closeSse: () => { try { workerWs.close(); } catch {} },
+        });
       });
     });
   });
@@ -404,8 +452,8 @@ try {
   // activity (the cancel is best-effort and may or may not be in
   // the ring — the strongest signal is that the bridge published
   // it; we verify by looking at the relay's per-request state
-  // indirectly: the bridge publishes, the relay forwards, the
-  // worker's SSE receives a remote.coding.request.cancel event).
+    // indirectly: the bridge publishes, the relay forwards, the
+    // worker's WebSocket receives a remote.coding.request.cancel event).
   //
   // We don't wait for a clean response from the bridge here; the
   // fake worker's shim doesn't react to cancels, so the response
@@ -422,9 +470,9 @@ try {
     console.log("[smoke] C.4 worker ready");
     let workerCancelSeen = false;
     let workerCancelRequestId = null;
-    // We attach a second SSE observer on the worker's stream: we
-    // also open /device/events from a third "spy" device to read
-    // EVERYTHING the relay broadcasts. But the relay only sends
+    // We attach a second WebSocket observer on the worker's stream:
+    // a third "spy" device would not receive EVERYTHING the relay
+    // broadcasts, because the relay only sends
     // remote.coding.* events to the worker, not to a spy. So we
     // instrument the existing sseReq in startFakeWorker? It's
     // captured in a closure; not easy to inspect.

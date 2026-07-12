@@ -1,10 +1,13 @@
-// Stage 9.1A: tests for src/auth/originrouterLogin.js.
+// Stage 9.7: tests for src/auth/originrouterLogin.js.
 //
-// Covers loginWithManualCode, loginWithCallback, openBrowser.
-// Mocks the global `fetch`. For openBrowser, we patch
-// `child_process.spawn` via the module cache so we can capture
-// the (cmd, argv) shape per platform without actually launching
-// a browser.
+// Covers loginUrlFor, loginWithDeviceFlow (RFC 8628), openBrowser.
+// Mocks the global `fetch` for the URL derivation test, and runs
+// a real local mock HTTP server for the device-flow tests (so the
+// polling loop exercises actual network code paths).
+//
+// openBrowser is tested via introspection (no actual browser launch)
+// and the unknown-platform branch (which prints the URL and
+// resolves).
 
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -80,6 +83,28 @@ function okJson(body) {
   };
 }
 
+// Stage 9.7: device-flow tests below use real fetch against a local
+// HTTP server. The legacy installFetchMock() above replaces
+// globalThis.fetch with a stub — restore the real fetch before any
+// device-flow test so it can talk to 127.0.0.1.
+function _restoreNativeFetch() {
+  // Node 18+ exposes fetch as a global; if installFetchMock has
+  // replaced it, deleting the property + re-importing from
+  // node:undici would be heavy. Simpler: install a thin pass-through
+  // that calls the real fetch by capturing it BEFORE the first
+  // installFetchMock. We snapshot it lazily on first device-flow
+  // test.
+  if (!_restoreNativeFetch._cached) {
+    // Temporarily unset our stub by calling installFetchMock with
+    // a no-op that returns undefined → caller falls through to
+    // ... actually, the cleanest path is to save the original
+    // globalThis.fetch right after Node bootstraps. We do that
+    // at module load time below.
+  }
+  globalThis.fetch = _restoreNativeFetch._cached;
+}
+_restoreNativeFetch._cached = globalThis.fetch;
+
 function hitCallback(url) {
   return new Promise((resolve, reject) => {
     const req = http.get(url, (res) => {
@@ -93,181 +118,47 @@ function hitCallback(url) {
 const cases = [];
 
 cases.push({
-  name: "loginUrlFor derives /originrouter/login from apiBaseUrl",
+  name: "loginUrlFor derives /cli/authorize from apiBaseUrl",
   run: () => {
     assert.equal(
       loginMod.loginUrlFor("https://server.example.com"),
-      "https://server.example.com/originrouter/login",
+      "https://server.example.com/cli/authorize",
     );
     assert.equal(
       loginMod.loginUrlFor("https://server.example.com/"),
-      "https://server.example.com/originrouter/login",
+      "https://server.example.com/cli/authorize",
     );
   },
 });
 
+// Stage 9.7: loginWithCallback tests removed along with the
+// loginWithCallback function (the browser-callback path was
+// retired — the device flow tests below cover all behavior the
+// CLI actually uses).
+
 cases.push({
-  name: "loginWithManualCode calls exchange and returns payload",
-  run: async () => {
-    const expected = {
-      device_id: "d1",
-      device_grant: "raw",
-      device_grant_id: "g1",
-      managed_coding_key: "sk-or-xyz",
-      managed_coding_key_id: "k1",
-      managed_coding_key_expires_at: 1700000000,
-      device_grant_idle_expires_at: 1707600000,
-      device_grant_absolute_expires_at: 1731456000,
-      scopes: ["coding"],
-      source: "originrouter_cli",
-    };
-    installFetchMock(() => okJson(expected));
-    const out = await loginMod.loginWithManualCode({
-      apiBaseUrl: "https://server.example.com",
-      code: "ABC",
-      deviceId: "d1",
-      deviceName: "n",
-      source: "originrouter_cli",
-    });
-    assert.equal(out.managed_coding_key_id, "k1");
+  name: "openBrowser is exported and is a function",
+  run: () => {
+    assert.equal(typeof loginMod.openBrowser, "function");
   },
 });
 
 cases.push({
-  name: "loginWithManualCode propagates exchange errors",
+  name: "openBrowser source dispatches per platform (introspected)",
   run: async () => {
-    installFetchMock(() => ({
-      ok: false, status: 400,
-      headers: { get: () => "application/json" },
-      json: async () => ({ code: "invalid_code", message: "bad" }),
-    }));
-    let thrown = null;
-    try {
-      await loginMod.loginWithManualCode({
-        apiBaseUrl: "https://server.example.com", code: "x",
-        deviceId: "d", deviceName: "n", source: "originrouter_cli",
-      });
-    } catch (e) {
-      thrown = e;
-    }
-    assert.ok(thrown, "expected throw");
-    assert.equal(thrown.status, 400);
-  },
-});
-
-cases.push({
-  name: "loginWithCallback returns exchange payload on good callback",
-  run: async () => {
-    const expected = {
-      device_id: "d1",
-      device_grant: "raw",
-      device_grant_id: "g1",
-      managed_coding_key: "sk-or-xyz",
-      managed_coding_key_id: "k1",
-      managed_coding_key_expires_at: 1700000000,
-      device_grant_idle_expires_at: 1707600000,
-      device_grant_absolute_expires_at: 1731456000,
-      scopes: ["coding"],
-      source: "originrouter_cli",
-    };
-    let lastUrl;
-    installFetchMock((url) => { lastUrl = url; return okJson(expected); });
-    let openedUrl = null;
-    const promise = loginMod.loginWithCallback({
-      apiBaseUrl: "https://server.example.com",
-      loginUrl: "https://login.example.com",
-      deviceId: "d-1",
-      deviceName: "Test",
-      source: "originrouter_cli",
-      timeoutMs: 5000,
-      openBrowserFn: async (url) => { openedUrl = url; },
-    });
-    await new Promise((r) => setTimeout(r, 50));
-    assert.ok(openedUrl, "openBrowser was called");
-    const u = new URL(openedUrl);
-    assert.equal(u.searchParams.get("originrouter_cli"), "1");
-    assert.equal(u.searchParams.get("device_id"), "d-1");
-    assert.equal(u.searchParams.get("device_name"), "Test");
-    assert.equal(u.searchParams.get("source"), "originrouter_cli");
-    assert.ok(u.searchParams.get("redirect_uri").includes("/originrouter/login/callback"));
-    const state = u.searchParams.get("state");
-    const redirectUri = u.searchParams.get("redirect_uri");
-    await hitCallback(`${redirectUri}?code=XYZ&state=${state}`);
-    const out = await promise;
-    assert.equal(out.managed_coding_key_id, "k1");
-    assert.ok(lastUrl.endsWith("/originrouter/auth/device/exchange"));
-  },
-});
-
-cases.push({
-  name: "loginWithCallback rejects state mismatch",
-  run: async () => {
-    installFetchMock(() => okJson({}));
-    let openedUrl = null;
-    const promise = loginMod.loginWithCallback({
-      apiBaseUrl: "https://server.example.com",
-      loginUrl: "https://login.example.com",
-      deviceId: "d-1", deviceName: "Test",
-      source: "originrouter_cli", timeoutMs: 5000,
-      openBrowserFn: async (url) => { openedUrl = url; },
-    });
-    const captured = promise.then(
-      () => null,
-      (e) => e,
+    // Read the source code of openBrowser and verify each platform
+    // branch references the expected spawn command. This avoids
+    // actually launching a browser in the test environment while
+    // still catching refactors that change the dispatch.
+    const fs = await import("node:fs");
+    const url = await import("node:url");
+    const src = fs.readFileSync(
+      url.fileURLToPath(new URL("../src/auth/originrouterLogin.js", import.meta.url)),
+      "utf8",
     );
-    await new Promise((r) => setTimeout(r, 50));
-    const u = new URL(openedUrl);
-    const redirectUri = u.searchParams.get("redirect_uri");
-    await hitCallback(`${redirectUri}?code=XYZ&state=wrong-state`);
-    const thrown = await captured;
-    assert.ok(thrown, "expected throw on state mismatch");
-    assert.match(thrown.message, /state mismatch|missing code/i);
-  },
-});
-
-cases.push({
-  name: "openBrowser resolves gracefully on darwin even when `open` is missing",
-  run: async () => {
-    // We do not actually need to verify the spawn argv shape here
-    // — the implementation review locks that in. We assert the
-    // function never throws and resolves.
-    const origPlatform = process.platform;
-    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
-    try {
-      await loginMod.openBrowser("https://x.example.com");
-      // success: function resolved without throwing
-      assert.ok(true);
-    } finally {
-      Object.defineProperty(process, "platform", { value: origPlatform, configurable: true });
-    }
-  },
-});
-
-cases.push({
-  name: "openBrowser resolves gracefully on linux even when `xdg-open` is missing",
-  run: async () => {
-    const origPlatform = process.platform;
-    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
-    try {
-      await loginMod.openBrowser("https://x.example.com");
-      assert.ok(true);
-    } finally {
-      Object.defineProperty(process, "platform", { value: origPlatform, configurable: true });
-    }
-  },
-});
-
-cases.push({
-  name: "openBrowser resolves gracefully on win32 even when `cmd` is missing",
-  run: async () => {
-    const origPlatform = process.platform;
-    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-    try {
-      await loginMod.openBrowser("https://x.example.com");
-      assert.ok(true);
-    } finally {
-      Object.defineProperty(process, "platform", { value: origPlatform, configurable: true });
-    }
+    assert.match(src, /platform === "darwin"[\s\S]{0,200}cmd = "open"/);
+    assert.match(src, /platform === "linux"[\s\S]{0,200}cmd = "xdg-open"/);
+    assert.match(src, /platform === "win32"[\s\S]{0,200}cmd = "cmd"/);
   },
 });
 
@@ -285,6 +176,296 @@ cases.push({
     } finally {
       Object.defineProperty(process, "platform", { value: origPlatform, configurable: true });
       process.stderr.write = origWrite;
+    }
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Stage 9.7 — loginWithDeviceFlow (RFC 8628) tests.
+//
+// These tests run a mock gateway on 127.0.0.1 and exercise:
+//   1. mint a user_code (POST /device/code)
+//   2. poll /device/token — succeeds on the second poll after we
+//      simulate approval server-side.
+//   3. error branches: expired_token, access_denied, slow_down.
+// ---------------------------------------------------------------------------
+
+function startDeviceFlowMockBackend() {
+  const state = {
+    device_codes: {},
+    nextPollError: null,
+    approvedCodes: new Set(),
+    consumedCodes: new Set(),
+  };
+  function readJson(req) {
+    return new Promise((resolveBody, reject) => {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        if (!text) return resolveBody({});
+        try { resolveBody(JSON.parse(text)); }
+        catch { reject(new Error("bad json")); }
+      });
+      req.on("error", reject);
+    });
+  }
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.pathname === "/auth/v1/device/code" && req.method === "POST") {
+      const body = await readJson(req);
+      const userCode = "TESTCODE";  // deterministic for test assertions
+      state.device_codes[userCode] = {
+        device_id: body.device_id, source: body.source || "originrouter_cli",
+        expires_at: Math.floor(Date.now() / 1000) + 600,
+      };
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({
+        device_code: userCode, user_code: userCode,
+        device_id: body.device_id, source: body.source || "originrouter_cli",
+        verification_uri: "https://h5.test/cli/authorize",
+        verification_uri_complete: `https://h5.test/cli/authorize?user_code=${userCode}`,
+        expires_in: 600, interval: 5,
+      }));
+      return;
+    }
+    if (url.pathname === "/auth/v1/device/token" && req.method === "POST") {
+      const body = await readJson(req);
+      const userCode = body.device_code;
+      if (state.nextPollError) {
+        const code = state.nextPollError;
+        state.nextPollError = null;
+        res.statusCode = 400;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ code: 0, msg: code, data: { error: code } }));
+        return;
+      }
+      const rec = state.device_codes[userCode];
+      if (!rec || rec.expires_at < Math.floor(Date.now() / 1000)) {
+        res.statusCode = 400;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ code: 0, msg: "expired_token", data: { error: "expired_token" } }));
+        return;
+      }
+      if (state.consumedCodes.has(userCode)) {
+        res.statusCode = 400;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ code: 0, msg: "invalid_grant", data: { error: "invalid_grant" } }));
+        return;
+      }
+      if (!state.approvedCodes.has(userCode)) {
+        res.statusCode = 400;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ code: 0, msg: "authorization_pending", data: { error: "authorization_pending", interval: 5 } }));
+        return;
+      }
+      state.consumedCodes.add(userCode);
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({
+        access_token: "rt_test_access_token_XYZ",
+        refresh_token: "or_rt_test_refresh_token_XYZ",
+        device_id: body.device_id,
+        device_grant: "grant-raw-XYZ",
+        token_endpoint: "https://surety.test/api/relay/token",
+        expires_at: Math.floor(Date.now() / 1000) + 3600,
+        scopes: ["coding"],
+        token_type: "Bearer",
+        source: rec.source,
+      }));
+      return;
+    }
+    res.statusCode = 404; res.end("not found");
+  });
+  return new Promise((resolveStarted) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      resolveStarted({
+        url: `http://127.0.0.1:${addr.port}`,
+        state, close: () => new Promise((r) => server.close(() => r())),
+      });
+    });
+  });
+}
+
+cases.push({
+  name: "loginWithDeviceFlow prints URL + user_code and returns on success",
+  run: async () => {
+    _restoreNativeFetch();
+    const backend = await startDeviceFlowMockBackend();
+    try {
+      let printed = "";
+      // Pre-approve after a 0ms delay so the second poll succeeds.
+      // We register an "approver" that flips the set after the first poll.
+      const pollsObserved = { count: 0 };
+      backend.state.approvedCodes; // (no-op; just keep reference)
+      // Start a tiny ticker that, after we see 1 pending, approves.
+      // Simpler: approve synchronously BEFORE the test starts; the
+      // first poll will then succeed immediately.
+      backend.state.approvedCodes.add("TESTCODE");
+
+      const sleepCalls = [];
+      const result = await loginMod.loginWithDeviceFlow({
+        apiBaseUrl: backend.url,
+        h5BaseUrl: "https://h5.test",
+        deviceId: "test-device-1",
+        deviceName: "Test Device",
+        source: "originrouter_cli",
+        timeoutMs: 5000,
+        initialIntervalMs: 10,
+        noBrowser: true,
+        openBrowserFn: async () => { throw new Error("should not be called when noBrowser=true"); },
+        sleepFn: async (ms) => { sleepCalls.push(ms); },
+        printFn: (line) => { printed += line + "\n"; },
+      });
+      assert.equal(result.access_token, "rt_test_access_token_XYZ");
+      assert.equal(result.device_grant, "grant-raw-XYZ");
+      assert.match(printed, /To complete login, open this URL and click Authorize:/);
+      assert.match(printed, /https:\/\/h5\.test\/cli\/authorize/);
+      assert.match(printed, /TESTCODE/);
+      assert.equal(sleepCalls.length, 1, "should poll exactly once when pre-approved");
+      assert.equal(sleepCalls[0], 5000);  // server-provided interval (5s)
+    } finally {
+      await backend.close();
+    }
+  },
+});
+
+cases.push({
+  name: "loginWithDeviceFlow keeps polling on authorization_pending",
+  run: async () => {
+    _restoreNativeFetch();
+    const backend = await startDeviceFlowMockBackend();
+    try {
+      // Approve after the second pending poll. We schedule approval
+      // via a microtask after the first poll is observed.
+      const pollsObserved = { count: 0 };
+      const origPost = backend.state; // keep handle
+      // Simulate by injecting an approval after a delay: poll returns
+      // authorization_pending on first call, then we approve and the
+      // next poll succeeds.
+      // Use the sleepFn as a sync point: approve after the 2nd sleep.
+      const sleepCalls = [];
+      const sleepFn = async (ms) => {
+        sleepCalls.push(ms);
+        if (sleepCalls.length === 2) {
+          backend.state.approvedCodes.add("TESTCODE");
+        }
+      };
+      const result = await loginMod.loginWithDeviceFlow({
+        apiBaseUrl: backend.url,
+        h5BaseUrl: "https://h5.test",
+        deviceId: "test-device-2",
+        timeoutMs: 5000,
+        initialIntervalMs: 5,
+        noBrowser: true,
+        openBrowserFn: async () => {},
+        sleepFn,
+        printFn: () => {},
+      });
+      assert.equal(sleepCalls.length, 2, "should poll twice (pending then success)");
+      assert.equal(result.access_token, "rt_test_access_token_XYZ");
+    } finally {
+      await backend.close();
+    }
+  },
+});
+
+cases.push({
+  name: "loginWithDeviceFlow handles slow_down by backing off",
+  run: async () => {
+    _restoreNativeFetch();
+    const backend = await startDeviceFlowMockBackend();
+    try {
+      backend.state.approvedCodes.add("TESTCODE");
+      // First poll returns slow_down, second returns success.
+      let pollCount = 0;
+      const sleepCalls = [];
+      // Wrap the backend's poll handler to inject slow_down on first call.
+      // Easier: queue two errors — slow_down then none.
+      const errQueue = ["slow_down"];
+      const origPoll = backend.state; // dummy
+      // Intercept by replacing the http server handler — too invasive.
+      // Instead: use the deviceTokenNextError-style mechanism we don't have.
+      // Workaround: cancel the test and use a different approach — we
+      // pre-set nextPollError via the nextPollError field and reset on each.
+      backend.state.nextPollError = "slow_down";  // consumed on first poll
+      const sleepFn = async (ms) => { sleepCalls.push(ms); };
+      const result = await loginMod.loginWithDeviceFlow({
+        apiBaseUrl: backend.url,
+        h5BaseUrl: "https://h5.test",
+        deviceId: "test-device-3",
+        timeoutMs: 5000,
+        initialIntervalMs: 5,
+        noBrowser: true,
+        openBrowserFn: async () => {},
+        sleepFn,
+        printFn: () => {},
+      });
+      // First sleep = 5s (server interval). Second sleep = 10s (5s + 5s back-off).
+      assert.equal(sleepCalls.length, 2, "should poll twice");
+      assert.equal(sleepCalls[0], 5000);
+      assert.equal(sleepCalls[1], 10000, "second sleep should back off by 5s");
+      assert.equal(result.access_token, "rt_test_access_token_XYZ");
+    } finally {
+      await backend.close();
+    }
+  },
+});
+
+cases.push({
+  name: "loginWithDeviceFlow rejects on access_denied",
+  run: async () => {
+    _restoreNativeFetch();
+    const backend = await startDeviceFlowMockBackend();
+    try {
+      backend.state.nextPollError = "access_denied";
+      let caught;
+      try {
+        await loginMod.loginWithDeviceFlow({
+          apiBaseUrl: backend.url,
+          h5BaseUrl: "https://h5.test",
+          deviceId: "test-device-4",
+          timeoutMs: 5000,
+          initialIntervalMs: 5,
+          noBrowser: true,
+          openBrowserFn: async () => {},
+          sleepFn: async () => {},
+          printFn: () => {},
+        });
+      } catch (e) { caught = e; }
+      assert.ok(caught, "should throw on access_denied");
+      assert.match(caught.message, /device_flow_denied/);
+    } finally {
+      await backend.close();
+    }
+  },
+});
+
+cases.push({
+  name: "loginWithDeviceFlow rejects on expired_token",
+  run: async () => {
+    _restoreNativeFetch();
+    const backend = await startDeviceFlowMockBackend();
+    try {
+      backend.state.nextPollError = "expired_token";
+      let caught;
+      try {
+        await loginMod.loginWithDeviceFlow({
+          apiBaseUrl: backend.url,
+          h5BaseUrl: "https://h5.test",
+          deviceId: "test-device-5",
+          timeoutMs: 5000,
+          initialIntervalMs: 5,
+          noBrowser: true,
+          openBrowserFn: async () => {},
+          sleepFn: async () => {},
+          printFn: () => {},
+        });
+      } catch (e) { caught = e; }
+      assert.ok(caught, "should throw on expired_token");
+      assert.match(caught.message, /device_flow_expired/);
+    } finally {
+      await backend.close();
     }
   },
 });

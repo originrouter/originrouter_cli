@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { hostname, userInfo } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { startDaemon } from "./daemon/daemon.js";
@@ -46,7 +47,18 @@ import { RemoteCodingProxyManager } from "./proxy/remoteCodingProxyManager.js";
 import { runLocalAgentSession } from "./local/localAgentSession.js";
 import { readSessions } from "./persistence/sessionLog.js";
 import { readApiToken, rotateApiToken } from "./persistence/authToken.js";
-import { ensureStateDir, getStateDir, readConfig, readDaemonState, readDevice, writeConfig } from "./persistence/state.js";
+import {
+  ensureStateDir,
+  ensureDevice,
+  getStateDir,
+  readConfig,
+  readDaemonState,
+  readDevice,
+  readLocalApiConfig,
+  writeConfig,
+  writeLocalApiConfig,
+} from "./persistence/state.js";
+import { LOOPBACK_ADDRESSES } from "./local/localApi.js";
 import {
   clearCodingAuth,
   readCodingAuth,
@@ -64,11 +76,21 @@ import {
   rotateCodingKey,
 } from "./auth/originrouterAuthClient.js";
 import {
-  loginWithCallback,
-  loginWithManualCode,
+  loginWithDeviceFlow,
   loginUrlFor,
+  relayResponseToShape,
+  persistRelayTokens,
 } from "./auth/originrouterLogin.js";
-import { DEFAULT_ORIGINROUTER_BASE_URL } from "./config/providerRoutes.js";
+import {
+  DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
+  DEFAULT_ORIGINROUTER_H5_BASE_URL,
+} from "./config/providerRoutes.js";
+// Stage 9.8: 集中式 CLI 错误信息产品化。所有 auth 路径的 catch
+// 末尾调 formatCliError(err) — 不用手写 console.error。
+import { formatCliError, reportCliError } from "./runtime/cliErrors.js";
+// Stage 9.8: `originrouter doctor` 诊断命令。
+import { runDoctor, printDoctorResults } from "./commands/doctor.js";
+import { handleServiceCommand } from "./commands/service.js";
 import { runClaudeSdkSession } from "./runtime/claudeSdkSession.js";
 import {
   detectClaudeAgentSdkAvailability,
@@ -76,7 +98,7 @@ import {
   detectNodePtyAvailability,
   detectTmuxAvailability,
 } from "./utils/detect.js";
-import { DEFAULT_DEVICE_ID, DEFAULT_EXECUTOR, DEFAULT_RELAY_URL, VERSION } from "./constants.js";
+import { DEFAULT_DEVICE_ID, DEFAULT_EXECUTOR, DEFAULT_LOCAL_API_PORT, DEFAULT_RELAY_URL, VERSION } from "./constants.js";
 
 function printHelp() {
   console.log(`originrouter ${VERSION}
@@ -101,7 +123,7 @@ Provider management (Stage 9.0):
                                    [--google-application-credentials <path>] [--azure-ad-token <t>] [--hf-token <t>]
                                    [--key-ref <id>] [--device-id <id>] [--grant-ref <id>] [--target proxy|agent]
 
-  --type originrouter  Official /coding subscription endpoint (default base URL https://server.originrouter.com).
+  --type originrouter  Official /coding subscription endpoint (default base URL https://server.easytransnote.com).
                         Requires --key-ref pointing at a locally stored managed coding key (see 'coding-key.json').
   --type proxy         Local LiteLLM proxy. Use --engine litellm (default) + --litellm-provider <id>.
                         --type litellm is accepted as an alias and persisted as proxy(engine=litellm).
@@ -140,6 +162,10 @@ Provider field metadata (Stage 7.7):
 Local API auth (Stage 6):
   originrouter token show                            Print the current token + browser URL
   originrouter token rotate                          Mint a new token (invalidates all open browser tabs)
+  originrouter local key show                        Alias for token show
+  originrouter local key rotate                      Alias for token rotate
+  originrouter local config show                     Print persisted local API bind/port settings
+  originrouter local config set [--port <p>] [--bind <addr>] [--allow-lan on|off]
 
 Legacy config commands (deprecated, prefer 'originrouter provider add'):
   originrouter config show
@@ -148,8 +174,10 @@ Legacy config commands (deprecated, prefer 'originrouter provider add'):
   originrouter claude-config --base-url <url> --api-key <key> --model <model> --small-fast-model <model> [legacy]
 
 Other:
-  originrouter daemon [--relay http://localhost:8787] [--device local-dev] [--local-port <p>]
+  originrouter daemon [--relay https://app.easytransnote.com] [--device local-dev] [--local-port <p>]
+                      [--bind 127.0.0.1|0.0.0.0] [--allow-lan]
   originrouter daemon-port                           Print the running daemon's local API URL (reads daemon.state.json)
+  originrouter service install|start|stop|restart|status|uninstall
   originrouter run -- <command> [args...]
   originrouter claude [args...]                  Start local Claude Code session (PTY) — uses resolved provider env
   originrouter claude --terminal [args...]      Alias for 'claude' (flag is a no-op)
@@ -161,7 +189,7 @@ Examples:
   originrouter run -- bash
   # Stage 9.0: official originrouter provider (real model id, keyRef is a
   # local managed-coding-key reference; the real exchange is 9.1+).
-  originrouter provider add official-originrouter --type originrouter --base-url https://server.originrouter.com --key-ref managed-key-1 --model claude-sonnet-4-6
+  originrouter provider add official-originrouter --type originrouter --base-url https://server.easytransnote.com --key-ref managed-key-1 --model claude-sonnet-4-6
   # Stage 9.0: proxy provider (LiteLLM via local proxy). The --type litellm
   # alias and --engine litellm are equivalent to the canonical --type proxy.
   originrouter provider add minimax --type proxy --engine litellm --litellm-provider anthropic --base-url https://api.easytransnote.com/coding --api-key sk-v1-xxx --model MiniMax-M3 --small-fast-model MiniMax-M2.7
@@ -184,21 +212,35 @@ Examples:
     --aws-web-identity-token os.environ/AWS_WEB_IDENTITY_TOKEN_FILE \
     --model anthropic.claude-3-5-sonnet-20241022-v2:0
 
-OriginRouter login credential flow (Stage 9.1A):
-  originrouter login [--api-base-url <url>] [--login-url <url>] [--device-name <name>] [--manual-code <code>]
+OriginRouter login credential flow (Stage 9.7):
+  originrouter login [--api-base-url <url>] [--device-name <name>]
+                     [--no-browser]
   originrouter logout [--api-base-url <url>]
   originrouter auth status
   originrouter auth rotate [--api-base-url <url>]
   originrouter auth device list [--api-base-url <url>]
 
-  --manual-code <code>  Required completion path for 9.1A. The browser
-                        callback path is experimental until 9.1A.1 wires
-                        Universal_PDF_H5 to call /originrouter/auth/login-code
-                        and redirect back to the CLI callback.
+  The login flow uses RFC 8628 device authorization grant: it prints
+  an 8-character user code + verification URL, opens the browser
+  (unless --no-browser), and polls the backend until you approve
+  on the H5 page. Works for SSH, Docker, CI, or any environment
+  where the CLI cannot receive a browser redirect.
+
+  --no-browser     Do not auto-open the browser; only print the
+                   URL + code. Use this in headless / SSH / Docker
+                   / CI environments.
+  --login-url      H5 base URL (rarely needed; defaults to the
+                   api-base-url's H5 server).
+
+  The login flow opens the user's default browser to the H5
+  /cli/authorize page. The user authorizes the device there;
+  H5 calls /device/approve and redirects back to the CLI
+  local HTTP server with the raw code. CLI then calls
+  /device/exchange to receive a device grant + managed coding key.
 
 OriginRouter wrapper options for claude/codex:
   --provider <name>                              Deprecated for claude; use 'originrouter route set'. Reserved for legacy/debug paths.
-  --originrouter-relay http://localhost:8787
+  --originrouter-relay https://app.easytransnote.com
   --originrouter-device local-dev
   --originrouter-session session-id
 `);
@@ -943,21 +985,35 @@ function resolveDaemonPort(portOverride) {
 
 function buildApiUrl(stateDir, token, portOverride) {
   const port = resolveDaemonPort(portOverride);
+  let host = "127.0.0.1";
+  try {
+    const state = readDaemonState();
+    const bind = state?.localApiBindAddress;
+    if (bind && bind !== "0.0.0.0") host = bind;
+  } catch {}
+  const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   if (!port) {
     // Best-effort: the user can still paste the token into a manually-built URL.
-    return `http://127.0.0.1:<port>/?daemon=127.0.0.1:<port>&token=${token}`;
+    return `http://${urlHost}:<port>/?daemon=${urlHost}:<port>&token=${token}`;
   }
-  return `http://127.0.0.1:${port}/?daemon=127.0.0.1:${port}&token=${token}`;
+  return `http://${urlHost}:${port}/?daemon=${urlHost}:${port}&token=${token}`;
 }
 
 function buildConsoleUrl(stateDir, token, portOverride) {
   const port = resolveDaemonPort(portOverride) || "<port>";
+  let host = "127.0.0.1";
+  try {
+    const state = readDaemonState();
+    const bind = state?.localApiBindAddress;
+    if (bind && bind !== "0.0.0.0") host = bind;
+  } catch {}
+  const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   const here = dirname(fileURLToPath(import.meta.url));
   const repoRoot = dirname(here);
   const consolePath = resolve(repoRoot, "..", "originrouter-test", "local-console.html");
   if (!existsSync(consolePath)) return buildApiUrl(stateDir, token, portOverride);
   const url = new URL(pathToFileURL(consolePath).toString());
-  url.searchParams.set("daemon", `127.0.0.1:${port}`);
+  url.searchParams.set("daemon", `${urlHost}:${port}`);
   url.searchParams.set("token", token);
   return url.toString();
 }
@@ -969,6 +1025,7 @@ function handleTokenCommand(args) {
     const token = rotateApiToken(stateDir);
     console.log("Token rotated.");
     console.log(`Token file: ${stateDir}/local-api.token`);
+    console.log(`Default local API port: ${DEFAULT_LOCAL_API_PORT}`);
     console.log(`URL: ${buildConsoleUrl(stateDir, token)}`);
     console.log(`API URL: ${buildApiUrl(stateDir, token)}`);
     return;
@@ -981,11 +1038,150 @@ function handleTokenCommand(args) {
       return;
     }
     console.log(`Token file: ${stateDir}/local-api.token`);
+    console.log(`Default local API port: ${DEFAULT_LOCAL_API_PORT}`);
     console.log(`URL: ${buildConsoleUrl(stateDir, token)}`);
     console.log(`API URL: ${buildApiUrl(stateDir, token)}`);
     return;
   }
   throw new Error(`Unknown token action: ${action}`);
+}
+
+function parseLocalConfigPort(raw) {
+  if (raw == null || raw === "") return undefined;
+  const parsed = Number.parseInt(String(raw), 10);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 65535) {
+    throw new Error(`--port must be an integer in [0, 65535] (got '${raw}')`);
+  }
+  return parsed;
+}
+
+function parseOnOff(raw, flag) {
+  if (raw == null) return undefined;
+  const value = String(raw).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(value)) return true;
+  if (["0", "false", "no", "off"].includes(value)) return false;
+  throw new Error(`${flag} must be on|off`);
+}
+
+function handleLocalConfigCommand(args) {
+  const stateDir = ensureStateDir();
+  const [action] = args;
+  if (!action || action === "show") {
+    const config = readLocalApiConfig();
+    const state = readDaemonState();
+    console.log(`Config file: ${stateDir}/local-api.json`);
+    console.log(`Token file:  ${stateDir}/local-api.token`);
+    console.log(`port:        ${config.port ?? DEFAULT_LOCAL_API_PORT}`);
+    console.log(`bindAddress: ${config.bindAddress || "127.0.0.1"}`);
+    console.log(`allowLan:    ${config.allowLan === true ? "on" : "off"}`);
+    if (state?.localApiPort) {
+      console.log(`running:     ${state.localApiBaseUrl || `http://127.0.0.1:${state.localApiPort}`}`);
+    }
+    return;
+  }
+  if (action === "set") {
+    const port = parseLocalConfigPort(_parseFlag(args, "port"));
+    const bindAddress = _parseFlag(args, "bind");
+    const allowLan = parseOnOff(_parseFlag(args, "allow-lan"), "--allow-lan");
+    const patch = {};
+    if (port !== undefined) patch.port = port;
+    if (bindAddress) patch.bindAddress = bindAddress;
+    if (allowLan !== undefined) patch.allowLan = allowLan;
+    if (Object.keys(patch).length === 0) {
+      throw new Error("Usage: originrouter local config set [--port <p>] [--bind <addr>] [--allow-lan on|off]");
+    }
+    const next = writeLocalApiConfig(patch);
+    console.log("Local API config updated.");
+    console.log(`port:        ${next.port ?? DEFAULT_LOCAL_API_PORT}`);
+    console.log(`bindAddress: ${next.bindAddress || "127.0.0.1"}`);
+    console.log(`allowLan:    ${next.allowLan === true ? "on" : "off"}`);
+    console.log("Restart `originrouter daemon` for changes to take effect.");
+    return;
+  }
+  throw new Error("Usage: originrouter local config show|set");
+}
+
+// Stage L: `local api status | set-host | set-port`.
+//
+// `local config` keeps its existing show/set semantics; the new `api`
+// subnamespace groups status / set-host / set-port for users who
+// reach Proxy Control from the App and need to copy / rotate the
+// daemon bearer key on demand. We never echo the token value —
+// `tokenSet: yes|no` only.
+function handleLocalApiCommand(args) {
+  const stateDir = ensureStateDir();
+  const [sub, ...rest] = args;
+  if (!sub || sub === "status") {
+    const config = readLocalApiConfig();
+    const state = readDaemonState();
+    const tokenSet = Boolean(readApiToken(stateDir));
+    console.log(`Config file: ${stateDir}/local-api.json`);
+    console.log(`port:        ${config.port ?? DEFAULT_LOCAL_API_PORT}`);
+    console.log(`bindAddress: ${config.bindAddress || "127.0.0.1"}`);
+    console.log(`allowLan:    ${config.allowLan === true ? "on" : "off"}`);
+    console.log(`tokenSet:    ${tokenSet ? "yes" : "no"}`);
+    if (state?.localApiPort) {
+      console.log(
+        `running:     ${state.localApiBaseUrl || `http://127.0.0.1:${state.localApiPort}`}`,
+      );
+    } else {
+      console.log(`running:     no`);
+    }
+    return;
+  }
+  if (sub === "set-host") {
+    const host = rest[0];
+    if (!host) {
+      throw new Error("Usage: originrouter local api set-host <address> [--allow-lan on]");
+    }
+    const trimmed = String(host).trim();
+    const allowLanFlag = parseOnOff(_parseFlag(args, "allow-lan"), "--allow-lan");
+    const existing = readLocalApiConfig();
+    const allowLan = allowLanFlag !== undefined
+      ? allowLanFlag
+      : (existing.allowLan === true);
+    const isLoopback = LOOPBACK_ADDRESSES.has(trimmed.toLowerCase());
+    if (!isLoopback) {
+      // Non-loopback bind MUST have a token in the store, otherwise
+      // remote clients can connect anonymously. Refuse before
+      // persisting so the user has to mint one first.
+      if (!readApiToken(stateDir)) {
+        throw new Error(
+          `Refusing to bind "${trimmed}" without a bearer token. ` +
+          `Run \`originrouter daemon\` first to mint one, then retry.`,
+        );
+      }
+      if (!allowLan) {
+        throw new Error(
+          `Refusing to bind "${trimmed}" without --allow-lan on.`,
+        );
+      }
+    }
+    writeLocalApiConfig({ bindAddress: trimmed, allowLan });
+    console.log(`bindAddress: ${trimmed}`);
+    console.log(`tokenSet:    ${readApiToken(stateDir) ? "yes" : "no"}`);
+    console.log("Restart `originrouter daemon` for the change to take effect.");
+    return;
+  }
+  if (sub === "set-port") {
+    const port = parseLocalConfigPort(rest[0]);
+    if (port === undefined) {
+      throw new Error("Usage: originrouter local api set-port <int>");
+    }
+    writeLocalApiConfig({ port });
+    const existingState = readDaemonState();
+    console.log(`port: ${port}`);
+    if (existingState?.localApiPort && existingState.localApiPort !== port) {
+      console.log(
+        `WARNING: daemon is currently bound to port ${existingState.localApiPort}. ` +
+          `Restart \`originrouter daemon\` to apply.`,
+      );
+    } else {
+      console.log("Restart `originrouter daemon` for the change to take effect.");
+    }
+    return;
+  }
+  throw new Error("Usage: originrouter local api status|set-host <addr>|set-port <int>");
 }
 
 // `addProvider` / `applyProviderUpdate` from providers.js own validation.
@@ -1139,7 +1335,7 @@ async function handleEnvPrint(args) {
     }
   }
   try {
-    providerResult = buildAgentProviderEnv(agent, config, {
+    providerResult = await buildAgentProviderEnv(agent, config, {
       provider: flagName,
       proxyStatus: staticProxyStatusFn(readLocalProxySnapshot()),
       remoteCodingStatus,
@@ -1242,6 +1438,22 @@ async function printDoctor(args = []) {
   const config = readConfig();
   const cur = config.currentProvider || {};
   if (cur.claude) console.log(`Default provider (claude): ${cur.claude}`);
+
+  // Stage 9.8: 接入 auth / relay / connectivity 检查。
+  // 不打印 banner 重复（已经在文件顶部），只追加新 section。
+  console.log("");
+  let checks;
+  try {
+    checks = await runDoctor({ config });
+  } catch (err) {
+    console.log(`  ! connectivity check failed: ${err.message || err}`);
+    process.exitCode = 1;
+    return;
+  }
+  const verdict = printDoctorResults(checks, { skipBanner: true });
+  if (verdict === "fail") {
+    process.exitCode = 1;
+  }
 }
 
 export async function main(argv) {
@@ -1327,13 +1539,42 @@ export async function main(argv) {
       process.exitCode = 1;
       return;
     }
-    console.log(`http://127.0.0.1:${state.localApiPort}`);
+    const bind = state.localApiBindAddress || "127.0.0.1";
+    const host = bind === "0.0.0.0" ? "127.0.0.1" : bind;
+    const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+    console.log(`http://${urlHost}:${state.localApiPort}`);
+    return;
+  }
+
+  if (command === "service") {
+    await handleServiceCommand(args);
     return;
   }
 
   if (command === "token") {
     handleTokenCommand(args);
     return;
+  }
+
+  if (command === "local") {
+    const [sub, action] = args;
+    if (sub === "key" || sub === "token") {
+      handleTokenCommand([action].filter(Boolean));
+      return;
+    }
+    if (sub === "config") {
+      handleLocalConfigCommand(args.slice(1));
+      return;
+    }
+    if (sub === "api") {
+      handleLocalApiCommand(args.slice(1));
+      return;
+    }
+    throw new Error(
+      "Usage: originrouter local {key|token} show|rotate | " +
+      "originrouter local config show|set | " +
+      "originrouter local api status|set-host <addr>|set-port <int>",
+    );
   }
 
   if (command === "run") {
@@ -1354,6 +1595,11 @@ export async function main(argv) {
 
   if (command === "auth") {
     await handleAuthCommand(args);
+    return;
+  }
+
+  if (command === "doctor") {
+    await handleDoctor(args);
     return;
   }
 
@@ -1385,7 +1631,7 @@ export async function main(argv) {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 9.1A — OriginRouter auth commands
+// Stage 9.6 — OriginRouter auth commands
 // ---------------------------------------------------------------------------
 
 function _parseFlag(args, name) {
@@ -1399,7 +1645,14 @@ function _parseFlag(args, name) {
 function _maskKey(rawKey) {
   if (!rawKey || typeof rawKey !== "string") return "(none)";
   if (rawKey.length < 4) return "****";
+  if (rawKey.startsWith("rt_")) return "rt_****" + rawKey.slice(-4);
   return "sk-or-****" + rawKey.slice(-4);
+}
+
+function _maskAtToken(rawAt) {
+  if (!rawAt || typeof rawAt !== "string") return "(none)";
+  if (rawAt.length < 4) return "****";
+  return "rt_****" + rawAt.slice(-4);
 }
 
 function _formatExpiry(epochMs) {
@@ -1407,84 +1660,108 @@ function _formatExpiry(epochMs) {
   return new Date(epochMs).toISOString();
 }
 
-function _authPayloadToManagedKey(payload, deviceId, deviceName) {
-  // Convert backend response shape to the on-disk managed-key shape.
-  // Backend returns epoch seconds (int); on-disk uses epoch ms.
-  return {
-    kind: KEY_KIND.MANAGED,
-    keyId: payload.managed_coding_key_id,
-    key: payload.managed_coding_key,
-    deviceGrantId: payload.device_grant_id,
-    deviceGrant: payload.device_grant,
-    deviceId: payload.device_id || deviceId,
-    expiresAt: payload.managed_coding_key_expires_at * 1000,
-    deviceGrantIdleExpiresAt: payload.device_grant_idle_expires_at * 1000,
-    deviceGrantAbsoluteExpiresAt: payload.device_grant_absolute_expires_at * 1000,
-    source: KEY_SOURCE.ORIGINROUTER_CLI,
-    scopes: [KEY_SCOPE.CODING],
-  };
-}
-
 async function handleLogin(args) {
   const stateDir = ensureStateDir();
-  const apiBaseUrl = _parseFlag(args, "api-base-url") || DEFAULT_ORIGINROUTER_BASE_URL;
-  const explicitLoginUrl = _parseFlag(args, "login-url");
-  const deviceName = _parseFlag(args, "device-name") || "cli-device";
-  const manualCode = _parseFlag(args, "manual-code");
+  const apiBaseUrl = _parseFlag(args, "api-base-url")
+    || process.env.ORIGINROUTER_API_BASE_URL
+    || DEFAULT_ORIGINROUTER_CONTROL_BASE_URL;
+  // Stage 9.7/9.8: H5 lives on a different host than the API gateway.
+  // Default is `https://originrouter.com` (the authorize page).
+  // Override with --login-url or ORIGINROUTER_LOGIN_URL.
+  const h5BaseUrl = _parseFlag(args, "login-url")
+    || process.env.ORIGINROUTER_LOGIN_URL
+    || DEFAULT_ORIGINROUTER_H5_BASE_URL;
+  const deviceName = _parseFlag(args, "device-name") || defaultDeviceName();
+  const noBrowser = args.includes("--no-browser");
   const device = ensureDeviceForLogin();
 
-  const loginUrl = explicitLoginUrl || loginUrlFor(apiBaseUrl);
-
-  let payload;
-  if (manualCode) {
-    payload = await loginWithManualCode({
+  // Stage 9.7/9.8: default flow is RFC 8628 device authorization
+  // grant. Mints an 8-char user_code via /device/code, prints the
+  // URL + code (optionally opens the browser), then polls
+  // /device/token until the user approves or the code expires.
+  // Works for SSH, Docker, CI, and any environment where the CLI
+  // cannot receive a browser redirect.
+  //
+  // Stage 9.8: the success payload is an OAuth 2.0 token pair
+  // (access_token + refresh_token). The CLI stores ONLY the
+  // refresh_token; the access_token is silently rotated by
+  // /device/refresh before expiry.
+  let oauthResp;
+  try {
+    oauthResp = await loginWithDeviceFlow({
       apiBaseUrl,
-      code: manualCode,
+      h5BaseUrl,
       deviceId: device.deviceId,
       deviceName,
       source: KEY_SOURCE.ORIGINROUTER_CLI,
+      noBrowser,
     });
-  } else {
-    // Browser callback is experimental in 9.1A — Universal_PDF_H5 is
-    // not yet wired to call /originrouter/auth/login-code. Print a
-    // clear notice and proceed; the CLI will time out if H5 never
-    // redirects. Use --manual-code for the supported path.
-    console.error(
-      "Note: browser callback is experimental in Stage 9.1A. " +
-      "Use `originrouter login --manual-code <code>` for the supported path. " +
-      "To get a code, run: curl -X POST <api>/originrouter/auth/login-code " +
-      "-H 'Authorization: Bearer uuid:<browser-uuid>' " +
-      "-H 'Content-Type: application/json' " +
-      "-d '{\"device_id\":\"<id>\",\"source\":\"originrouter_cli\"}'"
-    );
-    payload = await loginWithCallback({
-      apiBaseUrl,
-      loginUrl,
-      deviceId: device.deviceId,
-      deviceName,
-      source: KEY_SOURCE.ORIGINROUTER_CLI,
-    });
+  } catch (err) {
+    formatCliError(err);
+    return;
   }
 
-  const managedKey = _authPayloadToManagedKey(payload, device.deviceId, deviceName);
-  writeCodingAuth(stateDir, managedKey);
+  // Stage 9.9: 将 relay 响应转为 on-disk shape 并写入 coding-key.json
+  let stored;
+  try {
+    stored = persistRelayTokens({ stateDir, relayResponse: oauthResp });
+  } catch (err) {
+    formatCliError(err);
+    return;
+  }
 
   console.log(`Logged in to ${apiBaseUrl}`);
-  console.log(`Device:    ${managedKey.deviceId}`);
-  console.log(`Grant:     ${managedKey.deviceGrantId} (idle ${_formatExpiry(managedKey.deviceGrantIdleExpiresAt)} / abs ${_formatExpiry(managedKey.deviceGrantAbsoluteExpiresAt)})`);
-  console.log(`Key:       ${_maskKey(managedKey.key)} (id ${managedKey.keyId}, expires ${_formatExpiry(managedKey.expiresAt)})`);
+  console.log(`Device:    ${stored.deviceId}`);
+  console.log(`Token:     ${_maskAtToken(stored.accessToken)} (expires ${_formatExpiry(stored.accessTokenExpiresAt)})`);
 }
 
 function ensureDeviceForLogin() {
-  // Reuse the existing deviceId if present; otherwise mint one.
-  const existing = readDevice();
-  if (existing && existing.deviceId) return existing;
-  // Defer to ensureDevice from persistence/state.js semantics.
-  // We do not call writeConfig here; device.json is written by
-  // the existing CLI on first use. We use a deterministic shape
-  // matching ensureDevice():
-  //   { deviceId: "device-<uuid>" }
-  return { deviceId: existing?.deviceId || `device-${Date.now()}` };
+  // Stage 9.7: force a fresh device id when:
+  //   - device.json is missing
+  //   - device.json exists but the stored id is a known stale
+  //     default (e.g. "local-dev" from pre-9.7 daemons). Those ids
+  //     are NOT unique machine identifiers — they collide across
+  //     every host that ever ran the old daemon. ensureDevice()
+  //     detects this and regenerates a proper UUID-based id.
+  // Also derive the friendly device name from the machine hostname
+  // when the user didn't pass --device-name, so the H5 authorize
+  // page shows "Chengaoyan's MacBook Pro" instead of "cli-device".
+  return ensureDevice();
+}
+
+/**
+ * Stage 9.7.1: derive a default device name as `username@hostname`.
+ * Picked over `<username>'s CLI` so the H5 "我的设备" page can tell
+ * apart two machines logged in as the same OS user (e.g. a MacBook
+ * and a Linux desktop both running under `chengaoyan`). On macOS,
+ * `os.hostname()` returns the Bonjour/mDNS FQDN form like
+ * `chengaoyans-MacBook-Pro.local` — we strip the `.local` suffix
+ * because it's Bonjour plumbing, not a user-facing label. On
+ * Linux, `hostname()` already returns the short form, so this is a
+ * no-op there.
+ *
+ * The user can always override with `--device-name "<whatever>"`.
+ * Falls back gracefully when username is unavailable (CI sandboxes).
+ */
+function _shortHostname() {
+  const h = (hostname() || "").trim();
+  // Strip a single trailing `.local` (case-insensitive). Anything
+  // else is left alone — multi-label FQDNs on Linux/Windows still
+  // round-trip correctly.
+  return h.replace(/\.local$/i, "");
+}
+
+function defaultDeviceName() {
+  try {
+    const u = userInfo();
+    const user = (u.username || "").trim();
+    const host = _shortHostname();
+    if (user && host) return `${user}@${host}`;
+    if (user) return `${user}'s CLI`;
+    return host || "CLI";
+  } catch {
+    return "CLI";
+  }
 }
 
 async function handleLogout(args) {
@@ -1494,14 +1771,22 @@ async function handleLogout(args) {
     console.log("Not logged in.");
     return;
   }
-  const apiBaseUrl = _parseFlag(args, "api-base-url") || DEFAULT_ORIGINROUTER_BASE_URL;
+  const apiBaseUrl = _parseFlag(args, "api-base-url") || process.env.ORIGINROUTER_API_BASE_URL || DEFAULT_ORIGINROUTER_CONTROL_BASE_URL;
+  // Stage 9.8: revoke the full OAuth session (access + refresh
+  // tokens + device_grant), not just the device_grant audit row.
+  // Stage 9.9: relay 模式没有 refresh_token，revoke 走 device_grant
   try {
     if (stored.deviceGrant) {
-      await revokeDeviceGrant({ apiBaseUrl, deviceGrant: stored.deviceGrant });
+      await revokeDeviceGrant({
+        apiBaseUrl,
+        deviceGrant: stored.deviceGrant,
+        accessToken: stored.accessToken,
+        deviceId: stored.deviceId,
+      });
     }
   } catch (err) {
     console.warn(`logout: backend revoke failed: ${err.message}`);
-    console.warn("Clearing local file anyway. Server-side grant may still exist.");
+    console.warn("Clearing local file anyway. Server-side tokens may still exist.");
   }
   clearCodingAuth(stateDir);
   console.log("Logged out.");
@@ -1514,26 +1799,90 @@ function handleAuthStatus(args) {
     console.log("Not logged in.");
     return;
   }
-  console.log("Logged in (CLI)");
-  console.log(`Device:    ${stored.deviceId}`);
-  if (stored.deviceGrantId) {
-    console.log(`Grant:     ${stored.deviceGrantId} (idle ${_formatExpiry(stored.deviceGrantIdleExpiresAt)} / abs ${_formatExpiry(stored.deviceGrantAbsoluteExpiresAt)})`);
+  if (stored.kind === KEY_KIND.RELAY) {
+    console.log("Logged in (CLI relay)");
+    console.log(`Device:    ${stored.deviceId}`);
+    console.log(`Token:     ${_maskAtToken(stored.accessToken)} (expires ${_formatExpiry(stored.accessTokenExpiresAt)})`);
+    console.log(`Endpoint:  ${stored.tokenEndpoint}`);
+    console.log(`Source:    ${stored.source}`);
+  } else {
+    // Legacy shape (pre-9.9).
+    console.log("Logged in (CLI; legacy managed-key shape)");
+    console.log(`Device:    ${stored.deviceId}`);
+    if (stored.deviceGrantId) {
+      console.log(`Grant:     ${stored.deviceGrantId} (idle ${_formatExpiry(stored.deviceGrantIdleExpiresAt)} / abs ${_formatExpiry(stored.deviceGrantAbsoluteExpiresAt)})`);
+    }
+    console.log(`Key:       ${_maskKey(stored.key)} (id ${stored.keyId}, expires ${_formatExpiry(stored.expiresAt)})`);
+    console.log(`Source:    ${stored.source}`);
   }
-  console.log(`Key:       ${_maskKey(stored.key)} (id ${stored.keyId}, expires ${_formatExpiry(stored.expiresAt)})`);
-  console.log(`Source:    ${stored.source}`);
 }
 
 async function handleAuthRotate(args) {
   const stateDir = ensureStateDir();
   const stored = readCodingAuth(stateDir);
-  if (!stored || !stored.deviceGrant) {
-    console.error("Run `originrouter login` first.");
-    process.exitCode = 1;
+  if (!stored) {
+    reportCliError("You're not signed in to OriginRouter.", {
+      next: "Run `originrouter login`.",
+    });
     return;
   }
-  const apiBaseUrl = _parseFlag(args, "api-base-url") || DEFAULT_ORIGINROUTER_BASE_URL;
-  const rotated = await rotateCodingKey({ apiBaseUrl, deviceGrant: stored.deviceGrant });
-  // Preserve device + grant metadata; replace key fields.
+  const apiBaseUrl = _parseFlag(args, "api-base-url") || process.env.ORIGINROUTER_API_BASE_URL || DEFAULT_ORIGINROUTER_CONTROL_BASE_URL;
+  // Stage 9.9: relay 模式直接用 device_grant 调 surety 重新签发 token
+  if (stored.kind === KEY_KIND.RELAY && stored.deviceGrant && stored.tokenEndpoint) {
+    let body;
+    try {
+      const resp = await fetch(stored.tokenEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          v: "v1",
+          "device-id": stored.deviceId,
+          "device-grant": stored.deviceGrant,
+        }),
+      });
+      body = await resp.json();
+    } catch (err) {
+      formatCliError(err);
+      return;
+    }
+    if (body.code !== 0) {
+      const errMsg = body.msg || "unknown";
+      const isRevoked = errMsg.includes("revoked") || errMsg.includes("invalid_grant");
+      reportCliError(
+        isRevoked ? "This device was revoked or expired." : "Token rotation failed.",
+        {
+          detail: errMsg,
+          next: isRevoked
+            ? "Run `originrouter login` to reconnect."
+            : "Run `originrouter doctor` to check connectivity to the relay.",
+        },
+      );
+      return;
+    }
+    const merged = {
+      ...stored,
+      accessToken: body.data["relay-access-token"],
+      accessTokenExpiresAt: body.data["expires-at"] * 1000,
+    };
+    writeCodingAuth(stateDir, merged);
+    console.log(`Token rotated.`);
+    console.log(`Token:     ${_maskAtToken(merged.accessToken)} (expires ${_formatExpiry(merged.accessTokenExpiresAt)})`);
+    return;
+  }
+  // Legacy pre-9.9 path.
+  if (!stored.deviceGrant) {
+    reportCliError("Stored credential has no deviceGrant.", {
+      next: "Run `originrouter login` first.",
+    });
+    return;
+  }
+  let rotated;
+  try {
+    rotated = await rotateCodingKey({ apiBaseUrl, deviceGrant: stored.deviceGrant });
+  } catch (err) {
+    formatCliError(err);
+    return;
+  }
   const merged = {
     ...stored,
     keyId: rotated.managed_coding_key_id,
@@ -1549,12 +1898,24 @@ async function handleAuthDeviceList(args) {
   const stateDir = ensureStateDir();
   const stored = readCodingAuth(stateDir);
   if (!stored || !stored.deviceGrant) {
-    console.error("Run `originrouter login` first.");
-    process.exitCode = 1;
+    reportCliError("You're not signed in to OriginRouter.", {
+      next: "Run `originrouter login`.",
+    });
     return;
   }
-  const apiBaseUrl = _parseFlag(args, "api-base-url") || DEFAULT_ORIGINROUTER_BASE_URL;
-  const resp = await listDevices({ apiBaseUrl, deviceGrant: stored.deviceGrant });
+  const apiBaseUrl = _parseFlag(args, "api-base-url") || process.env.ORIGINROUTER_API_BASE_URL || DEFAULT_ORIGINROUTER_CONTROL_BASE_URL;
+  let resp;
+  try {
+    resp = await listDevices({
+      apiBaseUrl,
+      deviceGrant: stored.deviceGrant,
+      accessToken: stored.accessToken,
+      deviceId: stored.deviceId,
+    });
+  } catch (err) {
+    formatCliError(err);
+    return;
+  }
   console.log(`scope: ${resp.scope}`);
   for (const d of resp.devices || []) {
     console.log(`---`);
@@ -1582,6 +1943,7 @@ function handleAuthCommand(args) {
   if (sub === "status") return handleAuthStatus(rest);
   if (sub === "rotate") return handleAuthRotate(rest);
   if (sub === "device" && rest[0] === "list") return handleAuthDeviceList(rest.slice(1));
-  console.error(`Unknown auth subcommand: ${sub}`);
-  process.exitCode = 1;
+  reportCliError(`Unknown auth subcommand: ${sub}`, {
+    next: "Run `originrouter --help` for usage.",
+  });
 }

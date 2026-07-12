@@ -1,4 +1,10 @@
 import process from "node:process";
+import {
+  buildRuntimeEventEnvelope,
+  createTerminalActivityReporter,
+  reportRuntimeEvent,
+  startApprovalDecisionPolling,
+} from "../agent/bridgeReporter.js";
 import { createAdapter } from "../adapters/createAdapter.js";
 import { buildAgentProviderEnv, willRouteRemoteCoding } from "../config/claudeConfig.js";
 import { DEFAULT_DEVICE_ID, DEFAULT_RELAY_URL } from "../constants.js";
@@ -190,7 +196,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // currentProvider[agent] points to an openai-compatible profile AND the
   // proxy is not running for it. Stage 4 routes through the proxy when the
   // status reports `state: "running"` for this exact provider.
-  const providerResult = buildAgentProviderEnv(agent, localConfig, {
+  const providerResult = await buildAgentProviderEnv(agent, localConfig, {
     provider: options.provider,
     proxyStatus,
     remoteCodingStatus,
@@ -201,6 +207,14 @@ export async function runLocalAgentSession(agent, rawArgs) {
   const baseEnv = { ...process.env, ...providerEnv };
   let exited = false;
   let scanTimer = null;
+  let stopApprovalPolling = () => {};
+  const terminalActivityReporter = createTerminalActivityReporter({
+    sessionId,
+    agentType: agent,
+    title: `${agent} local session`,
+    deviceName: device.host,
+    stateDir: ensureStateDir(),
+  });
 
   const send = (type, extra = {}) => {
     relayClient.send(type, {
@@ -209,8 +223,25 @@ export async function runLocalAgentSession(agent, rawArgs) {
       ...extra,
     }).catch(() => {});
   };
+  const report = (type, extra = {}) => {
+    if (type !== "session.started" && type !== "session.exited" && type !== "session.error" && type !== "agent.event") {
+      return;
+    }
+    const payload = buildRuntimeEventEnvelope({
+      sessionId,
+      agentType: agent,
+      title: `${agent} session`,
+      deviceName: device.host,
+      eventType: type,
+      event: type === "agent.event" ? extra.event : extra,
+      summary: extra.summary,
+    });
+    reportRuntimeEvent(payload, { stateDir: ensureStateDir() }).catch(() => {});
+  };
 
   const cleanup = () => {
+    stopApprovalPolling();
+    stopApprovalPolling = () => {};
     if (scanTimer) {
       clearInterval(scanTimer);
       scanTimer = null;
@@ -218,6 +249,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     if (typeof adapter.cleanup === "function") {
       adapter.cleanup();
     }
+    terminalActivityReporter.stop();
     if (process.stdin.isTTY) {
       process.stdin.setRawMode(false);
     }
@@ -241,6 +273,12 @@ export async function runLocalAgentSession(agent, rawArgs) {
     });
   }
 
+  stopApprovalPolling = startApprovalDecisionPolling({
+    sessionId,
+    stateDir: ensureStateDir(),
+    onDecision: (payload) => handleRemoteEvent(payload, { sessionId, adapter, executor }),
+  });
+
   const launch = adapter.buildLaunch();
   const metadata = adapter.describe();
   // Stage 8.4: lift the runtime tag to a top-level local so the
@@ -258,12 +296,15 @@ export async function runLocalAgentSession(agent, rawArgs) {
     onOutput: (data) => {
       writeLocal(data);
       send("terminal.output", { data });
+      terminalActivityReporter.ingest(data);
       for (const event of adapter.handleOutput(data)) {
         send("agent.event", { event });
+        report("agent.event", { event });
       }
     },
     onExit: ({ code, signal }) => {
       exited = true;
+      void terminalActivityReporter.flush();
       cleanup();
       const exitedAt = new Date().toISOString();
       try {
@@ -272,11 +313,13 @@ export async function runLocalAgentSession(agent, rawArgs) {
         console.error(`[session-log] ${error.message}`);
       }
       send("session.exited", { code, signal });
+      report("session.exited", { code, signal });
       process.exitCode = code ?? (signal ? 1 : 0);
       setTimeout(() => process.exit(process.exitCode || 0), 20);
     },
     onError: (error) => {
       send("session.error", { message: error.message });
+      report("session.error", { message: error.message });
       console.error(error.message);
     },
   });
@@ -295,6 +338,10 @@ export async function runLocalAgentSession(agent, rawArgs) {
     pid: started.pid,
     startedBy: "local-wrapper",
   });
+  report("session.started", {
+    runtime,
+    executor: started.executor,
+  });
 
   // Stage 8.9: emit agent.mode.status once per session. The local
   // `agent` command is mapped to the protocol provider string
@@ -303,6 +350,14 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // viewing mode/status only. Remote mode switching is Stage 9.0+.
   const modeList = agent === "codex" ? CODEX_AVAILABLE_MODES : CLAUDE_AVAILABLE_MODES;
   send("agent.event", {
+    event: buildModeStatusEvent({
+      sessionId,
+      provider: agent === "codex" ? "codex" : "claude",
+      runtime,
+      availableModes: modeList,
+    }),
+  });
+  report("agent.event", {
     event: buildModeStatusEvent({
       sessionId,
       provider: agent === "codex" ? "codex" : "claude",
@@ -337,6 +392,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     scanTimer = setInterval(() => {
       for (const event of adapter.scanStructuredEvents()) {
         send("agent.event", { event });
+        report("agent.event", { event });
       }
     }, 1000);
   }

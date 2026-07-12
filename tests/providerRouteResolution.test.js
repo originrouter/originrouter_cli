@@ -17,6 +17,7 @@
 import assert from "node:assert/strict";
 import {
   DEFAULT_ORIGINROUTER_BASE_URL,
+  DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
   resolveRoute,
 } from "../src/config/providerRoutes.js";
 
@@ -129,7 +130,14 @@ cases.push({
 cases.push({
   name: "DEFAULT_ORIGINROUTER_BASE_URL is the official server",
   run: () => {
-    assert.equal(DEFAULT_ORIGINROUTER_BASE_URL, "https://server.originrouter.com");
+    assert.equal(DEFAULT_ORIGINROUTER_BASE_URL, "https://server.easytransnote.com");
+  },
+});
+
+cases.push({
+  name: "DEFAULT_ORIGINROUTER_CONTROL_BASE_URL is the control server",
+  run: () => {
+    assert.equal(DEFAULT_ORIGINROUTER_CONTROL_BASE_URL, "https://app.easytransnote.com");
   },
 });
 

@@ -1,6 +1,6 @@
 // Stage 3: Daemon local HTTP API.
 //
-// Bound to 127.0.0.1 only. The browser-facing control surface for OriginRouter
+// Bound to 127.0.0.1 by default. The browser-facing control surface for OriginRouter
 // local sessions. Read paths delegate to existing modules; write paths call
 // sessionManager.handleEvent() directly — the same entry point the daemon
 // already uses when handling events from the relay.
@@ -43,8 +43,22 @@ import {
 import { LITELLM_PROVIDERS } from "../proxy/litellmCatalog.js";
 import { readApiToken } from "../persistence/authToken.js";
 import { getStateDir, readConfig, readProxyState, writeConfig } from "../persistence/state.js";
+import { DEFAULT_RELAY_URL } from "../constants.js";
 
-const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "localhost"]);
+// Exported so CLI subcommands (e.g. `local api set-host`) can apply
+// the same gating as the runtime auth layer. Keep the set in lock-
+// step with the bind-address check in `startLocalApi` above.
+export const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"]);
+
+function isLoopbackAddress(address) {
+  return LOOPBACK_ADDRESSES.has(String(address || "").toLowerCase());
+}
+
+function httpHost(address) {
+  return String(address).includes(":") && !String(address).startsWith("[")
+    ? `[${address}]`
+    : address;
+}
 
 // Bearer-token regex: case-insensitive 64 hex chars.
 const BEARER_RE = /^Bearer\s+([a-f0-9]{64})$/i;
@@ -70,10 +84,12 @@ function placeholderProxyStatus() {
 
 // ---------- Lifecycle ----------
 
-export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathOpt } = {}) {
+export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathOpt, allowLan = false } = {}) {
   const bindAddress = ctx.bindAddress || "127.0.0.1";
-  if (!LOOPBACK_ADDRESSES.has(bindAddress)) {
-    throw new Error(`bindAddress must be 127.0.0.1 or ::1 (got "${bindAddress}")`);
+  const lanAllowed = Boolean(ctx.allowLanControl || allowLan);
+  const isLoopback = LOOPBACK_ADDRESSES.has(bindAddress);
+  if (!isLoopback && !lanAllowed) {
+    throw new Error(`non-loopback bindAddress requires --allow-lan (got "${bindAddress}")`);
   }
 
   // Wrap the caller-supplied ctx so that live fields (`localApiPort`,
@@ -83,6 +99,8 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
   // its first request.
   const liveCtx = {
     bindAddress,
+    isLoopback,
+    allowLanControl: lanAllowed,
     configProvider: ctx.configProvider || (() => readConfig()),
     getProxyStatus: ctx.getProxyStatus || placeholderProxyStatus,
     startProxy: ctx.startProxy,
@@ -92,9 +110,13 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
     startedAt: ctx.startedAt || new Date().toISOString(),
     pid: ctx.pid || process.pid,
     version: ctx.version || "0.1.0",
-    relayUrl: ctx.relayUrl || "http://localhost:8787",
+    relayUrl: ctx.relayUrl || DEFAULT_RELAY_URL,
     relayConnected: ctx.relayConnected || (() => false),
-    deviceId: ctx.deviceId || "local-dev",
+    get deviceId() {
+      return typeof ctx.deviceId === "function"
+        ? ctx.deviceId()
+        : (ctx.deviceId || "local-dev");
+    },
     // Stage 6: token file path. The dispatch reads the file on every request
     // (not snapshotted) so a `token rotate` takes effect without a restart.
     // Priority: ctx.apiTokenPath > startLocalApi({ apiTokenPath }) > env
@@ -209,6 +231,7 @@ function requireAuth(req, ctx) {
   const needsAuth = !(req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS")
     || isAuthRequiredGetPath;
   if (!needsAuth) return { ok: true };
+  if (isLoopbackAddress(req.socket?.remoteAddress)) return { ok: true };
   const header = req.headers.authorization;
   if (!header) {
     return { ok: false, status: 401, error: "unauthorized", reason: "missing" };
@@ -393,10 +416,16 @@ async function handleLocalStatus(ctx) {
       startedAt,
       uptimeSeconds,
       port: ctx.localApiPort,
+      bindAddress: ctx.bindAddress,
+      baseUrl: `http://${httpHost(ctx.bindAddress)}:${ctx.localApiPort}`,
+      authMode: "bearer",
+      lanEnabled: !ctx.isLoopback,
     },
     relay: {
       url: ctx.relayUrl,
       connected: ctx.relayConnected(),
+      authState: typeof ctx.relayAuthState === "function" ? ctx.relayAuthState() : undefined,
+      authError: typeof ctx.relayAuthError === "function" ? ctx.relayAuthError() : undefined,
     },
     // Stage 5: real probe (was a hardcoded "not-installed" stub in Stage 3+4).
     proxy: await ctx.getProxyStatus(),
@@ -572,7 +601,16 @@ async function handleProxyControl(ctx, res, action, body) {
   // Stage 7.5: start/restart default to routes mode. Passing a provider is
   // still accepted as a debug/provider-mode escape hatch.
   const provider = typeof body.provider === "string" && body.provider ? body.provider : null;
-  const port = Number.parseInt(body.port, 10);
+  let port = Number.parseInt(body.port, 10);
+  if (action === "restart" && !Number.isFinite(port)) {
+    try {
+      const status = await ctx.getProxyStatus();
+      const currentPort = Number.parseInt(status?.port, 10);
+      if (status?.state === "running" && Number.isFinite(currentPort)) {
+        port = currentPort;
+      }
+    } catch {}
+  }
   if (!Number.isFinite(port) || port < 1024 || port > 65535) {
     return sendError(res, 400, `body.port must be an integer in [1024, 65535]`);
   }

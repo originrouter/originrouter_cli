@@ -270,19 +270,19 @@ try {
     apiKey: "sk-mm",
     model: "MiniMax-M3",
   });
-  assert.throws(
+  await assert.rejects(
     () => buildAgentProviderEnv("claude", cfg, { provider: "minimax" }),
     (err) => err.code === "PROVIDER_UNSUPPORTED",
   );
-  assert.throws(
+  await assert.rejects(
     () => buildAgentProviderEnv("claude", cfg, { provider: "deepseek" }),
     (err) => err.code === "PROVIDER_UNSUPPORTED",
   );
   const curDeepseek = setCurrentProvider(cfg, "claude", "deepseek");
-  assert.throws(() => buildAgentProviderEnv("claude", curDeepseek), (err) => err.code === "PROVIDER_UNSUPPORTED");
+  await assert.rejects(() => buildAgentProviderEnv("claude", curDeepseek), (err) => err.code === "PROVIDER_UNSUPPORTED");
   // Stage 8.0: Codex is route-mode only. routes.codex.main unset →
   // PROVIDER_UNSUPPORTED (no legacy currentProvider.codex fallback).
-  assert.throws(
+  await assert.rejects(
     () => buildAgentProviderEnv("codex", cfg),
     (err) => err.code === "PROVIDER_UNSUPPORTED" && /routes\.codex\.main/.test(err.message),
   );

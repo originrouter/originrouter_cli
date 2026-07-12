@@ -7,6 +7,7 @@
 
 import assert from "node:assert/strict";
 import http from "node:http";
+import { WebSocketServer } from "ws";
 import { buildAgentProviderEnv, willRouteRemoteCoding } from "../src/config/claudeConfig.js";
 import { RemoteCodingRelayProxy } from "../src/runtime/remoteCodingRelayProxy.js";
 import { staticProxyStatusFn, NOOP_REMOTE_CODING_SNAPSHOT } from "../src/proxy/snapshot.js";
@@ -25,7 +26,7 @@ const RELAY_PORT = 28787 + Math.floor(Math.random() * 1000);
   const probe = staticProxyStatusFn({
     state: "running", port: 40123, host: "127.0.0.1", pid: 9999, runtime: "remote-coding",
   });
-  const r = buildAgentProviderEnv("claude", config, { remoteCodingStatus: probe });
+  const r = await buildAgentProviderEnv("claude", config, { remoteCodingStatus: probe });
   assert.equal(r.source, "remote-coding");
   assert.equal(r.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:40123");
   assert.equal(r.env.ANTHROPIC_API_KEY, "sk-noop-litellm-passthrough");
@@ -42,7 +43,7 @@ const RELAY_PORT = 28787 + Math.floor(Math.random() * 1000);
   const probe = staticProxyStatusFn({
     state: "running", port: 40123, host: "127.0.0.1", pid: 9999, runtime: "remote-coding",
   });
-  const r = buildAgentProviderEnv("codex", config, { remoteCodingStatus: probe });
+  const r = await buildAgentProviderEnv("codex", config, { remoteCodingStatus: probe });
   assert.equal(r.source, "remote-coding");
   assert.equal(r.env.OPENAI_BASE_URL, "http://127.0.0.1:40123/v1");
   assert.equal(r.env.OPENAI_API_KEY, "sk-noop-litellm-passthrough");
@@ -56,7 +57,7 @@ const RELAY_PORT = 28787 + Math.floor(Math.random() * 1000);
   };
   let threw = null;
   try {
-    buildAgentProviderEnv("claude", config, { remoteCodingStatus: staticProxyStatusFn(NOOP_REMOTE_CODING_SNAPSHOT) });
+    await buildAgentProviderEnv("claude", config, { remoteCodingStatus: staticProxyStatusFn(NOOP_REMOTE_CODING_SNAPSHOT) });
   } catch (err) { threw = err; }
   assert.ok(threw, "expected throw");
   assert.equal(threw.code, "PROVIDER_UNSUPPORTED");
@@ -70,7 +71,7 @@ const RELAY_PORT = 28787 + Math.floor(Math.random() * 1000);
   };
   const probe = staticProxyStatusFn({ state: "running", port: 40123, host: "127.0.0.1", pid: 9999 });
   let threw = null;
-  try { buildAgentProviderEnv("claude", config, { remoteCodingStatus: probe }); } catch (err) { threw = err; }
+  try { await buildAgentProviderEnv("claude", config, { remoteCodingStatus: probe }); } catch (err) { threw = err; }
   assert.ok(threw);
   assert.equal(threw.code, "PROVIDER_UNSUPPORTED");
   assert.match(threw.message, /target=agent is not supported/);
@@ -91,7 +92,7 @@ const RELAY_PORT = 28787 + Math.floor(Math.random() * 1000);
   };
   const probe = staticProxyStatusFn({ state: "running", port: 40123, host: "127.0.0.1", pid: 9999 });
   let threw = null;
-  try { buildAgentProviderEnv("claude", config, { remoteCodingStatus: probe }); } catch (err) { threw = err; }
+  try { await buildAgentProviderEnv("claude", config, { remoteCodingStatus: probe }); } catch (err) { threw = err; }
   assert.ok(threw);
   assert.equal(threw.code, "PROVIDER_UNSUPPORTED");
   assert.match(threw.message, /claude\.small.*remote provider/);
@@ -104,7 +105,7 @@ const RELAY_PORT = 28787 + Math.floor(Math.random() * 1000);
   };
   const probe = staticProxyStatusFn({ state: "running", port: 40123, host: "127.0.0.1", pid: 9999 });
   let threw = null;
-  try { buildAgentProviderEnv("claude", config, { remoteCodingStatus: probe }); } catch (err) { threw = err; }
+  try { await buildAgentProviderEnv("claude", config, { remoteCodingStatus: probe }); } catch (err) { threw = err; }
   assert.ok(threw);
   assert.match(threw.message, /requires a deviceId/);
 }
@@ -120,56 +121,68 @@ const RELAY_PORT = 28787 + Math.floor(Math.random() * 1000);
   assert.equal(willRouteRemoteCoding(base("proxy", undefined), "claude"), false);
 }
 
-// ---- Group B + C: caller-side HTTP↔SSE bridge against a fake relay ----
+// ---- Group B + C: caller-side HTTP↔WS bridge against a fake relay ----
 
 // One fake relay process for all bridge cases. The relay keeps a
 // single "current script" that the next request will execute.
 const fakeRelay = await new Promise((resolve) => {
-  const callerSseClients = new Set();
+  const callerWsClients = new Set();
   let pendingScript = [];
   const postedEnvelopes = [];   // 9.2.1: every envelope the proxy POSTs is captured here.
   const server = http.createServer((req, res) => {
-    if (req.method === "GET" && req.url.startsWith("/device/events")) {
-      const url = new URL(req.url, `http://${req.headers.host}`);
-      const deviceId = url.searchParams.get("deviceId");
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-      });
-      res.write(`data: ${JSON.stringify({ type: "device.connected", deviceId })}\n\n`);
-      if (deviceId?.startsWith("caller-")) callerSseClients.add(res);
-      req.on("close", () => { callerSseClients.delete(res); });
-      return;
-    }
-    if (req.method === "POST" && req.url === "/device/message") {
+    if (req.method === "POST" && req.url === "/relay/v1/messages") {
       const chunks = [];
       req.on("data", (c) => chunks.push(c));
       req.on("end", () => {
-        const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+        const wrapper = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+        const body = wrapper.payload || wrapper;
         postedEnvelopes.push(body);
         if (body.type === "remote.coding.request") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true, accepted: true }));
+          res.end(JSON.stringify({ code: 0, data: { accepted: true } }));
           for (const evt of pendingScript) {
-            const sse = `data: ${JSON.stringify({ ...evt, requestId: body.requestId })}\n\n`;
-            for (const c of callerSseClients) c.write(sse);
+            for (const c of callerWsClients) c.send(JSON.stringify({ ...evt, requestId: body.requestId }));
           }
           pendingScript = [];
           return;
         }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ code: 0, data: { accepted: true } }));
       });
       return;
     }
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: false }));
   });
+  const wss = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (req, socket, head) => {
+    if (!req.url?.startsWith("/relay/v1/devices/")) {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      const parts = req.url.split("/");
+      const deviceId = decodeURIComponent(parts[4] || "");
+      ws.send(JSON.stringify({ type: "device.connected", device_id: deviceId }));
+      if (deviceId.startsWith("caller-")) callerWsClients.add(ws);
+      ws.on("message", (raw) => {
+        const body = JSON.parse(String(raw));
+        postedEnvelopes.push(body);
+        if (body.type === "remote.coding.request") {
+          for (const evt of pendingScript) {
+            ws.send(JSON.stringify({ ...evt, requestId: body.requestId }));
+          }
+          pendingScript = [];
+        }
+      });
+      ws.on("close", () => { callerWsClients.delete(ws); });
+    });
+  });
   server.unref();
   server.listen(RELAY_PORT, "127.0.0.1", () => {
     resolve({
       server,
+      wss,
       setNextScript: (events) => { pendingScript = events; },
       getPostedEnvelopes: () => postedEnvelopes.slice(),
     });
@@ -315,6 +328,7 @@ for (const p of proxies) {
   try { await p.stop(); } catch {}
 }
 fakeRelay.server.close();
+fakeRelay.wss.close();
 fakeRelay.server.unref();
 await new Promise((r) => setTimeout(r, 30));
 
@@ -326,53 +340,64 @@ await new Promise((r) => setTimeout(r, 30));
 const RELAY2_PORT = 27787 + Math.floor(Math.random() * 1000);
 
 const fakeRelay2 = await new Promise((resolve) => {
-  const callerSseClients = new Set();
+  const callerWsClients = new Set();
   // Queue of pending scripts (FIFO). Each incoming request drains
   // the head of the queue. The next script in the queue is consumed
   // by the next request. Each script's events are tagged with the
   // requestId of the request that consumed the script.
   const scriptQueue = [];
   const server = http.createServer((req, res) => {
-    if (req.method === "GET" && req.url.startsWith("/device/events")) {
-      const url = new URL(req.url, `http://${req.headers.host}`);
-      const deviceId = url.searchParams.get("deviceId");
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-      });
-      res.write(`data: ${JSON.stringify({ type: "device.connected", deviceId })}\n\n`);
-      if (deviceId?.startsWith("caller-")) callerSseClients.add(res);
-      req.on("close", () => { callerSseClients.delete(res); });
-      return;
-    }
-    if (req.method === "POST" && req.url === "/device/message") {
+    if (req.method === "POST" && req.url === "/relay/v1/messages") {
       const chunks = [];
       req.on("data", (c) => chunks.push(c));
       req.on("end", () => {
-        const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+        const wrapper = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+        const body = wrapper.payload || wrapper;
         if (body.type === "remote.coding.request") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true, accepted: true }));
+          res.end(JSON.stringify({ code: 0, data: { accepted: true } }));
           const script = scriptQueue.shift() || [];
           for (const evt of script) {
-            const sse = `data: ${JSON.stringify({ ...evt, requestId: body.requestId })}\n\n`;
-            for (const c of callerSseClients) c.write(sse);
+            for (const c of callerWsClients) c.send(JSON.stringify({ ...evt, requestId: body.requestId }));
           }
           return;
         }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ code: 0, data: { accepted: true } }));
       });
       return;
     }
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: false }));
   });
+  const wss = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (req, socket, head) => {
+    if (!req.url?.startsWith("/relay/v1/devices/")) {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      const parts = req.url.split("/");
+      const deviceId = decodeURIComponent(parts[4] || "");
+      ws.send(JSON.stringify({ type: "device.connected", device_id: deviceId }));
+      if (deviceId.startsWith("caller-")) callerWsClients.add(ws);
+      ws.on("message", (raw) => {
+        const body = JSON.parse(String(raw));
+        if (body.type === "remote.coding.request") {
+          const script = scriptQueue.shift() || [];
+          for (const evt of script) {
+            ws.send(JSON.stringify({ ...evt, requestId: body.requestId }));
+          }
+        }
+      });
+      ws.on("close", () => { callerWsClients.delete(ws); });
+    });
+  });
   server.unref();
   server.listen(RELAY2_PORT, "127.0.0.1", () => {
     resolve({
       server,
+      wss,
       enqueueScript: (script) => { scriptQueue.push(script); },
     });
   });
@@ -453,6 +478,7 @@ try {
     try { await p.stop(); } catch {}
   }
   fakeRelay2.server.close();
+  fakeRelay2.wss.close();
   fakeRelay2.server.unref();
   await new Promise((r) => setTimeout(r, 30));
 }

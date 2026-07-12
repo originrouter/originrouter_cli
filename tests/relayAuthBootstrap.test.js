@@ -8,7 +8,7 @@
 //   4. auth=on Surety 5xx / network -> code="surety_unavailable", message === code
 //      and the message does NOT contain deviceGrant or token.
 //   5. auth=on no coding-key.json -> code="no_device_grant", message === code
-//   6. auth=on no SURETY_BASE_URL -> code="surety_unavailable", message === code
+//   6. forceAuth can derive Surety base URL from relay tokenEndpoint
 //
 // Every test asserts err.message === err.code EXACTLY (no concatenation).
 
@@ -67,7 +67,8 @@ try {
     assert.equal(isRelayAuthOn(), false);
   });
 
-  // 6. auth=on but no SURETY_BASE_URL — throws surety_unavailable.
+  // 6a. auth=on but no credential — throws no_device_grant before any
+  // Surety URL check. This lets the daemon stay local-only before login.
   await withAuthEnv("on", async () => {
     await withSuretyEnv(undefined, async () => {
       let threw = null;
@@ -79,8 +80,8 @@ try {
         });
       } catch (err) { threw = err; }
       assert.ok(threw instanceof RelayAuthBootstrapError, `expected RelayAuthBootstrapError, got: ${threw}`);
-      assert.equal(threw.code, "surety_unavailable");
-      assert.equal(threw.message, "surety_unavailable", "err.message must equal err.code exactly");
+      assert.equal(threw.code, "no_device_grant");
+      assert.equal(threw.message, "no_device_grant", "err.message must equal err.code exactly");
     });
   });
 
@@ -120,6 +121,91 @@ try {
     expiresAt: Date.now() + 3600_000,
     scopes: ["coding"],
   }, null, 2));
+
+  // 6b. daemon forceAuth reuses a still-valid relay token without issuing a
+  // new one, so daemon startup does not invalidate the cached token that
+  // doctor/App use.
+  const relayShapeDir = mkdtempSync(join(tmpdir(), "relay-auth-bootstrap-relay-shape-"));
+  try {
+    writeFileSync(join(relayShapeDir, "coding-key.json"), JSON.stringify({
+      kind: "relay",
+      source: "originrouter_cli",
+      accessToken: "rt_cached",
+      accessTokenExpiresAt: Date.now() + 3600_000,
+      deviceGrant: REAL_GRANT,
+      deviceId: REAL_DEVICE,
+      tokenEndpoint: "https://surety.example.test/api/relay/token",
+      scopes: ["coding"],
+    }, null, 2));
+    await withAuthEnv("off", async () => {
+      await withSuretyEnv(undefined, async () => {
+        let fetchCalled = false;
+        const r = await buildRelayClientOptions({
+          stateDir: relayShapeDir,
+          relayUrl: "http://127.0.0.1:9999",
+          fallbackDeviceId: "f",
+          fetchFn: async () => {
+            fetchCalled = true;
+            throw new Error("should not refresh a valid cached token");
+          },
+          forceAuth: true,
+        });
+        assert.equal(fetchCalled, false);
+        assert.equal(r.authState, "on");
+        assert.equal(r.authToken, "rt_cached");
+        assert.equal(r.deviceId, REAL_DEVICE);
+      });
+    });
+  } finally {
+    rmSync(relayShapeDir, { recursive: true, force: true });
+  }
+
+  // 6c. When the cached relay token is expired, forceAuth can refresh via the
+  // stored tokenEndpoint; launchd/systemd services do not need SURETY_BASE_URL.
+  const expiredRelayShapeDir = mkdtempSync(join(tmpdir(), "relay-auth-bootstrap-relay-shape-expired-"));
+  try {
+    writeFileSync(join(expiredRelayShapeDir, "coding-key.json"), JSON.stringify({
+      kind: "relay",
+      source: "originrouter_cli",
+      accessToken: "rt_expired",
+      accessTokenExpiresAt: Date.now() - 1_000,
+      deviceGrant: REAL_GRANT,
+      deviceId: REAL_DEVICE,
+      tokenEndpoint: "https://surety.example.test/api/relay/token",
+      scopes: ["coding"],
+    }, null, 2));
+    await withAuthEnv("off", async () => {
+      await withSuretyEnv(undefined, async () => {
+        let calledUrl = "";
+        const fakeFetch = async (url) => {
+          calledUrl = String(url);
+          return new Response(JSON.stringify({
+            code: 0,
+            msg: "success",
+            data: {
+              "relay-access-token": "rt_derived",
+              "expires-at": Math.floor(Date.now() / 1000) + 3600,
+              "token-id": "tid-derived",
+              scopes: ["relay.remote_coding"],
+            },
+          }), { status: 200, headers: { "content-type": "application/json" } });
+        };
+        const r = await buildRelayClientOptions({
+          stateDir: expiredRelayShapeDir,
+          relayUrl: "http://127.0.0.1:9999",
+          fallbackDeviceId: "f",
+          fetchFn: fakeFetch,
+          forceAuth: true,
+        });
+        assert.equal(calledUrl, "https://surety.example.test/api/relay/token");
+        assert.equal(r.authState, "on");
+        assert.equal(r.authToken, "rt_derived");
+        assert.equal(r.deviceId, REAL_DEVICE);
+      });
+    });
+  } finally {
+    rmSync(expiredRelayShapeDir, { recursive: true, force: true });
+  }
 
   // 2. auth=on happy path — fake fetchFn returns a Surety 200/0.
   await withAuthEnv("on", async () => {

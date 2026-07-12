@@ -8,16 +8,22 @@
 //   2. Constructor with authToken -> postJson carries Authorization: Bearer <token>
 //   3. setAuthToken(newToken) updates the bearer on subsequent calls
 //   4. authToken: null after setAuthToken() clears the header
-//   5. SSE connectEvents also carries Authorization when authToken is set
+//   5. WebSocket connectEvents also carries Authorization when authToken is set
 
 import http from "node:http";
 import assert from "node:assert/strict";
+import { WebSocketServer } from "ws";
 import { RelayClient } from "../src/relay/relayClient.js";
 
 const PORT = 19100 + Math.floor(Math.random() * 1000);
 
 function makeCapture() {
   const captured = { requests: [] };
+  const wss = new WebSocketServer({ noServer: true });
+  wss.on("connection", (ws) => {
+    ws.send(JSON.stringify({ type: "ping" }));
+    ws.close();
+  });
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -28,25 +34,23 @@ function makeCapture() {
         headers: req.headers,
         body,
       });
-      if (req.url.startsWith("/device/events")) {
-        // SSE — return a single event then close. The production
-        // relay keeps the stream open, but this unit test only needs
-        // to capture the Authorization header; closing avoids leaving
-        // an active reader that keeps the Node process alive.
-        res.writeHead(200, {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-        });
-        res.write(`data: ${JSON.stringify({ type: "ping" })}\n\n`);
-        res.end();
-        return;
-      }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
     });
   });
+  server.on("upgrade", (req, socket, head) => {
+    captured.requests.push({
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body: "",
+    });
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  });
   return new Promise((resolve) => {
-    server.listen(PORT, "127.0.0.1", () => resolve({ server, captured }));
+    server.listen(PORT, "127.0.0.1", () => resolve({ server, wss, captured }));
   });
 }
 
@@ -61,6 +65,7 @@ try {
     const c = new RelayClient({ relayUrl: `http://127.0.0.1:${PORT}`, deviceId: "d1" });
     await c.send("test", { foo: "bar" });
     assert.equal(captured.requests[0].headers.authorization, undefined);
+    assert.equal(captured.requests[0].url, "/relay/v1/messages");
     server.close();
     console.log("[1] default constructor -> no Authorization ok");
   }
@@ -119,23 +124,23 @@ try {
     console.log("[4] setAuthToken(null) -> no Authorization ok");
   }
 
-  // 5. SSE connectEvents carries Authorization
+  // 5. WebSocket connectEvents carries Authorization
   {
     const { server, captured } = await makeCapture();
     const c = new RelayClient({
       relayUrl: `http://127.0.0.1:${PORT}`,
       deviceId: "d1",
-      authToken: "rt_sse",
+      authToken: "rt_ws",
     });
     const connPromise = c.connectEvents(() => {});
     await delay(150);
-    const sseReq = captured.requests.find((r) => r.url.startsWith("/device/events"));
-    assert.ok(sseReq, "expected an SSE request to be captured");
-    assert.equal(sseReq.headers.authorization, "Bearer rt_sse");
+    const wsReq = captured.requests.find((r) => r.url.startsWith("/relay/v1/devices/d1/ws"));
+    assert.ok(wsReq, "expected a WebSocket request to be captured");
+    assert.equal(wsReq.headers.authorization, "Bearer rt_ws");
     await connPromise;
     server.close();
   }
-  console.log("[5] connectEvents -> Authorization: Bearer rt_sse ok");
+  console.log("[5] connectEvents -> Authorization: Bearer rt_ws ok");
 
   console.log("relay client auth ok");
 } catch (err) {

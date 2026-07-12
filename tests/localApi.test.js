@@ -57,6 +57,19 @@ try {
     resolvePermission(payload) { this.resolvePermissionCalls.push(payload); },
   };
   const sessionId = "test-session-1";
+  let proxyStatus = {
+    state: "not-installed",
+    port: null,
+    version: null,
+    pid: null,
+    currentProvider: null,
+    mode: null,
+    routesHash: null,
+    aliases: null,
+    note: "LiteLLM proxy control lands in Stage 4.",
+  };
+  const proxyRestartCalls = [];
+  const proxyStartCalls = [];
   const fakeSessionManager = {
     sessions: new Map([
       [sessionId, {
@@ -98,10 +111,19 @@ try {
   const liveCtx = {
     sessionManager: fakeSessionManager,
     configProvider: () => readConfig(),
+    getProxyStatus: async () => proxyStatus,
+    startProxy: async (args) => {
+      proxyStartCalls.push(args);
+      return { ok: true, state: "running", port: args.port, pid: 7786, mode: args.mode };
+    },
+    restartProxy: async (args) => {
+      proxyRestartCalls.push(args);
+      return { ok: true, state: "running", port: args.port, pid: 7788, mode: args.mode };
+    },
     startedAt: new Date(Date.now() - 5000).toISOString(), // 5s uptime
     pid: 99999,
     version: "test-0.1.0",
-    relayUrl: "http://localhost:8787",
+    relayUrl: "https://app.easytransnote.com",
     deviceId: "local-dev",
     relayConnected: () => relayConnected,
   };
@@ -112,8 +134,8 @@ try {
 
   const base = `http://127.0.0.1:${serverHandle.port}`;
 
-  // Stage 6: pass `noAuth: true` on a request to skip the Authorization
-  // header. Used by the auth tests that assert 401/503 responses.
+  // Stage 6+: pass `noAuth: true` on a request to skip the Authorization
+  // header. Loopback requests are allowed; LAN requests still require bearer.
   async function getJson(path, { noAuth = false } = {}) {
     const headers = noAuth ? {} : { ...AUTH };
     const r = await fetch(`${base}${path}`, { headers });
@@ -156,15 +178,51 @@ try {
     assert.equal(body.daemon.pid, 99999);
     assert.equal(body.daemon.deviceId, "local-dev");
     assert.equal(body.daemon.version, "test-0.1.0");
+    assert.equal(body.daemon.bindAddress, "127.0.0.1");
+    assert.equal(body.daemon.authMode, "bearer");
+    assert.equal(body.daemon.lanEnabled, false);
+    assert.equal(body.daemon.baseUrl, `http://127.0.0.1:${serverHandle.port}`);
     assert.ok(body.daemon.uptimeSeconds >= 4, "uptime should reflect the seeded 5s start");
-    assert.equal(body.relay.url, "http://localhost:8787");
+    assert.equal(body.relay.url, "https://app.easytransnote.com");
     assert.equal(body.relay.connected, false);
     assert.equal(body.proxy.state, "not-installed");
-    // Stage 5: handleLocalStatus now returns the real getProxyStatus() shape
-    // (richer than the Stage 3 stub). The test's liveCtx has no getProxyStatus
-    // override, so placeholderProxyStatus() runs — its shape is what we assert.
     assert.equal(body.proxy.port, null);
     assert.match(body.proxy.note, /LiteLLM/);
+  }
+
+  // ---------- POST /proxy/restart ----------
+  {
+    const start = await postJson("/proxy/start", { port: 43123 });
+    assert.equal(start.status, 200);
+    assert.equal(start.body.ok, true);
+    assert.deepEqual(proxyStartCalls.at(-1), { mode: "route", port: 43123 });
+
+    proxyStatus = {
+      state: "running",
+      port: 43123,
+      version: "1.83.0",
+      pid: 7787,
+      currentProvider: null,
+      mode: "route",
+      routesHash: "abc",
+      aliases: null,
+    };
+    const { status, body } = await postJson("/proxy/restart", {});
+    assert.equal(status, 200);
+    assert.equal(body.ok, true);
+    assert.equal(body.port, 43123);
+    assert.deepEqual(proxyRestartCalls.at(-1), { mode: "route", port: 43123 });
+    proxyStatus = {
+      state: "not-installed",
+      port: null,
+      version: null,
+      pid: null,
+      currentProvider: null,
+      mode: null,
+      routesHash: null,
+      aliases: null,
+      note: "LiteLLM proxy control lands in Stage 4.",
+    };
   }
 
   // ---------- GET /providers ----------
@@ -254,8 +312,8 @@ try {
   }
   {
     const { status, body } = await getJson("/routes", { noAuth: true });
-    assert.equal(status, 401);
-    assert.equal(body.ok, false);
+    assert.equal(status, 200);
+    assert.equal(body.ok, true);
   }
   {
     const { status, body } = await getJson("/routes");
@@ -603,54 +661,21 @@ try {
     assert.ok(body.tokenFile.endsWith("local-api.token"), `tokenFile = ${body.tokenFile}`);
   }
 
-  // ---------- Write without token → 401 ----------
+  // ---------- Loopback write without token succeeds ----------
   {
     const { status, body } = await postJson("/providers/use", { name: "minimax", agent: "claude" }, { noAuth: true });
-    assert.equal(status, 401);
-    assert.equal(body.reason, "missing");
-    assert.equal(body.error, "unauthorized");
-    const r = await fetch(`${base}/providers`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "ghost", type: "anthropic", baseUrl: "https://x", apiKey: "sk-x", model: "m" }),
-    });
-    assert.equal(r.status, 401);
+    assert.equal(status, 200);
+    assert.equal(body.ok, true);
+    assert.equal(body.setProvider, "minimax");
   }
 
-  // ---------- Malformed token → 401 ----------
-  {
-    const r = await fetch(`${base}/providers/use`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": "Bearer not-hex" },
-      body: JSON.stringify({ name: "minimax", agent: "claude" }),
-    });
-    assert.equal(r.status, 401);
-    const body = await r.json();
-    assert.equal(body.reason, "malformed");
-  }
-
-  // ---------- Wrong token → 401 ----------
-  {
-    const wrong = "0".repeat(64);
-    const r = await fetch(`${base}/providers/use`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${wrong}` },
-      body: JSON.stringify({ name: "minimax", agent: "claude" }),
-    });
-    assert.equal(r.status, 401);
-    const body = await r.json();
-    assert.equal(body.reason, "invalid");
-    // The 401 must also include the WWW-Authenticate hint.
-    assert.match(r.headers.get("www-authenticate") || "", /Bearer realm="originrouter-local"/);
-  }
-
-  // ---------- /proxy/logs requires auth (GET) ----------
+  // ---------- /proxy/logs is available to loopback without token ----------
   {
     const r = await fetch(`${base}/proxy/logs?tail=10`);
-    assert.equal(r.status, 401);
+    assert.equal(r.status, 404);
   }
   {
-    // Without a logPath recorded, even authenticated request returns 404.
+    // Without a logPath recorded, authenticated request also returns 404.
     const { status, body } = await getJson("/proxy/logs?tail=10");
     assert.equal(status, 404);
   }
@@ -782,7 +807,8 @@ try {
     assert.equal(r.headers.get("access-control-allow-headers"), "Content-Type, Authorization");
   }
 
-  // Bind safety: refuses non-loopback addresses BEFORE attempting to listen.
+  // Bind safety: refuses non-loopback addresses BEFORE attempting to listen
+  // unless the caller explicitly opts into LAN control.
   // We construct the ctx with bindAddress: "0.0.0.0" and assert the throw —
   // no second server is started.
   let bindError = null;
@@ -795,7 +821,19 @@ try {
     bindError = err;
   }
   assert.ok(bindError, "startLocalApi with bindAddress='0.0.0.0' should throw");
-  assert.match(bindError.message, /bindAddress must be 127\.0\.0\.1 or ::1/);
+  assert.match(bindError.message, /requires --allow-lan/);
+
+  let lanHandle = null;
+  try {
+    lanHandle = await startLocalApi({
+      sessionManager: fakeSessionManager,
+      bindAddress: "0.0.0.0",
+      allowLanControl: true,
+    }, { port: 0 });
+    assert.equal(lanHandle.bindAddress, "0.0.0.0");
+  } finally {
+    if (lanHandle) await lanHandle.close();
+  }
 
   // Same for any non-loopback address.
   for (const bad of ["192.168.1.1", "10.0.0.1", "8.8.8.8"]) {

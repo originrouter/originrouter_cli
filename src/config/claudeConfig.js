@@ -18,7 +18,11 @@ import {
   resolveRoute,
 } from "./providerRoutes.js";
 import { readCodingAuth } from "../persistence/codingAuth.js";
-import { isManagedKeyShape } from "../runtime/authContract.js";
+import {
+  isAnyManagedCredentialShape,
+  isManagedKeyShape,
+  KEY_KIND,
+} from "../runtime/authContract.js";
 import { getStateDir } from "../persistence/state.js";
 import { NOOP_ANTHROPIC_API_KEY } from "../proxy/litellm.js";
 
@@ -94,34 +98,62 @@ function originrouterBaseForRuntime(provider, runtime) {
   return joinUrlPath(baseUrl, route.endpoint);
 }
 
-function readManagedCodingKeyForRuntime(options = {}) {
+// Stage 9.9: read the relay access_token for the current runtime.
+// Silently re-signs the token via surety /api/relay/token if it has
+// <60s of headroom. Returns the stored shape with a fresh accessToken.
+// Throws PROVIDER_UNSUPPORTED if no credential is on disk, if the
+// stored shape is malformed, or if the device_grant has been revoked.
+async function readManagedCodingKeyForRuntime(options = {}) {
   const stateDir = options.stateDir || getStateDir();
+  if (typeof options.readCodingAuthForRuntime === "function") {
+    return options.readCodingAuthForRuntime(stateDir);
+  }
   const stored = typeof options.readCodingAuth === "function"
     ? options.readCodingAuth(stateDir)
     : readCodingAuth(stateDir);
-  // Stage 9.1B: malformed coding-key.json (missing deviceGrant, missing
-  // scopes, wrong source) is rejected before injecting env, so a stale or
-  // hand-edited file produces a clean login prompt rather than a leaked
-  // ANTHROPIC_API_KEY= with an empty value. The shape check is placed
-  // before the expiry check: a malformed file is a setup problem
-  // (login again), not a key-age problem (rotate).
-  if (!stored || !isManagedKeyShape(stored)) {
+  if (!stored) {
     const err = new Error(
-      "OriginRouter provider requires a local managed coding key. " +
-      "Run `originrouter login --manual-code <code>` first.",
+      "OriginRouter provider requires a local credential. " +
+      "Run `originrouter login` first.",
     );
     err.code = "PROVIDER_UNSUPPORTED";
     throw err;
   }
-  if (typeof stored.expiresAt === "number" && stored.expiresAt <= Date.now()) {
+  if (!isAnyManagedCredentialShape(stored)) {
     const err = new Error(
-      "OriginRouter managed coding key has expired. " +
-      "Run `originrouter auth rotate` or `originrouter login --manual-code <code>`.",
+      "Stored OriginRouter credential has an unknown shape. " +
+      "Run `originrouter login` again to refresh.",
     );
     err.code = "PROVIDER_UNSUPPORTED";
     throw err;
   }
-  return stored;
+  // Legacy pre-9.9 managed-key shape: no silent refresh available.
+  if (stored.kind === KEY_KIND.MANAGED) {
+    if (typeof stored.expiresAt === "number" && stored.expiresAt <= Date.now()) {
+      const err = new Error(
+        "OriginRouter managed coding key has expired. " +
+        "Run `originrouter login` to upgrade to the relay shape.",
+      );
+      err.code = "PROVIDER_UNSUPPORTED";
+      throw err;
+    }
+    return stored;
+  }
+  // Stage 9.9 relay shape: silently re-sign via surety /api/relay/token
+  const ensure = options.ensureFreshAccessToken || (await import("../runtime/relayTokenRefresher.js")).ensureFreshAccessToken;
+  try {
+    return await ensure({ stateDir });
+  } catch (refreshErr) {
+    if (refreshErr && (refreshErr.code === "RELAY_LOGIN_REQUIRED" || refreshErr.code === "RELAY_GRANT_REVOKED")) {
+      const err = new Error(
+        `OriginRouter credential issue: ${refreshErr.message}. ` +
+        "Run `originrouter login` again.",
+      );
+      err.code = "PROVIDER_UNSUPPORTED";
+      throw err;
+    }
+    throw refreshErr;
+  }
 }
 
 function routeProvider(config, routeEntry) {
@@ -241,7 +273,7 @@ export function unsetClaudeConfigValue(config, key) {
 // Stage 7.6: claude no longer has a direct path. The resolver does NOT
 // call resolveProvider() for claude — it only consults routes + the proxy
 // snapshot. currentProvider.claude is irrelevant.
-export function buildAgentProviderEnv(agent, config, options = {}) {
+export async function buildAgentProviderEnv(agent, config, options = {}) {
   if (agent === "claude") {
     const probe = typeof options.proxyStatus === "function" ? options.proxyStatus() : null;
     const remoteCodingProbe = typeof options.remoteCodingStatus === "function"
@@ -271,10 +303,16 @@ export function buildAgentProviderEnv(agent, config, options = {}) {
     }
     const originrouterRoutes = assertClaudeOriginrouterRoutes(config, eff);
     if (originrouterRoutes) {
-      const managed = readManagedCodingKeyForRuntime(options);
+      const managed = await readManagedCodingKeyForRuntime(options);
+      // Stage 9.8: the on-disk shape is OAuth refresh. The
+      // access_token (1h) is the short-lived Bearer for LLM calls;
+      // the refresh_token (30d) lives on disk. Use accessToken
+      // here. Pre-9.8 stored keys fall back to .key for backward
+      // compat.
+      const apiKey = managed.accessToken || managed.key;
       const env = {
         ANTHROPIC_BASE_URL: originrouterBaseForRuntime(originrouterRoutes.mainProvider, "claude"),
-        ANTHROPIC_API_KEY: managed.key,
+        ANTHROPIC_API_KEY: apiKey,
         ANTHROPIC_MODEL: eff.main.model || originrouterRoutes.mainProvider.model,
         ANTHROPIC_SMALL_FAST_MODEL: (eff.small && (eff.small.model || originrouterRoutes.smallProvider.model))
           || eff.main.model
@@ -381,10 +419,11 @@ export function buildAgentProviderEnv(agent, config, options = {}) {
       };
     }
     if (mainProvider?.type === "originrouter") {
-      const managed = readManagedCodingKeyForRuntime(options);
+      const managed = await readManagedCodingKeyForRuntime(options);
+      const apiKey = managed.accessToken || managed.key;
       const env = {
         OPENAI_BASE_URL: originrouterBaseForRuntime(mainProvider, "codex-app-server"),
-        OPENAI_API_KEY: managed.key,
+        OPENAI_API_KEY: apiKey,
         OPENAI_MODEL: codexRoutes.main.model || mainProvider.model,
       };
       return {
