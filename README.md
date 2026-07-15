@@ -19,11 +19,11 @@ The structure is intentionally inspired by Happy's CLI architecture, but this co
 ## Commands
 
 ```bash
-# Stage 7.7: provider / profile management (catalog fidelity)
-# --type is optional; defaults to litellm. Every flag below corresponds to a
+# Local provider / profile management (LiteLLM only)
+# --type is optional; defaults to LiteLLM proxy. Every flag below corresponds to a
 # field in the catalog profile selected by --litellm-provider. Unknown flags
 # are rejected at save time (the catalog is the source of truth).
-originrouter provider add <name> [--type litellm] --litellm-provider <id> [--base-url <u>] [--api-key <k>] [--auth-token <k>] [--organization <o>] [--model <m>] [--small-fast-model <m>] [--api-version <v>] [--aws-region <r>] [--aws-access-key-id <id>] [--aws-secret-access-key <k>] [--aws-session-token <t>] [--aws-profile-name <p>] [--aws-bedrock-runtime-endpoint <u>] [--aws-role-name <r>] [--aws-session-name <n>] [--aws-web-identity-token <t>] [--aws-sts-endpoint <u>] [--sagemaker-base-url <u>] [--vertex-project <id>] [--vertex-location <loc>] [--vertex-credentials <json>] [--google-application-credentials <path>] [--azure-ad-token <t>] [--hf-token <t>]
+originrouter provider add <name> [--type proxy] --litellm-provider <id> [--base-url <u>] [--api-key <k>] [--auth-token <k>] [--organization <o>] [--model <m>] [--small-fast-model <m>] [--api-version <v>] [--aws-region <r>] [--aws-access-key-id <id>] [--aws-secret-access-key <k>] [--aws-session-token <t>] [--aws-profile-name <p>] [--aws-bedrock-runtime-endpoint <u>] [--aws-role-name <r>] [--aws-session-name <n>] [--aws-web-identity-token <t>] [--aws-sts-endpoint <u>] [--sagemaker-base-url <u>] [--vertex-project <id>] [--vertex-location <loc>] [--vertex-credentials <json>] [--google-application-credentials <path>] [--azure-ad-token <t>] [--hf-token <t>]
 originrouter provider update <name> [same flags as add]
 
 # Secrets can be literal values OR env references. Env references are
@@ -41,6 +41,14 @@ originrouter provider use <name> [--agent claude|codex] [--force]
 originrouter provider remove <name>
 originrouter env print [--provider <name>] [--agent claude|codex]
 originrouter doctor provider <name>
+
+# Login-backed route sources are not created through `provider add`.
+# Cloud displays models available to the signed-in account; Remote displays
+# account-authorized CLI devices.
+originrouter route cloud models
+originrouter route cloud set claude.main
+originrouter route remote devices
+originrouter route remote set codex.main
 
 # Legacy config commands (deprecated, prefer 'originrouter provider add'):
 originrouter config show
@@ -551,8 +559,7 @@ python3 originrouter_auth_route_test.py            # 9.1A Flask test_client rout
 ```bash
 export ORIGINROUTER_HOME="$(mktemp -d)"
 originrouter login --manual-code <code> --api-base-url <api>
-originrouter provider add official --type originrouter --key-ref current --model claude-sonnet-4-6
-originrouter route set claude.main --provider official
+originrouter route cloud set claude.main
 originrouter env print --agent claude
 # Source: originrouter-coding
 # ANTHROPIC_BASE_URL=https://server.easytransnote.com/coding
@@ -560,7 +567,7 @@ originrouter env print --agent claude
 # ANTHROPIC_MODEL=claude-sonnet-4-6
 # ANTHROPIC_SMALL_FAST_MODEL=claude-sonnet-4-6
 
-originrouter route set codex.main --provider official-codex --model gpt-5-codex
+originrouter route cloud set codex.main
 originrouter env print --agent codex
 # Source: originrouter-coding
 # OPENAI_BASE_URL=https://server.easytransnote.com/coding/v1
@@ -684,9 +691,9 @@ originrouter proxy start --port 40123
 originrouter daemon                        # worker daemon listens for remote.coding.request
 
 # Caller device (anywhere reachable to the worker via originrouter-server):
-originrouter provider add laptop-remote \
-  --type remote --device-id office --grant-ref current --target proxy
-originrouter route set codex.main --provider laptop-remote --model gpt-5-codex
+# The command lists account-authorized online CLI devices and creates the
+# remote route record internally after a selection.
+originrouter route remote set codex.main
 originrouter env print --agent codex       # starts a temporary relay proxy in this process,
                                           # prints the real port, then tears it down
 # Source: remote-coding

@@ -65,6 +65,15 @@ import { formatCliError, reportCliError } from "./runtime/cliErrors.js";
 import { runDoctor, printDoctorResults } from "./commands/doctor.js";
 import { handleServiceCommand } from "./commands/service.js";
 import { handleAuthCommand, handleLogin, handleLogout } from "./commands/auth.js";
+import {
+  chooseCloudModel,
+  chooseRemoteDevice,
+  loadCloudModels,
+  loadRemoteCliDevices,
+  printCloudModels,
+  printRemoteCliDevices,
+  remoteProviderName,
+} from "./commands/routeSources.js";
 import { runClaudeSdkSession } from "./runtime/claudeSdkSession.js";
 import {
   detectClaudeAgentSdkAvailability,
@@ -85,8 +94,8 @@ Usage:
   originrouter sessions [--json]
   originrouter env print [--provider <name>] [--agent claude|codex]
 
-Provider management (Stage 9.0):
-  originrouter provider add <name> [--type originrouter|proxy|remote] [--base-url <u>] [--model <m>]
+Local LiteLLM provider management:
+  originrouter provider add <name> [--type proxy] [--base-url <u>] [--model <m>]
                                    [--engine <e>] [--litellm-provider <id>] [--api-key <k>] [--auth-token <k>]
                                    [--organization <o>] [--small-fast-model <m> [legacy]] [--api-version <v>]
                                    [--aws-region <r>] [--aws-access-key-id <id>] [--aws-secret-access-key <k>]
@@ -95,14 +104,10 @@ Provider management (Stage 9.0):
                                    [--aws-web-identity-token <t>] [--aws-sts-endpoint <u>] [--sagemaker-base-url <u>]
                                    [--vertex-project <id>] [--vertex-location <loc>] [--vertex-credentials <json>]
                                    [--google-application-credentials <path>] [--azure-ad-token <t>] [--hf-token <t>]
-                                   [--key-ref <id>] [--device-id <id>] [--grant-ref <id>] [--target proxy|agent]
 
-  --type originrouter  Official /coding subscription endpoint (default base URL https://server.easytransnote.com).
-                        Requires --key-ref pointing at a locally stored managed coding key (see 'coding-key.json').
   --type proxy         Local LiteLLM proxy. Use --engine litellm (default) + --litellm-provider <id>.
                         --type litellm is accepted as an alias and persisted as proxy(engine=litellm).
-  --type remote        Authorized remote device (Stage 9.1+ real impl). Requires --device-id + --grant-ref.
-                        --target defaults to 'proxy'; 'agent' uses the remote agent runtime.
+  OriginRouter Cloud and remote devices are login-backed route sources, not local providers.
 
 originrouter provider update <name> [same flags as add]
   originrouter provider list
@@ -116,6 +121,10 @@ Model routes (Stage 7.5 / 7.6):
   originrouter route set <agent>.<slot> --provider <name> [--model <m>]
                                  agent ∈ { claude }   slot ∈ { main, small }
   originrouter route clear <agent>.<slot>
+  originrouter route cloud models
+  originrouter route cloud set <agent>.<slot> [--model <id>]
+  originrouter route remote devices
+  originrouter route remote set <agent>.<slot> [--device <id>] [--model <id>]
   Aliases are fixed: originrouter-claude-model (main) and originrouter-claude-fast-model (small).
 
 LiteLLM proxy (Stage 4 + Stage 7.5 + 7.6 + 7.7):
@@ -161,14 +170,13 @@ Other:
 
 Examples:
   originrouter run -- bash
-  # Stage 9.0: official originrouter provider (real model id, keyRef is a
-  # local managed-coding-key reference; the real exchange is 9.1+).
-  originrouter provider add official-originrouter --type originrouter --base-url https://server.easytransnote.com --key-ref managed-key-1 --model claude-sonnet-4-6
   # Stage 9.0: proxy provider (LiteLLM via local proxy). The --type litellm
   # alias and --engine litellm are equivalent to the canonical --type proxy.
   originrouter provider add minimax --type proxy --engine litellm --litellm-provider anthropic --base-url https://api.easytransnote.com/coding --api-key sk-v1-xxx --model MiniMax-M3 --small-fast-model MiniMax-M2.7
-  # Stage 9.0: remote provider (forward to an authorized device).
-  originrouter provider add laptop-remote --type remote --device-id device-x --grant-ref grant-1 --target proxy
+  # Login-backed source selectors: Cloud presents the available models; Remote
+  # presents the authorized CLI devices for the current account.
+  originrouter route cloud set claude.main
+  originrouter route remote set codex.main
   originrouter provider use minimax
   originrouter env print
   originrouter claude
@@ -585,12 +593,7 @@ function handleProvider(args) {
 
   if (action === "add") {
     const opts = parseProviderAddOptions([name, ...rest]);
-    if (opts.type === "openai-compatible") {
-      throw new Error(
-        `type 'openai-compatible' is no longer supported. ` +
-        `Use --type proxy --litellm-provider custom_openai (or --type litellm as an alias) instead.`,
-      );
-    }
+    assertManualProviderWriteIsLocalProxy(config, opts, "add");
     const next = addProviderFromFlags(config, opts);
     writeConfig(next);
     maybeNoteLegacySmallFastModel(opts);
@@ -600,12 +603,7 @@ function handleProvider(args) {
   if (action === "update") {
     if (!name) throw new Error("Usage: originrouter provider update <name> [flags...]");
     const opts = parseProviderAddOptions([name, ...rest]);
-    if (opts.type === "openai-compatible") {
-      throw new Error(
-        `type 'openai-compatible' is no longer supported. ` +
-        `Use --type proxy --litellm-provider custom_openai (or --type litellm as an alias) instead.`,
-      );
-    }
+    assertManualProviderWriteIsLocalProxy(config, opts, "update");
     const result = updateProviderFromFlags(config, name, opts);
     const warnings = takeUpdateWarnings(result);
     writeConfig(result);
@@ -699,6 +697,41 @@ function handleProvider(args) {
   throw new Error(`Unknown provider action: ${action}`);
 }
 
+/// A manually created Provider always represents this machine's LiteLLM
+/// configuration. Cloud and remote records carry account-scoped grants and
+/// must be created by the login-backed route selectors below.
+function assertManualProviderWriteIsLocalProxy(config, opts, action) {
+  const requestedType = opts.type || "proxy";
+  if (requestedType === "openai-compatible") {
+    throw new Error(
+      "type 'openai-compatible' is no longer supported. " +
+      "Use --type proxy --litellm-provider custom_openai instead.",
+    );
+  }
+  if (requestedType !== "proxy" && requestedType !== "litellm") {
+    throw new Error(
+      `provider ${action} only supports local LiteLLM proxy providers. ` +
+      "Use `originrouter route cloud set <agent>.<slot>` for OriginRouter Cloud " +
+      "or `originrouter route remote set <agent>.<slot>` for an authorized device.",
+    );
+  }
+  if (opts.auth || opts.deviceId || opts.target) {
+    throw new Error(
+      "Login-backed provider fields are not accepted here. Use `originrouter route cloud` or `originrouter route remote`.",
+    );
+  }
+  if (action === "update") {
+    const current = (config.providers || {})[opts.name];
+    if (!current) throw new Error(`unknown provider '${opts.name}'`);
+    if (normalizeProviderForRead(current).type !== "proxy") {
+      throw new Error(
+        `provider '${opts.name}' is login-backed and cannot be edited manually. ` +
+        "Choose its model or device through `originrouter route cloud` / `originrouter route remote`.",
+      );
+    }
+  }
+}
+
 // ---------- route ----------
 
 function parseRouteTarget(target) {
@@ -768,8 +801,12 @@ function printRouteShow(config, agent) {
   console.log(`  routesHash: ${hashRoutes(allRoutes)}`);
 }
 
-function handleRoute(args) {
+async function handleRoute(args) {
   const [action, ...rest] = args;
+
+  if (action === "cloud") return handleCloudRouteSource(rest);
+  if (action === "remote") return handleRemoteRouteSource(rest);
+
   const config = readConfig();
 
   if (!action || action === "list") {
@@ -804,6 +841,112 @@ function handleRoute(args) {
     return;
   }
   throw new Error(`Unknown route action: ${action}`);
+}
+
+async function handleCloudRouteSource(args) {
+  const [action, ...rest] = args;
+  const stateDir = ensureStateDir();
+  const models = await loadCloudModels({ stateDir });
+
+  if (action === "models") {
+    printCloudModels(models);
+    return;
+  }
+  if (action !== "set") {
+    throw new Error(
+      "Usage: originrouter route cloud models | set <agent>.<slot> [--model <id>]",
+    );
+  }
+
+  const target = rest[0];
+  const options = parseOptionArgs(rest.slice(1));
+  const { agent, slot } = parseRouteTarget(target);
+  const selectedModel = await chooseCloudModel(models, options["--model"]);
+  const config = readConfig();
+  const providers = config.providers || {};
+  const existing = Object.values(providers).find(
+    (provider) => normalizeProviderForRead(provider).type === "originrouter",
+  );
+  let next = config;
+  let providerName;
+  if (existing) {
+    providerName = existing.name;
+  } else {
+    if (providers["originrouter-cloud"]) {
+      throw new Error(
+        "Provider name 'originrouter-cloud' is reserved for the login-backed Cloud route source.",
+      );
+    }
+    providerName = "originrouter-cloud";
+    next = addProvider(next, {
+      name: providerName,
+      type: "originrouter",
+      model: selectedModel.id,
+      auth: { type: "managed_originrouter_key", keyRef: "current" },
+    });
+  }
+  next = setRoute(next, agent, slot, {
+    provider: providerName,
+    model: selectedModel.id,
+  });
+  writeConfig(next);
+  console.log(`Route ${target} now uses OriginRouter Cloud: ${selectedModel.id}.`);
+}
+
+async function handleRemoteRouteSource(args) {
+  const [action, ...rest] = args;
+  const stateDir = ensureStateDir();
+  const devices = (await loadRemoteCliDevices({ stateDir })).filter(
+    (device) => device.online,
+  );
+
+  if (action === "devices") {
+    printRemoteCliDevices(devices);
+    return;
+  }
+  if (action !== "set") {
+    throw new Error(
+      "Usage: originrouter route remote devices | set <agent>.<slot> [--device <id>] [--model <id>]",
+    );
+  }
+
+  const target = rest[0];
+  const options = parseOptionArgs(rest.slice(1));
+  const { agent, slot } = parseRouteTarget(target);
+  const device = await chooseRemoteDevice(devices, options["--device"]);
+  const config = readConfig();
+  const providers = config.providers || {};
+  const existing = Object.values(providers).find((provider) =>
+    normalizeProviderForRead(provider).type === "remote" &&
+      provider.target === "proxy" &&
+      provider.deviceId === device.deviceId,
+  );
+  let next = config;
+  let providerName;
+  if (existing) {
+    providerName = existing.name;
+  } else {
+    providerName = remoteProviderName(device.deviceId);
+    if (providers[providerName]) {
+      throw new Error(
+        `Provider name '${providerName}' is reserved for remote device '${device.deviceId}'.`,
+      );
+    }
+    next = addProvider(next, {
+      name: providerName,
+      type: "remote",
+      deviceId: device.deviceId,
+      target: "proxy",
+      auth: { type: "device_grant", grantRef: "current" },
+      ...(options["--model"] ? { model: options["--model"] } : {}),
+    });
+  }
+  next = setRoute(next, agent, slot, {
+    provider: providerName,
+    ...(options["--model"] ? { model: options["--model"] } : {}),
+  });
+  writeConfig(next);
+  console.log(`Route ${target} now uses remote CLI device: ${device.deviceName || device.deviceId}.`);
 }
 
 // ---------- proxy ----------
@@ -1480,7 +1623,7 @@ export async function main(argv) {
   }
 
   if (command === "route") {
-    handleRoute(args);
+    await handleRoute(args);
     return;
   }
 

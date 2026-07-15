@@ -469,7 +469,6 @@ cases.push({
         assert.equal(parsed.accessToken, "rt_devflow_access_token_xyz");
         assert.equal(parsed.deviceGrant, Object.keys(backend.state.grants)[0]);
         assert.equal(parsed.tokenEndpoint, "https://surety.test/api/relay/token");
-        assert.match(r.stdout, /Logged in to /);
         assert.match(r.stdout, /Device:/);
       } finally {
         rmSync(home, { recursive: true, force: true });

@@ -34,8 +34,17 @@ import {
   requestDeviceCode,
 } from "./originrouterAuthClient.js";
 
-function loginUrlFor(apiBaseUrl) {
-  return `${apiBaseUrl.replace(/\/+$/, "")}/cli/authorize`;
+function loginUrlFor(h5BaseUrl) {
+  return `${h5BaseUrl.replace(/\/+$/, "")}/cli/authorize`;
+}
+
+function verificationUrlFor({ h5BaseUrl, userCode, deviceId, deviceName, source }) {
+  const url = new URL(loginUrlFor(h5BaseUrl));
+  url.searchParams.set("user_code", userCode);
+  url.searchParams.set("device_id", deviceId);
+  url.searchParams.set("device_name", deviceName || deviceId);
+  url.searchParams.set("source", source || "originrouter_cli");
+  return url.toString();
 }
 
 // ---------------------------------------------------------------------------
@@ -200,9 +209,16 @@ export async function loginWithDeviceFlow({
   }
 
   const userCode = codeResp.user_code;
-  const verificationUri = codeResp.verification_uri;
-  const verificationUriComplete =
-    codeResp.verification_uri_complete || `${verificationUri}?user_code=${userCode}`;
+  // The API and browser application intentionally live on different hosts.
+  // Build the browser URL from the CLI's trusted H5 configuration instead of
+  // accepting a stale or misconfigured verification host from the API.
+  const verificationUriComplete = verificationUrlFor({
+    h5BaseUrl,
+    userCode,
+    deviceId,
+    deviceName,
+    source,
+  });
   // Server-provided interval wins (gateway is the source of truth);
   // the constructor default is the floor.
   const baseIntervalMs = (codeResp.interval ? codeResp.interval * 1000 : initialIntervalMs);
@@ -274,5 +290,4 @@ export async function loginWithDeviceFlow({
   });
 }
 
-export { loginUrlFor };
-
+export { loginUrlFor, verificationUrlFor };

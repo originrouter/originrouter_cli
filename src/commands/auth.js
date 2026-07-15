@@ -111,7 +111,6 @@ export async function handleLogin(args) {
     return;
   }
 
-  console.log(`Logged in to ${apiBaseUrl}`);
   console.log(`Device:    ${stored.deviceId}`);
   console.log(`Token:     ${maskAtToken(stored.accessToken)} (expires ${formatExpiry(stored.accessTokenExpiresAt)})`);
 }

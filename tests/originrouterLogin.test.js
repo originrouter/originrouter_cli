@@ -118,7 +118,7 @@ function hitCallback(url) {
 const cases = [];
 
 cases.push({
-  name: "loginUrlFor derives /cli/authorize from apiBaseUrl",
+  name: "loginUrlFor derives /cli/authorize from h5BaseUrl",
   run: () => {
     assert.equal(
       loginMod.loginUrlFor("https://server.example.com"),
@@ -127,6 +127,22 @@ cases.push({
     assert.equal(
       loginMod.loginUrlFor("https://server.example.com/"),
       "https://server.example.com/cli/authorize",
+    );
+  },
+});
+
+cases.push({
+  name: "verificationUrlFor uses the configured H5 host and includes device context",
+  run: () => {
+    assert.equal(
+      loginMod.verificationUrlFor({
+        h5BaseUrl: "https://originrouter.com",
+        userCode: "RFZ68HC2",
+        deviceId: "device-test",
+        deviceName: "chengaoyan@MacBook-Pro",
+        source: "originrouter_cli",
+      }),
+      "https://originrouter.com/cli/authorize?user_code=RFZ68HC2&device_id=device-test&device_name=chengaoyan%40MacBook-Pro&source=originrouter_cli",
     );
   },
 });
@@ -322,6 +338,9 @@ cases.push({
       assert.match(printed, /To complete login, open this URL and click Authorize:/);
       assert.match(printed, /https:\/\/h5\.test\/cli\/authorize/);
       assert.match(printed, /TESTCODE/);
+      assert.match(printed, /device_id=test-device-1/);
+      assert.match(printed, /device_name=Test\+Device/);
+      assert.match(printed, /source=originrouter_cli/);
       assert.equal(sleepCalls.length, 1, "should poll exactly once when pre-approved");
       assert.equal(sleepCalls[0], 5000);  // server-provided interval (5s)
     } finally {
