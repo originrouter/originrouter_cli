@@ -264,14 +264,10 @@ function validateOriginrouterRecord(p, { name }) {
       `provider '${name}' baseUrl must start with http:// or https:// (got '${p.baseUrl}')`
     );
   }
-  if (!p.auth || typeof p.auth !== "object" || p.auth.type !== "managed_originrouter_key") {
+  if (!p.auth || typeof p.auth !== "object" || p.auth.type !== "oauth") {
     throw new Error(
-      `provider '${name}' (type=originrouter) requires auth.type='managed_originrouter_key' ` +
-      `with a keyRef pointing at a local managed coding API key.`
+      `provider '${name}' (type=originrouter) requires auth.type='oauth'.`
     );
-  }
-  if (!p.auth.keyRef || typeof p.auth.keyRef !== "string") {
-    throw new Error(`provider '${name}' (type=originrouter) auth.keyRef is required`);
   }
   if (!p.model || typeof p.model !== "string") {
     throw new Error(
@@ -286,13 +282,10 @@ function validateRemoteRecord(p, { name }) {
   if (!p.deviceId || typeof p.deviceId !== "string") {
     throw new Error(`provider '${name}' (type=remote) deviceId is required`);
   }
-  if (!p.auth || typeof p.auth !== "object" || p.auth.type !== "device_grant") {
+  if (!p.auth || typeof p.auth !== "object" || p.auth.type !== "oauth") {
     throw new Error(
-      `provider '${name}' (type=remote) requires auth.type='device_grant' with a grantRef.`
+      `provider '${name}' (type=remote) requires auth.type='oauth'.`
     );
-  }
-  if (!p.auth.grantRef || typeof p.auth.grantRef !== "string") {
-    throw new Error(`provider '${name}' (type=remote) auth.grantRef is required`);
   }
   if (p.target != null && p.target !== "proxy" && p.target !== "agent") {
     throw new Error(
@@ -796,11 +789,8 @@ export function doctorProvider(provider) {
     if (norm.baseUrl != null && !/^https?:\/\//.test(norm.baseUrl)) {
       errors.push("baseUrl must start with http:// or https://");
     }
-    if (!norm.auth || norm.auth.type !== "managed_originrouter_key") {
-      errors.push("auth.type must be 'managed_originrouter_key'");
-    }
-    if (norm.auth && !norm.auth.keyRef) {
-      errors.push("auth.keyRef is required");
+    if (!norm.auth || norm.auth.type !== "oauth") {
+      errors.push("auth.type must be 'oauth'");
     }
     if (!norm.model) errors.push("model is missing (real model id, e.g. 'claude-sonnet-4-6')");
   } else if (norm.type === "proxy") {
@@ -843,11 +833,8 @@ export function doctorProvider(provider) {
     if (!norm.model) errors.push("model is missing");
   } else if (norm.type === "remote") {
     if (!norm.deviceId) errors.push("deviceId is required");
-    if (!norm.auth || norm.auth.type !== "device_grant") {
-      errors.push("auth.type must be 'device_grant'");
-    }
-    if (norm.auth && !norm.auth.grantRef) {
-      errors.push("auth.grantRef is required");
+    if (!norm.auth || norm.auth.type !== "oauth") {
+      errors.push("auth.type must be 'oauth'");
     }
     if (norm.target != null && norm.target !== "proxy" && norm.target !== "agent") {
       errors.push(`target must be 'proxy' or 'agent' (got '${norm.target}')`);

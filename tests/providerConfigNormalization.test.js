@@ -111,14 +111,13 @@ cases.push({
       name: "official",
       type: "originrouter",
       baseUrl: "https://server.originrouter.com",
-      auth: { type: "managed_originrouter_key", keyRef: "managed-key-1" },
+      auth: { type: "oauth" },
       model: "claude-sonnet-4-6",
     });
     assert.equal(r.ok, true, `unexpected throw: ${r.error && r.error.message}`);
     assert.equal(r.provider.type, "originrouter");
     assert.equal(r.provider.model, "claude-sonnet-4-6");
-    assert.equal(r.provider.auth.type, "managed_originrouter_key");
-    assert.equal(r.provider.auth.keyRef, "managed-key-1");
+    assert.equal(r.provider.auth.type, "oauth");
   },
 });
 
@@ -129,7 +128,7 @@ cases.push({
     const r = tryAdd({
       name: "official-default-base",
       type: "originrouter",
-      auth: { type: "managed_originrouter_key", keyRef: "managed-key-1" },
+      auth: { type: "oauth" },
       model: "claude-sonnet-4-6",
     });
     assert.equal(r.ok, true, `unexpected throw: ${r.error && r.error.message}`);
@@ -138,41 +137,36 @@ cases.push({
   },
 });
 
-// 8. addProvider rejects originrouter without auth.keyRef.
+// 8. addProvider rejects originrouter without OAuth auth metadata.
 cases.push({
-  name: "addProvider originrouter without auth.keyRef throws",
+  name: "addProvider originrouter without OAuth auth throws",
   run: () => {
-    // The validator checks auth.type before keyRef. We pass a malformed
-    // auth object to reach the keyRef check; without auth at all, the
-    // type check fires first (also correct). Both throw — we only need
-    // one of them to assert the gate exists.
     const r = tryAdd({
       name: "official",
       type: "originrouter",
-      auth: { type: "managed_originrouter_key" },
+      auth: { type: "other" },
       model: "claude-sonnet-4-6",
     });
     assert.equal(r.ok, false);
-    assert.match(r.error.message, /auth\.keyRef is required/);
+    assert.match(r.error.message, /auth\.type='oauth'/);
   },
 });
 
-// 9. addProvider accepts remote with deviceId + auth.grantRef.
+// 9. addProvider accepts a login-backed remote device.
 cases.push({
-  name: "addProvider remote with deviceId+grantRef succeeds",
+  name: "addProvider remote with deviceId and OAuth auth succeeds",
   run: () => {
     const r = tryAdd({
       name: "laptop",
       type: "remote",
       deviceId: "device-x",
-      auth: { type: "device_grant", grantRef: "grant-1" },
+      auth: { type: "oauth" },
       target: "proxy",
     });
     assert.equal(r.ok, true, `unexpected throw: ${r.error && r.error.message}`);
     assert.equal(r.provider.type, "remote");
     assert.equal(r.provider.deviceId, "device-x");
-    assert.equal(r.provider.auth.type, "device_grant");
-    assert.equal(r.provider.auth.grantRef, "grant-1");
+    assert.equal(r.provider.auth.type, "oauth");
     assert.equal(r.provider.target, "proxy");
   },
 });
@@ -184,7 +178,7 @@ cases.push({
     const r = tryAdd({
       name: "laptop",
       type: "remote",
-      auth: { type: "device_grant", grantRef: "grant-1" },
+      auth: { type: "oauth" },
     });
     assert.equal(r.ok, false);
     assert.match(r.error.message, /deviceId is required/);

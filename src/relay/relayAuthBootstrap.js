@@ -14,15 +14,11 @@
 //     every call. Callers use it for both initial construction AND reconnect
 //     refresh. The returned { deviceId, authToken } is the source of truth
 //     for what the RelayClient should use right now.
-//   - On any failure, throws RelayAuthBootstrapError with err.code === the
-//     mapped Surety error code. err.message === err.code exactly (no
-//     concatenation, no Surety original message, no deviceGrant, no token).
-//   - Never logs raw deviceGrant or raw token.
+//   - On any failure, throws RelayAuthBootstrapError with err.code ===
+//     err.message. Never includes OAuth credentials in the message.
 
-import { readCodingAuth } from "../persistence/codingAuth.js";
-import { acquireRelayAccessToken } from "../auth/suretyTokenClient.js";
-import { ensureFreshAccessToken } from "../runtime/relayTokenRefresher.js";
-import { KEY_KIND } from "../runtime/authContract.js";
+import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
+import { accessTokenFor, OAUTH_RESOURCES } from "../runtime/authContract.js";
 
 export class RelayAuthBootstrapError extends Error {
   constructor(code) {
@@ -36,16 +32,12 @@ export function isRelayAuthOn() {
   return (process.env.ORIGINROUTER_RELAY_AUTH || "off") === "on";
 }
 
-function suretyBaseUrlFromTokenEndpoint(tokenEndpoint) {
-  if (typeof tokenEndpoint !== "string" || !tokenEndpoint) return "";
-  return tokenEndpoint.replace(/\/api\/relay\/token\/?$/, "");
-}
-
 export async function buildRelayClientOptions({
   stateDir,
   relayUrl,
   fallbackDeviceId,
   fetchFn = globalThis.fetch,
+  ensureFreshAccessTokenFn = ensureFreshAccessToken,
   forceAuth = false,
 } = {}) {
   if (!forceAuth && !isRelayAuthOn()) {
@@ -57,53 +49,27 @@ export async function buildRelayClientOptions({
     };
   }
 
-  let stored;
+  let stored = null;
   try {
-    stored = readCodingAuth(stateDir);
-  } catch {
-    throw new RelayAuthBootstrapError("no_device_grant");
+    stored = await ensureFreshAccessTokenFn({
+      stateDir,
+      resource: OAUTH_RESOURCES.RELAY,
+      fetchFn,
+    });
+  } catch (err) {
+    throw new RelayAuthBootstrapError(err?.code || "oauth_refresh_failed");
   }
-  if (!stored || !stored.deviceGrant || !stored.deviceId) {
-    throw new RelayAuthBootstrapError("no_device_grant");
+  if (!stored || !stored.deviceId) {
+    throw new RelayAuthBootstrapError("login_required");
   }
-  if (stored.kind === KEY_KIND.RELAY && stored.accessToken && stored.tokenEndpoint) {
-    let fresh;
-    try {
-      fresh = await ensureFreshAccessToken({ stateDir, fetchFn });
-    } catch (err) {
-      throw new RelayAuthBootstrapError(err?.code || "relay_refresh_failed");
-    }
-    return {
-      relayUrl,
-      deviceId: fresh.deviceId,
-      authToken: fresh.accessToken,
-      authState: "on",
-      tokenExpiresAt: Math.floor(fresh.accessTokenExpiresAt / 1000),
-    };
-  }
-  const suretyUrl =
-    process.env.SURETY_BASE_URL || suretyBaseUrlFromTokenEndpoint(stored.tokenEndpoint);
-  if (!suretyUrl) {
-    throw new RelayAuthBootstrapError("surety_unavailable");
-  }
-
-  const result = await acquireRelayAccessToken({
-    suretyUrl,
-    deviceId: stored.deviceId,
-    deviceGrant: stored.deviceGrant,
-    fetchFn,
-  });
-
-  if (!result.ok) {
-    // Throw with the code only; never the Surety original message.
-    throw new RelayAuthBootstrapError(result.error || "unexpected_response");
-  }
+  const relayToken = accessTokenFor(stored, OAUTH_RESOURCES.RELAY);
+  if (!relayToken?.token) throw new RelayAuthBootstrapError("relay_token_missing");
 
   return {
     relayUrl,
     deviceId: stored.deviceId,
-    authToken: result.token,
+    authToken: relayToken.token,
     authState: "on",
-    tokenExpiresAt: result.expiresAt,
+    tokenExpiresAt: Math.floor(relayToken.expiresAt / 1000),
   };
 }

@@ -1,447 +1,72 @@
-# OriginRouter Login Credential Architecture
+# CLI OAuth Credential Architecture
 
-> **Stage 9.1B — runtime Claude/Codex wired to OriginRouter /coding.**
-> - 9.0: contract + storage + Dart / TypeScript / Python shape modules + endpoint doc.
-> - 9.1A: real routes (5 endpoints under `/originrouter/auth/...`),
->   CLI commands (`originrouter login --manual-code <code>` is
->   the required completion path), and the
->   `api_model_key_metadata` SQL migration.
-> - 9.1B: runtime `buildAgentProviderEnv` reads `coding-key.json` for routes of
->   `type=originrouter`; no local LiteLLM proxy required for direct routes.
-> - Browser callback UX (login → `/login-code` → CLI callback
->   redirect) is **experimental in 9.1A**; the CLI shape is
->   final, but Universal_PDF_H5 wiring ships in 9.1A.1.
+## Stored shape
 
-## Why `uuid` is NOT a long-term /coding key
+The CLI stores one OAuth credential document:
 
-The backend's `Authorization: Bearer uuid:<uuid>` shape is a
-**browser login session**. It is not a CLI / App credential for
-these reasons:
-
-1. **Scope too large.** A browser uuid has full user-scope
-   authority. Leaking it gives an attacker everything. A
-   managed coding key is scoped to `scope: "coding"` only.
-2. **No per-device revocation.** A uuid cannot be revoked for
-   a single device. A managed key is bound to a `device_id`
-   and a `device_grant_id`; revoking the grant invalidates
-   the key in one call.
-3. **Weak audit.** A uuid is shared across every browser tab
-   and request; audit logs cannot tell which device made a
-   given call. A managed key carries `source`
-   (`originrouter_cli` / `originrouter_app`) and `device_id`
-   on every request.
-4. **Non-standard format.** `uuid:<uuid>` is a custom header
-   value the backend invented. It is not compatible with
-   Claude / OpenAI / Codex toolchains, all of which expect an
-   `x-api-key` or `Authorization: Bearer <api-key>` header.
-5. **Bad rotation story.** A uuid changes only when the user
-   re-logs in. A managed key is auto-rotated by the CLI / App
-   on a 30-day cadence (see below).
-
-The Stage 9.0 contract is: **the CLI and the Flutter App hold a
-managed coding API key, never the browser uuid.** The browser
-uuid is used only to perform the one-time exchange that mints
-the first managed key (Stage 9.1+).
-
-## Lifetimes
-
-| Token | Lifetime | Notes |
-|---|---|---|
-| Login code | 5–10 minutes, single-use | Stage 9.1+ — issued by the login page, exchanged for a device grant. |
-| Device grant | 90-day idle, 365-day absolute, revocable | The grant is the umbrella identity. Revoking the grant invalidates every managed key bound to it. |
-| Managed coding API key | 30 days default, auto-rotated by CLI / App | Bound to `device_id`. The CLI / App rotates the key 7 days before expiry (Stage 9.1+). |
-
-The 30-day default is preferred over a 90-day alternative
-because the managed key is the only token that can actually
-consume model resources. Shorter lifetimes limit blast radius.
-
-## Token types
-
-```ts
-type LoginCode = {
-  value: string;
-  expiresAt: number;       // epoch ms; between 5 and 10 min from issue
-  singleUse: true;
-};
-
-type DeviceGrant = {
-  deviceId: string;
-  userId: string;
-  issuedAt: number;        // epoch ms
-  lastUsedAt: number;      // epoch ms
-  idleExpiresAt: number;   // issuedAt + 90d
-  absoluteExpiresAt: number; // issuedAt + 365d
-  revokedAt?: number;      // epoch ms; absent when active
-};
-
-// Canonical ManagedCodingKey — exactly what `isManagedKeyShape`
-// (src/runtime/authContract.js) requires. The runtime reads this
-// shape from `<stateDir>/coding-key.json` and uses `key` as the
-// Authorization: Bearer value, `deviceGrant` as the
-// Authorization: Bearer value for rotate / revoke.
-type ManagedCodingKey = {
-  kind: "managed";                              // always "managed"
-  keyId: string;                                // opaque ok_<token>
-  key: string;                                  // raw API key value
-  deviceGrantId: string;                        // opaque og_<token>
-  deviceGrant: string;                          // raw device-grant token
-  deviceId: string;
-  source: "originrouter_cli" | "originrouter_app";
-  scopes: ["coding"];                           // Stage 9.0: only "coding"
-  expiresAt: number;                            // epoch ms; 30d default
-  // Optional — validated when present:
-  deviceGrantIdleExpiresAt?: number;            // epoch ms; 90d
-  deviceGrantAbsoluteExpiresAt?: number;        // epoch ms; 365d
-  // Persisted by writeCodingAuth; not part of the shape check:
-  writtenAt?: number;                           // epoch ms; set by IO layer
-};
+```js
+{
+  kind: "oauth",
+  clientId: "originrouter_cli",
+  source: "originrouter_cli",
+  deviceId: "device-<32 hex>",
+  sessionId: "or_ses_...",
+  refreshToken: "or_rt_...",
+  refreshExpiresAt: 0,
+  tokenEndpoint: "https://surety.easytransnote.com/api/oauth/token",
+  revocationEndpoint: "https://surety.easytransnote.com/api/oauth/revoke",
+  accessTokens: {
+    control: { token: "or_at_...", expiresAt: 0, scopes: [] },
+    ai: { token: "or_at_...", expiresAt: 0, scopes: [] },
+    coding: { token: "or_at_...", expiresAt: 0, scopes: [] },
+    relay: { token: "or_at_...", expiresAt: 0, scopes: [] }
+  }
+}
 ```
 
-These are the **canonical** shapes. Each platform
-implements them in its own language:
+The file is private (`0600`). No managed coding key, device grant, backend
+service key, or hardware identifier is stored.
 
-- **TypeScript / JavaScript:** `src/runtime/authContract.js`
-  in the CLI repo. Exports `KEY_SCOPE`, `KEY_SOURCE`,
-  `KEY_KIND`, `LOGIN_CODE_TTL_MS_MIN/MAX`, etc.
-- **Dart:** `lib/features/auth/auth_state.dart` + the
-  `ProviderConfig` sealed class in
-  `lib/features/providers/provider_config.dart`.
-- **Python:** `UPT_back_end/ai/server/originrouter_auth_contract.py`.
-  The dataclass `ManagedCodingKey` and the
-  `validate_managed_key_shape` helper are the backend's
-  reference.
+## Login
 
-## Managed key rotation
+The CLI uses the RFC 8628 Device Authorization Grant against Surety. The
+Device Code is short-lived and secret; the User Code is safe to display but
+must still expire quickly.
 
-The CLI and the App auto-rotate the managed key 7 days before
-its `expiresAt`. Rotation is a single POST to the backend
-(`POST /originrouter/auth/device/rotate-coding-key` — Stage
-9.1+). The previous key is invalidated in the same call. The
-on-disk record is overwritten in place; the file mode stays
-0o600.
+After approval, the CLI receives the first Access/Refresh Token pair. It then
+rotates the Refresh Token sequentially to obtain tokens for:
 
-If the CLI / App is offline when rotation is due, the key is
-still usable until `expiresAt`. The first network call after
-expiry triggers a rotation; if that fails, the CLI / App shows
-a "managed key expired, please re-authenticate" prompt and
-stops sending requests.
-
-## Local storage expectations
-
-**CLI side:** `<stateDir>/coding-key.json`, mode 0o600. The
-record is the `ManagedCodingKey` shape above plus a
-`writtenAt: number` field (epoch ms, set by `writeCodingAuth`).
-The IO layer is `src/persistence/codingAuth.js`. The pure
-shape check is `isManagedKeyShape` in
-`src/runtime/authContract.js`. **The IO layer delegates the
-shape check to the pure helper** — there is exactly one source
-of truth for "what counts as a valid managed key."
-
-**App side:** Stage 9.0 keeps the AuthState in memory; Stage
-9.1+ integrates with the OS keychain (Keychain on iOS / macOS,
-Keystore on Android, Credential Manager on Windows / Linux).
-The App mirrors the CLI's `coding-key.json` shape; the
-provider / auth flows on the App side read from
-`lib/features/auth/auth_state.dart` and `provider_config.dart`.
-
-**No default secret sync.** The CLI and App do NOT sync the
-managed key to each other, to the cloud, or to any relay.
-Stage 9.0 explicitly forbids it. If a future stage adds sync,
-it must be initiated by the local CLI explicitly and should be
-E2EE; this is a 9.1+ design discussion, not a 9.0 deliverable.
-
-## Logout behavior
-
-`originrouter logout` (Stage 9.1+) clears the local file via
-`clearCodingAuth(stateDir)` and POSTs
-`POST /originrouter/auth/device/revoke` to the backend. The
-backend revokes the device grant, which in turn invalidates
-every managed key bound to it. The user can immediately log in
-again from any device.
-
-Stage 9.0 ships only the storage side of logout. The CLI
-subcommand and the backend endpoint are 9.1+.
-
-## Backend endpoint contract (Stage 9.1A)
-
-These endpoints ARE registered in 9.1A at
-`UPT_back_end/ai/server/routes/originrouter_auth.py`. Full
-contract lives in `UPT_back_end/docs/originrouter-auth.md`.
-
-- `POST /originrouter/auth/login-code` — browser-authenticated.
-  Mints a one-time code (5–10 min, single-use).
-- `POST /originrouter/auth/device/exchange` — exchanges a code
-  for a device grant + first managed key. Returns raw grant
-  and raw key exactly once.
-- `POST /originrouter/auth/device/rotate-coding-key` — rotates
-  the managed key bound to the calling device. Idempotent on
-  the device-grant side; the rotation itself produces a new key
-  every call.
-- `POST /originrouter/auth/device/revoke` — revokes the calling
-  device's grant and all bound keys. Returns
-  `{already_revoked: bool}`.
-- `GET  /originrouter/auth/devices` — returns the **calling
-  device only** under `scope: "current_device_only"`. Not a
-  full user-device list.
-
-## Runtime wiring (Stage 9.1B)
-
-`src/config/claudeConfig.js` `buildAgentProviderEnv(agent, config, options)`
-returns:
-
-| Trigger | ANTHROPIC_BASE_URL | OPENAI_BASE_URL | source |
-|---|---|---|---|
-| route → originrouter | `<base>/coding` | `<base>/coding/v1` | `originrouter-coding` |
-| route → proxy + hash match | `http://127.0.0.1:<port>` | `http://127.0.0.1:<port>/v1` | `routes` |
-| otherwise | throws PROVIDER_UNSUPPORTED | throws PROVIDER_UNSUPPORTED | — |
-
-`auth.keyRef` is a **local managed coding key reference**, not a fixed key id.
-After `originrouter auth rotate`, the new key id differs but the reference is
-unchanged; the runtime always reads the current `<stateDir>/coding-key.json`.
-
-In Stage 9.1B, only `keyRef: "current"` is meaningful for the CLI runtime —
-the runtime reads the file on disk, not a key-by-key-id table. Future stages
-may add additional `keyRef` values (e.g. per-environment), but the
-authoritative value today is `current`, and the runtime contract is
-"whatever is in `coding-key.json` right now." Anyone who later assumes
-`keyRef` must match `keyId` will break after the first rotate.
-
-The runtime also rejects malformed `coding-key.json` (missing `deviceGrant`,
-missing `scopes`, wrong `source`) before injecting env, so a stale or
-hand-edited file produces a clean login prompt rather than a leaked
-`ANTHROPIC_API_KEY=` with an empty value.
-
-## Login command
-
-The required 9.1A completion path is `--manual-code <code>`:
-
-```
-# 1. Mint a code from the backend (browser uuid auth).
-CODE=$(curl -s -X POST <api>/originrouter/auth/login-code \
-  -H "Authorization: Bearer uuid:<known-uuid>" \
-  -H "Content-Type: application/json" \
-  -d '{"device_id":"smoke-device","source":"originrouter_cli"}' \
-  | python3 -c "import sys,json;print(json.load(sys.stdin)['code'])")
-
-# 2. Exchange it on the CLI.
-originrouter login --manual-code "$CODE" --api-base-url <api>
-# → writes <stateDir>/coding-key.json with the full managed key
-#   (deviceGrant, deviceId, deviceGrantIdleExpiresAt, etc.)
-
-originrouter auth status        # masked summary, no backend call
-originrouter auth rotate        # rotates via backend
-originrouter auth device list   # current_device_only block
-originrouter logout             # revokes + clears local file
+```text
+originrouter.control
+originrouter.ai
+originrouter.coding
+originrouter.relay
 ```
 
-The browser callback flow (`originrouter login` without
-`--manual-code`) opens a local HTTP server on 127.0.0.1 and
-waits for `/originrouter/login/callback?code=...&state=...`.
-End-to-end UX requires Universal_PDF_H5 to call
-`/login-code` and redirect to the callback URL. That wiring is
-**9.1A.1**. Until then, `--manual-code` is the supported path.
+Sequential rotation is mandatory. Refreshing audiences in parallel would
+reuse the same one-time Refresh Token and trigger session compromise handling.
 
-The managed key written here is what `originrouter claude` /
-`originrouter codex` read at runtime (Stage 9.1B). The runtime
-also rejects malformed `coding-key.json` (missing `deviceGrant`,
-missing `scopes`, wrong `source`) before injecting env, so a
-stale or hand-edited file produces a clean login prompt rather
-than a leaked `ANTHROPIC_API_KEY=` with an empty value.
+## Runtime refresh
 
-## Remote provider runtime wiring (Stage 9.2)
+`src/runtime/oauthTokenRefresher.js`:
 
-A route of `type=remote, target=proxy` makes the caller's local
-Claude/Codex talk to a worker device's local proxy through
-`originrouter-server` as a typed relay. The runtime env points at a
-caller-side `RemoteCodingRelayProxy` on `127.0.0.1:<port>`, owned
-by the local `originrouter claude` / `originrouter codex` wrapper
-process (not the long-running daemon). The relay proxy bridges HTTP
-↔ SSE `remote.coding.*` events to the relay. The worker-side daemon
-receives `remote.coding.request`, strips caller credential/transport
-headers (`authorization`, `x-api-key`, `host`, `content-length`,
-`connection`, `transfer-encoding`), and forwards the request to the
-worker's local LiteLLM proxy, streaming the response back.
+1. Reads the credential under a cross-process lock.
+2. Rejects an expired Refresh Token before network access.
+3. Reuses an Access Token when it has more than 60 seconds remaining.
+4. Rotates the Refresh Token for the exact requested resource.
+5. Atomically persists both the new RT and new audience AT.
 
-The relay forwards the request and response bodies opaquely — it
-does not parse them, does not log them, does not write them to disk,
-and replaces `headers` and `body` with placeholders in its debug
-ring. End-to-end confidentiality (so the relay genuinely cannot
-read the body) requires WebRTC / E2EE and is a later stage. 9.2
-ships no formal auth — `remote.coding.*` is routed by `deviceId`
-alone. A future "9.x security" stage will add `relayAccessToken`
-signed by the worker's `deviceGrant`; that stage is the only correct
-place to put a real auth check.
+The runtime never falls back from one audience to another.
 
-Stage 9.2 supports only `target=proxy`. `target=agent` (run the
-worker's own Claude/Codex) and WebRTC/P2P are deferred to 9.3+.
+## Revocation and replacement
 
-## Stage 9.3 — relay access tokens (Surety v2)
+Logout calls the Surety public revocation endpoint and clears the local file.
+Server-side device revoke revokes the Surety session. A new login using the
+same `(outer_user_id, device_id, source)` replaces the previous active session.
 
-9.3 introduces a second credential layer above the managed coding
-key, scoped to the relay transport only. The managed coding key
-stays the LLM-side credential (it authenticates the CLI to
-`https://server.originrouter.com/coding/v1/messages`); the relay
-access token authenticates the CLI to the worker-side relay.
+## Trust boundary
 
-### Two-token model
-
-| Token | Owner | Lifetime | Scope |
-|---|---|---|---|
-| `deviceGrant` | CLI (long-lived) | until revoke | managed-coding-key + relay auth |
-| `relayAccessToken` | Surety (short-lived) | 10 min (`RELAY_TOKEN_TTL_SECONDS=600`) | relay.remote_coding |
-
-The CLI reads `deviceGrant` from `<stateDir>/coding-key.json`
-(Stage 9.1A) and on every remote route startup calls Surety's
-`/api/relay/token` to exchange it for a fresh `relayAccessToken`.
-The `relayAccessToken` is what the CLI sends to the relay as
-`Authorization: Bearer <relayAccessToken>`.
-
-The LLM API key is **never** touched by Surety or the relay. It
-goes from the CLI directly to the model endpoint. The internal
-auth credentials (`deviceGrant`, `relayAccessToken`) and the LLM
-credential are completely separated.
-
-### Wire protocol
-
-Surety endpoints use the existing Surety style (no `/v2/...` prefix):
-
-- `POST /api/relay/token` — body `{v:"v1", device-id, device-grant}`
-  returns `{code:0, data:{relay-access-token, expires-at, token-id, scopes:["relay.remote_coding"]}}`.
-- `POST /api/relay/verify` — body `{v:"v1", relay-access-token, device-id, scope}`
-  returns `{code:0, data:{device-id, scopes, expires-at, token-id}}`.
-- `POST /api/relay/devices/seed` — admin-only (`X-Surety-Admin` header).
-  Seeds a `deviceGrant` for testing.
-
-Error codes (negative; non-zero on failure):
-`-1 invalid_grant`, `-2 revoked_grant`, `-3 expired_grant`,
-`-4 invalid_token`, `-5 expired_token`, `-6 revoked_token`,
-`-7 device_mismatch`, `-8 insufficient_scope`, `-9 internal_error`,
-`-10 admin_unauthorized` (HTTP 401), `-11 invalid params`,
-`-12 wrong content type`, `-13 payload too large`.
-
-### Why the wire version is `v1`, not `v2`
-
-The Surety project convention uses `body.v` as a per-module protocol
-version. `/api/object/encode` uses `body.v = "v1"`,
-`/api/object_strong/*` uses `body.v = "v1"`. The new relay auth
-endpoints follow the same convention: `body.v = "v1"`. The stage
-name "Surety v2" refers to the API generation, not the wire
-version. If the relay token format ever changes in a way that's
-not backward-compatible, that change will introduce
-`body.v = "v2"` for `/api/relay/*` only — other modules keep
-their own `v`.
-
-### Why the scope is `relay.remote_coding`, not `coding`
-
-`KEY_SCOPE.CODING` is the local managed-key field (Stage 9.1A) that
-identifies what the managed key unlocks on the LLM side. The
-relay token scope is a separate string — `relay.remote_coding` —
-that identifies what the bearer is allowed to do on the relay
-transport. Using the same string for both would conflate the
-two security models.
-
-### Relay-side auth rules
-
-When `ORIGINROUTER_RELAY_AUTH=on` (the production default once
-9.3 ships), the relay enforces the bearer on:
-
-- `GET /device/events?deviceId=X` — bearer must verify with
-  `deviceId = X` and scope `relay.remote_coding`.
-- `POST /device/message` — envelope-type-aware:
-  - `remote.coding.request` → verify against `envelope.sourceDeviceId`
-  - `remote.coding.response.*` → verify against
-    `remoteRequests[requestId].targetDeviceId` (the worker side
-    is identified by lookup, because response envelopes don't
-    carry the target deviceId).
-  - `remote.coding.request.cancel` → verify against
-    `envelope.deviceId`.
-  - `device.connected` / `device.disconnected` / `device.heartbeat`
-    via `/device/message` → **rejected with HTTP 400 +
-    `control_plane_not_allowed_via_message`**. These types are
-    emitted only by the relay itself, on `/device/events` and the
-    close-handler. This makes "clients cannot forge
-    `device.connected`" a server-enforced invariant, not a soft
-    convention.
-  - Generic broadcast (any other envelope) → bearer required; if
-    the envelope has a body `deviceId`, the token's deviceId must
-    match it.
-
-`/health` and `/debug/events` stay open (no auth). The
-`/debug/events` ring still masks `headers` and `body` for any
-`remote.coding.*` event (`{ "<masked>": true }` + `null`), so a
-compromised token still cannot exfiltrate prompts or LLM API
-keys through the debug ring.
-
-### Refresh path
-
-The CLI's `RemoteCodingProxyManager` schedules a refresh 60s
-before `expiresAt` (default TTL 10 min, so refresh every ~9 min).
-If Surety returns 401/403 during the refresh, the manager
-force-stops the proxy and surfaces a clear error.
-
-### Dev / local bypass
-
-`ORIGINROUTER_RELAY_AUTH=off` on **both** server and CLI. The
-9.2 dev path and tests run with this set. Asymmetric
-configuration (server=on, CLI=off) manifests as silent 401s;
-the README documents this. Production deployments must set
-`on` on both sides, and `SURETY_BASE_URL` to the real
-Surety service.
-
----
-
-## Stage 9.9 — Surety Relay 认证架构
-
-Stage 9.9 将 CLI 认证从本地 OAuth token（`or_at_` / `or_rt_`）迁移到 surety relay 模式。密钥签发和校验全部由 surety 服务负责，网关（ai/server）不再直接查 token 表。
-
-### 新的 Token 类型
-
-| Token | 格式 | 生命周期 | 存储位置 |
-|-------|------|----------|----------|
-| device_grant | `<secrets.token_urlsafe(48)>` | 无过期（随 relay_device_grants 表） | CLI 本地 `coding-key.json` |
-| access_token | `rt_<32B-base64url>` | 1 小时 | CLI 内存 + 磁盘缓存 |
-
-### 流程
-
-```
-登录（一次性）：
-  CLI → originrouter_cli /device/code
-  用户 → H5 授权页
-  CLI → originrouter_cli /device/token
-    内部：查 users.outerId → 调 surety /api/relay/devices/seed 注册
-         → 调 surety /api/relay/token 签首个 access_token
-    返回给 CLI: {device_grant, access_token, token_endpoint, expires_at, device_id}
-
-刷新（CLI 直达 surety，用户无感知）：
-  CLI → surety /api/relay/token (用 device_grant + device_id)
-    返回: {relay-access-token, expires-at}
-
-LLM 请求：
-  CLI → ai/server (Authorization: Bearer rt_<token>)
-    ai/server → surety /api/relay/verify
-      返回: {outer-user-id, device-id, scopes}
-    ai/server 用 outer_user_id 查 users 表 → 放行
-```
-
-### On-disk Shape (coding-key.json)
-
-```ts
-type RelayCredential = {
-  kind: "relay";
-  deviceGrant: string;           // 长期凭证，调 surety 签发 token 用
-  deviceId: string;              // device-<sha256-fingerprint>
-  tokenEndpoint: string;         // surety /api/relay/token URL
-  accessToken: string;           // rt_<base64url>，1h 过期
-  accessTokenExpiresAt: number;  // epoch ms
-  scopes: ["coding"];
-  source: "originrouter_cli";
-  writtenAt?: number;            // epoch ms
-};
-```
-
-### 关键文件
-
-- `se/authContract.js` — `KEY_KIND.RELAY`, `isRelayShape()`
-- `src/runtime/relayTokenRefresher.js` — 静默刷新逻辑
-- `src/config/claudeConfig.js` — `readManagedCodingKeyForRuntime()` 调 refresher
-- `src/persistence/codingAuth.js` — 磁盘读写
+The CLI talks directly to Surety for Device Code, token exchange, refresh, and
+public revocation. It talks to `originrouter_server` only for application and
+Relay APIs. Backend service-key authenticated Surety endpoints are never
+called by the CLI.

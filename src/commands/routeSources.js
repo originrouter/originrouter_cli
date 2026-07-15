@@ -8,7 +8,8 @@ import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
 import { DEFAULT_ORIGINROUTER_BASE_URL } from "../config/providerRoutes.js";
-import { ensureFreshAccessToken } from "../runtime/relayTokenRefresher.js";
+import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
+import { accessTokenFor, OAUTH_RESOURCES } from "../runtime/authContract.js";
 
 const CONTROL_CANDIDATES = Object.freeze([
   {
@@ -76,9 +77,13 @@ export async function selectControlBaseUrl({
   return viable[0].candidate.controlBaseUrl;
 }
 
-async function signedInToken({ stateDir, ensureFreshAccessTokenFn = ensureFreshAccessToken }) {
-  const credential = await ensureFreshAccessTokenFn({ stateDir });
-  const token = credential?.accessToken || credential?.key;
+async function signedInToken({
+  stateDir,
+  resource,
+  ensureFreshAccessTokenFn = ensureFreshAccessToken,
+}) {
+  const credential = await ensureFreshAccessTokenFn({ stateDir, resource });
+  const token = accessTokenFor(credential, resource)?.token;
   if (!token) {
     throw new Error("OriginRouter Cloud and remote routes require `originrouter login`.");
   }
@@ -126,7 +131,11 @@ export async function loadCloudModels({
   env = process.env,
   ensureFreshAccessTokenFn = ensureFreshAccessToken,
 } = {}) {
-  const token = await signedInToken({ stateDir, ensureFreshAccessTokenFn });
+  const token = await signedInToken({
+    stateDir,
+    resource: OAUTH_RESOURCES.AI,
+    ensureFreshAccessTokenFn,
+  });
   const baseUrl = trimBaseUrl(env.ORIGINROUTER_AI_SERVER_BASE_URL || DEFAULT_ORIGINROUTER_BASE_URL);
   const payload = await requestJson(fetchFn, `${baseUrl}/ai/model`, {
     method: "POST",
@@ -167,10 +176,14 @@ export async function loadRemoteCliDevices({
   selectControlBaseUrlFn = selectControlBaseUrl,
 } = {}) {
   const [token, controlBaseUrl] = await Promise.all([
-    signedInToken({ stateDir, ensureFreshAccessTokenFn }),
+    signedInToken({
+      stateDir,
+      resource: OAUTH_RESOURCES.CONTROL,
+      ensureFreshAccessTokenFn,
+    }),
     selectControlBaseUrlFn({ fetchFn, env }),
   ]);
-  const payload = await requestJson(fetchFn, `${trimBaseUrl(controlBaseUrl)}/app/v1/devices`, {
+  const payload = await requestJson(fetchFn, `${trimBaseUrl(controlBaseUrl)}/cli/v1/devices`, {
     method: "GET",
     headers: { Authorization: `Bearer ${token}` },
   });

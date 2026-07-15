@@ -118,8 +118,8 @@ module in the CLI that constructs these paths.
 
 ## Out of scope (preserved)
 
-- The resolver does NOT resolve auth (managed key exchange
-  is 9.1+).
+- The resolver does NOT perform OAuth exchange or refresh; runtime auth owns
+  that responsibility.
 - The resolver does NOT retry on network failure.
 - The resolver does NOT decide whether the local daemon is
   allowed to control a remote device — that is a separate

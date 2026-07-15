@@ -1,7 +1,8 @@
 import { readCodingAuth } from "../persistence/codingAuth.js";
 import { getStateDir } from "../persistence/state.js";
 import { DEFAULT_ORIGINROUTER_CONTROL_BASE_URL } from "../config/providerRoutes.js";
-import { ensureFreshAccessToken } from "../runtime/relayTokenRefresher.js";
+import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
+import { accessTokenFor, OAUTH_RESOURCES } from "../runtime/authContract.js";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_APPROVAL_POLL_INTERVAL_MS = 2_000;
@@ -27,6 +28,27 @@ function stripAnsi(text) {
     /\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g,
     "",
   );
+}
+
+async function resolveControlAuth({
+  stateDir,
+  readCodingAuthFn,
+  ensureFreshAccessTokenFn,
+}) {
+  let credential;
+  try {
+    credential = await ensureFreshAccessTokenFn({
+      stateDir,
+      resource: OAUTH_RESOURCES.CONTROL,
+    });
+    if (!credential && readCodingAuthFn) credential = readCodingAuthFn(stateDir);
+  } catch {
+    return { error: "no_coding_auth" };
+  }
+  const token = accessTokenFor(credential, OAUTH_RESOURCES.CONTROL)?.token;
+  if (!token) return { error: "no_access_token" };
+  if (!credential.deviceId) return { error: "no_device_id" };
+  return { credential, token };
 }
 
 export function buildRuntimeEventEnvelope({
@@ -58,19 +80,13 @@ export async function reportRuntimeEvent(payload, {
   ensureFreshAccessTokenFn = ensureFreshAccessToken,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 } = {}) {
-  let auth;
-  try {
-    auth = await ensureFreshAccessTokenFn({ stateDir });
-    if (!auth && readCodingAuthFn) auth = readCodingAuthFn(stateDir);
-  } catch {
-    return { ok: false, error: "no_coding_auth" };
-  }
-  if (!auth || typeof auth.accessToken !== "string" || !auth.accessToken) {
-    return { ok: false, error: "no_access_token" };
-  }
-  if (!auth.deviceId) {
-    return { ok: false, error: "no_device_id" };
-  }
+  const resolved = await resolveControlAuth({
+    stateDir,
+    readCodingAuthFn,
+    ensureFreshAccessTokenFn,
+  });
+  if (resolved.error) return { ok: false, error: resolved.error };
+  const { credential: auth, token } = resolved;
   if (typeof fetchFn !== "function") {
     return { ok: false, error: "fetch_unavailable" };
   }
@@ -82,7 +98,7 @@ export async function reportRuntimeEvent(payload, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${auth.accessToken}`,
+        Authorization: `Bearer ${token}`,
         "X-OriginRouter-Device-Id": auth.deviceId,
       },
       body: JSON.stringify(payload),
@@ -103,19 +119,13 @@ export async function reportLocalControlRuntime(payload, {
   ensureFreshAccessTokenFn = ensureFreshAccessToken,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 } = {}) {
-  let auth;
-  try {
-    auth = await ensureFreshAccessTokenFn({ stateDir });
-    if (!auth && readCodingAuthFn) auth = readCodingAuthFn(stateDir);
-  } catch {
-    return { ok: false, error: "no_coding_auth" };
-  }
-  if (!auth || typeof auth.accessToken !== "string" || !auth.accessToken) {
-    return { ok: false, error: "no_access_token" };
-  }
-  if (!auth.deviceId) {
-    return { ok: false, error: "no_device_id" };
-  }
+  const resolved = await resolveControlAuth({
+    stateDir,
+    readCodingAuthFn,
+    ensureFreshAccessTokenFn,
+  });
+  if (resolved.error) return { ok: false, error: resolved.error };
+  const { credential: auth, token } = resolved;
   if (typeof fetchFn !== "function") {
     return { ok: false, error: "fetch_unavailable" };
   }
@@ -135,7 +145,7 @@ export async function reportLocalControlRuntime(payload, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${auth.accessToken}`,
+        Authorization: `Bearer ${token}`,
         "X-OriginRouter-Device-Id": auth.deviceId,
       },
       body: JSON.stringify(body),
@@ -257,19 +267,15 @@ export async function pollResolvedApprovals({
   if (!normalizedSessionId) {
     return { ok: false, error: "invalid_session_id", approvals: [] };
   }
-  let auth;
-  try {
-    auth = await ensureFreshAccessTokenFn({ stateDir });
-    if (!auth && readCodingAuthFn) auth = readCodingAuthFn(stateDir);
-  } catch {
-    return { ok: false, error: "no_coding_auth", approvals: [] };
+  const resolved = await resolveControlAuth({
+    stateDir,
+    readCodingAuthFn,
+    ensureFreshAccessTokenFn,
+  });
+  if (resolved.error) {
+    return { ok: false, error: resolved.error, approvals: [] };
   }
-  if (!auth || typeof auth.accessToken !== "string" || !auth.accessToken) {
-    return { ok: false, error: "no_access_token", approvals: [] };
-  }
-  if (!auth.deviceId) {
-    return { ok: false, error: "no_device_id", approvals: [] };
-  }
+  const { credential: auth, token } = resolved;
   if (typeof fetchFn !== "function") {
     return { ok: false, error: "fetch_unavailable", approvals: [] };
   }
@@ -283,7 +289,7 @@ export async function pollResolvedApprovals({
     const resp = await fetchFn(url, {
       method: "GET",
       headers: {
-        Authorization: `Bearer ${auth.accessToken}`,
+        Authorization: `Bearer ${token}`,
         "X-OriginRouter-Device-Id": auth.deviceId,
       },
       signal: controller.signal,

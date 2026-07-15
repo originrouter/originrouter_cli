@@ -13,7 +13,7 @@ import { buildAgentProviderEnv } from "../src/config/claudeConfig.js";
 import { addProvider, setCurrentProvider } from "../src/config/providers.js";
 import { setRoute, clearRoute, CODEX_MAIN_ALIAS, getAllRoutes, hashRoutes, getRoutes, MAIN_ALIAS, SMALL_ALIAS } from "../src/config/routes.js";
 import { writeCodingAuth } from "../src/persistence/codingAuth.js";
-import { KEY_KIND, KEY_SCOPE, KEY_SOURCE } from "../src/runtime/authContract.js";
+import { makeOAuthCredential } from "./support/oauthCredential.js";
 
 const home = mkdtempSync(join(tmpdir(), "originrouter-claude-routes-"));
 process.env.ORIGINROUTER_HOME = home;
@@ -211,27 +211,14 @@ try {
   // writeCodingAuth, and assert the env vars are derived from
   // DEFAULT_ORIGINROUTER_BASE_URL ("https://server.easytransnote.com").
 
-  // helper: write a well-formed managed key matching isManagedKeyShape
-  function seedManagedKey(home, overrides = {}) {
-    const key = {
-      kind: KEY_KIND.MANAGED,                 // "managed"
-      keyId: "ok_test_key",
-      key: "sk-or-v1-ok-test-key",
-      deviceGrantId: "og_test_grant_id",
-      deviceGrant: "og_test_grant_token_for_unit_tests_only",
-      deviceId: "device-test-001",
-      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
-      source: KEY_SOURCE.ORIGINROUTER_CLI,    // "originrouter_cli"
-      scopes: [KEY_SCOPE.CODING],             // ["coding"]
-      ...overrides,
-    };
-    writeCodingAuth(home, key);
+  function seedOAuthCredential(home, overrides = {}) {
+    writeCodingAuth(home, makeOAuthCredential(overrides));
   }
 
   // ---- (13) claude originrouter direct smoke ----
   {
     const official = { name: "official", type: "originrouter",
-      auth: { type: "managed_originrouter_key", keyRef: "current" },
+      auth: { type: "oauth" },
       model: "claude-sonnet-4-6" };
     const configWithOfficial = {
       ...config,
@@ -243,14 +230,14 @@ try {
     const configWithoutSmall = clearRoute(configWithOfficial, "claude", "small");
     const configRouted = setRoute(configWithoutSmall, "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
-    seedManagedKey(home);
+    seedOAuthCredential(home);
     // proxyStatus returning "stopped" must NOT block originrouter direct.
     const out = await buildAgentProviderEnv("claude", configRouted, {
       proxyStatus: () => ({ state: "stopped" }),
     });
     assert.equal(out.source, "originrouter-coding");
     assert.equal(out.env.ANTHROPIC_BASE_URL, "https://server.easytransnote.com/coding");
-    assert.equal(out.env.ANTHROPIC_API_KEY, "sk-or-v1-ok-test-key");
+    assert.equal(out.env.ANTHROPIC_API_KEY, "or_at_coding_test");
     assert.equal(out.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
     // small falls back to main
     assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, "claude-sonnet-4-6");
@@ -259,7 +246,7 @@ try {
   // ---- (14) codex originrouter direct smoke ----
   {
     const officialCodex = { name: "official-codex", type: "originrouter",
-      auth: { type: "managed_originrouter_key", keyRef: "current" },
+      auth: { type: "oauth" },
       model: "gpt-5-codex",
       baseUrl: "https://server.originrouter.com" };
     const configWithOfficialCodex = {
@@ -275,7 +262,7 @@ try {
     });
     assert.equal(out.source, "originrouter-coding");
     assert.equal(out.env.OPENAI_BASE_URL, "https://server.originrouter.com/coding/v1");
-    assert.equal(out.env.OPENAI_API_KEY, "sk-or-v1-ok-test-key");
+    assert.equal(out.env.OPENAI_API_KEY, "or_at_coding_test");
     assert.equal(out.env.OPENAI_MODEL, "gpt-5-codex");
   }
 } finally {

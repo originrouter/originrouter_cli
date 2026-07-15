@@ -9,6 +9,7 @@ import {
   reportRuntimeEvent,
   startApprovalDecisionPolling,
 } from "../src/agent/bridgeReporter.js";
+import { makeOAuthCredential } from "./support/oauthCredential.js";
 
 test("buildRuntimeEventEnvelope normalizes and truncates strings", () => {
   const payload = buildRuntimeEventEnvelope({
@@ -46,7 +47,7 @@ test("reportRuntimeEvent fails closed without coding auth", async () => {
   assert.equal(result.error, "no_access_token");
 });
 
-test("reportRuntimeEvent uses relay access token and device id header", async () => {
+test("reportRuntimeEvent uses control access token and device id header", async () => {
   let called = null;
   const result = await reportRuntimeEvent(
     buildRuntimeEventEnvelope({
@@ -57,10 +58,10 @@ test("reportRuntimeEvent uses relay access token and device id header", async ()
     }),
     {
       stateDir: "/tmp/originrouter-missing-auth",
-      ensureFreshAccessTokenFn: async () => ({
-        accessToken: "rt-secret",
-        deviceId: "device-1",
-      }),
+      ensureFreshAccessTokenFn: async ({ resource }) => {
+        assert.equal(resource, "originrouter.control");
+        return makeOAuthCredential({ deviceId: "device-1" });
+      },
       fetchFn: async (url, options) => {
         called = { url: String(url), options };
         return { ok: true, status: 200 };
@@ -70,7 +71,7 @@ test("reportRuntimeEvent uses relay access token and device id header", async ()
 
   assert.equal(result.ok, true);
   assert.match(called.url, /\/cli\/v1\/agent\/runtime-event$/);
-  assert.equal(called.options.headers.Authorization, "Bearer rt-secret");
+  assert.equal(called.options.headers.Authorization, "Bearer or_at_control_test");
   assert.equal(called.options.headers["X-OriginRouter-Device-Id"], "device-1");
 });
 
@@ -86,10 +87,7 @@ test("reportLocalControlRuntime posts display-safe daemon status", async () => {
     },
     {
       stateDir: "/tmp/originrouter-missing-auth",
-      ensureFreshAccessTokenFn: async () => ({
-        accessToken: "rt-secret",
-        deviceId: "device-1",
-      }),
+      ensureFreshAccessTokenFn: async () => makeOAuthCredential({ deviceId: "device-1" }),
       fetchFn: async (url, options) => {
         called = { url: String(url), options };
         return { ok: true, status: 200 };
@@ -99,7 +97,7 @@ test("reportLocalControlRuntime posts display-safe daemon status", async () => {
 
   assert.equal(result.ok, true);
   assert.match(called.url, /\/cli\/v1\/local-control\/runtime$/);
-  assert.equal(called.options.headers.Authorization, "Bearer rt-secret");
+  assert.equal(called.options.headers.Authorization, "Bearer or_at_control_test");
   assert.equal(called.options.headers["X-OriginRouter-Device-Id"], "device-1");
   assert.deepEqual(JSON.parse(called.options.body), {
     cli_running: true,
@@ -115,13 +113,10 @@ test("pollResolvedApprovals maps decided approvals into runtime decisions", asyn
   const result = await pollResolvedApprovals({
     sessionId: "session-1",
     stateDir: "/tmp/originrouter-missing-auth",
-    ensureFreshAccessTokenFn: async () => ({
-      accessToken: "rt-secret",
-      deviceId: "device-1",
-    }),
+    ensureFreshAccessTokenFn: async () => makeOAuthCredential({ deviceId: "device-1" }),
     fetchFn: async (url, options) => {
       calledUrl = String(url);
-      assert.equal(options.headers.Authorization, "Bearer rt-secret");
+      assert.equal(options.headers.Authorization, "Bearer or_at_control_test");
       assert.equal(options.headers["X-OriginRouter-Device-Id"], "device-1");
       return {
         ok: true,
@@ -177,10 +172,7 @@ test("startApprovalDecisionPolling emits mapped permission resolves once", async
     intervalMs: 20,
     timeoutMs: 50,
     stateDir: "/tmp/originrouter-missing-auth",
-    ensureFreshAccessTokenFn: async () => ({
-      accessToken: "rt-secret",
-      deviceId: "device-1",
-    }),
+    ensureFreshAccessTokenFn: async () => makeOAuthCredential({ deviceId: "device-1" }),
     fetchFn: async () => {
       fetchCalls += 1;
       return {

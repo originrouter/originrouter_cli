@@ -22,28 +22,16 @@ import {
   getAllRoutes, hashRoutes, setRoute,
 } from "../src/config/routes.js";
 import { writeCodingAuth } from "../src/persistence/codingAuth.js";
-import { KEY_KIND, KEY_SCOPE, KEY_SOURCE } from "../src/runtime/authContract.js";
 import { DEFAULT_ORIGINROUTER_BASE_URL } from "../src/config/providerRoutes.js";
+import { makeOAuthCredential } from "./support/oauthCredential.js";
 
 const home = mkdtempSync(join(tmpdir(), "originrouter-runtime-route-"));
 process.env.ORIGINROUTER_HOME = home;
 
 // ---- helpers ----
 
-function seedManagedKey(home, overrides = {}) {
-  const key = {
-    kind: KEY_KIND.MANAGED,
-    keyId: "ok_test_key",
-    key: "sk-or-v1-ok-test-key",
-    deviceGrantId: "og_test_grant_id",
-    deviceGrant: "og_test_grant_token_for_unit_tests_only",
-    deviceId: "device-test-001",
-    expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
-    source: KEY_SOURCE.ORIGINROUTER_CLI,
-    scopes: [KEY_SCOPE.CODING],
-    ...overrides,
-  };
-  writeCodingAuth(home, key);
+function seedOAuthCredential(home, overrides = {}) {
+  writeCodingAuth(home, makeOAuthCredential(overrides));
 }
 
 // Bypass writeCodingAuth to feed the runtime guard bad input on purpose.
@@ -57,7 +45,7 @@ function clearCodingKeyFile(home) {
 
 const officialClaude = {
   name: "official", type: "originrouter",
-  auth: { type: "managed_originrouter_key", keyRef: "current" },
+  auth: { type: "oauth" },
   model: "claude-sonnet-4-6",
 };
 const officialClaudeWithBaseUrl = {
@@ -66,7 +54,7 @@ const officialClaudeWithBaseUrl = {
 };
 const fastOrig = {
   name: "fast-orig", type: "originrouter",
-  auth: { type: "managed_originrouter_key", keyRef: "current" },
+  auth: { type: "oauth" },
   model: "claude-haiku-4-5",
 };
 const moonshotProxy = {
@@ -75,7 +63,7 @@ const moonshotProxy = {
 };
 const officialCodex = {
   name: "official-codex", type: "originrouter",
-  auth: { type: "managed_originrouter_key", keyRef: "current" },
+  auth: { type: "oauth" },
   model: "gpt-5-codex",
   baseUrl: "https://alt.originrouter.example",
 };
@@ -92,7 +80,7 @@ cases.push({
   name: "claude originrouter direct: returns source + four env vars",
   run: async () => {
     clearCodingKeyFile(home);
-    seedManagedKey(home);
+    seedOAuthCredential(home);
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
     const out = await buildAgentProviderEnv("claude", cfg, {
@@ -101,7 +89,7 @@ cases.push({
     assert.equal(out.source, "originrouter-coding");
     assert.equal(out.env.ANTHROPIC_BASE_URL,
       `${DEFAULT_ORIGINROUTER_BASE_URL}/coding`);
-    assert.equal(out.env.ANTHROPIC_API_KEY, "sk-or-v1-ok-test-key");
+    assert.equal(out.env.ANTHROPIC_API_KEY, "or_at_coding_test");
     assert.equal(out.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
     // small falls back to main when small slot not configured
     assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, "claude-sonnet-4-6");
@@ -112,7 +100,7 @@ cases.push({
   name: "claude originrouter direct: provider.baseUrl override",
   run: async () => {
     clearCodingKeyFile(home);
-    seedManagedKey(home);
+    seedOAuthCredential(home);
     const cfg = { providers: { "official-baseurl": officialClaudeWithBaseUrl } };
     const routed = setRoute(cfg, "claude", "main",
       { provider: "official-baseurl", model: "claude-sonnet-4-6" });
@@ -127,7 +115,7 @@ cases.push({
   name: "claude originrouter direct: explicit small route model wins over main",
   run: async () => {
     clearCodingKeyFile(home);
-    seedManagedKey(home);
+    seedOAuthCredential(home);
     const cfg = { providers: { official: officialClaude, "fast-orig": fastOrig } };
     const routed = setRoute(cfg, "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
@@ -145,7 +133,7 @@ cases.push({
   name: "claude originrouter direct: small route model missing → fallback to main",
   run: async () => {
     clearCodingKeyFile(home);
-    seedManagedKey(home);
+    seedOAuthCredential(home);
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
     // explicitly no small slot
@@ -160,7 +148,7 @@ cases.push({
   name: "claude originrouter direct: mixed provider (main=originrouter small=proxy) throws",
   run: async () => {
     clearCodingKeyFile(home);
-    seedManagedKey(home);
+    seedOAuthCredential(home);
     const cfg = { providers: { official: officialClaude, "moonshot-proxy": moonshotProxy } };
     const routed = setRoute(cfg, "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
@@ -180,7 +168,7 @@ cases.push({
   name: "claude originrouter direct: no local proxy required",
   run: async () => {
     clearCodingKeyFile(home);
-    seedManagedKey(home);
+    seedOAuthCredential(home);
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
     // proxyStatus returning not-installed must not block the direct branch
@@ -208,15 +196,27 @@ cases.push({
 });
 
 cases.push({
-  name: "claude originrouter direct: expired coding key throws rotate hint",
+  name: "claude originrouter direct: failed coding-token refresh throws login hint",
   run: async () => {
     clearCodingKeyFile(home);
-    seedManagedKey(home, { expiresAt: Date.now() - 60 * 1000 });
+    seedOAuthCredential(home, {
+      accessTokens: {
+        coding: {
+          token: "or_at_coding_expired",
+          expiresAt: Date.now() - 60_000,
+          scopes: ["coding.invoke"],
+        },
+      },
+    });
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
     await assert.rejects(
       () => buildAgentProviderEnv("claude", cfg, {
         proxyStatus: () => ({ state: "stopped" }),
+        ensureFreshAccessToken: async ({ resource }) => {
+          assert.equal(resource, "originrouter.coding");
+          throw new Error("refresh failed");
+        },
       }),
       (err) => err.code === "PROVIDER_UNSUPPORTED"
         && /originrouter login/.test(err.message),
@@ -227,21 +227,10 @@ cases.push({
 // --- malformed-shape guard (Stage 9.1B §A.1.1) ---
 
 cases.push({
-  name: "claude originrouter direct: malformed key missing deviceGrant throws login hint",
+  name: "claude originrouter direct: malformed credential missing refresh token throws login hint",
   run: async () => {
     clearCodingKeyFile(home);
-    const goodKey = {
-      kind: KEY_KIND.MANAGED,
-      keyId: "ok_test_key",
-      key: "sk-or-v1-ok-test-key",
-      deviceGrantId: "og_test_grant_id",
-      deviceGrant: "og_test_grant_token_for_unit_tests_only",
-      deviceId: "device-test-001",
-      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
-      source: KEY_SOURCE.ORIGINROUTER_CLI,
-      scopes: [KEY_SCOPE.CODING],
-    };
-    const { deviceGrant: _omit, ...bad } = goodKey;
+    const { refreshToken: _omit, ...bad } = makeOAuthCredential();
     void _omit;
     writeRawJsonKey(home, bad);
     const cfg = setRoute(baseConfig(), "claude", "main",
@@ -257,23 +246,16 @@ cases.push({
 });
 
 cases.push({
-  name: "claude originrouter direct: malformed key missing scopes throws login hint",
+  name: "claude originrouter direct: malformed coding token missing scopes throws login hint",
   run: async () => {
     clearCodingKeyFile(home);
-    const goodKey = {
-      kind: KEY_KIND.MANAGED,
-      keyId: "ok_test_key",
-      key: "sk-or-v1-ok-test-key",
-      deviceGrantId: "og_test_grant_id",
-      deviceGrant: "og_test_grant_token_for_unit_tests_only",
-      deviceId: "device-test-001",
-      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
-      source: KEY_SOURCE.ORIGINROUTER_CLI,
-      scopes: [KEY_SCOPE.CODING],
-    };
-    const { scopes: _omit, ...bad } = goodKey;
+    const good = makeOAuthCredential();
+    const { scopes: _omit, ...badCoding } = good.accessTokens.coding;
     void _omit;
-    writeRawJsonKey(home, bad);
+    writeRawJsonKey(home, {
+      ...good,
+      accessTokens: { ...good.accessTokens, coding: badCoding },
+    });
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
     await assert.rejects(
@@ -287,21 +269,13 @@ cases.push({
 });
 
 cases.push({
-  name: "claude originrouter direct: scopes not including 'coding' throws login hint",
+  name: "claude originrouter direct: malformed credential missing coding token throws login hint",
   run: async () => {
     clearCodingKeyFile(home);
-    const goodKey = {
-      kind: KEY_KIND.MANAGED,
-      keyId: "ok_test_key",
-      key: "sk-or-v1-ok-test-key",
-      deviceGrantId: "og_test_grant_id",
-      deviceGrant: "og_test_grant_token_for_unit_tests_only",
-      deviceId: "device-test-001",
-      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
-      source: KEY_SOURCE.ORIGINROUTER_CLI,
-      scopes: ["other"],
-    };
-    writeRawJsonKey(home, goodKey);
+    const good = makeOAuthCredential();
+    const { coding: _omit, ...withoutCoding } = good.accessTokens;
+    void _omit;
+    writeRawJsonKey(home, { ...good, accessTokens: withoutCoding });
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
     await assert.rejects(
@@ -318,20 +292,7 @@ cases.push({
   name: "claude originrouter direct: wrong source throws login hint",
   run: async () => {
     clearCodingKeyFile(home);
-    // isManagedKeyShape accepts originrouter_cli AND originrouter_app; a
-    // source outside that set is rejected by the shape guard.
-    const goodKey = {
-      kind: KEY_KIND.MANAGED,
-      keyId: "ok_test_key",
-      key: "sk-or-v1-ok-test-key",
-      deviceGrantId: "og_test_grant_id",
-      deviceGrant: "og_test_grant_token_for_unit_tests_only",
-      deviceId: "device-test-001",
-      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
-      source: "rogue-source",
-      scopes: [KEY_SCOPE.CODING],
-    };
-    writeRawJsonKey(home, goodKey);
+    writeRawJsonKey(home, makeOAuthCredential({ source: "rogue-source" }));
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
     await assert.rejects(
@@ -350,7 +311,7 @@ cases.push({
   name: "codex originrouter direct: returns source + three env vars",
   run: async () => {
     clearCodingKeyFile(home);
-    seedManagedKey(home);
+    seedOAuthCredential(home);
     const cfg = { providers: { "official-codex": officialCodex } };
     const routed = setRoute(cfg, "codex", "main",
       { provider: "official-codex", model: "gpt-5-codex" });
@@ -359,7 +320,7 @@ cases.push({
     });
     assert.equal(out.source, "originrouter-coding");
     assert.equal(out.env.OPENAI_BASE_URL, "https://alt.originrouter.example/coding/v1");
-    assert.equal(out.env.OPENAI_API_KEY, "sk-or-v1-ok-test-key");
+    assert.equal(out.env.OPENAI_API_KEY, "or_at_coding_test");
     assert.equal(out.env.OPENAI_MODEL, "gpt-5-codex");
   },
 });
@@ -368,7 +329,7 @@ cases.push({
   name: "codex originrouter direct: provider.baseUrl falls back when null",
   run: async () => {
     clearCodingKeyFile(home);
-    seedManagedKey(home);
+    seedOAuthCredential(home);
     const cfg = { providers: { "official": { ...officialClaude, model: "gpt-5-codex" } } };
     const routed = setRoute(cfg, "codex", "main",
       { provider: "official", model: "gpt-5-codex" });
@@ -384,7 +345,7 @@ cases.push({
   name: "codex originrouter direct: no local proxy required",
   run: async () => {
     clearCodingKeyFile(home);
-    seedManagedKey(home);
+    seedOAuthCredential(home);
     const cfg = { providers: { "official-codex": officialCodex } };
     const routed = setRoute(cfg, "codex", "main",
       { provider: "official-codex", model: "gpt-5-codex" });

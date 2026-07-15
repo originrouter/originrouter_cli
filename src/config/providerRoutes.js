@@ -14,7 +14,7 @@
 //     originrouter-claude-fast-model, originrouter-codex-model)
 //   - the default originrouter base URL
 //
-// It does NOT resolve auth, fetch a managed key, or perform
+// It does NOT exchange or refresh OAuth credentials, or perform
 // retries. Those are 9.1+ concerns.
 
 import { PROVIDER_TYPE } from "./providers.js";
@@ -72,6 +72,7 @@ export const DEFAULT_ORIGINROUTER_CONTROL_BASE_URL = "https://app.easytransnote.
 // API gateway (different host). Override via --login-url or
 // ORIGINROUTER_LOGIN_URL.
 export const DEFAULT_ORIGINROUTER_H5_BASE_URL = "https://originrouter.com";
+export const DEFAULT_SURETY_BASE_URL = "https://surety.easytransnote.com";
 
 /**
  * Pure: given a provider type, runtime, and (optional) explicit

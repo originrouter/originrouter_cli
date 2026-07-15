@@ -1,7 +1,4 @@
-// Stage 9.3 — RelayClient authToken seam tests.
-//
-// Verifies the additive `authToken` parameter on
-// `src/relay/relayClient.js` (the worker daemon's hot path).
+// RelayClient access-token transport tests.
 //
 // Cases:
 //   1. Default constructor (no authToken) -> postJson sends no Authorization header
@@ -76,12 +73,12 @@ try {
     const c = new RelayClient({
       relayUrl: `http://127.0.0.1:${PORT}`,
       deviceId: "d1",
-      authToken: "rt_alpha",
+      authToken: "or_at_alpha",
     });
     await c.send("test", { foo: "bar" });
-    assert.equal(captured.requests[0].headers.authorization, "Bearer rt_alpha");
+    assert.equal(captured.requests[0].headers.authorization, "Bearer or_at_alpha");
     server.close();
-    console.log("[2] authToken -> Authorization: Bearer rt_alpha ok");
+    console.log("[2] authToken -> Authorization bearer ok");
   }
 
   // 3. setAuthToken updates the bearer
@@ -90,13 +87,13 @@ try {
     const c = new RelayClient({
       relayUrl: `http://127.0.0.1:${PORT}`,
       deviceId: "d1",
-      authToken: "rt_old",
+      authToken: "or_at_old",
     });
     await c.send("first", {});
-    c.setAuthToken("rt_new");
+    c.setAuthToken("or_at_new");
     await c.send("second", {});
-    assert.equal(captured.requests[0].headers.authorization, "Bearer rt_old");
-    assert.equal(captured.requests[1].headers.authorization, "Bearer rt_new");
+    assert.equal(captured.requests[0].headers.authorization, "Bearer or_at_old");
+    assert.equal(captured.requests[1].headers.authorization, "Bearer or_at_new");
     server.close();
     console.log("[3] setAuthToken -> new token in next call ok");
   }
@@ -107,7 +104,7 @@ try {
     const c = new RelayClient({
       relayUrl: `http://127.0.0.1:${PORT}`,
       deviceId: "d1",
-      authToken: "rt_x",
+      authToken: "or_at_x",
     });
     c.setAuthToken(null);
     // Retry once if the previous server's close hasn't fully released
@@ -130,17 +127,17 @@ try {
     const c = new RelayClient({
       relayUrl: `http://127.0.0.1:${PORT}`,
       deviceId: "d1",
-      authToken: "rt_ws",
+      authToken: "or_at_ws",
     });
     const connPromise = c.connectEvents(() => {});
     await delay(150);
     const wsReq = captured.requests.find((r) => r.url.startsWith("/relay/v1/devices/d1/ws"));
     assert.ok(wsReq, "expected a WebSocket request to be captured");
-    assert.equal(wsReq.headers.authorization, "Bearer rt_ws");
+    assert.equal(wsReq.headers.authorization, "Bearer or_at_ws");
     await connPromise;
     server.close();
   }
-  console.log("[5] connectEvents -> Authorization: Bearer rt_ws ok");
+  console.log("[5] connectEvents -> Authorization bearer ok");
 
   console.log("relay client auth ok");
 } catch (err) {

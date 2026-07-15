@@ -371,7 +371,7 @@ try {
   const ok = normalizeProviderForRead({ name: "x", type: "proxy", engine: "litellm", litellmProvider: "deepseek" });
   assert.equal(ok._legacy, undefined);
   assert.equal(ok._legacyType, undefined);
-  const ok2 = normalizeProviderForRead({ name: "y", type: "originrouter", baseUrl: "https://x", auth: { type: "managed_originrouter_key", keyRef: "k" }, model: "m" });
+  const ok2 = normalizeProviderForRead({ name: "y", type: "originrouter", baseUrl: "https://x", auth: { type: "oauth" }, model: "m" });
   assert.equal(ok2.type, "originrouter");
   assert.equal(ok2._legacy, undefined);
 

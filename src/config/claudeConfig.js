@@ -19,9 +19,9 @@ import {
 } from "./providerRoutes.js";
 import { readCodingAuth } from "../persistence/codingAuth.js";
 import {
-  isAnyManagedCredentialShape,
-  isManagedKeyShape,
-  KEY_KIND,
+  accessTokenFor,
+  isOAuthCredentialShape,
+  OAUTH_RESOURCES,
 } from "../runtime/authContract.js";
 import { getStateDir } from "../persistence/state.js";
 import { NOOP_ANTHROPIC_API_KEY } from "../proxy/litellm.js";
@@ -98,11 +98,7 @@ function originrouterBaseForRuntime(provider, runtime) {
   return joinUrlPath(baseUrl, route.endpoint);
 }
 
-// Stage 9.9: read the relay access_token for the current runtime.
-// Silently re-signs the token via surety /api/relay/token if it has
-// <60s of headroom. Returns the stored shape with a fresh accessToken.
-// Throws PROVIDER_UNSUPPORTED if no credential is on disk, if the
-// stored shape is malformed, or if the device_grant has been revoked.
+// Resolve a fresh OriginRouter Coding audience token for Claude/Codex.
 async function readManagedCodingKeyForRuntime(options = {}) {
   const stateDir = options.stateDir || getStateDir();
   if (typeof options.readCodingAuthForRuntime === "function") {
@@ -119,7 +115,7 @@ async function readManagedCodingKeyForRuntime(options = {}) {
     err.code = "PROVIDER_UNSUPPORTED";
     throw err;
   }
-  if (!isAnyManagedCredentialShape(stored)) {
+  if (!isOAuthCredentialShape(stored)) {
     const err = new Error(
       "Stored OriginRouter credential has an unknown shape. " +
       "Run `originrouter login` again to refresh.",
@@ -127,32 +123,26 @@ async function readManagedCodingKeyForRuntime(options = {}) {
     err.code = "PROVIDER_UNSUPPORTED";
     throw err;
   }
-  // Legacy pre-9.9 managed-key shape: no silent refresh available.
-  if (stored.kind === KEY_KIND.MANAGED) {
-    if (typeof stored.expiresAt === "number" && stored.expiresAt <= Date.now()) {
-      const err = new Error(
-        "OriginRouter managed coding key has expired. " +
-        "Run `originrouter login` to upgrade to the relay shape.",
-      );
-      err.code = "PROVIDER_UNSUPPORTED";
-      throw err;
-    }
+  if (
+    (typeof options.readCodingAuthForRuntime === "function" ||
+      typeof options.readCodingAuth === "function") &&
+    typeof options.ensureFreshAccessToken !== "function"
+  ) {
     return stored;
   }
-  // Stage 9.9 relay shape: silently re-sign via surety /api/relay/token
-  const ensure = options.ensureFreshAccessToken || (await import("../runtime/relayTokenRefresher.js")).ensureFreshAccessToken;
+  const ensure = options.ensureFreshAccessToken || (await import("../runtime/oauthTokenRefresher.js")).ensureFreshAccessToken;
   try {
-    return await ensure({ stateDir });
+    const fresh = await ensure({ stateDir, resource: OAUTH_RESOURCES.CODING });
+    if (!fresh) throw new Error("OAuth credential is unavailable");
+    return fresh;
   } catch (refreshErr) {
-    if (refreshErr && (refreshErr.code === "RELAY_LOGIN_REQUIRED" || refreshErr.code === "RELAY_GRANT_REVOKED")) {
-      const err = new Error(
-        `OriginRouter credential issue: ${refreshErr.message}. ` +
-        "Run `originrouter login` again.",
-      );
-      err.code = "PROVIDER_UNSUPPORTED";
-      throw err;
-    }
-    throw refreshErr;
+    const err = new Error(
+      "OriginRouter coding credential is unavailable. " +
+      "Run `originrouter login` again.",
+    );
+    err.code = "PROVIDER_UNSUPPORTED";
+    err.cause = refreshErr;
+    throw err;
   }
 }
 
@@ -304,12 +294,7 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
     const originrouterRoutes = assertClaudeOriginrouterRoutes(config, eff);
     if (originrouterRoutes) {
       const managed = await readManagedCodingKeyForRuntime(options);
-      // Stage 9.8: the on-disk shape is OAuth refresh. The
-      // access_token (1h) is the short-lived Bearer for LLM calls;
-      // the refresh_token (30d) lives on disk. Use accessToken
-      // here. Pre-9.8 stored keys fall back to .key for backward
-      // compat.
-      const apiKey = managed.accessToken || managed.key;
+      const apiKey = accessTokenFor(managed, OAUTH_RESOURCES.CODING)?.token;
       const env = {
         ANTHROPIC_BASE_URL: originrouterBaseForRuntime(originrouterRoutes.mainProvider, "claude"),
         ANTHROPIC_API_KEY: apiKey,
@@ -420,7 +405,7 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
     }
     if (mainProvider?.type === "originrouter") {
       const managed = await readManagedCodingKeyForRuntime(options);
-      const apiKey = managed.accessToken || managed.key;
+      const apiKey = accessTokenFor(managed, OAUTH_RESOURCES.CODING)?.token;
       const env = {
         OPENAI_BASE_URL: originrouterBaseForRuntime(mainProvider, "codex-app-server"),
         OPENAI_API_KEY: apiKey,

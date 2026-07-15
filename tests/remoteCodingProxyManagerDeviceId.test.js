@@ -19,23 +19,15 @@ import { join } from "node:path";
 import { WebSocketServer } from "ws";
 
 import { RemoteCodingProxyManager } from "../src/proxy/remoteCodingProxyManager.js";
+import { makeOAuthCredential } from "./support/oauthCredential.js";
 
 const tmpStateDir = mkdtempSync(join(tmpdir(), "rcpm-devid-"));
 try {
-  // The coding-key.json shape must satisfy isManagedKeyShape().
-  // deviceGrant and deviceId are what _acquireToken() reads.
-  const expiresAtMs = Date.now() + 3600_000;
-  writeFileSync(join(tmpStateDir, "coding-key.json"), JSON.stringify({
-    kind: "managed",
-    source: "originrouter_cli",
-    keyId: "ck-test",
-    key: "sk-test",
-    deviceGrantId: "dgid-test",
-    deviceGrant: "dg-test-grant-9.5",
-    deviceId: "prod-X-from-coding-key",
-    expiresAt: expiresAtMs,
-    scopes: ["coding"],
-  }, null, 2));
+  writeFileSync(join(tmpStateDir, "coding-key.json"), JSON.stringify(
+    makeOAuthCredential({ deviceId: "prod-X-from-coding-key" }),
+    null,
+    2,
+  ));
 
   const captured = [];
   const relay = await new Promise((resolve) => {
@@ -54,21 +46,10 @@ try {
       resolve({ server, wss, port: server.address().port });
     });
   });
-  const fetchFn = async (url, opts = {}) => {
-    if (String(url).includes("/api/relay/token")) {
-      return new Response(JSON.stringify({
-        code: 0,
-        msg: "success",
-        data: { "relay-access-token": "test-token", "expires-at": Math.floor(Date.now()/1000) + 3600, "token-id": "tid", scopes: ["relay.remote_coding"] },
-      }), { status: 200, headers: { "content-type": "application/json" } });
-    }
-    throw new Error(`unexpected fetch URL: ${url}`);
-  };
+  const fetchFn = globalThis.fetch;
 
   const prevAuth = process.env.ORIGINROUTER_RELAY_AUTH;
-  const prevSurety = process.env.SURETY_BASE_URL;
   process.env.ORIGINROUTER_RELAY_AUTH = "on";
-  process.env.SURETY_BASE_URL = "http://127.0.0.1:9001";
   try {
     const mgr = new RemoteCodingProxyManager({
       stateDir: tmpStateDir,
@@ -97,8 +78,6 @@ try {
   } finally {
     if (prevAuth === undefined) delete process.env.ORIGINROUTER_RELAY_AUTH;
     else process.env.ORIGINROUTER_RELAY_AUTH = prevAuth;
-    if (prevSurety === undefined) delete process.env.SURETY_BASE_URL;
-    else process.env.SURETY_BASE_URL = prevSurety;
     relay.wss.close();
     relay.server.close();
   }

@@ -9,17 +9,14 @@
 // 9.3 auth behavior is gated by `ORIGINROUTER_RELAY_AUTH`:
 //   - "off" (default): no token acquisition. The proxy is constructed
 //     with `authToken: null` and behaves exactly like 9.2.
-//   - "on": the manager reads `<stateDir>/coding-key.json`, extracts
-//     `deviceGrant` and `deviceId`, calls Surety at `SURETY_BASE_URL`
-//     to exchange for a `relayAccessToken`, and constructs the proxy
-//     with that token. Refresh is scheduled 60s before `expiresAt`.
-// Stage 9.4 — env var name unified to `SURETY_BASE_URL` (the prior
-// name from 9.3 has been removed entirely from this codebase).
-// Clean break, no fallback.
+//   - "on": the manager obtains the OriginRouter Relay audience token from
+//     the OAuth credential and constructs the proxy with that token. Refresh
+//     is scheduled 60 seconds before expiry.
 
 import { readCodingAuth } from "../persistence/codingAuth.js";
 import { RemoteCodingRelayProxy } from "../runtime/remoteCodingRelayProxy.js";
-import { acquireRelayAccessToken } from "../auth/suretyTokenClient.js";
+import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
+import { OAUTH_RESOURCES } from "../runtime/authContract.js";
 
 const REFRESH_LEAD_MS = 60_000; // refresh 60s before expiresAt
 
@@ -32,13 +29,11 @@ export class RemoteCodingProxyManager {
     stateDir,
     relayUrl,
     deviceId,
-    suretyUrl = null,
     fetchFn = globalThis.fetch,
   }) {
     this.stateDir = stateDir;
     this.relayUrl = relayUrl;
     this.deviceId = deviceId;
-    this.suretyUrl = suretyUrl || process.env.SURETY_BASE_URL || "";
     this.fetchFn = fetchFn;
     this._proxy = null;
     this._refreshTimer = null;
@@ -55,17 +50,24 @@ export class RemoteCodingProxyManager {
   }
 
   async _acquireToken() {
-    const stored = readCodingAuth(this.stateDir);
-    if (!stored || !stored.deviceGrant || !stored.deviceId) {
-      return { ok: false, error: "no_device_grant" };
+    try {
+      const stored = await ensureFreshAccessToken({
+        stateDir: this.stateDir,
+        resource: OAUTH_RESOURCES.RELAY,
+        fetchFn: this.fetchFn,
+      });
+      const relay = stored?.accessTokens?.relay;
+      if (!stored || !relay?.token || !stored.deviceId) {
+        return { ok: false, error: "oauth_login_required" };
+      }
+      return {
+        ok: true,
+        token: relay.token,
+        expiresAt: relay.expiresAt / 1000,
+      };
+    } catch (error) {
+      return { ok: false, error: error.code || "oauth_refresh_failed" };
     }
-    const result = await acquireRelayAccessToken({
-      suretyUrl: this.suretyUrl,
-      deviceId: stored.deviceId,
-      deviceGrant: stored.deviceGrant,
-      fetchFn: this.fetchFn,
-    });
-    return result;
   }
 
   async _acquireWithRetry() {

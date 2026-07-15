@@ -7,6 +7,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { makeOAuthCredential } from "./support/oauthCredential.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = dirname(here);
@@ -300,32 +301,30 @@ try {
   const env = { ORIGINROUTER_HOME: home };
 
   try {
-    // Seed providers: an originrouter provider for Claude and Codex.
-    await runCli(["provider", "add", "official",
-      "--type", "originrouter",
-      "--key-ref", "current",
-      "--model", "claude-sonnet-4-6"], { env });
-    await runCli(["provider", "add", "official-codex",
-      "--type", "originrouter",
-      "--key-ref", "current",
-      "--model", "gpt-5-codex"], { env });
+    // OriginRouter Cloud providers are login-backed and cannot be added by
+    // `provider add`; seed the derived route records directly for this env
+    // rendering regression test.
+    writeFileSync(join(home, "config.json"), JSON.stringify({
+      providers: {
+        official: {
+          name: "official",
+          type: "originrouter",
+          auth: { type: "oauth" },
+          model: "claude-sonnet-4-6",
+        },
+        "official-codex": {
+          name: "official-codex",
+          type: "originrouter",
+          auth: { type: "oauth" },
+          model: "gpt-5-codex",
+        },
+      },
+    }, null, 2));
 
-    // Write a valid managed coding key directly. The CLI has no `login`
-    // command that can run against a fake backend here, so we use the
-    // same storage helper as the 9.1A smoke test (tests/cliLogin.test.js).
+    // Seed a valid OAuth credential so env resolution can select the Coding
+    // audience token without contacting Surety.
     const { writeCodingAuth } = await import("../src/persistence/codingAuth.js");
-    const { KEY_KIND, KEY_SCOPE, KEY_SOURCE } = await import("../src/runtime/authContract.js");
-    writeCodingAuth(home, {
-      kind: KEY_KIND.MANAGED,
-      keyId: "ok_test_key",
-      key: "sk-or-v1-ok-test-key",
-      deviceGrantId: "og_test_grant_id",
-      deviceGrant: "og_test_grant_token_for_unit_tests_only",
-      deviceId: "device-test-001",
-      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
-      source: KEY_SOURCE.ORIGINROUTER_CLI,
-      scopes: [KEY_SCOPE.CODING],
-    });
+    writeCodingAuth(home, makeOAuthCredential());
 
     // ---- claude env print: Source: originrouter-coding + masked key ----
     await runCli(["route", "set", "claude.main",
@@ -334,15 +333,15 @@ try {
     {
       const r = await runCli(["env", "print", "--agent", "claude"], { env });
       assert.match(r.stdout, /Source: originrouter-coding/);
-      assert.match(r.stdout, /ANTHROPIC_BASE_URL=https:\/\/server\.originrouter\.com\/coding/);
+      assert.match(r.stdout, /ANTHROPIC_BASE_URL=https:\/\/server\.easytransnote\.com\/coding/);
       assert.match(r.stdout, /ANTHROPIC_MODEL=claude-sonnet-4-6/);
       assert.match(r.stdout, /ANTHROPIC_SMALL_FAST_MODEL=claude-sonnet-4-6/);
       // Raw-key leak check: the masked key form must be present (mask
       // format is `sk-o...ey`), and the raw key value must never appear
       // in stdout.
-      assert.match(r.stdout, /ANTHROPIC_API_KEY=sk-o\.\.\.ey/);
-      assert.ok(!r.stdout.includes("sk-or-v1-ok-test-key"),
-        "raw managed key must never appear in env print output");
+      assert.match(r.stdout, /ANTHROPIC_API_KEY=or_a\.\.\.st/);
+      assert.ok(!r.stdout.includes("or_at_coding_test"),
+        "raw Coding access token must never appear in env print output");
       // Agent-aware header
       assert.match(r.stdout, /Effective env \(what claude will see\):/);
     }
@@ -354,11 +353,11 @@ try {
     {
       const r = await runCli(["env", "print", "--agent", "codex"], { env });
       assert.match(r.stdout, /Source: originrouter-coding/);
-      assert.match(r.stdout, /OPENAI_BASE_URL=https:\/\/server\.originrouter\.com\/coding\/v1/);
+      assert.match(r.stdout, /OPENAI_BASE_URL=https:\/\/server\.easytransnote\.com\/coding\/v1/);
       assert.match(r.stdout, /OPENAI_MODEL=gpt-5-codex/);
-      assert.match(r.stdout, /OPENAI_API_KEY=sk-o\.\.\.ey/);
-      assert.ok(!r.stdout.includes("sk-or-v1-ok-test-key"),
-        "raw managed key must never appear in env print output");
+      assert.match(r.stdout, /OPENAI_API_KEY=or_a\.\.\.st/);
+      assert.ok(!r.stdout.includes("or_at_coding_test"),
+        "raw Coding access token must never appear in env print output");
       // Agent-aware header — must NOT say "claude"
       assert.match(r.stdout, /Effective env \(what codex will see\):/);
       assert.ok(!/Effective env \(what claude will see\):/.test(r.stdout),

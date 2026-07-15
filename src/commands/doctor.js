@@ -11,12 +11,18 @@
 //   Result: <N> passed, <N> warning, <N> failed — <verdict>
 
 import { readCodingAuth } from "../persistence/codingAuth.js";
-import { isAnyManagedCredentialShape, KEY_KIND } from "../runtime/authContract.js";
+import {
+  accessTokenFor,
+  isOAuthCredentialShape,
+  OAUTH_RESOURCES,
+} from "../runtime/authContract.js";
 import { getStateDir } from "../persistence/state.js";
+import { readConfig } from "../persistence/state.js";
 import { getRoutes } from "../config/routes.js";
 import {
   DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
   DEFAULT_ORIGINROUTER_H5_BASE_URL,
+  DEFAULT_SURETY_BASE_URL,
 } from "../config/providerRoutes.js";
 
 const RESET = "\x1b[0m";
@@ -56,7 +62,7 @@ export async function runDoctor(options = {}) {
 
   const checks = [
     await _checkSignin(stateDir),
-    await _checkTokenVerify(stateDir, timeoutMs),
+    await _checkTokenVerify(stateDir),
     _checkCodingKeyShape(stateDir),
     _checkRoutesConfig(config),
     await _checkReachable(`${suretyBaseUrl}/healthz`, "Surety", timeoutMs),
@@ -127,7 +133,7 @@ async function _checkSignin(stateDir) {
       next: "Run `originrouter login`.",
     };
   }
-  if (!isAnyManagedCredentialShape(stored)) {
+  if (!isOAuthCredentialShape(stored)) {
     return {
       name: "Sign-in",
       status: "fail",
@@ -141,85 +147,52 @@ async function _checkSignin(stateDir) {
   return { name: "Sign-in", status: "pass", detail: `signed in as ${label}` };
 }
 
-async function _checkTokenVerify(stateDir, timeoutMs) {
+async function _checkTokenVerify(stateDir) {
   const stored = readCodingAuth(stateDir);
   if (!stored) {
     return { name: "Token", status: "skip", detail: "skipped (not signed in)" };
   }
-  if (stored.kind !== KEY_KIND.RELAY) {
-    // Legacy managed-key shape: we cannot verify remotely without the key.
-    return {
-      name: "Token",
-      status: "warn",
-      detail: "pre-9.9 managed-key shape; remote verify unavailable",
-      next: "Run `originrouter login` to upgrade to the relay shape.",
-    };
-  }
-  if (!stored.tokenEndpoint || !stored.accessToken) {
+  if (!isOAuthCredentialShape(stored)) {
     return {
       name: "Token",
       status: "fail",
-      detail: "stored token is missing endpoint or value",
+      detail: "stored OAuth credential is malformed",
       next: "Run `originrouter login` again.",
     };
   }
-  // Stage 9.9: derive the verify endpoint from tokenEndpoint base.
-  // Token endpoint is /api/relay/token; verify is /api/relay/verify.
-  const verifyEndpoint = stored.tokenEndpoint.replace(/\/token$/, "/verify");
-  async function verifyWithScope(scope) {
-    const resp = await fetch(verifyEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        v: "v1",
-        "relay-access-token": stored.accessToken,
-        "device-id": stored.deviceId,
-        scope,
-      }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    const body = await resp.json().catch(() => null);
-    return { resp, body, scope };
-  }
 
-  try {
-    let { resp, body, scope } = await verifyWithScope("relay.remote_coding");
-    if (
-      body
-      && body.code !== 0
-      && (body.code === -8 || String(body.msg || "").includes("insufficient_scope"))
-    ) {
-      ({ resp, body, scope } = await verifyWithScope("coding"));
-    }
-    if (!resp.ok || !body || body.code !== 0) {
-      const msg = (body && (body.msg || body.message)) || `HTTP ${resp.status}`;
-      return {
-        name: "Token",
-        status: "fail",
-        detail: `relay rejected token: ${msg}`,
-        next: "Run `originrouter login` again.",
-      };
-    }
-    // Compute remaining lifetime in minutes.
-    const expiresAt = body.data && body.data["expires-at"];
-    let expiryDetail = "valid";
-    if (typeof expiresAt === "number") {
-      const remainingMin = Math.max(0, Math.floor((expiresAt * 1000 - Date.now()) / 60000));
-      expiryDetail = `valid (expires in ${remainingMin} min)`;
-    }
-    return {
-      name: "Token",
-      status: "pass",
-      detail: `relay token ${expiryDetail}${scope === "coding" ? " (legacy scope)" : ""}`,
-    };
-  } catch (err) {
+  const now = Date.now();
+  if (stored.refreshExpiresAt <= now) {
     return {
       name: "Token",
       status: "fail",
-      detail: `couldn't reach relay: ${err.message || err}`,
-      next: "Check your network. Run `originrouter doctor` again.",
+      detail: "refresh token has expired",
+      next: "Run `originrouter login` again.",
     };
   }
+
+  const resources = Object.values(OAUTH_RESOURCES);
+  const expired = resources.filter((resource) => {
+    const token = accessTokenFor(stored, resource);
+    return !token || token.expiresAt <= now;
+  });
+  const refreshMinutes = Math.max(
+    0,
+    Math.floor((stored.refreshExpiresAt - now) / 60_000),
+  );
+  if (expired.length > 0) {
+    return {
+      name: "Token",
+      status: "warn",
+      detail: `${expired.length} access token(s) need refresh; refresh session valid for ${refreshMinutes} min`,
+      next: "The next authenticated request will refresh the required audience token.",
+    };
+  }
+  return {
+    name: "Token",
+    status: "pass",
+    detail: `4 audience tokens cached; refresh session valid for ${refreshMinutes} min`,
+  };
 }
 
 function _checkCodingKeyShape(stateDir) {
@@ -227,7 +200,7 @@ function _checkCodingKeyShape(stateDir) {
   if (!stored) {
     return { name: "Coding key file", status: "skip", detail: "no file (not signed in)" };
   }
-  if (!isAnyManagedCredentialShape(stored)) {
+  if (!isOAuthCredentialShape(stored)) {
     return {
       name: "Coding key file",
       status: "fail",
@@ -324,18 +297,12 @@ function _checkWorkerConfigured(config) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function _inferSuretyBaseUrl(apiBaseUrl) {
-  // Stage 9.9: default to the production surety host. Override via
-  // ORIGINROUTER_SURETY_BASE_URL env var.
-  return process.env.ORIGINROUTER_SURETY_BASE_URL || "https://surety.easytransnote.com";
+function _inferSuretyBaseUrl() {
+  return process.env.SURETY_BASE_URL || DEFAULT_SURETY_BASE_URL;
 }
 
 function _readConfigSafe() {
-  // Lazy: avoid pulling in the full config loader (which can hit
-  // disk paths the doctor command doesn't depend on). If a config
-  // is needed, callers can pass `options.config` explicitly.
   try {
-    const { readConfig } = require("../config/store.js");
     return readConfig();
   } catch {
     return null;

@@ -8,8 +8,9 @@ import {
   remoteProviderName,
   selectControlBaseUrl,
 } from "../src/commands/routeSources.js";
+import { makeOAuthCredential } from "./support/oauthCredential.js";
 
-const signedIn = async () => ({ accessToken: "rt_test_token" });
+const signedIn = async () => makeOAuthCredential();
 
 {
   const baseUrl = await selectControlBaseUrl({
@@ -49,7 +50,7 @@ const signedIn = async () => ({ accessToken: "rt_test_token" });
   });
   assert.deepEqual(models, [{ id: "claude-1", name: "Claude One", origin: "OriginRouter Cloud" }]);
   assert.equal(calls[0].url, "https://ai.example/ai/model");
-  assert.equal(calls[0].options.headers.Authorization, "Bearer rt_test_token");
+  assert.equal(calls[0].options.headers.Authorization, "Bearer or_at_ai_test");
   const selected = await chooseCloudModel(models, "claude-1");
   assert.equal(selected.id, "claude-1");
 }
@@ -60,8 +61,8 @@ const signedIn = async () => ({ accessToken: "rt_test_token" });
     env: { ORIGINROUTER_CONTROL_BASE_URL: "https://control.example" },
     ensureFreshAccessTokenFn: signedIn,
     fetchFn: async (url, options) => {
-      assert.equal(url, "https://control.example/app/v1/devices");
-      assert.equal(options.headers.Authorization, "Bearer rt_test_token");
+      assert.equal(url, "https://control.example/cli/v1/devices");
+      assert.equal(options.headers.Authorization, "Bearer or_at_control_test");
       return {
         ok: true,
         status: 200,
