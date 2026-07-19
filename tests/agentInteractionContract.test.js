@@ -26,11 +26,13 @@ import assert from "node:assert/strict";
 import {
   INTERACTION_KINDS,
   INTERACTION_SOURCES,
+  buildInteractionRequest,
   buildInteractionResolved,
   interactionToPermissionEvent,
   isInteractionRequest,
   isInteractionResolve,
   permissionEventToInteraction,
+  normalizeInteractionResolve,
 } from "../src/runtime/agentInteractionContract.js";
 
 const CLAUDE_CALL_ID = "claude-perm-1781663400000-a1b2c3d4e";
@@ -83,6 +85,38 @@ const DEFAULT_DECISIONS = [
   assert.deepEqual(out.resolution.decisions, DEFAULT_DECISIONS);
   assert.equal(out.terminalReply, null,
     "non raw_terminal kind must not invent a terminalReply envelope");
+}
+
+// ---- 11. Managed generic request/resolve contract ----
+
+{
+  const request = buildInteractionRequest({
+    provider: "claude",
+    runtime: "claude-sdk",
+    sessionId: "s-managed",
+    interactionId: "ask-1",
+    source: INTERACTION_SOURCES.HOOK,
+    kind: INTERACTION_KINDS.QUESTIONS,
+    title: "Choose a target",
+    prompt: "Where should this deploy?",
+    payload: { questions: [{ id: "target" }] },
+    containsSecret: true,
+  });
+  assert.equal(request.kind, "questions");
+  assert.equal(request.containsSecret, true);
+  assert.deepEqual(request.payload, { questions: [{ id: "target" }] });
+
+  const resolved = normalizeInteractionResolve({
+    interactionId: "ask-1",
+    action: "submit",
+    response: { answers: { target: ["staging"] } },
+  });
+  assert.equal(resolved.action, "submit");
+  assert.deepEqual(resolved.response.answers.target, ["staging"]);
+  assert.throws(
+    () => normalizeInteractionResolve({ interactionId: "ask-1", action: "approved" }),
+    TypeError,
+  );
 }
 
 // ---- 2. Codex permission → agent.interaction.requested ----

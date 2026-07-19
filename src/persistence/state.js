@@ -97,22 +97,27 @@ export function writeLocalApiConfig(config) {
   return next;
 }
 
-export function writeProxyState(state) {
-  writeJson(join(ensureStateDir(), "proxy.state.json"), {
+function proxyStatePath(stateKey = "proxy") {
+  const safeKey = String(stateKey || "proxy").replace(/[^a-z0-9_-]/gi, "-");
+  return join(ensureStateDir(), `${safeKey}.state.json`);
+}
+
+export function writeProxyState(state, stateKey = "proxy") {
+  writeJson(proxyStatePath(stateKey), {
     version: VERSION,
     updatedAt: new Date().toISOString(),
     ...state,
   });
 }
 
-export function readProxyState() {
-  return readJson(join(ensureStateDir(), "proxy.state.json")) || null;
+export function readProxyState(stateKey = "proxy") {
+  return readJson(proxyStatePath(stateKey)) || null;
 }
 
-export function clearProxyState() {
+export function clearProxyState(stateKey = "proxy") {
   // Removes the proxy.state.json file if present. Used by `proxy stop` and
   // by the manager when a started process is found to be already dead.
-  const path = join(ensureStateDir(), "proxy.state.json");
+  const path = proxyStatePath(stateKey);
   if (existsSync(path)) {
     try { unlinkSync(path); } catch {}
   }

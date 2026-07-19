@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
-import { decisionToHookJson } from "../src/adapters/claude/hookServer.js";
+import { request as httpRequest } from "node:http";
+import {
+  decisionToElicitationHookJson,
+  decisionToHookJson,
+  startClaudeHookServer,
+} from "../src/adapters/claude/hookServer.js";
 import { permissionEventToInteraction } from "../src/runtime/agentInteractionContract.js";
 
 // v1 conservative mapping. `approved_for_session` is intentionally identical
@@ -92,6 +97,73 @@ assert.deepEqual(
   permissionOutput({ behavior: "allow" }),
   "approved (one-shot) must never echo updatedPermissions",
 );
+
+assert.deepEqual(
+  decisionToElicitationHookJson("accept", { content: { account: "primary" } }),
+  {
+    hookSpecificOutput: {
+      hookEventName: "Elicitation",
+      action: "accept",
+      content: { account: "primary" },
+    },
+  },
+);
+assert.equal(
+  decisionToElicitationHookJson("cancel").hookSpecificOutput.action,
+  "cancel",
+);
+assert.equal(
+  decisionToElicitationHookJson("unknown").hookSpecificOutput.action,
+  "decline",
+);
+
+const postJson = (port, path, payload) => new Promise((resolve, reject) => {
+  const body = JSON.stringify(payload);
+  const req = httpRequest({
+    host: "127.0.0.1",
+    port,
+    path,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(body),
+    },
+  }, (res) => {
+    const chunks = [];
+    res.on("data", (chunk) => chunks.push(chunk));
+    res.on("end", () => resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))));
+  });
+  req.on("error", reject);
+  req.end(body);
+});
+
+{
+  let hookServer;
+  hookServer = await startClaudeHookServer({
+    onElicitationRequest(interactionId) {
+      setImmediate(() => hookServer.resolveElicitation({
+        interactionId,
+        action: "accept",
+        content: { account: "primary" },
+      }));
+    },
+  });
+  try {
+    const response = await postJson(hookServer.port, "/hook/elicitation", {
+      hook_event_name: "Elicitation",
+      elicitation_id: "elicit-http-1",
+      mode: "form",
+      mcp_server_name: "github",
+      message: "Choose an account",
+      requested_schema: { type: "object" },
+    });
+    assert.deepEqual(response, decisionToElicitationHookJson("accept", {
+      content: { account: "primary" },
+    }));
+  } finally {
+    hookServer.stop();
+  }
+}
 
 // ---- Stage 8.9: structural round-trip via permissionEventToInteraction ----
 

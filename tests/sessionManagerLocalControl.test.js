@@ -111,3 +111,45 @@ test("SessionManager starts route-mode proxy for local-control litellm start", a
   });
   assert.deepEqual(starts, [{ mode: "route", port: 40123 }]);
 });
+
+test("SessionManager starts Remote Share with an explicit Provider allow-list", async () => {
+  const previousHome = process.env.ORIGINROUTER_HOME;
+  const home = mkdtempSync(join(tmpdir(), "originrouter-remote-share-test-"));
+  process.env.ORIGINROUTER_HOME = home;
+  const starts = [];
+  try {
+    writeConfig({ providers: PROVIDERS });
+    const manager = new SessionManager({
+      relayClient: { send: async () => ({ ok: true }) },
+      deviceId: "device-test",
+      defaultExecutor: "fake",
+      remoteShareProxyManager: {
+        async start(args) {
+          starts.push(args);
+          return { ok: true };
+        },
+      },
+    });
+
+    await manager.handleLocalControlEvent({
+      type: "local_control.remote_share.start",
+      providers: ["deepseek", "glm"],
+      port: 40124,
+    });
+
+    assert.deepEqual(starts, [{
+      mode: "share",
+      providerNames: ["deepseek", "glm"],
+      port: 40124,
+    }]);
+    assert.deepEqual(readConfig().remoteShare, {
+      enabled: true,
+      providers: ["deepseek", "glm"],
+      port: 40124,
+    });
+  } finally {
+    if (previousHome === undefined) delete process.env.ORIGINROUTER_HOME;
+    else process.env.ORIGINROUTER_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});

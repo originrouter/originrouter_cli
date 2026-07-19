@@ -1,5 +1,33 @@
 # Agent Interaction Contract (Stage 8.8 + Stage 8.9)
 
+## Current managed-runtime contract
+
+`originrouter claude-terminal` and `originrouter codex-terminal` use a newer
+managed-runtime contract than the legacy Stage 8.8 adapter flow documented
+below. The default `originrouter claude` and `originrouter codex` commands keep
+the native PTY interfaces and add Relay-backed remote input, output,
+interrupt/stop, lifecycle, and supported hook interactions.
+
+- The CLI process owns the authoritative in-memory pending interaction map.
+- Full prompts, form schemas, commands, paths, answers, and message bodies use
+  authenticated Relay messages only; they are not written to MySQL.
+- CLI to App messages are `agent.interaction.requested`,
+  `agent.interaction.result`, `agent.interactions.snapshot`, and
+  `agent.stream.event`.
+- App to CLI messages are `agent.interactions.snapshot.request` and
+  `agent.interaction.resolve` with a stable `responseId`.
+- A response is first-writer-wins. The CLI reports `applying` while the native
+  runtime consumes it, then `applied`, `expired`, `failed`, `canceled`, or
+  `not_found`. Terminal results are retained as five-minute idempotency
+  tombstones.
+- After an App, Server, or WebSocket reconnect, the App requests a snapshot.
+  Each active CLI session returns its pending/applying interactions and up to
+  100 recent transient events.
+
+The Stage 8.8/8.9 material below remains the compatibility contract for PTY
+adapters and the local API. It is not the persistence model for the explicit
+managed Claude SDK or Codex app-server sessions.
+
 > **Stage 8.8 is a design + contract-test stage.** **Stage 8.9
 > is the first runtime-wiring stage** that promotes the helper
 > from "production does not import it" to "imported by
@@ -498,3 +526,25 @@ The console lives at
 (outside the CLI repo). It is validated by the manual steps in
 `docs/agent-runtime-audit.md` Stage 8.9 section, not by the
 `npm test` chain.
+
+## 12. Semantic session mirror
+
+Agent Control mirrors the semantic Claude session, not terminal pixels.
+
+- `user.text` and `agent.text` form the App conversation timeline.
+- Thinking, tools, permissions, questions, and lifecycle events remain typed
+  activity or interaction events.
+- Claude JSONL is the history source of truth. The application server never
+  stores message bodies.
+- `agent.history.request` asks the active CLI session for one page. The opaque
+  cursor is meaningful only to that session.
+- `agent.history.page` returns at most 100 messages and 96 KiB. The App can
+  request older pages while the session remains reachable.
+- `agent.message.result` confirms that the target session, rather than merely
+  a device socket, consumed an App message.
+
+Transport selection is local-first. Native sessions register with the local
+daemon and expose the same protocol through the authenticated loopback API.
+The App uses Relay only when the requested session is not available locally.
+Local registration, events, commands, and history cursors are memory-only and
+disappear when the session or daemon exits.

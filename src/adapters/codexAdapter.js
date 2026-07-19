@@ -1,7 +1,8 @@
 import { TerminalAdapter } from "./terminalAdapter.js";
-import { CodexAppServerClient, isCodexAppServerAvailable } from "./codex/appServerClient.js";
+import { CodexAppServerClient } from "./codex/appServerClient.js";
 import { mapCodexAppServerEvent, mapCodexApprovalRequest } from "./codex/eventMapper.js";
 import { CODEX_MAIN_ALIAS } from "../config/routes.js";
+import { CodexJsonlScanner, readCodexConversationHistory } from "./codex/jsonlScanner.js";
 import {
   permissionEventToInteraction,
   INTERACTION_SOURCES,
@@ -22,7 +23,7 @@ function userProvidedModel(args) {
 }
 
 export class CodexAdapter extends TerminalAdapter {
-  constructor({ args = [], appServerClient: appServerClientOverride = null, appServerAvailable: appServerAvailableOverride = null } = {}) {
+  constructor({ args = [], cwd = process.cwd(), appServerClient: appServerClientOverride = null, appServerAvailable: appServerAvailableOverride = null, nativeConfig = false } = {}) {
     super({ command: "codex", args });
     this.kind = "codex";
     this.pendingEvents = [];
@@ -36,6 +37,10 @@ export class CodexAdapter extends TerminalAdapter {
     // default behaviour (no overrides) is unchanged.
     this.appServerAvailable = appServerAvailableOverride;
     this.appServerClientOverride = appServerClientOverride;
+    this.cwd = cwd;
+    this.startedAt = Date.now();
+    this.scanner = new CodexJsonlScanner({ cwd, startedAt: this.startedAt });
+    this.nativeConfig = Boolean(nativeConfig);
   }
 
   describe() {
@@ -46,18 +51,25 @@ export class CodexAdapter extends TerminalAdapter {
       // relay doesn't claim "codex-app-server" is one of the sources
       // when we fell back to terminal-only.
       structuredSources: this.appServerAvailable
-        ? ["codex-app-server", "terminal-output"]
-        : ["terminal-output"],
+        ? ["codex-app-server", "codex-jsonl", "terminal-output"]
+        : ["codex-jsonl", "terminal-output"],
       // Stage 8.4: top-level runtime tag. `"codex-app-server"` when
       // the structured app-server path is active, `null` otherwise.
       // The relay/UI uses this to label the session; the session log
       // also writes the same value (src/local/localAgentSession.js).
-      runtime: this.appServerAvailable ? "codex-app-server" : null,
+      runtime: this.appServerAvailable ? "codex-app-server" : "codex-pty",
     };
   }
 
   buildLaunch() {
     let args = this.args.slice();
+    if (this.nativeConfig) {
+      return {
+        command: "codex",
+        args,
+        env: {},
+      };
+    }
     if (!userProvidedModel(args)) {
       // Stage 8.0: routes.codex.main is the source of truth. Inject the
       // fixed alias so Codex Code's model lookup hits the local LiteLLM
@@ -90,20 +102,24 @@ export class CodexAdapter extends TerminalAdapter {
     // Stage 8.9: capture sessionId for dual-emit. The Codex event
     // mapper never sees sessionId; the adapter enriches here.
     this.sessionId = sessionId ?? null;
+    this.cwd = cwd || this.cwd;
+    this.startedAt = Date.now();
+    this.scanner = new CodexJsonlScanner({ cwd: this.cwd, startedAt: this.startedAt });
     // Stage 8.9: skip the system probe when the caller passed an
     // explicit appServerAvailable override (test seam). The
     // production default still probes via isCodexAppServerAvailable.
     if (this.appServerAvailable === null) {
-      this.appServerAvailable = await isCodexAppServerAvailable();
+      this.appServerAvailable = false;
     }
     if (!this.appServerAvailable) {
       this.pendingEvents.push({
         type: "agent.adapter.status",
         provider: "codex",
         appServerAvailable: false,
-        message: "codex app-server is not available; falling back to terminal adapter events.",
+        state: "native_tui_limited",
+        message: "Native Codex TUI uses local JSONL mirroring. Structured approvals require the managed Codex mode.",
       });
-      return;
+      return false;
     }
 
     this.appServerClient = this.appServerClientOverride || new CodexAppServerClient();
@@ -167,7 +183,26 @@ export class CodexAdapter extends TerminalAdapter {
   }
 
   scanStructuredEvents() {
-    return this.pendingEvents.splice(0);
+    const scanned = this.scanner.scan();
+    if (this.scanner.transcriptPath && !this._reportedTranscriptPath) {
+      this._reportedTranscriptPath = true;
+      scanned.unshift({
+        type: "agent.session.start",
+        provider: "codex",
+        sessionId: this.sessionId,
+        transcriptPath: this.scanner.transcriptPath,
+        cwd: this.cwd,
+      });
+    }
+    return [...this.pendingEvents.splice(0), ...scanned];
+  }
+
+  getTranscriptPath() {
+    return this.scanner.transcriptPath || null;
+  }
+
+  readConversationHistory(options = {}) {
+    return readCodexConversationHistory(this.getTranscriptPath(), options);
   }
 
   resolvePermission({ callId, interactionId, decision, reason }) {
@@ -196,6 +231,7 @@ export class CodexAdapter extends TerminalAdapter {
       decision: decision || "denied",
       reason: reason || undefined,
     });
+    return true;
   }
 
   cleanup() {

@@ -10,7 +10,7 @@
 
 | Type | Transport | Endpoint prefix | Auth | Notes |
 |---|---|---|---|---|
-| `originrouter` | `originrouter-coding` | `/coding/...` | managed coding key (Stage 9.1+ exchange) | Real model id. Default base URL `https://server.originrouter.com`. |
+| `originrouter` | `originrouter-coding` | `/coding/...` | session-local auth proxy | Real model id. Fixed upstream `https://api.easytransnote.com`. |
 | `proxy` | `proxy` | `/v1/...` | LiteLLM-rendered; engine is `litellm` | Fixed alias per slot. |
 | `remote` | `remote` | `null` (the device resolves) | device grant | Off by default. 9.1+ real impl. |
 
@@ -98,7 +98,7 @@ remote side should answer:
 
 ## DEFAULT_ORIGINROUTER_BASE_URL
 
-`https://server.originrouter.com` is exported from
+`https://api.easytransnote.com` is exported from
 `src/config/providerRoutes.js`. The CLI's `buildAgentProviderEnv`
 and the runtime path that actually opens the HTTP connection
 must use this constant when a provider record's `baseUrl` is

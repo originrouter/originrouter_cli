@@ -4,3 +4,4 @@ export const DEFAULT_DEVICE_ID = "local-dev";
 export const DEFAULT_EXECUTOR = "pty";
 export const DEFAULT_LOCAL_API_PORT = 7437;
 export const DEFAULT_PROXY_PORT = 40123;
+export const DEFAULT_REMOTE_SHARE_PROXY_PORT = 40124;

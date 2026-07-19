@@ -33,6 +33,14 @@ export class PtyExecutor {
     this.terminal?.write(data);
   }
 
+  async submitMessage(data) {
+    this.write(String(data || ""));
+    // Claude/Codex distinguish a standalone Enter key from a newline that is
+    // part of a pasted input chunk. Keep them as separate PTY writes.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    this.write("\r");
+  }
+
   resize(cols, rows) {
     this.terminal?.resize(cols, rows);
   }

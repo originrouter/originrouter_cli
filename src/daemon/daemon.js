@@ -1,6 +1,6 @@
 import process from "node:process";
 import { reportLocalControlRuntime } from "../agent/bridgeReporter.js";
-import { DEFAULT_DEVICE_ID, DEFAULT_EXECUTOR, DEFAULT_LOCAL_API_PORT, DEFAULT_RELAY_URL, VERSION } from "../constants.js";
+import { DEFAULT_DEVICE_ID, DEFAULT_EXECUTOR, DEFAULT_LOCAL_API_PORT, DEFAULT_RELAY_URL, DEFAULT_REMOTE_SHARE_PROXY_PORT, VERSION } from "../constants.js";
 import { startLocalApi } from "../local/localApi.js";
 import { ProxyManager } from "../proxy/manager.js";
 import { apiTokenPath, ensureApiToken } from "../persistence/authToken.js";
@@ -9,6 +9,7 @@ import { buildRelayClientOptions } from "../relay/relayAuthBootstrap.js";
 import { RelayClient } from "../relay/relayClient.js";
 import { parseOptions } from "../utils/options.js";
 import { SessionManager } from "./sessionManager.js";
+import { agentDetailDefaultFromConfig } from "../runtime/agentDetailProfile.js";
 
 function httpHost(address) {
   return String(address).includes(":") && !String(address).startsWith("[")
@@ -94,11 +95,16 @@ export async function startDaemon(args) {
   const proxyManager = new ProxyManager({
     stateDir,
   });
+  const remoteShareProxyManager = new ProxyManager({
+    stateDir,
+    stateKey: "remote-share-proxy",
+  });
   const sessionManager = new SessionManager({
     relayClient,
     deviceId: effectiveDeviceId,
     defaultExecutor: executor,
     proxyManager,
+    remoteShareProxyManager,
   });
 
   // Stage 3 + Stage 4 + Stage 6: start the local 127.0.0.1-only HTTP API.
@@ -123,6 +129,18 @@ export async function startDaemon(args) {
     startProxy: ({ provider, providerName, mode, port }) => proxyManager.start({ providerName: providerName || provider, mode, port }),
     stopProxy: () => proxyManager.stop(),
     restartProxy: ({ provider, providerName, mode, port }) => proxyManager.restart({ providerName: providerName || provider, mode, port }),
+    getRemoteShareProxyStatus: () => remoteShareProxyManager.status(),
+    startRemoteShareProxy: ({ providerNames, port }) => remoteShareProxyManager.start({
+      providerNames,
+      mode: "share",
+      port,
+    }),
+    stopRemoteShareProxy: () => remoteShareProxyManager.stop(),
+    restartRemoteShareProxy: ({ providerNames, port }) => remoteShareProxyManager.restart({
+      providerNames,
+      mode: "share",
+      port,
+    }),
   };
   const configuredLocalPort = parsePort(process.env.ORIGINROUTER_LOCAL_PORT, "ORIGINROUTER_LOCAL_PORT")
     ?? parsePort(localApiConfig.port, "local-api.json port");
@@ -162,13 +180,16 @@ export async function startDaemon(args) {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[daemon] received ${signal}, shutting down…`);
+    try { await sessionManager.shutdown(signal); } catch (e) { console.error(`[daemon] session stop: ${e.message}`); }
     try { await proxyManager.stop(); } catch (e) { console.error(`[daemon] proxy stop: ${e.message}`); }
+    try { await remoteShareProxyManager.stop(); } catch (e) { console.error(`[daemon] remote share proxy stop: ${e.message}`); }
     try { await localApi.close(); } catch (e) { console.error(`[daemon] local api close: ${e.message}`); }
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     process.exit(0);
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGHUP", () => shutdown("SIGHUP"));
 
   const localApiState = () => ({
     localApiPort: localApi.port,
@@ -182,12 +203,25 @@ export async function startDaemon(args) {
 
   const reportLocalControlHeartbeat = async () => {
     const proxyStatus = await proxyManager.status().catch(() => null);
+    const remoteShareStatus = await remoteShareProxyManager.status().catch(() => null);
+    const config = readConfig();
+    const remoteShareProviderNames = remoteShareStatus?.currentProviders?.length
+      ? remoteShareStatus.currentProviders
+      : config.remoteShare?.providers || [];
+    const remoteShareCatalog = remoteShareProviderNames
+      .map((name) => config.providers?.[name])
+      .filter((provider) => provider?.type === "proxy" && provider?.engine === "litellm")
+      .map((provider) => ({ provider: provider.name, model: provider.model || "" }));
     return reportLocalControlRuntime({
       cliRunning: true,
       cliVersion: VERSION,
       cliUptimeSeconds: Math.floor((Date.now() - Date.parse(startedAt)) / 1000),
       proxyRunning: Boolean(proxyStatus && proxyStatus.state === "running"),
       proxyBaseUrl: buildProxyBaseUrl(proxyStatus),
+      remoteShareRunning: Boolean(remoteShareStatus && remoteShareStatus.state === "running"),
+      remoteShareBaseUrl: buildProxyBaseUrl(remoteShareStatus),
+      remoteShareCatalog,
+      agentDetailProfile: agentDetailDefaultFromConfig(config),
     }, { stateDir }).catch(() => ({ ok: false, error: "request_failed" }));
   };
   heartbeatTimer = setInterval(() => {
@@ -216,6 +250,20 @@ export async function startDaemon(args) {
     console.warn("[daemon] LAN control is enabled. Keep the bearer token private and avoid exposing this port to the public internet.");
   }
   console.log(`[daemon] proxy manager: ${await proxyManager.status().then((s) => `${s.state}${s.port ? ` (port ${s.port})` : ""}`)}`);
+  console.log(`[daemon] remote share proxy: ${await remoteShareProxyManager.status().then((s) => `${s.state}${s.port ? ` (port ${s.port})` : ""}`)}`);
+
+  const configuredRemoteShare = readConfig().remoteShare;
+  if (configuredRemoteShare?.enabled && configuredRemoteShare.providers?.length) {
+    remoteShareProxyManager.start({
+      mode: "share",
+      providerNames: configuredRemoteShare.providers,
+      port: configuredRemoteShare.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
+    }).then((result) => {
+      if (!result.ok) console.error(`[daemon] remote share restore failed: ${result.error}`);
+    }).catch((error) => {
+      console.error(`[daemon] remote share restore failed: ${error.message}`);
+    });
+  }
 
   for (;;) {
     try {

@@ -81,6 +81,12 @@ export class TmuxExecutor {
     tmux(["send-keys", "-t", this.sessionName, ...parts]).catch(() => {});
   }
 
+  async submitMessage(data) {
+    if (!this.sessionName) return;
+    await tmux(["send-keys", "-t", this.sessionName, "-l", String(data || "")]);
+    await tmux(["send-keys", "-t", this.sessionName, "Enter"]);
+  }
+
   resize() {}
 
   interrupt() {

@@ -3,9 +3,127 @@ import { startClaudeHookServer } from "./claude/hookServer.js";
 import { cleanupClaudeHookSettings, generateClaudeHookSettings } from "./claude/hookSettings.js";
 import { ClaudeJsonlScanner, getClaudeProjectPath } from "./claude/jsonlScanner.js";
 import {
+  buildInteractionRequest,
+  INTERACTION_KINDS,
   permissionEventToInteraction,
   INTERACTION_SOURCES,
 } from "../runtime/agentInteractionContract.js";
+import { readClaudeConversationHistory } from "../runtime/claudeConversationHistory.js";
+
+const CLAUDE_NATIVE_MODES = Object.freeze([
+  { id: "default", label: "Default" },
+  { id: "acceptEdits", label: "Accept edits" },
+  { id: "plan", label: "Plan" },
+  { id: "auto", label: "Auto" },
+  { id: "dontAsk", label: "Don't ask" },
+  { id: "bypassPermissions", label: "Bypass permissions" },
+]);
+
+function safeText(value, maxLength = 512) {
+  return String(value || "").slice(0, maxLength);
+}
+
+function schemaContainsSecret(value) {
+  if (!value || typeof value !== "object") return false;
+  if (value.writeOnly === true || value.format === "password") return true;
+  return Object.values(value).some(schemaContainsSecret);
+}
+
+export function mapClaudeHookEvent(payload = {}) {
+  const eventName = safeText(payload.hook_event_name || payload.hookEventName, 64);
+  if (!eventName) return null;
+  if (eventName === "Stop") {
+    return {
+      type: "agent.task.complete",
+      provider: "claude",
+      status: "complete",
+      reason: safeText(payload.reason, 512),
+    };
+  }
+  if (eventName === "StopFailure") {
+    return {
+      type: "agent.task.aborted",
+      provider: "claude",
+      status: "error",
+      reason: safeText(payload.error || payload.reason, 4096),
+    };
+  }
+  if (eventName === "UserPromptSubmit") {
+    return {
+      type: "agent.task.started",
+      provider: "claude",
+      id: safeText(payload.prompt_id || payload.uuid || payload.session_id, 128),
+    };
+  }
+  const activity = ({
+    SessionEnd: "session_end",
+    SubagentStart: "subagent_started",
+    SubagentStop: "subagent_stopped",
+    PreCompact: "context_compacting",
+    PostCompact: "context_compacted",
+    Notification: "notification",
+    TeammateIdle: "teammate_idle",
+    TaskCreated: "background_task_created",
+    TaskCompleted: "background_task_completed",
+    ConfigChange: "config_changed",
+    WorktreeCreate: "worktree_created",
+    WorktreeRemove: "worktree_removed",
+    InstructionsLoaded: "instructions_loaded",
+    CwdChanged: "cwd_changed",
+    FileChanged: "file_changed",
+    MessageDisplay: "message_displayed",
+    PermissionDenied: "permission_denied",
+    Setup: "setup",
+    UserPromptExpansion: "user_prompt_expanded",
+    ElicitationResult: "elicitation_completed",
+  })[eventName];
+  if (!activity) return null;
+  const summary = ({
+    SessionEnd: "Claude session is ending",
+    SubagentStart: "Claude started a subagent",
+    SubagentStop: "Claude subagent stopped",
+    PreCompact: "Claude is compacting context",
+    PostCompact: "Claude compacted the conversation context",
+    Notification: safeText(payload.message || payload.text, 512) || "Claude notification",
+    TeammateIdle: "Claude teammate is idle",
+    TaskCreated: "Claude background task created",
+    TaskCompleted: "Claude background task completed",
+    ConfigChange: "Claude configuration changed",
+    WorktreeCreate: "Claude created a worktree",
+    WorktreeRemove: "Claude removed a worktree",
+    InstructionsLoaded: "Claude loaded instructions",
+    CwdChanged: "Claude working directory changed",
+    FileChanged: "Claude observed a file change",
+    MessageDisplay: safeText(payload.message || payload.text, 512) || "Claude displayed a message",
+    PermissionDenied: "Claude denied a permission request",
+    Setup: "Claude session setup updated",
+    UserPromptExpansion: "Claude expanded a user prompt",
+    ElicitationResult: `Claude MCP input ${safeText(payload.action, 32) || "completed"}`,
+  })[eventName];
+  return {
+    type: "agent.activity",
+    provider: "claude",
+    activity,
+    summary,
+    detail: safeText(payload.error || payload.reason, 4096),
+    metadata: {
+      hook_event: eventName,
+      source: safeText(payload.source, 64),
+      notification_type: safeText(payload.notification_type, 64),
+      task_id: safeText(payload.task_id, 128),
+      task_subject: safeText(payload.task_subject || payload.subject, 512),
+      agent_id: safeText(payload.agent_id, 128),
+      agent_type: safeText(payload.agent_type, 128),
+      file_path: safeText(payload.file_path, 1024),
+      cwd: safeText(payload.cwd, 1024),
+      worktree_path: safeText(payload.worktree_path, 1024),
+      permission_mode: safeText(payload.permission_mode, 32),
+      elicitation_id: safeText(payload.elicitation_id, 128),
+      mcp_server_name: safeText(payload.mcp_server_name, 128),
+      action: safeText(payload.action, 32),
+    },
+  };
+}
 
 export class ClaudeAdapter extends TerminalAdapter {
   constructor({ args = [], cwd = process.cwd(), hookServerFactory } = {}) {
@@ -24,12 +142,46 @@ export class ClaudeAdapter extends TerminalAdapter {
     // Captured at beforeStart() from the session context. The hook
     // server and event mapper never see sessionId; we enrich here.
     this.sessionId = null;
+    this.pendingInteractionInputs = new Map();
+    this.currentMode = "default";
+  }
+
+  questionPayload(input) {
+    return {
+      questions: (Array.isArray(input?.questions) ? input.questions : []).slice(0, 4).map((question, index) => ({
+        id: `q${index + 1}`,
+        header: String(question?.header || `Question ${index + 1}`).slice(0, 64),
+        question: String(question?.question || "").slice(0, 2048),
+        multiple: Boolean(question?.multiSelect),
+        allow_other: true,
+        options: (Array.isArray(question?.options) ? question.options : []).slice(0, 8).map((option, optionIndex) => ({
+          id: `o${optionIndex + 1}`,
+          label: String(option?.label || "").slice(0, 128),
+          description: String(option?.description || "").slice(0, 512),
+          preview: String(option?.preview || "").slice(0, 4096),
+        })),
+      })),
+    };
+  }
+
+  questionUpdatedInput(input, response) {
+    const answers = response?.answers && typeof response.answers === "object"
+      ? response.answers
+      : {};
+    const mapped = {};
+    (Array.isArray(input?.questions) ? input.questions : []).slice(0, 4).forEach((question, index) => {
+      const raw = answers[`q${index + 1}`];
+      const values = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
+      mapped[String(question?.question || `Question ${index + 1}`)] = values.map(String).join(", ");
+    });
+    return { ...input, answers: mapped };
   }
 
   describe() {
     return {
       ...super.describe(),
       adapter: this.kind,
+      runtime: "claude-pty",
       projectPath: this.projectPath,
       structuredSources: ["claude-jsonl", "claude-hook"],
     };
@@ -60,6 +212,19 @@ export class ClaudeAdapter extends TerminalAdapter {
     this.sessionId = sessionId ?? null;
     this.startedAt = Date.now();
     this.scanner = new ClaudeJsonlScanner({ transcriptPath: null, startedAt: this.startedAt });
+    const pushModeStatus = (mode) => {
+      const normalized = safeText(mode, 32);
+      if (!normalized || normalized === this.currentMode) return;
+      this.currentMode = normalized;
+      this.pendingEvents.push({
+        type: "agent.mode.status",
+        provider: "claude",
+        runtime: "claude-pty",
+        mode: normalized,
+        modeControl: "unsupported",
+        availableModes: CLAUDE_NATIVE_MODES,
+      });
+    };
     this.hookServer = await this.hookServerFactory({
       onSessionStart: (sessionId, payload) => {
         const transcriptPath = payload.transcript_path || null;
@@ -72,10 +237,11 @@ export class ClaudeAdapter extends TerminalAdapter {
           sessionId,
           cwd: payload.cwd,
           transcriptPath,
-          raw: payload,
         });
+        pushModeStatus(payload.permission_mode || payload.permissionMode);
       },
       onPermissionRequest: (callId, event) => {
+        pushModeStatus(event.permissionMode);
         // Stage 8.9: dual-emit. Legacy event first (the relay and
         // downstream consumers expect it); then the new
         // agent.interaction.requested envelope for the App card
@@ -83,16 +249,48 @@ export class ClaudeAdapter extends TerminalAdapter {
         // adapter enriches from this.sessionId captured above.
         this.pendingEvents.push(event);
         if (this.sessionId == null) return;
+        this.pendingInteractionInputs.set(callId, {
+          tool: event.tool,
+          input: event.input && typeof event.input === "object" ? event.input : {},
+          permissionSuggestions: Array.isArray(event.permissionSuggestions)
+            ? event.permissionSuggestions
+            : [],
+        });
         try {
-          const interaction = permissionEventToInteraction(event, {
-            source: INTERACTION_SOURCES.HOOK,
-            // Match current session.started runtime. Stage 8.7's
-            // claude-pty rename is contracted but not yet wired
-            // here; do NOT diverge between the two envelopes.
-            runtime: null,
-            sessionId: this.sessionId,
-            createdAt: Date.now(),
-          });
+          const interaction = event.tool === "AskUserQuestion"
+            ? buildInteractionRequest({
+                provider: "claude",
+                runtime: "claude-pty",
+                sessionId: this.sessionId,
+                interactionId: callId,
+                source: INTERACTION_SOURCES.HOOK,
+                kind: INTERACTION_KINDS.QUESTIONS,
+                title: "Claude has questions",
+                prompt: "Answer the questions to continue.",
+                payload: this.questionPayload(event.input),
+              })
+            : event.tool === "ExitPlanMode" || event.tool === "exit_plan_mode"
+              ? buildInteractionRequest({
+                  provider: "claude",
+                  runtime: "claude-pty",
+                  sessionId: this.sessionId,
+                  interactionId: callId,
+                  source: INTERACTION_SOURCES.HOOK,
+                  kind: INTERACTION_KINDS.CONFIRM,
+                  title: "Implement this plan?",
+                  prompt: "Review Claude's plan before continuing.",
+                  payload: {
+                    tool: event.tool,
+                    display_name: "Exit plan mode",
+                    plan: typeof event.input?.plan === "string" ? event.input.plan.slice(0, 65_536) : "",
+                  },
+                })
+              : permissionEventToInteraction(event, {
+                  source: INTERACTION_SOURCES.HOOK,
+                  runtime: "claude-pty",
+                  sessionId: this.sessionId,
+                  createdAt: Date.now(),
+                });
           this.pendingEvents.push(interaction);
         } catch (err) {
           // Defensive: the helper only throws on shape-invalid
@@ -102,6 +300,7 @@ export class ClaudeAdapter extends TerminalAdapter {
         }
       },
       onPermissionTimeout: (callId, event) => {
+        this.pendingInteractionInputs.delete(callId);
         // The hook server's 55s timer fired without a remote decision. Tell
         // the front end explicitly so it can show "Remote approval timed
         // out" rather than waiting for an agent.permission.resolved that
@@ -114,10 +313,45 @@ export class ClaudeAdapter extends TerminalAdapter {
           reason: "timeout",
         });
       },
+      onElicitationRequest: (interactionId, event) => {
+        this.pendingInteractionInputs.set(interactionId, {
+          kind: "elicitation",
+          mode: event.mode,
+        });
+        this.pendingEvents.push(buildInteractionRequest({
+          provider: "claude",
+          runtime: "claude-pty",
+          sessionId: this.sessionId,
+          interactionId,
+          source: INTERACTION_SOURCES.HOOK,
+          kind: event.mode === "url" ? INTERACTION_KINDS.URL : INTERACTION_KINDS.FORM,
+          title: event.serverName || "Claude MCP request",
+          prompt: event.message || "The MCP server needs input.",
+          payload: event.mode === "url"
+            ? { url: event.url, server_name: event.serverName }
+            : { schema: event.requestedSchema, server_name: event.serverName },
+          containsSecret: schemaContainsSecret(event.requestedSchema),
+        }));
+      },
+      onElicitationTimeout: (interactionId) => {
+        this.pendingInteractionInputs.delete(interactionId);
+        this.pendingEvents.push({
+          type: "agent.permission.resolved",
+          provider: "claude",
+          callId: interactionId,
+          decision: "denied",
+          reason: "timeout",
+        });
+      },
+      onHookEvent: (payload) => {
+        const event = mapClaudeHookEvent(payload);
+        if (event) this.pendingEvents.push(event);
+      },
     });
     this.hookSettingsPath = generateClaudeHookSettings({
       port: this.hookServer.port,
       registerPermissionRequest: !this.isNonInteractive(this.args),
+      registerElicitation: !this.isNonInteractive(this.args),
     });
   }
 
@@ -125,19 +359,57 @@ export class ClaudeAdapter extends TerminalAdapter {
     return [...this.pendingEvents.splice(0), ...this.scanner.scan()];
   }
 
+  getTranscriptPath() {
+    return this.scanner.transcriptPath || null;
+  }
+
+  readConversationHistory(options = {}) {
+    return readClaudeConversationHistory(this.getTranscriptPath(), options);
+  }
+
   resolvePermission(payload) {
-    if (!this.hookServer) return;
-    const callId = payload.callId || payload.id;
+    if (!this.hookServer) return false;
+    const callId = payload.callId || payload.interactionId || payload.id;
     if (!callId) {
       this.pendingEvents.push({
         type: "agent.permission.resolve.error",
         provider: "claude",
         message: "No callId in /client/permission payload.",
       });
-      return;
+      return false;
     }
     const decision = payload.decision || "denied";
-    const ok = this.hookServer.resolvePermission({ callId, decision, reason: payload.reason });
+    const pending = this.pendingInteractionInputs.get(callId);
+    if (pending?.kind === "elicitation") {
+      const action = payload.action === "submit" || payload.action === "allow"
+        ? "accept"
+        : payload.action === "cancel" || decision === "abort"
+          ? "cancel"
+          : "decline";
+      const ok = this.hookServer.resolveElicitation({
+        interactionId: callId,
+        action,
+        content: payload.response?.values || payload.response || {},
+      });
+      if (!ok) return false;
+      this.pendingInteractionInputs.delete(callId);
+      this.pendingEvents.push({
+        type: "agent.permission.resolved",
+        provider: "claude",
+        callId,
+        decision: action === "accept" ? "approved" : action === "cancel" ? "abort" : "denied",
+      });
+      return true;
+    }
+    const updatedInput = pending?.tool === "AskUserQuestion"
+      ? this.questionUpdatedInput(pending.input, payload.response)
+      : undefined;
+    const ok = this.hookServer.resolvePermission({
+      callId,
+      decision,
+      reason: payload.reason,
+      updatedInput,
+    });
     if (!ok) {
       this.pendingEvents.push({
         type: "agent.permission.resolve.error",
@@ -145,21 +417,25 @@ export class ClaudeAdapter extends TerminalAdapter {
         callId,
         message: "No pending Claude hook permission for this callId.",
       });
-      return;
+      return false;
     }
+    this.pendingInteractionInputs.delete(callId);
     this.pendingEvents.push({
       type: "agent.permission.resolved",
       provider: "claude",
       callId,
       decision,
-      // v1: the session rule has not actually been registered with
-      // Claude Code. Mark it so the UI can grey the button.
-      sessionRulePending: decision === "approved_for_session",
+      // Claude only supplies session-rule suggestions for some prompts.
+      // Mark the fallback so the App does not claim a rule was installed.
+      sessionRulePending: decision === "approved_for_session"
+        && !(pending?.permissionSuggestions?.length > 0),
     });
+    return true;
   }
 
   cleanup() {
     this.hookServer?.stop();
     cleanupClaudeHookSettings(this.hookSettingsPath);
+    this.pendingInteractionInputs.clear();
   }
 }

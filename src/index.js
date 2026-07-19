@@ -68,6 +68,7 @@ import { handleAuthCommand, handleLogin, handleLogout } from "./commands/auth.js
 import {
   chooseCloudModel,
   chooseRemoteDevice,
+  chooseRemoteProvider,
   loadCloudModels,
   loadRemoteCliDevices,
   printCloudModels,
@@ -75,6 +76,7 @@ import {
   remoteProviderName,
 } from "./commands/routeSources.js";
 import { runClaudeSdkSession } from "./runtime/claudeSdkSession.js";
+import { runCodexAppServerSession } from "./runtime/codexAppServerSession.js";
 import {
   detectClaudeAgentSdkAvailability,
   detectCliAvailability,
@@ -82,6 +84,10 @@ import {
   detectTmuxAvailability,
 } from "./utils/detect.js";
 import { DEFAULT_DEVICE_ID, DEFAULT_EXECUTOR, DEFAULT_LOCAL_API_PORT, DEFAULT_RELAY_URL, VERSION } from "./constants.js";
+import {
+  agentDetailDefaultFromConfig,
+  setAgentDetailDefault,
+} from "./runtime/agentDetailProfile.js";
 
 function printHelp() {
   console.log(`originrouter ${VERSION}
@@ -93,6 +99,7 @@ Usage:
   originrouter doctor [provider <name>]
   originrouter sessions [--json]
   originrouter env print [--provider <name>] [--agent claude|codex]
+  originrouter agent detail [set concise|standard|detailed]
 
 Local LiteLLM provider management:
   originrouter provider add <name> [--type proxy] [--base-url <u>] [--model <m>]
@@ -162,11 +169,12 @@ Other:
   originrouter daemon-port                           Print the running daemon's local API URL (reads daemon.state.json)
   originrouter service install|start|stop|restart|status|uninstall
   originrouter run -- <command> [args...]
-  originrouter claude [args...]                  Start local Claude Code session (PTY) — uses resolved provider env
-  originrouter claude --terminal [args...]      Alias for 'claude' (flag is a no-op)
-  originrouter claude-terminal [args...]         Alias for 'claude' (PTY route)
-  originrouter claude-sdk [args...]              Start Claude through the Agent SDK runtime
-  originrouter codex [args...]                   Start local Codex session and expose it for remote control (PTY)
+  originrouter claude [args...]                   Start native Claude Code TUI with remote control
+  originrouter codex [args...]                    Start native Codex TUI with remote control
+  originrouter claude-terminal [args...]          Start managed Claude Agent SDK session
+  originrouter codex-terminal [args...]           Start managed Codex app-server session
+  originrouter claude-sdk [args...]               Alias for managed Claude session
+  originrouter codex-app-server [args...]         Alias for managed Codex session
 
 Examples:
   originrouter run -- bash
@@ -224,7 +232,39 @@ OriginRouter wrapper options for claude/codex:
   --originrouter-relay https://app.easytransnote.com
   --originrouter-device local-dev
   --originrouter-session session-id
+  --originrouter-autonomy manual|guarded|unrestricted|custom
+  --originrouter-detail concise|standard|detailed  Override this session's installed default
+  --originrouter-auto-approve                    Alias for --originrouter-autonomy guarded
+  --originrouter-auto-allow <scope[,scope...]>   Use a custom unattended allow-list; repeatable
+                                                 scopes: plan_continue, explicit_continue_questions, read_tools,
+                                                 workspace_edits, workspace_commands, additional_permissions,
+                                                 destructive_commands, elevated_commands, network_mutations,
+                                                 outside_workspace, unknown_tools
+  --originrouter-native-config                   Native TUI only: use the installed Claude/Codex auth, model, environment, and config; keep OriginRouter remote control only
+  --originrouter-native                          Alias for --originrouter-native-config
 `);
+}
+
+export function resolveAgentCommand(command, args = []) {
+  if (command === "claude") {
+    return {
+      agent: "claude",
+      runtime: "native-pty",
+      args: args.includes("--terminal")
+        ? args.filter((arg) => arg !== "--terminal")
+        : args.slice(),
+    };
+  }
+  if (command === "codex") {
+    return { agent: "codex", runtime: "native-pty", args: args.slice() };
+  }
+  if (command === "claude-sdk" || command === "claude-terminal") {
+    return { agent: "claude", runtime: "claude-sdk", args: args.slice() };
+  }
+  if (command === "codex-terminal" || command === "codex-app-server") {
+    return { agent: "codex", runtime: "codex-app-server", args: args.slice() };
+  }
+  return null;
 }
 
 function parseRunArgs(args) {
@@ -367,6 +407,23 @@ function handleConfig(args) {
   }
 
   throw new Error(`Unknown config action: ${action}`);
+}
+
+function handleAgentSettings(args) {
+  const [section, action, value] = args;
+  if (section !== "detail") {
+    throw new Error("Usage: originrouter agent detail [set concise|standard|detailed]");
+  }
+  if (!action || action === "show") {
+    console.log(agentDetailDefaultFromConfig(readConfig()));
+    return;
+  }
+  if (action !== "set" || !value) {
+    throw new Error("Usage: originrouter agent detail set concise|standard|detailed");
+  }
+  const next = setAgentDetailDefault(readConfig(), value);
+  writeConfig(next);
+  console.log(`Agent detail default: ${agentDetailDefaultFromConfig(next)}`);
 }
 
 function handleClaudeConfig(args) {
@@ -886,7 +943,7 @@ async function handleRemoteRouteSource(args) {
   const [action, ...rest] = args;
   const stateDir = ensureStateDir();
   const devices = (await loadRemoteCliDevices({ stateDir })).filter(
-    (device) => device.online,
+    (device) => device.online && device.remoteShareRunning,
   );
 
   if (action === "devices") {
@@ -903,6 +960,8 @@ async function handleRemoteRouteSource(args) {
   const options = parseOptionArgs(rest.slice(1));
   const { agent, slot } = parseRouteTarget(target);
   const device = await chooseRemoteDevice(devices, options["--device"]);
+  const selected = await chooseRemoteProvider(device, options["--model"]);
+  const selectedModel = selected.provider;
   const config = readConfig();
   const providers = config.providers || {};
   const existing = Object.values(providers).find((provider) =>
@@ -927,12 +986,12 @@ async function handleRemoteRouteSource(args) {
       deviceId: device.deviceId,
       target: "proxy",
       auth: { type: "oauth" },
-      ...(options["--model"] ? { model: options["--model"] } : {}),
+      model: selectedModel,
     });
   }
   next = setRoute(next, agent, slot, {
     provider: providerName,
-    ...(options["--model"] ? { model: options["--model"] } : {}),
+    model: selectedModel,
   });
   writeConfig(next);
   console.log(`Route ${target} now uses remote CLI device: ${device.deviceName || device.deviceId}.`);
@@ -1343,7 +1402,7 @@ function maybeNoteLegacySmallFastModel(opts) {
 
 // ---------- env print ----------
 
-const ANTHROPIC_ENV_VARS = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"];
+const ANTHROPIC_ENV_VARS = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"];
 // Stage 9.1B: Codex uses OPENAI_* env vars, not ANTHROPIC_*.
 const OPENAI_ENV_VARS    = ["OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"];
 function envVarsFor(agent) {
@@ -1454,7 +1513,17 @@ async function handleEnvPrint(args) {
       remoteCodingProxyManager = null;
     }
   }
-  const providerEnv = providerResult?.env || {};
+  const providerEnv = { ...(providerResult?.env || {}) };
+  if (providerResult?.source === "originrouter-coding") {
+    if (agent === "claude") {
+      providerEnv.ANTHROPIC_API_KEY = "";
+      providerEnv.ANTHROPIC_BASE_URL = "http://127.0.0.1:<session-port>/coding";
+      providerEnv.ANTHROPIC_AUTH_TOKEN = "or_local_<session-capability>";
+    } else {
+      providerEnv.OPENAI_BASE_URL = "http://127.0.0.1:<session-port>/coding/v1";
+      providerEnv.OPENAI_API_KEY = "or_local_<session-capability>";
+    }
+  }
 
   // Stage 9.1B: print `Source: <transport>` on success only. On failure
   // there is no source to advertise — skip the line. The "Effective env"
@@ -1496,7 +1565,7 @@ async function handleEnvPrint(args) {
 // Only API keys are sensitive; model names and base URLs are shown in full.
 // Stage 9.1B: also mask OPENAI_API_KEY (Codex direct branch).
 function formatEnvValue(key, value) {
-  if (key === "ANTHROPIC_API_KEY" || key === "OPENAI_API_KEY") return maskSecret(value, true);
+  if (key === "ANTHROPIC_API_KEY" || key === "ANTHROPIC_AUTH_TOKEN" || key === "OPENAI_API_KEY") return maskSecret(value, true);
   return value;
 }
 
@@ -1626,6 +1695,11 @@ export async function main(argv) {
     return;
   }
 
+  if (command === "agent") {
+    handleAgentSettings(args);
+    return;
+  }
+
   if (command === "claude-config") {
     handleClaudeConfig(args);
     return;
@@ -1709,25 +1783,17 @@ export async function main(argv) {
     return;
   }
 
-  if (command === "claude-sdk") {
-    await runClaudeSdkSession(args);
+  const agentCommand = resolveAgentCommand(command, args);
+  if (agentCommand?.runtime === "claude-sdk") {
+    await runClaudeSdkSession(agentCommand.args);
     return;
   }
-
-  if (command === "claude-terminal") {
-    await runLocalAgentSession("claude", args);
+  if (agentCommand?.runtime === "codex-app-server") {
+    await runCodexAppServerSession(agentCommand.args);
     return;
   }
-
-  if (command === "claude" || command === "codex") {
-    // `claude --terminal [args...]` is accepted as a no-op alias for the
-    // default PTY path; the flag is stripped before forwarding. The PTY
-    // route is the default for both `claude` and `codex`. To use the
-    // structured SDK path, run `claude-sdk` instead.
-    const forwardedArgs = command === "claude" && args.includes("--terminal")
-      ? args.filter((arg) => arg !== "--terminal")
-      : args;
-    await runLocalAgentSession(command, forwardedArgs);
+  if (agentCommand?.runtime === "native-pty") {
+    await runLocalAgentSession(agentCommand.agent, agentCommand.args);
     return;
   }
 

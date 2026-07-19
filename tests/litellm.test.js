@@ -13,6 +13,7 @@ import {
   pipBinaryPath,
   pythonBinaryPath,
   renderLitellmConfigYaml,
+  renderLitellmProvidersConfigYaml,
   renderLitellmRoutesConfigYaml,
   runtimeDir,
   venvDir,
@@ -54,6 +55,31 @@ assert.ok(NOOP_ANTHROPIC_API_KEY.startsWith("sk-"), "no-op key must be non-empty
 }
 
 // ---------- renderLitellmConfigYaml ----------
+{
+  const yaml = renderLitellmProvidersConfigYaml([
+    {
+      name: "deepseek",
+      type: "proxy",
+      engine: "litellm",
+      litellmProvider: "deepseek",
+      apiKey: "sk-deepseek",
+      model: "deepseek-chat",
+    },
+    {
+      name: "glm",
+      type: "proxy",
+      engine: "litellm",
+      litellmProvider: "custom_openai",
+      baseUrl: "https://glm.example/v1",
+      apiKey: "sk-glm",
+      model: "glm-5",
+    },
+  ]);
+  assert.match(yaml, /model_name: deepseek/);
+  assert.match(yaml, /model_name: glm/);
+  assert.match(yaml, /model: deepseek\/deepseek-chat/);
+  assert.match(yaml, /model: openai\/glm-5/);
+}
 {
   // DeepSeek via the legacy openai-compatible path renders to the v1 YAML
   // byte-for-byte (backward compat). The `deepseek/` prefix is selected by

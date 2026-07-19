@@ -13,6 +13,7 @@
 // in the JSON body:
 //   SessionStart       -> POST /hook/session-start
 //   PermissionRequest  -> POST /hook/permission-request
+//   Other registered lifecycle hooks -> POST /hook/event
 //
 // Stage 8.5: the HTTP layer lives in claude-session-hook-forwarder-impl.cjs
 // as the pure `postHookBody()` function. This wrapper is a thin CJS shell

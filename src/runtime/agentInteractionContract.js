@@ -16,19 +16,29 @@
 // A dedicated canceled event is a future-stage concern if the UI
 // ever needs the distinction.
 //
-// The helper covers `kind: "permission"` for round-trip (forward and
-// reverse). Other kinds (`confirm | single_select | multi_select |
-// free_text | raw_terminal`) are reserved for future wiring stages;
-// the forward map accepts them, but the reverse map only round-trips
-// `kind: "permission"` and throws TypeError on others.
+// Managed runtimes use permission, confirm, questions, form, and URL.
+// The legacy reverse map remains permission-only because the old
+// agent.permission.* envelope cannot represent the richer responses.
 
 export const INTERACTION_KINDS = Object.freeze({
   PERMISSION: "permission",
   CONFIRM: "confirm",
+  QUESTIONS: "questions",
+  FORM: "form",
+  URL: "url",
+  // Legacy aliases retained for the PTY compatibility path. Managed
+  // runtimes emit QUESTIONS/FORM instead.
   SINGLE_SELECT: "single_select",
   MULTI_SELECT: "multi_select",
   FREE_TEXT: "free_text",
   RAW_TERMINAL: "raw_terminal",
+});
+
+export const INTERACTION_ACTIONS = Object.freeze({
+  ALLOW: "allow",
+  DENY: "deny",
+  CANCEL: "cancel",
+  SUBMIT: "submit",
 });
 
 // Where the request originated on the local machine. These are
@@ -58,6 +68,83 @@ function isFrozenMember(table, value) {
 
 function isNonEmptyString(value) {
   return typeof value === "string" && value.length > 0;
+}
+
+function copyObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? { ...value }
+    : {};
+}
+
+export function buildInteractionRequest(payload = {}) {
+  if (!payload || typeof payload !== "object") {
+    throw new TypeError("buildInteractionRequest: payload is required");
+  }
+  const {
+    provider = null,
+    runtime = null,
+    sessionId = null,
+    interactionId,
+    source = INTERACTION_SOURCES.APP_SERVER,
+    kind,
+    title = null,
+    prompt = null,
+    payload: requestPayload = {},
+    containsSecret = false,
+    expiresAt = null,
+  } = payload;
+  if (!isNonEmptyString(interactionId)) {
+    throw new TypeError("buildInteractionRequest: interactionId is required");
+  }
+  if (!isFrozenMember(INTERACTION_SOURCES, source)) {
+    throw new TypeError(`buildInteractionRequest: unknown source ${JSON.stringify(source)}`);
+  }
+  if (![
+    INTERACTION_KINDS.PERMISSION,
+    INTERACTION_KINDS.CONFIRM,
+    INTERACTION_KINDS.QUESTIONS,
+    INTERACTION_KINDS.FORM,
+    INTERACTION_KINDS.URL,
+  ].includes(kind)) {
+    throw new TypeError(`buildInteractionRequest: unsupported managed kind ${JSON.stringify(kind)}`);
+  }
+  return {
+    type: "agent.interaction.requested",
+    provider,
+    runtime,
+    sessionId,
+    interactionId,
+    source,
+    kind,
+    title,
+    prompt,
+    payload: copyObject(requestPayload),
+    containsSecret: Boolean(containsSecret),
+    expiresAt: Number.isFinite(expiresAt) ? Math.max(0, Math.floor(expiresAt)) : null,
+  };
+}
+
+export function normalizeInteractionResolve(payload = {}) {
+  if (!payload || typeof payload !== "object") {
+    throw new TypeError("normalizeInteractionResolve: payload is required");
+  }
+  const interactionId = payload.interactionId || payload.callId;
+  const action = String(payload.action || "").trim().toLowerCase();
+  if (!isNonEmptyString(interactionId)) {
+    throw new TypeError("normalizeInteractionResolve: interactionId is required");
+  }
+  if (!Object.values(INTERACTION_ACTIONS).includes(action)) {
+    throw new TypeError(`normalizeInteractionResolve: unknown action ${JSON.stringify(action)}`);
+  }
+  return {
+    interactionId,
+    responseId: payload.responseId || payload.deliveryId || null,
+    publicInteractionId: payload.publicInteractionId || null,
+    deliveryId: payload.deliveryId || null,
+    kind: payload.kind || null,
+    action,
+    response: copyObject(payload.response),
+  };
 }
 
 // Forward map: `agent.permission.request.detected` (or any object

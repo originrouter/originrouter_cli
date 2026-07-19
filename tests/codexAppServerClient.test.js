@@ -678,4 +678,56 @@ async function captureSpawnEnv(env) {
     "new envelope always carries the new eventType");
 }
 
+// ---- 36. Managed app-server request and thread helpers ----
+
+{
+  const { client, writes } = makeClient();
+  client.onServerRequest(async ({ method, params }) => {
+    assert.equal(method, "item/tool/requestUserInput");
+    assert.equal(params.itemId, "question-1");
+    return { answers: { target: { answers: ["staging"] } } };
+  });
+  feed(client, {
+    jsonrpc: "2.0",
+    id: 90,
+    method: "item/tool/requestUserInput",
+    params: { itemId: "question-1" },
+  });
+  await flush();
+  assert.deepEqual(writes.at(-1), {
+    jsonrpc: "2.0",
+    id: 90,
+    result: { answers: { target: { answers: ["staging"] } } },
+  });
+
+  const threadPromise = client.startThread({ cwd: "/tmp/project" });
+  const threadRequest = writes.at(-1);
+  assert.equal(threadRequest.method, "thread/start");
+  feed(client, {
+    jsonrpc: "2.0",
+    id: threadRequest.id,
+    result: { thread: { id: "thread-1" } },
+  });
+  assert.equal((await threadPromise).thread.id, "thread-1");
+}
+
+// ---- 37. Stop-current-task uses Codex turn/interrupt ----
+
+{
+  const { client, writes } = makeClient();
+  const interruptPromise = client.interruptTurn("thread-stop-1", "turn-stop-1");
+  const request = writes.at(-1);
+  assert.equal(request.method, "turn/interrupt");
+  assert.deepEqual(request.params, {
+    threadId: "thread-stop-1",
+    turnId: "turn-stop-1",
+  });
+  feed(client, {
+    jsonrpc: "2.0",
+    id: request.id,
+    result: {},
+  });
+  await interruptPromise;
+}
+
 console.log("codex app-server client tests ok");

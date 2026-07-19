@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { claudeConversationMessagesFromRaw } from "../../runtime/claudeTranscriptMessages.js";
 
 // Kept for backwards compatibility with tests / callers that still import
 // `getClaudeProjectPath`. No longer used by ClaudeJsonlScanner itself.
@@ -24,10 +25,15 @@ export function mapClaudeJsonLine(line) {
   }
 
   if (raw.type === "assistant") {
+    for (const message of claudeConversationMessagesFromRaw(raw)) {
+      events.push({
+        type: "agent.text",
+        text: message.text,
+        eventId: message.messageId,
+        createdAt: message.createdAt,
+      });
+    }
     for (const block of raw.message?.content || []) {
-      if (block.type === "text") {
-        events.push({ type: "agent.text", text: block.text });
-      }
       if (block.type === "thinking") {
         events.push({ type: "agent.thinking", text: block.thinking || block.text || "" });
       }
@@ -45,8 +51,13 @@ export function mapClaudeJsonLine(line) {
 
   if (raw.type === "user") {
     const content = raw.message?.content;
-    if (typeof content === "string") {
-      events.push({ type: "user.text", text: content });
+    for (const message of claudeConversationMessagesFromRaw(raw)) {
+      events.push({
+        type: "user.text",
+        text: message.text,
+        eventId: message.messageId,
+        createdAt: message.createdAt,
+      });
     }
     if (Array.isArray(content)) {
       for (const block of content) {

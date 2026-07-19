@@ -35,7 +35,9 @@ const DEFAULTS = {
 
 function pickPath(eventName) {
   if (eventName === "PermissionRequest") return "/hook/permission-request";
-  return "/hook/session-start";
+  if (eventName === "Elicitation") return "/hook/elicitation";
+  if (eventName === "SessionStart") return "/hook/session-start";
+  return "/hook/event";
 }
 
 // Preserve the original dual-form event-name parsing — Claude Code
@@ -127,7 +129,7 @@ async function postHookBody(body, port, options = {}) {
   // PermissionRequest is held open by the server for up to 55s;
   // the forwarder's per-attempt timeout must safely exceed that,
   // otherwise a normal remote approval would be aborted.
-  const perAttemptTimeoutMs = eventName === "PermissionRequest"
+  const perAttemptTimeoutMs = eventName === "PermissionRequest" || eventName === "Elicitation"
     ? opts.permissionRequestTimeoutMs
     : opts.perAttemptTimeoutMs;
 

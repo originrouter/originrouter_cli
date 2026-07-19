@@ -88,7 +88,7 @@ function originrouterBaseForRuntime(provider, runtime) {
     runtime,
     model: provider?.model,
   });
-  const baseUrl = provider?.baseUrl || DEFAULT_ORIGINROUTER_BASE_URL;
+  const baseUrl = DEFAULT_ORIGINROUTER_BASE_URL;
   if (route.endpoint.endsWith("/v1/messages")) {
     return joinUrlPath(baseUrl, route.endpoint.slice(0, -"/v1/messages".length));
   }

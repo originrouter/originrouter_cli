@@ -26,6 +26,7 @@ import {
   pipBinaryPath,
   pythonBinaryPath,
   renderLitellmConfigYaml,
+  renderLitellmProvidersConfigYaml,
   renderLitellmRoutesConfigYaml,
   runtimeDir,
   venvDir,
@@ -52,17 +53,39 @@ const CRASH_SIGNALS = new Set([
 export class ProxyManager {
   constructor({
     stateDir,
+    stateKey = "proxy",
     pythonCommand = "python3",
     logger = console,
     spawnFn = spawn,
     fetchFn = globalThis.fetch,
   }) {
     this.stateDir = stateDir;
+    this.stateKey = stateKey;
     this.pythonCommand = pythonCommand;
     this.logger = logger;
     this.spawnFn = spawnFn;
     this.fetchFn = fetchFn;
     this.activeChild = null; // tracked so `stop()` can SIGTERM even if state is stale
+  }
+
+  _readState() {
+    return readProxyState(this.stateKey);
+  }
+
+  _writeState(state) {
+    return writeProxyState(state, this.stateKey);
+  }
+
+  _clearState() {
+    return clearProxyState(this.stateKey);
+  }
+
+  _configDir() {
+    return join(this.stateDir, `${this.stateKey}.state.d`);
+  }
+
+  _logPrefix() {
+    return this.stateKey === "proxy" ? "litellm" : this.stateKey;
   }
 
   // ----------------------------------------------------------------
@@ -94,7 +117,7 @@ export class ProxyManager {
   // start
   // ----------------------------------------------------------------
 
-  async start({ providerName, mode = "route", version = LITELLM_PACKAGE.match(/==(.+)$/)[1], port = 0 } = {}) {
+  async start({ providerName, providerNames, mode = "route", version = LITELLM_PACKAGE.match(/==(.+)$/)[1], port = 0 } = {}) {
     if (!isInstalled(this.stateDir, version)) {
       return { ok: false, error: `LiteLLM not installed. Run \`originrouter proxy install\` first.` };
     }
@@ -124,12 +147,62 @@ export class ProxyManager {
       return await this._startRouteInner({ version, port, allRoutes, providers });
     }
 
+    if (mode === "share") {
+      const selectedNames = [...new Set(
+        (Array.isArray(providerNames) ? providerNames : [])
+          .map((name) => String(name || "").trim())
+          .filter(Boolean),
+      )];
+      if (selectedNames.length === 0) {
+        return { ok: false, error: "remote share requires at least one local LiteLLM provider" };
+      }
+      const configuredProviders = config.providers || {};
+      const selectedProviders = [];
+      for (const name of selectedNames) {
+        const provider = configuredProviders[name];
+        if (!provider) {
+          return { ok: false, error: `unknown provider '${name}'. Run \`originrouter provider list\`.` };
+        }
+        const providerIsLiteLlm = provider.type === "openai-compatible"
+          || provider.type === "litellm"
+          || (provider.type === "proxy" && provider.engine === "litellm");
+        if (!providerIsLiteLlm) {
+          return {
+            ok: false,
+            error: `provider '${name}' is not a local LiteLLM provider and cannot be shared`,
+          };
+        }
+        selectedProviders.push(provider.type === "openai-compatible"
+          ? { ...provider, type: "litellm", litellmProvider: "custom_openai" }
+          : provider);
+      }
+
+      while (this._startLock) await this._startLock;
+      let release;
+      this._startLock = new Promise((resolve) => { release = resolve; });
+      try {
+        return await this._startInner({
+          providerNames: selectedNames,
+          providers: selectedProviders,
+          mode: "share",
+          version,
+          port,
+        });
+      } finally {
+        this._startLock = null;
+        release();
+      }
+    }
+
     // mode === "provider" — legacy path
     const provider = (config.providers || {})[providerName];
     if (!provider) {
       return { ok: false, error: `unknown provider '${providerName}'. Run \`originrouter provider list\`.` };
     }
-    if (provider.type !== "openai-compatible" && provider.type !== "litellm") {
+    const providerIsLiteLlm = provider.type === "openai-compatible"
+      || provider.type === "litellm"
+      || (provider.type === "proxy" && provider.engine === "litellm");
+    if (!providerIsLiteLlm) {
       return {
         ok: false,
         error: `provider '${providerName}' is type='${provider.type}'. The proxy only routes type='litellm' providers (and the legacy type='openai-compatible' alias). type='anthropic' is the direct path — it does not run through LiteLLM.`,
@@ -145,14 +218,14 @@ export class ProxyManager {
     let release;
     this._startLock = new Promise((r) => { release = r; });
     try {
-      return await this._startInner({ providerName, version, port, provider });
+      return await this._startInner({ providerName, version, port, provider, mode: "provider" });
     } finally {
       this._startLock = null;
       release();
     }
   }
 
-  async _startInner({ providerName, version, port, provider }) {
+  async _startInner({ providerName, providerNames = [], version, port, provider, providers = [], mode = "provider" }) {
     // Reconcile stale state FIRST. status() self-heals if the recorded pid
     // is dead (clears the state file). After this call, `fresh.state ===
     // "running"` only when there's a real, live process.
@@ -160,7 +233,7 @@ export class ProxyManager {
     if (fresh.state === "running") {
       return {
         ok: false,
-        error: `proxy already running on port ${fresh.port} (pid ${fresh.pid}, provider ${fresh.currentProvider}). Run \`originrouter proxy stop\` first.`,
+        error: `proxy already running on port ${fresh.port} (pid ${fresh.pid}). Stop it before starting another configuration.`,
       };
     }
 
@@ -169,13 +242,20 @@ export class ProxyManager {
     // Legacy type=openai-compatible records project to litellm/custom_openai
     // before rendering so the renderer sees a uniform input shape. The disk
     // record is NOT modified here; the migration happens on next PUT.
-    const configDir = join(this.stateDir, "proxy.state.d");
+    const configDir = this._configDir();
     mkdirSync(configDir, { recursive: true });
-    const configPath = join(configDir, `config-${providerName}.yaml`);
-    const forRender = provider.type === "openai-compatible"
-      ? { ...provider, type: "litellm", litellmProvider: "custom_openai" }
-      : provider;
-    writeFileSync(configPath, renderLitellmConfigYaml(forRender), { mode: 0o600 });
+    const configPath = join(
+      configDir,
+      mode === "share" ? "config-share.yaml" : `config-${providerName}.yaml`,
+    );
+    if (mode === "share") {
+      writeFileSync(configPath, renderLitellmProvidersConfigYaml(providers), { mode: 0o600 });
+    } else {
+      const forRender = provider.type === "openai-compatible"
+        ? { ...provider, type: "litellm", litellmProvider: "custom_openai" }
+        : provider;
+      writeFileSync(configPath, renderLitellmConfigYaml(forRender), { mode: 0o600 });
+    }
 
     // Bind safety: only loopback.
     if (PROXY_HOST !== "127.0.0.1") {
@@ -188,7 +268,7 @@ export class ProxyManager {
     // Capture stdout/stderr to a per-proxy log file so failures are inspectable.
     const logDir = join(this.stateDir, "logs");
     mkdirSync(logDir, { recursive: true });
-    const logPath = join(logDir, `litellm-${Date.now()}.log`);
+    const logPath = join(logDir, `${this._logPrefix()}-${Date.now()}.log`);
     const outFd = openSync(logPath, "a", 0o600);
     const errFd = openSync(logPath, "a", 0o600);
 
@@ -211,12 +291,12 @@ export class ProxyManager {
       // last-exit reason into proxy.state.json (in place of clearing it
       // immediately) so the next status() call can surface it to the UI.
       // The state file gets cleared on the next status() reconcile pass.
-      const cur = readProxyState();
+      const cur = this._readState();
       if (cur && cur.pid === child.pid) {
         const isCrash = (signal && CRASH_SIGNALS.has(signal))
           || (code != null && code !== 0);
         const reason = isCrash ? "crashed" : "stopped";
-        writeProxyState({
+        this._writeState({
           ...cur,
           state: "stopped",
           lastExitReason: reason,
@@ -245,7 +325,7 @@ export class ProxyManager {
     const healthy = await this._waitForHealth(healthUrl);
     if (!healthy) {
       child.kill("SIGTERM");
-      clearProxyState();
+      this._clearState();
       return {
         ok: false,
         error: `proxy failed to become healthy on ${healthUrl} within ${HEALTH_POLL_TIMEOUT_MS}ms. Check ${logPath}.`,
@@ -254,13 +334,15 @@ export class ProxyManager {
     }
 
     // Persist state.
-    writeProxyState({
+    this._writeState({
       version_pinned: version,
       state: "running",
       pid: child.pid,
       port,
       host: PROXY_HOST,
-      provider: providerName,
+      mode,
+      provider: mode === "provider" ? providerName : null,
+      providers: mode === "share" ? providerNames : null,
       startedAt: new Date().toISOString(),
       configPath,
       logPath,
@@ -271,7 +353,9 @@ export class ProxyManager {
       state: "running",
       port,
       pid: child.pid,
-      provider: providerName,
+      mode,
+      provider: mode === "provider" ? providerName : null,
+      providers: mode === "share" ? providerNames : null,
       version,
       configPath,
       logPath,
@@ -312,7 +396,7 @@ export class ProxyManager {
       }
 
       const routesHash = hashRoutes(allRoutes);
-      const configDir = join(this.stateDir, "proxy.state.d");
+      const configDir = this._configDir();
       mkdirSync(configDir, { recursive: true });
       const configPath = join(configDir, `config-routes-${routesHash}.yaml`);
       writeFileSync(configPath, yaml, { mode: 0o600 });
@@ -323,7 +407,7 @@ export class ProxyManager {
 
       const logDir = join(this.stateDir, "logs");
       mkdirSync(logDir, { recursive: true });
-      const logPath = join(logDir, `litellm-${Date.now()}.log`);
+      const logPath = join(logDir, `${this._logPrefix()}-${Date.now()}.log`);
       const outFd = openSync(logPath, "a", 0o600);
       const errFd = openSync(logPath, "a", 0o600);
 
@@ -342,12 +426,12 @@ export class ProxyManager {
       child.on("exit", (code, signal) => {
         this.logger.log(`[proxy] process exited code=${code} signal=${signal}`);
         this.activeChild = null;
-        const cur = readProxyState();
+        const cur = this._readState();
         if (cur && cur.pid === child.pid) {
           const isCrash = (signal && CRASH_SIGNALS.has(signal))
             || (code != null && code !== 0);
           const reason = isCrash ? "crashed" : "stopped";
-          writeProxyState({
+          this._writeState({
             ...cur,
             state: "stopped",
             lastExitReason: reason,
@@ -362,7 +446,7 @@ export class ProxyManager {
       const healthy = await this._waitForHealth(healthUrl);
       if (!healthy) {
         child.kill("SIGTERM");
-        clearProxyState();
+        this._clearState();
         return {
           ok: false,
           error: `proxy failed to become healthy on ${healthUrl} within ${HEALTH_POLL_TIMEOUT_MS}ms. Check ${logPath}.`,
@@ -378,7 +462,7 @@ export class ProxyManager {
         }
       }
 
-      writeProxyState({
+      this._writeState({
         version_pinned: version,
         state: "running",
         pid: child.pid,
@@ -411,10 +495,10 @@ export class ProxyManager {
   }
 
   async stop() {
-    const cur = readProxyState();
+    const cur = this._readState();
     if (!cur || cur.state !== "running") {
       this.activeChild = null;
-      clearProxyState();
+      this._clearState();
       return { ok: true, state: "stopped", note: "no running proxy" };
     }
     const pid = cur.pid;
@@ -444,7 +528,7 @@ export class ProxyManager {
     // effectively a no-op overwrite.)
     if (cur && cur.pid === pid) {
       try {
-        writeProxyState({
+        this._writeState({
           ...cur,
           state: "stopped",
           lastExitReason: "stopped",
@@ -454,7 +538,7 @@ export class ProxyManager {
         });
       } catch {}
     }
-    clearProxyState();
+    this._clearState();
     this.activeChild = null;
     return { ok: true, state: "stopped", pid };
   }
@@ -466,12 +550,19 @@ export class ProxyManager {
   // Stage 7.5: restart defaults to route mode. If the previous state was
   // mode=provider, that mode is preserved (so a debug session isn't silently
   // switched). If stopped and no --port, error.
-  async restart({ providerName, port, mode } = {}) {
-    const prev = readProxyState();
+  async restart({ providerName, providerNames, port, mode } = {}) {
+    const prev = this._readState();
     const prevMode = mode || (prev && prev.mode) || "route";
     await this.stop();
     if (prevMode === "route") {
       return await this.start({ mode: "route", port });
+    }
+    if (prevMode === "share") {
+      return await this.start({
+        mode: "share",
+        providerNames: providerNames || prev?.providers || [],
+        port,
+      });
     }
     return await this.start({ mode: "provider", providerName, port });
   }
@@ -488,13 +579,14 @@ export class ProxyManager {
         version: null,
         pid: null,
         currentProvider: null,
+        currentProviders: [],
         mode: null,
         routesHash: null,
         aliases: null,
         note: "Run `originrouter proxy install` to set up LiteLLM.",
       };
     }
-    const cur = readProxyState();
+    const cur = this._readState();
     if (!cur || cur.state !== "running") {
       return {
         state: "stopped",
@@ -502,6 +594,7 @@ export class ProxyManager {
         version: cur?.version_pinned || LITELLM_PACKAGE.match(/==(.+)$/)[1],
         pid: null,
         currentProvider: cur?.provider || null,
+        currentProviders: Array.isArray(cur?.providers) ? cur.providers : [],
         mode: cur?.mode || null,
         routesHash: cur?.routesHash || null,
         aliases: cur?.aliases || null,
@@ -534,13 +627,15 @@ export class ProxyManager {
         lastExitSignal: cur.lastExitSignal || null,
         lastExitAt: cur.lastExitAt || null,
       };
-      clearProxyState();
+      this._clearState();
       return {
         state: "stopped",
         port: null,
         version: cur.version_pinned,
         pid: null,
         currentProvider: cur.provider,
+        currentProviders: Array.isArray(cur.providers) ? cur.providers : [],
+        mode: cur.mode || null,
         note: alive ? "proxy unhealthy" : "proxy process exited",
         ...lastExit,
       };
@@ -552,6 +647,7 @@ export class ProxyManager {
       pid: cur.pid,
       host: cur.host || PROXY_HOST,
       currentProvider: cur.provider,
+      currentProviders: Array.isArray(cur.providers) ? cur.providers : [],
       mode: cur.mode || "provider",
       routesHash: cur.routesHash || null,
       aliases: cur.aliases || null,

@@ -49,17 +49,15 @@ const ALIASES = Object.freeze({
   "codex":       "originrouter-codex-model",
 });
 
-// Stage 9.0/9.7: the official originrouter coding API gateway.
+// Official OriginRouter Coding API gateway. All /coding/v1/messages,
+// /coding/v1/chat/completions, and /coding/v1/responses traffic uses this
+// fixed host. Model-catalog requests use DEFAULT_ORIGINROUTER_AI_SERVER_BASE_URL.
 // Used when a provider record's `baseUrl` is null/undefined.
 //
-// Stage 9.7 deployment reality: the API gateway and the H5
-// authorize page live on DIFFERENT domains. The API gateway
-// runs on `server.easytransnote.com` (this URL); the H5 page
-// runs on `originrouter.com` (configured separately via
-// `DEFAULT_ORIGINROUTER_H5_BASE_URL` below + the
-// `--login-url` / `ORIGINROUTER_LOGIN_URL` overrides).
-//
-export const DEFAULT_ORIGINROUTER_BASE_URL = "https://server.easytransnote.com";
+export const DEFAULT_ORIGINROUTER_BASE_URL = "https://api.easytransnote.com";
+
+// AI model catalogue host. This is not used for Coding inference traffic.
+export const DEFAULT_ORIGINROUTER_AI_SERVER_BASE_URL = "https://server.easytransnote.com";
 
 // Stage 10: the unified App/CLI control plane. Keep this separate
 // from DEFAULT_ORIGINROUTER_BASE_URL so auth/control migration does

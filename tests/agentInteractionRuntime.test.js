@@ -25,10 +25,12 @@ import {
 // received so the test can invoke it with a synthetic legacy event.
 function makeFakeHookServer() {
   let registered = null;
+  let registeredElicitation = null;
   const fake = {
     port: 0,
     stop: () => {},
     resolvePermission: () => true,
+    resolveElicitation: () => true,
   };
   return {
     fake,
@@ -36,11 +38,58 @@ function makeFakeHookServer() {
       if (!registered) throw new Error("hook callback not registered");
       registered(callId, event);
     },
+    invokeElicitationRequest(interactionId, event) {
+      if (!registeredElicitation) throw new Error("elicitation callback not registered");
+      registeredElicitation(interactionId, event);
+    },
     async factory(opts) {
       registered = opts.onPermissionRequest;
+      registeredElicitation = opts.onElicitationRequest;
       return fake;
     },
   };
+}
+
+// Native Claude MCP elicitation is routed through the same interaction
+// registry and returned to the blocking Hook as structured content.
+{
+  const hook = makeFakeHookServer();
+  let resolvedPayload = null;
+  hook.fake.resolveElicitation = (payload) => {
+    resolvedPayload = payload;
+    return true;
+  };
+  const adapter = new ClaudeAdapter({
+    args: [],
+    cwd: "/tmp/proj",
+    hookServerFactory: hook.factory,
+  });
+  await adapter.beforeStart({ sessionId: "s-claude-elicit", send: () => {} });
+  hook.invokeElicitationRequest("elicit-1", {
+    interactionId: "elicit-1",
+    mode: "form",
+    serverName: "github",
+    message: "Choose an account",
+    requestedSchema: {
+      type: "object",
+      properties: { account: { type: "string" } },
+      required: ["account"],
+    },
+  });
+  const interaction = adapter.scanStructuredEvents().at(-1);
+  assert.equal(interaction.kind, "form");
+  assert.equal(interaction.payload.server_name, "github");
+  adapter.resolvePermission({
+    interactionId: "elicit-1",
+    decision: "approved",
+    action: "submit",
+    response: { values: { account: "primary" } },
+  });
+  assert.deepEqual(resolvedPayload, {
+    interactionId: "elicit-1",
+    action: "accept",
+    content: { account: "primary" },
+  });
 }
 
 const CLAUDE_CALL_ID = "claude-perm-1781663400000-a1b2c3d4e";
@@ -84,8 +133,7 @@ const CODEX_CALL_ID = "codex-approval-1781663500000-zyxwvu";
   assert.equal(interaction.source, "hook");
   assert.equal(interaction.sessionId, "s-claude-1",
     "new envelope carries the sessionId the hook server never saw");
-  assert.equal(interaction.runtime, null,
-    "Stage 8.9: Claude PTY runtime stays null (matches session.started; 8.7 not back-ported)");
+  assert.equal(interaction.runtime, "claude-pty");
   assert.equal(interaction.interactionId, CLAUDE_CALL_ID,
     "interactionId == legacy callId");
   assert.equal(interaction.callId, CLAUDE_CALL_ID);
@@ -93,6 +141,46 @@ const CODEX_CALL_ID = "codex-approval-1781663500000-zyxwvu";
   assert.deepEqual(interaction.input, { command: "npm test" });
   assert.deepEqual(interaction.permissionSuggestions, legacyEvent.permissionSuggestions);
   assert.equal(interaction.resolution.eventType, "agent.interaction.resolve");
+}
+
+// Native AskUserQuestion is a real questions interaction and its answer is
+// returned to Claude through PermissionRequest.updatedInput.
+{
+  const hook = makeFakeHookServer();
+  let resolvedPayload = null;
+  hook.fake.resolvePermission = (payload) => {
+    resolvedPayload = payload;
+    return true;
+  };
+  const adapter = new ClaudeAdapter({
+    args: [],
+    cwd: "/tmp/proj",
+    hookServerFactory: hook.factory,
+  });
+  await adapter.beforeStart({ sessionId: "s-claude-questions", send: () => {} });
+  hook.invokePermissionRequest("ask-1", {
+    type: "agent.permission.request.detected",
+    provider: "claude",
+    callId: "ask-1",
+    tool: "AskUserQuestion",
+    input: {
+      questions: [{
+        header: "Mode",
+        question: "Which mode?",
+        multiSelect: false,
+        options: [{ label: "Plan" }, { label: "Build" }],
+      }],
+    },
+  });
+  const interaction = adapter.scanStructuredEvents().at(-1);
+  assert.equal(interaction.kind, "questions");
+  assert.equal(interaction.payload.questions[0].multiple, false);
+  adapter.resolvePermission({
+    interactionId: "ask-1",
+    decision: "approved",
+    response: { answers: { q1: ["Build"] } },
+  });
+  assert.equal(resolvedPayload.updatedInput.answers["Which mode?"], "Build");
 }
 
 // ---- 2. Codex dual-emit (app-server available) ----
@@ -285,6 +373,55 @@ const CODEX_CALL_ID = "codex-approval-1781663500000-zyxwvu";
 }
 
 // ---- 8. buildModeStatusEvent emits the documented shape ----
+
+{
+  const submitted = [];
+  const applied = await handleRemoteEvent(
+    {
+      type: "agent.message",
+      sessionId: "s-message-1",
+      message: "Explain the current changes",
+    },
+    {
+      sessionId: "s-message-1",
+      adapter: {},
+      executor: {
+        submitMessage: async (data) => submitted.push(data),
+        write: () => {},
+        resize: () => {},
+        interrupt: () => {},
+        stop: () => {},
+      },
+    },
+  );
+  assert.equal(applied, true);
+  assert.deepEqual(submitted, ["Explain the current changes"]);
+}
+
+{
+  const writes = [];
+  const applied = await handleRemoteEvent(
+    {
+      type: "agent.message",
+      sessionId: "s-message-fallback",
+      message: "Submit this once",
+    },
+    {
+      sessionId: "s-message-fallback",
+      adapter: {},
+      executor: {
+        write: (data) => writes.push(data),
+        resize: () => {},
+        interrupt: () => {},
+        stop: () => {},
+      },
+    },
+  );
+  assert.equal(applied, true);
+  assert.deepEqual(writes, ["Submit this once", "\r"]);
+}
+
+// ---- 9. buildModeStatusEvent emits the documented shape ----
 
 {
   const ev = buildModeStatusEvent({

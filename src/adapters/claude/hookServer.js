@@ -17,7 +17,22 @@ import { createServer } from "node:http";
 
 const PERMISSION_TIMEOUT_MS = 55_000;
 
-export function decisionToHookJson(decision, { permissionSuggestions } = {}) {
+export function decisionToElicitationHookJson(action, { content } = {}) {
+  const normalized = action === "accept" || action === "decline" || action === "cancel"
+    ? action
+    : "decline";
+  return {
+    hookSpecificOutput: {
+      hookEventName: "Elicitation",
+      action: normalized,
+      ...(normalized === "accept" && content && typeof content === "object"
+        ? { content }
+        : {}),
+    },
+  };
+}
+
+export function decisionToHookJson(decision, { permissionSuggestions, updatedInput } = {}) {
   const output = (value) => ({
     hookSpecificOutput: {
       hookEventName: "PermissionRequest",
@@ -38,9 +53,16 @@ export function decisionToHookJson(decision, { permissionSuggestions } = {}) {
       && Array.isArray(permissionSuggestions)
       && permissionSuggestions.length > 0
     ) {
-      return output({ behavior: "allow", updatedPermissions: permissionSuggestions });
+      return output({
+        behavior: "allow",
+        updatedPermissions: permissionSuggestions,
+        ...(updatedInput && typeof updatedInput === "object" ? { updatedInput } : {}),
+      });
     }
-    return output({ behavior: "allow" });
+    return output({
+      behavior: "allow",
+      ...(updatedInput && typeof updatedInput === "object" ? { updatedInput } : {}),
+    });
   }
   if (decision === "denied") {
     return output({
@@ -74,8 +96,9 @@ function buildPermissionRequestEvent(callId, payload) {
     callId,
     tool: payload.tool_name || payload.toolName || "unknown",
     input: payload.tool_input || payload.toolInput || {},
-    // Carried on the wire for future use; not acted on by the v1 hook server.
+    // Echoed back as updatedPermissions for approved_for_session decisions.
     permissionSuggestions: payload.permission_suggestions || payload.permissionSuggestions || [],
+    permissionMode: payload.permission_mode || payload.permissionMode || null,
     resolution: {
       eventType: "agent.permission.resolve",
       decisions: ["approved", "approved_for_session", "denied", "abort"],
@@ -83,11 +106,31 @@ function buildPermissionRequestEvent(callId, payload) {
   };
 }
 
-export function startClaudeHookServer({ onSessionStart, onPermissionRequest, onPermissionTimeout } = {}) {
+function buildElicitationRequestEvent(interactionId, payload) {
+  return {
+    interactionId,
+    mode: payload.mode === "url" ? "url" : "form",
+    serverName: payload.mcp_server_name || payload.serverName || "",
+    message: payload.message || "",
+    url: payload.url || "",
+    requestedSchema: payload.requested_schema || payload.requestedSchema || {},
+    elicitationId: payload.elicitation_id || payload.elicitationId || null,
+  };
+}
+
+export function startClaudeHookServer({
+  onSessionStart,
+  onPermissionRequest,
+  onPermissionTimeout,
+  onElicitationRequest,
+  onElicitationTimeout,
+  onHookEvent,
+} = {}) {
   return new Promise((resolve, reject) => {
     const pendingPermissions = new Map();
+    const pendingElicitations = new Map();
 
-    const resolvePermission = ({ callId, decision, reason }) => {
+    const resolvePermission = ({ callId, decision, reason, updatedInput }) => {
       const pending = pendingPermissions.get(callId);
       if (!pending) return false;
       pendingPermissions.delete(callId);
@@ -99,8 +142,19 @@ export function startClaudeHookServer({ onSessionStart, onPermissionRequest, onP
       // entries created via the /hook/permission-request path).
       const json = decisionToHookJson(decision || "denied", {
         permissionSuggestions: pending.permissionSuggestions || [],
+        updatedInput,
       });
       pending.responseBody = JSON.stringify(json);
+      pending.respond();
+      return true;
+    };
+
+    const resolveElicitation = ({ interactionId, action, content }) => {
+      const pending = pendingElicitations.get(interactionId);
+      if (!pending) return false;
+      pendingElicitations.delete(interactionId);
+      clearTimeout(pending.timer);
+      pending.responseBody = JSON.stringify(decisionToElicitationHookJson(action, { content }));
       pending.respond();
       return true;
     };
@@ -191,6 +245,56 @@ export function startClaudeHookServer({ onSessionStart, onPermissionRequest, onP
           return;
         }
 
+        if (request.url === "/hook/elicitation") {
+          const interactionId = payload.elicitation_id
+            || payload.elicitationId
+            || `claude-elicit-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+          const event = buildElicitationRequestEvent(interactionId, payload);
+          let settled = false;
+          const entry = {
+            responseBody: null,
+            timer: null,
+            respond() {
+              if (settled) return;
+              settled = true;
+              response.writeHead(200, { "Content-Type": "application/json" });
+              response.end(entry.responseBody || JSON.stringify(decisionToElicitationHookJson("decline")));
+            },
+          };
+          entry.timer = setTimeout(() => {
+            if (!pendingElicitations.has(interactionId)) return;
+            pendingElicitations.delete(interactionId);
+            entry.responseBody = JSON.stringify(decisionToElicitationHookJson("decline"));
+            entry.respond();
+            if (typeof onElicitationTimeout === "function") {
+              try { onElicitationTimeout(interactionId, event); } catch {}
+            }
+          }, PERMISSION_TIMEOUT_MS);
+          pendingElicitations.set(interactionId, entry);
+          if (typeof onElicitationRequest === "function") {
+            try {
+              onElicitationRequest(interactionId, event);
+            } catch {
+              pendingElicitations.delete(interactionId);
+              clearTimeout(entry.timer);
+              entry.respond();
+            }
+          } else {
+            pendingElicitations.delete(interactionId);
+            clearTimeout(entry.timer);
+            entry.respond();
+          }
+          return;
+        }
+
+        if (request.url === "/hook/event") {
+          if (typeof onHookEvent === "function") {
+            try { onHookEvent(payload); } catch {}
+          }
+          response.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
+          return;
+        }
+
         response.writeHead(404).end("not found");
       });
     });
@@ -205,11 +309,20 @@ export function startClaudeHookServer({ onSessionStart, onPermissionRequest, onP
       resolve({
         port: address.port,
         resolvePermission,
+        resolveElicitation,
         stop: () => {
           for (const [, pending] of pendingPermissions) {
             clearTimeout(pending.timer);
+            pending.responseBody = JSON.stringify(decisionToHookJson("denied"));
+            pending.respond();
+          }
+          for (const [, pending] of pendingElicitations) {
+            clearTimeout(pending.timer);
+            pending.responseBody = JSON.stringify(decisionToElicitationHookJson("cancel"));
+            pending.respond();
           }
           pendingPermissions.clear();
+          pendingElicitations.clear();
           server.close();
         },
       });

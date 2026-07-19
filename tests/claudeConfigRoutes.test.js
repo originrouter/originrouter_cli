@@ -209,7 +209,7 @@ try {
   //
   // Seed an originrouter provider, write a valid managed coding key via
   // writeCodingAuth, and assert the env vars are derived from
-  // DEFAULT_ORIGINROUTER_BASE_URL ("https://server.easytransnote.com").
+  // DEFAULT_ORIGINROUTER_BASE_URL ("https://api.easytransnote.com").
 
   function seedOAuthCredential(home, overrides = {}) {
     writeCodingAuth(home, makeOAuthCredential(overrides));
@@ -236,7 +236,7 @@ try {
       proxyStatus: () => ({ state: "stopped" }),
     });
     assert.equal(out.source, "originrouter-coding");
-    assert.equal(out.env.ANTHROPIC_BASE_URL, "https://server.easytransnote.com/coding");
+    assert.equal(out.env.ANTHROPIC_BASE_URL, "https://api.easytransnote.com/coding");
     assert.equal(out.env.ANTHROPIC_API_KEY, "or_at_coding_test");
     assert.equal(out.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
     // small falls back to main
@@ -261,7 +261,7 @@ try {
       proxyStatus: () => ({ state: "stopped" }),
     });
     assert.equal(out.source, "originrouter-coding");
-    assert.equal(out.env.OPENAI_BASE_URL, "https://server.originrouter.com/coding/v1");
+    assert.equal(out.env.OPENAI_BASE_URL, "https://api.easytransnote.com/coding/v1");
     assert.equal(out.env.OPENAI_API_KEY, "or_at_coding_test");
     assert.equal(out.env.OPENAI_MODEL, "gpt-5-codex");
   }

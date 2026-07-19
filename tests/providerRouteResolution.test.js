@@ -130,7 +130,7 @@ cases.push({
 cases.push({
   name: "DEFAULT_ORIGINROUTER_BASE_URL is the official server",
   run: () => {
-    assert.equal(DEFAULT_ORIGINROUTER_BASE_URL, "https://server.easytransnote.com");
+    assert.equal(DEFAULT_ORIGINROUTER_BASE_URL, "https://api.easytransnote.com");
   },
 });
 

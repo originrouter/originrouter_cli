@@ -14,7 +14,7 @@
 //      a structured stderr diagnostic with error="hook_forwarder_retry_exhausted".
 //   6. HTTP 404 is fatal (no retry) and logs error="hook_forwarder_fatal".
 //   7. Per-attempt socket timeout fires ETIMEDOUT (does not hang).
-//   8. PermissionRequest uses 58s timeout; SessionStart uses 5s.
+//   8. PermissionRequest/Elicitation use 58s timeout; SessionStart uses 5s.
 //   9. pickPath + parseEventName dispatch correctly (incl. hookEventName).
 //  10. isRetryable classifies the documented error set correctly.
 
@@ -257,6 +257,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const cases = [
     { event: "SessionStart", expected: 5000 },
     { event: "PermissionRequest", expected: 58000 },
+    { event: "Elicitation", expected: 58000 },
   ];
   for (const { event, expected } of cases) {
     const setTimeoutSpy = { timeoutValue: undefined };
@@ -281,8 +282,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 assert.equal(pickPath("SessionStart"), "/hook/session-start");
 assert.equal(pickPath("PermissionRequest"), "/hook/permission-request");
-assert.equal(pickPath("Unknown"), "/hook/session-start");
-assert.equal(pickPath(""), "/hook/session-start");
+assert.equal(pickPath("Elicitation"), "/hook/elicitation");
+assert.equal(pickPath("PostCompact"), "/hook/event");
+assert.equal(pickPath("Unknown"), "/hook/event");
+assert.equal(pickPath(""), "/hook/event");
 assert.equal(
   parseEventName(JSON.stringify({ hook_event_name: "PermissionRequest" })),
   "PermissionRequest",

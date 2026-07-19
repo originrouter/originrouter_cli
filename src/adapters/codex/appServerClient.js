@@ -58,6 +58,7 @@ export class CodexAppServerClient {
     this.pending = new Map();
     this.eventHandler = null;
     this.approvalHandler = null;
+    this.serverRequestHandler = null;
     // Stage 8.1: lifecycle dedup + protocol lock + timeout configuration.
     this.notificationProtocol = "unknown"; // "unknown" | "legacy" | "raw"
     this.completedTurnIds = new Set();
@@ -99,6 +100,10 @@ export class CodexAppServerClient {
 
   onApproval(handler) {
     this.approvalHandler = handler;
+  }
+
+  onServerRequest(handler) {
+    this.serverRequestHandler = handler;
   }
 
   async connect({ cwd = process.cwd(), env = process.env } = {}) {
@@ -259,6 +264,22 @@ export class CodexAppServerClient {
       }, this.rpcTimeoutMs);
       this.pending.set(id, { resolve, reject, method, timer, epoch });
     });
+  }
+
+  startThread(params = {}) {
+    return this.request("thread/start", params);
+  }
+
+  startTurn(params = {}) {
+    return this.request("turn/start", params);
+  }
+
+  interruptTurn(threadId, turnId) {
+    return this.request("turn/interrupt", { threadId, turnId });
+  }
+
+  updateThreadSettings(params = {}) {
+    return this.request("thread/settings/update", params);
   }
 
   respond(id, result = {}) {
@@ -441,6 +462,11 @@ export class CodexAppServerClient {
   }
 
   async handleServerRequest(id, method, params) {
+    if (this.serverRequestHandler) {
+      const result = await this.serverRequestHandler({ id, method, params });
+      this.respond(id, result ?? {});
+      return;
+    }
     if (method === "item/commandExecution/requestApproval" || method === "execCommandApproval") {
       const legacy = method === "execCommandApproval";
       const callId = params.itemId || params.callId || String(id);
@@ -573,6 +599,7 @@ export class CodexAppServerClient {
           source: "thread/status/changed idle",
         });
       }
+      this.eventHandler?.({ type: "codex.notification", method, params });
       return;
     }
 

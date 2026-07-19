@@ -109,7 +109,7 @@ function fakeInstalledVenv(home, version = "1.83.0") {
   writeFileSync(litellmBinaryPath(home, version), "#!/bin/sh\necho mock\n");
 }
 
-function makeManager(home, { fetchOk = true, fetchBody = "{}" } = {}) {
+function makeManager(home, { fetchOk = true, fetchBody = "{}", stateKey = "proxy" } = {}) {
   const { calls, spawn, child } = mockSpawnFactory({ pid: 54321 });
   const fetchCalls = [];
   const fetchFn = async (url) => {
@@ -118,6 +118,7 @@ function makeManager(home, { fetchOk = true, fetchBody = "{}" } = {}) {
   };
   const manager = new ProxyManager({
     stateDir: home,
+    stateKey,
     pythonCommand: "/usr/bin/python3",
     logger: silentLogger,
     spawnFn: spawn,
@@ -181,6 +182,29 @@ try {
 
   // Default for the rest: venv IS installed.
   fakeInstalledVenv(home);
+
+  // ============================================================
+  // share-mode start renders and records every selected Provider
+  // ============================================================
+  {
+    await seedProviders(home);
+    clearProxyState("remote-share-proxy");
+    const { manager } = makeManager(home, { stateKey: "remote-share-proxy" });
+    const result = await manager.start({
+      mode: "share",
+      providerNames: ["minimax", "deepseek"],
+      port: 40124,
+    });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.providers, ["minimax", "deepseek"]);
+    const state = readProxyState("remote-share-proxy");
+    assert.equal(state.mode, "share");
+    assert.deepEqual(state.providers, ["minimax", "deepseek"]);
+    const yaml = readFileSync(state.configPath, "utf8");
+    assert.match(yaml, /model_name: minimax/);
+    assert.match(yaml, /model_name: deepseek/);
+    await manager.stop();
+  }
 
   // ============================================================
   // start() refuses unknown provider (legacy provider mode)

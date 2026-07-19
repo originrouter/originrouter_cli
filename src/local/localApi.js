@@ -43,7 +43,17 @@ import {
 import { LITELLM_PROVIDERS } from "../proxy/litellmCatalog.js";
 import { readApiToken } from "../persistence/authToken.js";
 import { getStateDir, readConfig, readProxyState, writeConfig } from "../persistence/state.js";
-import { DEFAULT_RELAY_URL } from "../constants.js";
+import { DEFAULT_RELAY_URL, DEFAULT_REMOTE_SHARE_PROXY_PORT } from "../constants.js";
+import {
+  AGENT_AUTONOMY_SCOPES,
+  normalizeAutonomyScopes,
+} from "../runtime/agentAutonomyPolicy.js";
+import {
+  AGENT_DETAIL_PROFILES,
+  agentDetailDefaultFromConfig,
+  setAgentDetailDefault,
+} from "../runtime/agentDetailProfile.js";
+import { ExternalAgentRegistry } from "./externalAgentRegistry.js";
 
 // Exported so CLI subcommands (e.g. `local api set-host`) can apply
 // the same gating as the runtime auth layer. Keep the set in lock-
@@ -106,7 +116,12 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
     startProxy: ctx.startProxy,
     stopProxy: ctx.stopProxy,
     restartProxy: ctx.restartProxy,
+    getRemoteShareProxyStatus: ctx.getRemoteShareProxyStatus || placeholderProxyStatus,
+    startRemoteShareProxy: ctx.startRemoteShareProxy,
+    stopRemoteShareProxy: ctx.stopRemoteShareProxy,
+    restartRemoteShareProxy: ctx.restartRemoteShareProxy,
     sessionManager: ctx.sessionManager,
+    externalAgentRegistry: ctx.externalAgentRegistry || new ExternalAgentRegistry(),
     startedAt: ctx.startedAt || new Date().toISOString(),
     pid: ctx.pid || process.pid,
     version: ctx.version || "0.1.0",
@@ -361,8 +376,189 @@ async function dispatch(ctx, req, res) {
       if (body.__error) return sendError(res, 400, body.__error);
       return handleProxyControl(ctx, res, action, body);
     }
+    if (req.method === "GET" && pathname === "/remote-share/status") {
+      return handleRemoteShareStatus(ctx, res);
+    }
+    if (req.method === "POST" && (
+      pathname === "/remote-share/start"
+      || pathname === "/remote-share/stop"
+      || pathname === "/remote-share/restart"
+    )) {
+      const action = pathname.slice("/remote-share/".length);
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      return handleRemoteShareControl(ctx, res, action, body);
+    }
     if (req.method === "GET" && pathname === "/sessions") {
       return sendOk(res, { sessions: handleSessionsList(ctx) });
+    }
+    if (req.method === "GET" && pathname === "/agent/local/sessions") {
+      return sendOk(res, { sessions: ctx.externalAgentRegistry.list() });
+    }
+    if (pathname === "/agent/local/settings/detail") {
+      if (req.method === "GET") {
+        const config = readConfig();
+        return sendOk(res, {
+          profile: agentDetailDefaultFromConfig(config),
+          available_profiles: AGENT_DETAIL_PROFILES,
+        });
+      }
+      if (req.method === "PUT") {
+        const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+        if (body.__error) return sendError(res, 400, body.__error);
+        try {
+          const next = setAgentDetailDefault(readConfig(), body.profile);
+          writeConfig(next);
+          return sendOk(res, {
+            profile: agentDetailDefaultFromConfig(next),
+            available_profiles: AGENT_DETAIL_PROFILES,
+          });
+        } catch (error) {
+          return sendError(res, 400, error.message || "invalid agent detail profile");
+        }
+      }
+      return sendError(res, 405, `method ${req.method} not allowed`);
+    }
+    if (req.method === "GET" && pathname === "/agent/local/events") {
+      return sendOk(res, ctx.externalAgentRegistry.eventsAfter(url.searchParams.get("after")));
+    }
+    if (req.method === "POST" && pathname === "/agent/local/sessions/register") {
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      return sendOk(res, { session: ctx.externalAgentRegistry.register(body) });
+    }
+
+    const localAgentMatch = pathname.match(
+      /^\/agent\/local\/sessions\/([^/]+)\/(update|unregister|events|commands|history|message|interrupt|stop|interaction|mode|autonomy)$/,
+    );
+    if (localAgentMatch) {
+      const sessionId = decodeURIComponent(localAgentMatch[1]);
+      const action = localAgentMatch[2];
+      try {
+        if (req.method === "GET" && action === "commands") {
+          return sendOk(
+            res,
+            ctx.externalAgentRegistry.commandsAfter(
+              sessionId,
+              url.searchParams.get("after"),
+            ),
+          );
+        }
+        if (req.method === "GET" && action === "history") {
+          return sendOk(
+            res,
+            ctx.externalAgentRegistry.history(sessionId, {
+              beforeCursor: url.searchParams.get("before"),
+              limit: url.searchParams.get("limit"),
+            }),
+          );
+        }
+        if (req.method !== "POST") {
+          return sendError(res, 405, `method ${req.method} not allowed`);
+        }
+        const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+        if (body.__error) return sendError(res, 400, body.__error);
+        if (action === "update") {
+          return sendOk(res, { session: ctx.externalAgentRegistry.update(sessionId, body) });
+        }
+        if (action === "unregister") {
+          ctx.externalAgentRegistry.unregister(sessionId, body);
+          return sendOk(res, { sessionId, status: body.status || "stopped" });
+        }
+        if (action === "events") {
+          const sequence = ctx.externalAgentRegistry.appendEvent(sessionId, body.event || {});
+          return sendOk(res, { sessionId, sequence });
+        }
+        if (action === "message") {
+          const message = String(body.message || "").trim();
+          if (!message || message.length > 8192) return sendError(res, 400, "invalid agent message");
+          const command = ctx.externalAgentRegistry.enqueueCommand(sessionId, {
+            type: "agent.message",
+            sessionId,
+            message,
+            messageId: body.messageId,
+          });
+          return sendOk(res, {
+            session_id: sessionId,
+            accepted: true,
+            request_id: command.commandId,
+          });
+        }
+        if (action === "interrupt") {
+          ctx.externalAgentRegistry.enqueueCommand(sessionId, {
+            type: "terminal.interrupt",
+            sessionId,
+          });
+          return sendOk(res, { session_id: sessionId, action, accepted: true });
+        }
+        if (action === "stop") {
+          ctx.externalAgentRegistry.enqueueCommand(sessionId, {
+            type: "session.stop",
+            sessionId,
+          });
+          return sendOk(res, { session_id: sessionId, action, accepted: true });
+        }
+        if (action === "interaction") {
+          const command = ctx.externalAgentRegistry.enqueueCommand(sessionId, {
+            ...body,
+            type: "agent.interaction.resolve",
+            sessionId,
+          });
+          return sendOk(res, {
+            session_id: sessionId,
+            accepted: true,
+            request_id: command.commandId,
+          });
+        }
+        if (action === "mode") {
+          const mode = String(body.mode || "").trim();
+          if (!mode || mode.length > 32) return sendError(res, 400, "invalid agent mode");
+          const command = ctx.externalAgentRegistry.enqueueCommand(sessionId, {
+            type: "agent.mode.set",
+            sessionId,
+            mode,
+            requestId: body.requestId,
+          });
+          return sendOk(res, {
+            session_id: sessionId,
+            accepted: true,
+            request_id: command.commandId,
+          });
+        }
+        if (action === "autonomy") {
+          const profile = String(body.profile || "").trim();
+          if (!['manual', 'guarded', 'unrestricted', 'custom'].includes(profile)) {
+            return sendError(res, 400, "invalid agent autonomy profile");
+          }
+          const rawScopes = Array.isArray(body.allowedScopes)
+            ? body.allowedScopes
+            : Array.isArray(body.allowed_scopes)
+              ? body.allowed_scopes
+              : [];
+          const knownScopes = new Set(AGENT_AUTONOMY_SCOPES.map((item) => item.id));
+          if (rawScopes.some((scope) => !knownScopes.has(String(scope || "")))) {
+            return sendError(res, 400, "invalid agent autonomy scope");
+          }
+          const allowedScopes = profile === "custom"
+            ? normalizeAutonomyScopes(rawScopes)
+            : [];
+          const command = ctx.externalAgentRegistry.enqueueCommand(sessionId, {
+            type: "agent.autonomy.set",
+            sessionId,
+            profile,
+            allowedScopes,
+            requestId: body.requestId,
+          });
+          return sendOk(res, {
+            session_id: sessionId,
+            accepted: true,
+            request_id: command.commandId,
+          });
+        }
+      } catch (error) {
+        const status = error?.code === "SESSION_NOT_FOUND" ? 404 : 409;
+        return sendError(res, status, error.message || "local agent request failed");
+      }
     }
 
     // /providers/:name (single segment) — GET | PUT | DELETE.
@@ -427,8 +623,32 @@ async function handleLocalStatus(ctx) {
       authState: typeof ctx.relayAuthState === "function" ? ctx.relayAuthState() : undefined,
       authError: typeof ctx.relayAuthError === "function" ? ctx.relayAuthError() : undefined,
     },
-    // Stage 5: real probe (was a hardcoded "not-installed" stub in Stage 3+4).
+    // Independent runtimes: agent routes and explicitly shared remote access.
     proxy: await ctx.getProxyStatus(),
+    remoteShare: await handleRemoteShareStatusPayload(ctx),
+    agentDetail: {
+      profile: agentDetailDefaultFromConfig(readConfig()),
+      availableProfiles: AGENT_DETAIL_PROFILES,
+    },
+  };
+}
+
+async function handleRemoteShareStatusPayload(ctx) {
+  const config = readConfig();
+  const configured = config.remoteShare || {};
+  const status = await ctx.getRemoteShareProxyStatus();
+  const providerNames = Array.isArray(status.currentProviders) && status.currentProviders.length > 0
+    ? status.currentProviders
+    : configured.providers || [];
+  const catalog = remoteShareProviders(config, providerNames).map((provider) => ({
+    provider: provider.name,
+    model: provider.model || null,
+  }));
+  return {
+    ...status,
+    enabled: configured.enabled === true,
+    providers: providerNames,
+    catalog,
   };
 }
 
@@ -623,6 +843,91 @@ async function handleProxyControl(ctx, res, action, body) {
     : { mode: "route", port });
   if (!result.ok) return sendError(res, 409, result.error || `${action} failed`);
   return sendOk(res, result);
+}
+
+function remoteShareProvider(config, providerName) {
+  if (!providerName) return null;
+  return listProviders(config).find(
+    (provider) => provider.name === providerName
+      && provider.type === "proxy"
+      && provider.engine === "litellm",
+  ) || null;
+}
+
+function remoteShareProviders(config, providerNames) {
+  if (!Array.isArray(providerNames)) return [];
+  return providerNames
+    .map((name) => remoteShareProvider(config, name))
+    .filter(Boolean);
+}
+
+function writeRemoteShareConfig({ enabled, providers, port }) {
+  const config = readConfig();
+  const next = {
+    ...config,
+    remoteShare: {
+      enabled: Boolean(enabled),
+      providers: providers || config.remoteShare?.providers || [],
+      port: port || config.remoteShare?.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
+    },
+  };
+  writeConfig(next);
+  return next.remoteShare;
+}
+
+async function handleRemoteShareStatus(ctx, res) {
+  return sendOk(res, await handleRemoteShareStatusPayload(ctx));
+}
+
+async function handleRemoteShareControl(ctx, res, action, body) {
+  if (action === "stop") {
+    if (typeof ctx.stopRemoteShareProxy !== "function") {
+      return sendError(res, 503, "remote share proxy manager not wired into daemon");
+    }
+    const result = await ctx.stopRemoteShareProxy();
+    if (!result.ok) return sendError(res, 500, result.error || "stop failed");
+    const configured = writeRemoteShareConfig({ enabled: false });
+    return sendOk(res, { ...result, ...configured });
+  }
+
+  const config = readConfig();
+  const providerNames = [...new Set(
+    (Array.isArray(body.providers) ? body.providers : config.remoteShare?.providers || [])
+      .map((name) => String(name || "").trim())
+      .filter(Boolean),
+  )];
+  if (providerNames.length === 0) {
+    return sendError(res, 400, "remote share requires at least one local LiteLLM provider");
+  }
+  const providers = remoteShareProviders(config, providerNames);
+  if (providers.length !== providerNames.length) {
+    return sendError(res, 400, "remote share contains an unknown or non-LiteLLM provider");
+  }
+  const parsedPort = Number.parseInt(body.port || config.remoteShare?.port || DEFAULT_REMOTE_SHARE_PROXY_PORT, 10);
+  if (!Number.isFinite(parsedPort) || parsedPort < 1024 || parsedPort > 65535) {
+    return sendError(res, 400, "body.port must be an integer in [1024, 65535]");
+  }
+  const fn = action === "start"
+    ? ctx.startRemoteShareProxy
+    : ctx.restartRemoteShareProxy;
+  if (typeof fn !== "function") {
+    return sendError(res, 503, `remote share ${action} not wired into daemon`);
+  }
+  const result = await fn({ providerNames, port: parsedPort });
+  if (!result.ok) return sendError(res, 409, result.error || `${action} failed`);
+  const configured = writeRemoteShareConfig({
+    enabled: true,
+    providers: providerNames,
+    port: parsedPort,
+  });
+  return sendOk(res, {
+    ...result,
+    ...configured,
+    catalog: providers.map((provider) => ({
+      provider: provider.name,
+      model: provider.model || null,
+    })),
+  });
 }
 
 // ---------- /providers/use ----------

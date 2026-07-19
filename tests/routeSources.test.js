@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   chooseCloudModel,
   chooseRemoteDevice,
+  chooseRemoteProvider,
   loadCloudModels,
   loadRemoteCliDevices,
   remoteProviderName,
@@ -69,7 +70,16 @@ const signedIn = async () => makeOAuthCredential();
         json: async () => ({
           data: {
             devices: [
-              { device_id: "device-cli-a", device_name: "Work Mac", online: true },
+              {
+                device_id: "device-cli-a",
+                device_name: "Work Mac",
+                online: true,
+                remote_share_running: true,
+                remote_share_catalog: [
+                  { provider: "deepseek", model: "deepseek-chat" },
+                  { provider: "glm", model: "glm-5" },
+                ],
+              },
               { device_id: "device-cli-b", device_name: "Laptop", online: false },
             ],
           },
@@ -79,6 +89,10 @@ const signedIn = async () => makeOAuthCredential();
   });
   assert.equal(devices.length, 2);
   assert.equal((await chooseRemoteDevice(devices, "device-cli-a")).deviceName, "Work Mac");
+  assert.deepEqual(await chooseRemoteProvider(devices[0], "glm"), {
+    provider: "glm",
+    model: "glm-5",
+  });
   assert.equal(remoteProviderName("device-cli-a"), remoteProviderName("device-cli-a"));
   assert.notEqual(remoteProviderName("device-cli-a"), remoteProviderName("device-cli-b"));
 }

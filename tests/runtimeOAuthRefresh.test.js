@@ -112,3 +112,74 @@ test("expired refresh session is rejected before network access", async () => {
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("custom headroom refreshes a token before a long-running request starts", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "originrouter-refresh-headroom-"));
+  try {
+    writeCodingAuth(stateDir, expiredCodingCredential({
+      accessTokens: {
+        coding: {
+          token: "or_at_coding_near_expiry",
+          expiresAt: Date.now() + 90_000,
+          scopes: ["coding.invoke"],
+        },
+      },
+    }));
+    let refreshCalls = 0;
+    const updated = await ensureFreshAccessToken({
+      stateDir,
+      resource: "originrouter.coding",
+      headroomMs: 120_000,
+      fetchFn: async () => {
+        refreshCalls += 1;
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              access_token: "or_at_coding_headroom_fresh",
+              refresh_token: "or_rt_headroom_rotated",
+              expires_in: 600,
+              refresh_expires_in: 2_592_000,
+              scope: "coding.invoke",
+            };
+          },
+        };
+      },
+    });
+    assert.equal(refreshCalls, 1);
+    assert.equal(updated.accessTokens.coding.token, "or_at_coding_headroom_fresh");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("forced refresh reuses a token already rotated by another request", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "originrouter-refresh-stale-"));
+  try {
+    writeCodingAuth(stateDir, expiredCodingCredential({
+      accessTokens: {
+        coding: {
+          token: "or_at_coding_already_rotated",
+          expiresAt: Date.now() + 600_000,
+          scopes: ["coding.invoke"],
+        },
+      },
+    }));
+    let refreshCalls = 0;
+    const updated = await ensureFreshAccessToken({
+      stateDir,
+      resource: "originrouter.coding",
+      forceRefresh: true,
+      staleToken: "or_at_coding_previous",
+      fetchFn: async () => {
+        refreshCalls += 1;
+        throw new Error("must not refresh twice");
+      },
+    });
+    assert.equal(refreshCalls, 0);
+    assert.equal(updated.accessTokens.coding.token, "or_at_coding_already_rotated");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});

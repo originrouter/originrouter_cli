@@ -5,7 +5,7 @@
 // relay.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startLocalApi, projectSession } from "../src/local/localApi.js";
@@ -70,6 +70,13 @@ try {
   };
   const proxyRestartCalls = [];
   const proxyStartCalls = [];
+  const remoteShareStartCalls = [];
+  let remoteShareStatus = {
+    state: "stopped",
+    port: null,
+    currentProviders: [],
+    mode: "share",
+  };
   const fakeSessionManager = {
     sessions: new Map([
       [sessionId, {
@@ -120,6 +127,19 @@ try {
       proxyRestartCalls.push(args);
       return { ok: true, state: "running", port: args.port, pid: 7788, mode: args.mode };
     },
+    getRemoteShareProxyStatus: async () => remoteShareStatus,
+    startRemoteShareProxy: async (args) => {
+      remoteShareStartCalls.push(args);
+      remoteShareStatus = {
+        state: "running",
+        port: args.port,
+        currentProviders: args.providerNames,
+        mode: "share",
+      };
+      return { ok: true, ...remoteShareStatus };
+    },
+    stopRemoteShareProxy: async () => ({ ok: true, state: "stopped" }),
+    restartRemoteShareProxy: async (args) => ({ ok: true, ...args, state: "running" }),
     startedAt: new Date(Date.now() - 5000).toISOString(), // 5s uptime
     pid: 99999,
     version: "test-0.1.0",
@@ -188,6 +208,22 @@ try {
     assert.equal(body.proxy.state, "not-installed");
     assert.equal(body.proxy.port, null);
     assert.match(body.proxy.note, /LiteLLM/);
+    assert.deepEqual(body.remoteShare.catalog, []);
+  }
+
+  // ---------- POST /remote-share/start ----------
+  {
+    const { status, body } = await postJson("/remote-share/start", {
+      providers: ["minimax", "deepseek"],
+      port: 40124,
+    });
+    assert.equal(status, 200);
+    assert.equal(body.ok, true);
+    assert.deepEqual(remoteShareStartCalls.at(-1), {
+      providerNames: ["minimax", "deepseek"],
+      port: 40124,
+    });
+    assert.deepEqual(body.catalog.map((item) => item.provider), ["minimax", "deepseek"]);
   }
 
   // ---------- POST /proxy/restart ----------
@@ -1011,6 +1047,112 @@ try {
     // The response in POST is `provider` (showProvider) which uses maskSecret.
     assert.notEqual(body.provider.awsSecretAccessKey, "very-long-secret-1234567890");
     assert.notEqual(body.provider.awsSessionToken, "session-token-abcdef");
+  }
+
+  // ---------- Local-first external Agent session bridge ----------
+  {
+    const initial = await getJson("/agent/local/settings/detail");
+    assert.equal(initial.status, 200);
+    assert.equal(initial.body.profile, "concise");
+
+    const updated = await putJson("/agent/local/settings/detail", {
+      profile: "standard",
+    });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.body.profile, "standard");
+    assert.equal(readConfig().agent.detailProfile, "standard");
+
+    const rejected = await putJson("/agent/local/settings/detail", {
+      profile: "raw-terminal",
+    });
+    assert.equal(rejected.status, 400);
+  }
+
+  // ---------- Local-first external Agent session bridge ----------
+  {
+    const transcriptPath = join(home, "claude-session.jsonl");
+    writeFileSync(transcriptPath, [
+      JSON.stringify({
+        type: "user",
+        uuid: "local-u1",
+        timestamp: "2026-07-17T00:00:00Z",
+        message: { content: "hello from terminal" },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        uuid: "local-a1",
+        timestamp: "2026-07-17T00:00:01Z",
+        message: { content: [{ type: "text", text: "hello from Claude" }] },
+      }),
+    ].join("\n"));
+    const registered = await postJson("/agent/local/sessions/register", {
+      sessionId: "external-claude-1",
+      agent: "claude",
+      title: "Claude local session",
+      deviceId: "local-dev",
+      transcriptPath,
+    });
+    assert.equal(registered.status, 200);
+    assert.equal(registered.body.session.session_id, "external-claude-1");
+
+    const sessions = await getJson("/agent/local/sessions");
+    assert.equal(sessions.body.sessions.length, 1);
+    assert.equal(sessions.body.sessions[0].control_path, "local");
+    assert.ok(!JSON.stringify(sessions.body).includes(transcriptPath));
+
+    const history = await getJson("/agent/local/sessions/external-claude-1/history?limit=50");
+    assert.deepEqual(history.body.messages.map((item) => item.text), [
+      "hello from terminal",
+      "hello from Claude",
+    ]);
+
+    const sent = await postJson("/agent/local/sessions/external-claude-1/message", {
+      message: "continue",
+    });
+    assert.equal(sent.body.accepted, true);
+    assert.match(sent.body.request_id, /^local_command_/);
+    const commands = await getJson("/agent/local/sessions/external-claude-1/commands?after=0");
+    assert.equal(commands.body.commands[0].message, "continue");
+
+    const interaction = await postJson("/agent/local/sessions/external-claude-1/interaction", {
+      interactionId: "interaction-local-1",
+      responseId: "response-local-1",
+      action: "allow",
+      response: { remember_for_session: true },
+    });
+    assert.equal(interaction.body.accepted, true);
+    const mode = await postJson("/agent/local/sessions/external-claude-1/mode", {
+      mode: "plan",
+      requestId: "mode-local-1",
+    });
+    assert.equal(mode.body.accepted, true);
+    const autonomy = await postJson("/agent/local/sessions/external-claude-1/autonomy", {
+      profile: "custom",
+      allowedScopes: ["workspace_edits", "workspace_commands"],
+      requestId: "autonomy-local-1",
+    });
+    assert.equal(autonomy.body.accepted, true);
+    const controlCommands = await getJson("/agent/local/sessions/external-claude-1/commands?after=1");
+    assert.deepEqual(controlCommands.body.commands.map((item) => item.type), [
+      "agent.interaction.resolve",
+      "agent.mode.set",
+      "agent.autonomy.set",
+    ]);
+    assert.deepEqual(controlCommands.body.commands.at(-1).allowedScopes, [
+      "workspace_edits",
+      "workspace_commands",
+    ]);
+
+    const stopped = await postJson("/agent/local/sessions/external-claude-1/stop", {});
+    assert.equal(stopped.body.accepted, true);
+    const stopCommand = await getJson("/agent/local/sessions/external-claude-1/commands?after=4");
+    assert.equal(stopCommand.body.commands[0].type, "session.stop");
+
+    await postJson("/agent/local/sessions/external-claude-1/events", {
+      event: { type: "agent.text", text: "live reply" },
+    });
+    const events = await getJson("/agent/local/events?after=0");
+    assert.equal(events.body.events[0].text, "live reply");
   }
 
   console.log("local api smoke ok");

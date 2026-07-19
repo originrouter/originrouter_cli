@@ -27,6 +27,10 @@ export class PipeExecutor {
     this.child?.stdin.write(data);
   }
 
+  submitMessage(data) {
+    this.child?.stdin.write(`${String(data || "")}\n`);
+  }
+
   resize() {}
 
   interrupt() {

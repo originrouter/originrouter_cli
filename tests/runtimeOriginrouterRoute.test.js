@@ -107,7 +107,7 @@ cases.push({
     const out = await buildAgentProviderEnv("claude", routed, {
       proxyStatus: () => ({ state: "stopped" }),
     });
-    assert.equal(out.env.ANTHROPIC_BASE_URL, "https://alt.originrouter.example/coding");
+    assert.equal(out.env.ANTHROPIC_BASE_URL, "https://api.easytransnote.com/coding");
   },
 });
 
@@ -319,7 +319,7 @@ cases.push({
       proxyStatus: () => ({ state: "stopped" }),
     });
     assert.equal(out.source, "originrouter-coding");
-    assert.equal(out.env.OPENAI_BASE_URL, "https://alt.originrouter.example/coding/v1");
+    assert.equal(out.env.OPENAI_BASE_URL, "https://api.easytransnote.com/coding/v1");
     assert.equal(out.env.OPENAI_API_KEY, "or_at_coding_test");
     assert.equal(out.env.OPENAI_MODEL, "gpt-5-codex");
   },

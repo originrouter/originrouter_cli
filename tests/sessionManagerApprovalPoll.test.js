@@ -103,3 +103,58 @@ test("SessionManager feeds polled approval decisions back into the running adapt
   assert.equal(typeof errorHandler, "function");
   rmSync(home, { recursive: true, force: true });
 });
+
+test("SessionManager shutdown stops sessions and reports their exit", async () => {
+  const home = mkdtempSync(join(tmpdir(), "originrouter-session-shutdown-test-"));
+  process.env.ORIGINROUTER_HOME = home;
+  const sent = [];
+  let exitHandler = null;
+  let stopCalls = 0;
+
+  const manager = new SessionManager({
+    relayClient: {
+      send(type, payload) {
+        sent.push({ type, payload });
+        return Promise.resolve();
+      },
+    },
+    deviceId: "device-test",
+    defaultExecutor: "fake",
+    createAdapterFn: () => ({
+      async beforeStart() {},
+      buildLaunch: () => ({ command: "bash", args: [], env: {} }),
+      describe: () => ({ runtime: "test-runtime" }),
+      handleOutput: () => [],
+      cleanup() {},
+    }),
+    createExecutorFn: () => ({
+      async start({ onExit }) {
+        exitHandler = onExit;
+        return { pid: 9876, executor: "fake" };
+      },
+      write() {},
+      resize() {},
+      interrupt() {},
+      stop() {
+        stopCalls += 1;
+        exitHandler?.({ code: null, signal: "SIGTERM" });
+      },
+    }),
+    buildAgentProviderEnvFn: async () => ({ env: {}, provider: null, source: "test" }),
+    startApprovalDecisionPollingFn: () => () => {},
+  });
+
+  await manager.startSession({
+    sessionId: "session-shutdown-1",
+    agent: "terminal",
+    command: "bash",
+    args: [],
+    cwd: "/tmp",
+  });
+  await manager.shutdown("SIGTERM");
+
+  assert.equal(stopCalls, 1);
+  assert.equal(manager.sessions.size, 0);
+  assert.ok(sent.some((item) => item.type === "session.exited"));
+  rmSync(home, { recursive: true, force: true });
+});

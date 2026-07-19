@@ -1,7 +1,7 @@
 import {
-  buildRuntimeEventEnvelope,
+  createRuntimeEventReporter,
   createTerminalActivityReporter,
-  reportRuntimeEvent,
+  startAgentSessionHeartbeat,
   startApprovalDecisionPolling,
 } from "../agent/bridgeReporter.js";
 import { createAdapter } from "../adapters/createAdapter.js";
@@ -10,10 +10,12 @@ import { clearRoute, setRoute } from "../config/routes.js";
 import { createExecutor } from "../executors/createExecutor.js";
 import { staticProxyStatusFn } from "../proxy/snapshot.js";
 import { appendSessionStart, patchSessionExit } from "../persistence/sessionLog.js";
-import { readConfig, writeConfig } from "../persistence/state.js";
-import { DEFAULT_PROXY_PORT } from "../constants.js";
+import { ensureStateDir, readConfig, writeConfig } from "../persistence/state.js";
+import { DEFAULT_PROXY_PORT, DEFAULT_REMOTE_SHARE_PROXY_PORT } from "../constants.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 import { handleRemoteCodingRequest } from "./remoteCodingServer.js";
+import { protectOriginrouterCodingEnv } from "../runtime/originrouterCodingAuthProxy.js";
+import { setAgentDetailDefault } from "../runtime/agentDetailProfile.js";
 
 export class SessionManager {
   constructor({
@@ -21,6 +23,7 @@ export class SessionManager {
     deviceId,
     defaultExecutor,
     proxyManager = null,
+    remoteShareProxyManager = null,
     startApprovalDecisionPollingFn = startApprovalDecisionPolling,
     createAdapterFn = createAdapter,
     createExecutorFn = createExecutor,
@@ -30,6 +33,7 @@ export class SessionManager {
     this.deviceId = deviceId;
     this.defaultExecutor = defaultExecutor;
     this.proxyManager = proxyManager;
+    this.remoteShareProxyManager = remoteShareProxyManager;
     this.startApprovalDecisionPollingFn = startApprovalDecisionPollingFn;
     this.createAdapterFn = createAdapterFn;
     this.createExecutorFn = createExecutorFn;
@@ -42,8 +46,8 @@ export class SessionManager {
   }
 
   async resolveLocalProxyUrl() {
-    if (!this.proxyManager) return null;
-    const status = await this.proxyManager.status();
+    if (!this.remoteShareProxyManager) return null;
+    const status = await this.remoteShareProxyManager.status();
     if (status && status.state === "running" && status.port) {
       return `http://${status.host || "127.0.0.1"}:${status.port}`;
     }
@@ -102,11 +106,65 @@ export class SessionManager {
 
   async handleLocalControlEvent(payload) {
     if (payload.type === "local_control.litellm.start") {
-      await this.startRouteModeProxy(payload.port);
+      const result = await this.startRouteModeProxy(payload.port);
+      if (!result?.ok) throw new Error(result?.error || "agent proxy start failed");
       return;
     }
     if (payload.type === "local_control.litellm.restart") {
-      await this.restartRouteModeProxy();
+      const result = await this.restartRouteModeProxy();
+      if (!result?.ok) throw new Error(result?.error || "agent proxy restart failed");
+      return;
+    }
+    if (payload.type === "local_control.remote_share.start") {
+      if (!this.remoteShareProxyManager) throw new Error("remote share proxy manager unavailable");
+      const result = await this.remoteShareProxyManager.start({
+        mode: "share",
+        providerNames: payload.providers,
+        port: payload.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
+      });
+      if (!result?.ok) throw new Error(result?.error || "remote share start failed");
+      const config = readConfig();
+      writeConfig({
+        ...config,
+        remoteShare: {
+          enabled: true,
+          providers: payload.providers,
+          port: payload.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
+        },
+      });
+      return;
+    }
+    if (payload.type === "local_control.remote_share.stop") {
+      if (!this.remoteShareProxyManager) throw new Error("remote share proxy manager unavailable");
+      const result = await this.remoteShareProxyManager.stop();
+      if (!result?.ok) throw new Error(result?.error || "remote share stop failed");
+      const config = readConfig();
+      writeConfig({
+        ...config,
+        remoteShare: {
+          ...(config.remoteShare || {}),
+          enabled: false,
+        },
+      });
+      return;
+    }
+    if (payload.type === "local_control.remote_share.restart") {
+      if (!this.remoteShareProxyManager) throw new Error("remote share proxy manager unavailable");
+      const result = await this.remoteShareProxyManager.restart({
+        mode: "share",
+        providerNames: payload.providers,
+        port: payload.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
+      });
+      if (!result?.ok) throw new Error(result?.error || "remote share restart failed");
+      const config = readConfig();
+      writeConfig({
+        ...config,
+        remoteShare: {
+          enabled: true,
+          providers: payload.providers,
+          port: payload.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
+        },
+      });
       return;
     }
     if (payload.type === "local_control.route.set") {
@@ -126,6 +184,10 @@ export class SessionManager {
       const next = clearRoute(config, String(payload.agent || ""), String(payload.slot || ""));
       writeConfig(next);
       await this.restartRouteModeProxyIfRunning();
+      return;
+    }
+    if (payload.type === "local_control.agent_detail.set") {
+      writeConfig(setAgentDetailDefault(readConfig(), payload.profile));
     }
   }
 
@@ -150,6 +212,9 @@ export class SessionManager {
       executor,
       createdAt: new Date().toISOString(),
     };
+    session.exitPromise = new Promise((resolve) => {
+      session.resolveExit = resolve;
+    });
     this.sessions.set(sessionId, session);
 
     const send = (type, extra = {}) => {
@@ -160,22 +225,25 @@ export class SessionManager {
         console.error(`[relay] ${error.message}`);
       });
     };
+    const runtimeReporter = createRuntimeEventReporter({
+      sessionId,
+      agentType: agent,
+      title: payload.title || `${agent} session`,
+      deviceName: payload.deviceName || "",
+    });
     const report = (type, extra = {}) => {
       if (type !== "session.started" && type !== "session.exited" && type !== "session.error" && type !== "agent.event") {
-        return;
+        return Promise.resolve();
       }
-      const payloadForBridge = buildRuntimeEventEnvelope({
-        sessionId,
-        agentType: agent,
-        title: payload.title || `${agent} session`,
-        deviceName: payload.deviceName || "",
-        eventType: type,
-        event: type === "agent.event" ? extra.event : extra,
-      });
-      reportRuntimeEvent(payloadForBridge).catch(() => {});
+      return runtimeReporter.report(type, extra);
     };
+    let terminalActivityReporter = null;
 
     const cleanupSession = () => {
+      if (typeof session.stopSessionHeartbeat === "function") {
+        session.stopSessionHeartbeat();
+        session.stopSessionHeartbeat = null;
+      }
       if (typeof session.stopApprovalPolling === "function") {
         session.stopApprovalPolling();
         session.stopApprovalPolling = null;
@@ -192,7 +260,41 @@ export class SessionManager {
         session.cleanedUp = true;
         adapter.cleanup();
       }
+      if (session.originrouterCodingProxy) {
+        session.originrouterCodingProxy.stop().catch(() => {});
+        session.originrouterCodingProxy = null;
+      }
     };
+
+    const finalizeSession = async ({ code, signal }) => {
+      if (session.finalized) return session.exitPromise;
+      session.finalized = true;
+      session.status = "exited";
+      const terminalFlush = terminalActivityReporter
+        ? terminalActivityReporter.flush().catch(() => {})
+        : Promise.resolve();
+      cleanupSession();
+      await terminalFlush;
+      try {
+        patchSessionExit({
+          sessionId,
+          status: "exited",
+          code,
+          signal,
+          exitedAt: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.error(`[session-log] ${error.message}`);
+      }
+      send("session.exited", { code, signal });
+      this.sessions.delete(sessionId);
+      try {
+        await report("session.exited", { code, signal });
+      } finally {
+        session.resolveExit?.();
+      }
+    };
+    session.finalize = finalizeSession;
 
     try {
       if (typeof adapter.beforeStart === "function") {
@@ -227,6 +329,11 @@ export class SessionManager {
           provider: payload.provider,
           proxyStatus: staticProxyStatusFn(proxySnapshot),
         });
+        const protectedResult = await protectOriginrouterCodingEnv(agent, providerResult, {
+          stateDir: ensureStateDir(),
+        });
+        providerResult = protectedResult.providerResult;
+        session.originrouterCodingProxy = protectedResult.proxy;
       } catch (providerErr) {
         if (providerErr.code === "PROVIDER_UNSUPPORTED") {
           send("session.error", { message: providerErr.message });
@@ -237,11 +344,15 @@ export class SessionManager {
       const providerEnv = providerResult.env;
       const resolvedProvider = providerResult.provider;
       const providerSource = providerResult.source;
-      const terminalActivityReporter = createTerminalActivityReporter({
+      terminalActivityReporter = createTerminalActivityReporter({
         sessionId,
         agentType: agent,
         title: payload.title || `${agent} session`,
         deviceName: this.deviceName || "",
+        reportRuntimeEventFn: (runtimePayload) => runtimeReporter.report(
+          "terminal.activity",
+          { summary: runtimePayload.summary },
+        ),
       });
       session.stopTerminalActivityReporter = () => {
         terminalActivityReporter.stop();
@@ -263,22 +374,7 @@ export class SessionManager {
           }
         },
         onExit: ({ code, signal }) => {
-          session.status = "exited";
-          void terminalActivityReporter.flush();
-          cleanupSession();
-          try {
-            patchSessionExit({
-              sessionId,
-              status: "exited",
-              code,
-              signal,
-              exitedAt: new Date().toISOString(),
-            });
-          } catch (error) {
-            console.error(`[session-log] ${error.message}`);
-          }
-          send("session.exited", { code, signal });
-          report("session.exited", { code, signal });
+          void finalizeSession({ code, signal });
         },
         onError: (error) => {
           send("session.error", { message: error.message });
@@ -291,8 +387,18 @@ export class SessionManager {
       session.executorKind = started.executor;
       session.stopApprovalPolling = this.startApprovalDecisionPollingFn({
         sessionId,
-        onDecision: (decisionPayload) => {
-          this.handleEvent(decisionPayload);
+        onDecision: async (decisionPayload) => {
+          const applied = this.handleEvent(decisionPayload);
+          if (applied !== false) {
+            await report("agent.event", {
+              event: {
+                type: "agent.permission.resolved",
+                callId: decisionPayload.interactionId,
+                decision: decisionPayload.decision,
+              },
+            });
+          }
+          return applied;
         },
       });
       send("session.started", {
@@ -310,6 +416,7 @@ export class SessionManager {
         executor: started.executor,
         pid: started.pid,
       });
+      session.stopSessionHeartbeat = startAgentSessionHeartbeat({ sessionId });
 
       try {
         appendSessionStart({
@@ -342,7 +449,40 @@ export class SessionManager {
       session.status = "error";
       cleanupSession();
       send("session.error", { message: error.message });
-      report("session.error", { message: error.message });
+      report("session.error", { message: error.message }).finally(() => {
+        session.resolveExit?.();
+      });
+      this.sessions.delete(sessionId);
+    }
+  }
+
+  async shutdown(signal = "SIGTERM") {
+    for (const controller of this.activeRemoteRequests.values()) {
+      try { controller.abort(); } catch {}
+    }
+    this.activeRemoteRequests.clear();
+
+    const exits = [];
+    const sessions = [...this.sessions.values()];
+    for (const session of sessions) {
+      exits.push(session.exitPromise);
+      try {
+        session.executor.stop();
+      } catch {
+        session.resolveExit?.();
+      }
+    }
+    if (exits.length === 0) return;
+    await Promise.race([
+      Promise.allSettled(exits),
+      new Promise((resolve) => setTimeout(resolve, 1500)),
+    ]);
+    for (const session of sessions) {
+      if (session.finalized) continue;
+      await Promise.race([
+        session.finalize({ code: null, signal }),
+        new Promise((resolve) => setTimeout(resolve, 1500)),
+      ]);
     }
   }
 
@@ -372,7 +512,7 @@ export class SessionManager {
     }
 
     const session = this.sessions.get(payload.sessionId);
-    if (!session) return;
+    if (!session) return false;
 
     if (payload.type === "terminal.input") {
       session.executor.write(payload.data || "");
@@ -388,10 +528,12 @@ export class SessionManager {
 
     if (payload.type === "agent.permission.resolve") {
       if (typeof session.adapter.resolvePermission === "function") {
-        session.adapter.resolvePermission(payload);
+        return session.adapter.resolvePermission(payload);
       } else if (payload.data) {
         session.executor.write(payload.data);
+        return true;
       }
+      return false;
     }
 
     if (payload.type === "session.stop") {
@@ -408,7 +550,8 @@ export class SessionManager {
         session.adapter.cleanup();
       }
       session.executor.stop();
-      this.sessions.delete(payload.sessionId);
+      return true;
     }
+    return true;
   }
 }

@@ -333,13 +333,13 @@ try {
     {
       const r = await runCli(["env", "print", "--agent", "claude"], { env });
       assert.match(r.stdout, /Source: originrouter-coding/);
-      assert.match(r.stdout, /ANTHROPIC_BASE_URL=https:\/\/server\.easytransnote\.com\/coding/);
+      assert.match(r.stdout, /ANTHROPIC_BASE_URL=http:\/\/127\.0\.0\.1:<session-port>\/coding/);
       assert.match(r.stdout, /ANTHROPIC_MODEL=claude-sonnet-4-6/);
       assert.match(r.stdout, /ANTHROPIC_SMALL_FAST_MODEL=claude-sonnet-4-6/);
       // Raw-key leak check: the masked key form must be present (mask
       // format is `sk-o...ey`), and the raw key value must never appear
       // in stdout.
-      assert.match(r.stdout, /ANTHROPIC_API_KEY=or_a\.\.\.st/);
+      assert.match(r.stdout, /ANTHROPIC_AUTH_TOKEN=or_l\.\.\.y>/);
       assert.ok(!r.stdout.includes("or_at_coding_test"),
         "raw Coding access token must never appear in env print output");
       // Agent-aware header
@@ -353,9 +353,9 @@ try {
     {
       const r = await runCli(["env", "print", "--agent", "codex"], { env });
       assert.match(r.stdout, /Source: originrouter-coding/);
-      assert.match(r.stdout, /OPENAI_BASE_URL=https:\/\/server\.easytransnote\.com\/coding\/v1/);
+      assert.match(r.stdout, /OPENAI_BASE_URL=http:\/\/127\.0\.0\.1:<session-port>\/coding\/v1/);
       assert.match(r.stdout, /OPENAI_MODEL=gpt-5-codex/);
-      assert.match(r.stdout, /OPENAI_API_KEY=or_a\.\.\.st/);
+      assert.match(r.stdout, /OPENAI_API_KEY=or_l\.\.\.y>/);
       assert.ok(!r.stdout.includes("or_at_coding_test"),
         "raw Coding access token must never appear in env print output");
       // Agent-aware header — must NOT say "claude"

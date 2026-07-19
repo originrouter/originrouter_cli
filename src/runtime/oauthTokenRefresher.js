@@ -20,6 +20,9 @@ export async function ensureFreshAccessToken({
   stateDir,
   resource = OAUTH_RESOURCES.CONTROL,
   nowMs = Date.now(),
+  headroomMs = HEADROOM_MS,
+  forceRefresh = false,
+  staleToken = null,
   fetchFn = globalThis.fetch,
 } = {}) {
   const current = readCodingAuth(stateDir);
@@ -31,14 +34,15 @@ export async function ensureFreshAccessToken({
     error.code = "OAUTH_RESOURCE_TOKEN_MISSING";
     throw error;
   }
-  if (nowMs < existing.expiresAt - HEADROOM_MS) return current;
+  if (!forceRefresh && nowMs < existing.expiresAt - headroomMs) return current;
 
   return withCodingAuthLock(stateDir, async () => {
     const stored = readCodingAuth(stateDir);
     if (!stored) return null;
     assertRefreshSessionValid(stored, Date.now());
     const freshCheck = accessTokenFor(stored, resource);
-    if (freshCheck && Date.now() < freshCheck.expiresAt - HEADROOM_MS) return stored;
+    if (forceRefresh && staleToken && freshCheck?.token !== staleToken) return stored;
+    if (!forceRefresh && freshCheck && Date.now() < freshCheck.expiresAt - headroomMs) return stored;
     const response = await refreshOAuthToken({
       tokenEndpoint: stored.tokenEndpoint,
       refreshToken: stored.refreshToken,

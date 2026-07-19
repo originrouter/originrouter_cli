@@ -5,7 +5,37 @@ import { getStateDir } from "../../persistence/state.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
-export function generateClaudeHookSettings({ port, registerPermissionRequest = true }) {
+const DISPLAY_HOOK_EVENTS = [
+  "SessionEnd",
+  "Stop",
+  "StopFailure",
+  "SubagentStart",
+  "SubagentStop",
+  "PreCompact",
+  "PostCompact",
+  "Notification",
+  "TeammateIdle",
+  "TaskCreated",
+  "TaskCompleted",
+  "ConfigChange",
+  "WorktreeCreate",
+  "WorktreeRemove",
+  "InstructionsLoaded",
+  "CwdChanged",
+  "FileChanged",
+  "MessageDisplay",
+  "PermissionDenied",
+  "Setup",
+  "UserPromptSubmit",
+  "UserPromptExpansion",
+  "ElicitationResult",
+];
+
+export function generateClaudeHookSettings({
+  port,
+  registerPermissionRequest = true,
+  registerElicitation = true,
+}) {
   const path = join(getStateDir(), "tmp", "claude-hooks", `session-hook-${process.pid}.json`);
   mkdirSync(dirname(path), { recursive: true });
 
@@ -27,6 +57,24 @@ export function generateClaudeHookSettings({ port, registerPermissionRequest = t
   // it explicitly to keep the config honest about what is actually wired.
   if (registerPermissionRequest) {
     hooks.PermissionRequest = [
+      {
+        matcher: "*",
+        hooks: [{ type: "command", command }],
+      },
+    ];
+  }
+
+  if (registerElicitation) {
+    hooks.Elicitation = [
+      {
+        matcher: "*",
+        hooks: [{ type: "command", command }],
+      },
+    ];
+  }
+
+  for (const eventName of DISPLAY_HOOK_EVENTS) {
+    hooks[eventName] = [
       {
         matcher: "*",
         hooks: [{ type: "command", command }],

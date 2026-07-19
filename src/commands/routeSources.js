@@ -7,7 +7,7 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-import { DEFAULT_ORIGINROUTER_BASE_URL } from "../config/providerRoutes.js";
+import { DEFAULT_ORIGINROUTER_AI_SERVER_BASE_URL } from "../config/providerRoutes.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import { accessTokenFor, OAUTH_RESOURCES } from "../runtime/authContract.js";
 
@@ -116,6 +116,19 @@ function nonEmptyString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
+function remoteShareCatalog(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of value) {
+    const provider = nonEmptyString(item?.provider);
+    if (!provider || seen.has(provider)) continue;
+    seen.add(provider);
+    out.push({ provider, model: nonEmptyString(item?.model) });
+  }
+  return out;
+}
+
 function displayOrigin(value) {
   const origin = nonEmptyString(value) || "OriginRouter";
   const normalized = origin.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -136,7 +149,9 @@ export async function loadCloudModels({
     resource: OAUTH_RESOURCES.AI,
     ensureFreshAccessTokenFn,
   });
-  const baseUrl = trimBaseUrl(env.ORIGINROUTER_AI_SERVER_BASE_URL || DEFAULT_ORIGINROUTER_BASE_URL);
+  const baseUrl = trimBaseUrl(
+    env.ORIGINROUTER_AI_SERVER_BASE_URL || DEFAULT_ORIGINROUTER_AI_SERVER_BASE_URL
+  );
   const payload = await requestJson(fetchFn, `${baseUrl}/ai/model`, {
     method: "POST",
     headers: {
@@ -194,6 +209,8 @@ export async function loadRemoteCliDevices({
       deviceId: nonEmptyString(device?.device_id),
       deviceName: nonEmptyString(device?.device_name),
       online: device?.online === true,
+      remoteShareRunning: device?.remote_share_running === true,
+      remoteShareCatalog: remoteShareCatalog(device?.remote_share_catalog),
     }))
     .filter((device) => device.deviceId);
 }
@@ -216,7 +233,9 @@ export function printRemoteCliDevices(devices, printFn = console.log) {
   }
   for (const device of devices) {
     const name = device.deviceName || device.deviceId;
-    printFn(`${name} (${device.deviceId})${device.online ? "" : " · offline"}`);
+    const count = device.remoteShareCatalog.length;
+    const detail = count > 0 ? ` · ${count} shared provider${count === 1 ? "" : "s"}` : "";
+    printFn(`${name} (${device.deviceId})${detail}${device.online ? "" : " · offline"}`);
   }
 }
 
@@ -271,6 +290,22 @@ export async function chooseRemoteDevice(devices, deviceId, options = {}) {
   return chooseFromList(devices, {
     label: "an authorized remote CLI device",
     formatItem: (device) => `${device.deviceName || device.deviceId} (${device.deviceId})${device.online ? "" : " · offline"}`,
+    ...options,
+  });
+}
+
+export async function chooseRemoteProvider(device, providerName, options = {}) {
+  const catalog = device?.remoteShareCatalog || [];
+  if (providerName) {
+    const selected = catalog.find((item) => item.provider === providerName);
+    if (!selected) {
+      throw new Error(`Provider '${providerName}' is not shared by remote device '${device.deviceId}'.`);
+    }
+    return selected;
+  }
+  return chooseFromList(catalog, {
+    label: `a shared Provider on ${device.deviceName || device.deviceId}`,
+    formatItem: (item) => item.model ? `${item.provider} · ${item.model}` : item.provider,
     ...options,
   });
 }

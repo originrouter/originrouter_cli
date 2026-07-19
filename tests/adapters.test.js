@@ -4,9 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClaudeJsonlScanner, mapClaudeJsonLine, mapClaudeJsonLineSince } from "../src/adapters/claude/jsonlScanner.js";
 import { CodexAppServerClient } from "../src/adapters/codex/appServerClient.js";
-import { mapCodexApprovalRequest, mapCodexAppServerEvent } from "../src/adapters/codex/eventMapper.js";
+import {
+  mapCodexApprovalRequest,
+  mapCodexAppServerEvent,
+  mapCodexNotification,
+} from "../src/adapters/codex/eventMapper.js";
 import { CodexAdapter } from "../src/adapters/codexAdapter.js";
+import { ClaudeAdapter, mapClaudeHookEvent } from "../src/adapters/claudeAdapter.js";
 import { mapClaudeSdkMessage } from "../src/runtime/claudeSdkEvents.js";
+
+assert.equal(new ClaudeAdapter({ args: [] }).describe().runtime, "claude-pty");
 
 const claudeEvents = mapClaudeJsonLine(JSON.stringify({
   type: "assistant",
@@ -37,6 +44,19 @@ assert.deepEqual(codexEvents[0], {
   input: { command: "npm test", cwd: "/repo" },
 });
 
+const codexAssistantEvents = mapCodexAppServerEvent({
+  type: "agent_message",
+  message: "<think>private chain of thought</think>\nVisible answer",
+});
+assert.deepEqual(codexAssistantEvents, [
+  { type: "agent.thinking", provider: "codex", text: "" },
+  { type: "agent.text", provider: "codex", text: "Visible answer" },
+]);
+assert.equal(
+  JSON.stringify(codexAssistantEvents).includes("private chain of thought"),
+  false,
+);
+
 // Stage 8.1: codex.initialized → agent.ready
 assert.deepEqual(mapCodexAppServerEvent({ type: "codex.initialized" }), [{
   type: "agent.ready",
@@ -64,6 +84,53 @@ assert.deepEqual(mapCodexAppServerEvent({
   code: 1,
   signal: null,
 });
+
+assert.deepEqual(mapCodexNotification("item/completed", {
+  item: {
+    type: "reasoning",
+    id: "reasoning-1",
+    summary: ["Checked the route", "Compared the fallback"],
+    content: ["private chain of thought must not be forwarded"],
+  },
+}), [{
+  type: "agent.thinking",
+  provider: "codex",
+  text: "Checked the route\nCompared the fallback",
+}]);
+
+const codexPlanEvent = mapCodexNotification("turn/plan/updated", {
+  explanation: "Implement in two steps",
+  plan: [
+    { step: "Update the mapper", status: "inProgress" },
+    { step: "Run tests", status: "pending" },
+  ],
+})[0];
+assert.equal(codexPlanEvent.type, "agent.activity");
+assert.equal(codexPlanEvent.activity, "plan_progress");
+assert.equal(codexPlanEvent.metadata.plan.length, 2);
+
+const codexMcpEvent = mapCodexNotification("item/started", {
+  item: {
+    type: "mcpToolCall",
+    id: "mcp-1",
+    server: "github",
+    tool: "search",
+    arguments: { query: "repo", authorization: "private" },
+  },
+})[0];
+assert.equal(codexMcpEvent.type, "agent.tool_call.start");
+assert.equal(codexMcpEvent.tool, "github/search");
+assert.equal(codexMcpEvent.input.arguments.authorization, "[redacted]");
+
+assert.deepEqual(mapCodexNotification("item/agentMessage/delta", {
+  delta: "duplicate partial text",
+}), []);
+
+const unknownCodexNotification = mapCodexNotification("future/privateNotification", {
+  secret: "must not cross",
+})[0];
+assert.equal(unknownCodexNotification.activity, "notification");
+assert.equal(JSON.stringify(unknownCodexNotification).includes("must not cross"), false);
 
 // Stage 8.4: codex.app_server.force_kill → agent.adapter.status state=force_killed
 assert.deepEqual(mapCodexAppServerEvent({
@@ -129,6 +196,137 @@ const sdkEvents = mapClaudeSdkMessage({
 
 assert.equal(sdkEvents.find((event) => event.type === "agent.text")?.text, "Checking files.");
 assert.equal(sdkEvents.find((event) => event.type === "agent.tool_call.start")?.callId, "toolu_sdk_1");
+
+const sdkStateEvents = mapClaudeSdkMessage({
+  type: "system",
+  subtype: "session_state_changed",
+  state: "requires_action",
+  uuid: "sdk-state-1",
+  session_id: "sdk-session",
+});
+assert.deepEqual(sdkStateEvents[0], {
+  type: "agent.adapter.status",
+  provider: "claude",
+  state: "requires_action",
+  message: "Claude requires user action",
+  metadata: { session_state: "requires_action" },
+  eventId: "claude_sdk-state-1_status_0",
+});
+
+const sdkCompactEvents = mapClaudeSdkMessage({
+  type: "system",
+  subtype: "compact_boundary",
+  compact_metadata: { trigger: "auto", pre_tokens: 1000, post_tokens: 250 },
+  uuid: "sdk-compact-1",
+  session_id: "sdk-session",
+});
+assert.equal(sdkCompactEvents[0].type, "agent.activity");
+assert.equal(sdkCompactEvents[0].activity, "context_compacted");
+assert.equal(sdkCompactEvents[0].metadata.pre_tokens, 1000);
+
+const sdkDeniedEvents = mapClaudeSdkMessage({
+  type: "system",
+  subtype: "permission_denied",
+  tool_name: "Bash",
+  tool_use_id: "tool-denied",
+  decision_reason_type: "rule",
+  decision_reason: "blocked",
+  message: "Command denied",
+  uuid: "sdk-denied-1",
+  session_id: "sdk-session",
+});
+assert.equal(sdkDeniedEvents[0].activity, "permission_denied");
+assert.equal(sdkDeniedEvents[0].detail, "Command denied");
+
+const sdkSensitiveToolEvents = mapClaudeSdkMessage({
+  type: "assistant",
+  uuid: "sdk-sensitive-1",
+  message: {
+    content: [{
+      type: "tool_use",
+      id: "tool-sensitive",
+      name: "Fetch",
+      input: { authorization: "Bearer private", url: "https://example.com" },
+    }],
+  },
+});
+assert.equal(sdkSensitiveToolEvents[0].input.authorization, "[redacted]");
+assert.equal(sdkSensitiveToolEvents[0].input.url, "https://example.com");
+
+assert.deepEqual(mapClaudeSdkMessage({
+  type: "stream_event",
+  uuid: "partial",
+  event: { type: "content_block_delta" },
+}), []);
+
+assert.deepEqual(mapClaudeHookEvent({
+  hook_event_name: "PostCompact",
+  session_id: "native-claude",
+  transcript_path: "/private/transcript.jsonl",
+  cwd: "/repo",
+}), {
+  type: "agent.activity",
+  provider: "claude",
+  activity: "context_compacted",
+  summary: "Claude compacted the conversation context",
+  detail: "",
+  metadata: {
+    hook_event: "PostCompact",
+    source: "",
+    notification_type: "",
+    task_id: "",
+    task_subject: "",
+    agent_id: "",
+    agent_type: "",
+    file_path: "",
+    cwd: "/repo",
+    worktree_path: "",
+    permission_mode: "",
+    elicitation_id: "",
+    mcp_server_name: "",
+    action: "",
+  },
+});
+
+assert.deepEqual(mapClaudeHookEvent({
+  hook_event_name: "UserPromptSubmit",
+  session_id: "native-claude",
+}), {
+  type: "agent.task.started",
+  provider: "claude",
+  id: "native-claude",
+});
+assert.equal(mapClaudeHookEvent({ hook_event_name: "Stop" }).type, "agent.task.complete");
+assert.equal(mapClaudeHookEvent({ hook_event_name: "StopFailure" }).type, "agent.task.aborted");
+
+const nativeDenied = mapClaudeHookEvent({
+  hook_event_name: "PermissionDenied",
+  permission_mode: "plan",
+});
+assert.equal(nativeDenied.activity, "permission_denied");
+assert.equal(nativeDenied.metadata.permission_mode, "plan");
+
+const nativeElicitationResult = mapClaudeHookEvent({
+  hook_event_name: "ElicitationResult",
+  elicitation_id: "elicit-1",
+  mcp_server_name: "github",
+  action: "accept",
+});
+assert.equal(nativeElicitationResult.activity, "elicitation_completed");
+assert.equal(nativeElicitationResult.metadata.elicitation_id, "elicit-1");
+assert.equal(
+  JSON.stringify(mapClaudeHookEvent({
+    hook_event_name: "PostCompact",
+    transcript_path: "/private/transcript.jsonl",
+  })).includes("transcript"),
+  false,
+);
+assert.deepEqual(mapClaudeSdkMessage({
+  type: "system",
+  subtype: "thinking_tokens",
+  estimated_tokens: 100,
+  estimated_tokens_delta: 10,
+}), []);
 
 // JSONL scanner must drop lines older than the wrapper's beforeStart time.
 // This is the regression test for the "history replays as live permission
@@ -207,10 +405,24 @@ assert.equal(
   const a = new CodexAdapter({ args: [] });
   a.appServerAvailable = true;
   assert.equal(a.describe().runtime, "codex-app-server");
-  assert.deepEqual(a.describe().structuredSources, ["codex-app-server", "terminal-output"]);
+  assert.deepEqual(a.describe().structuredSources, ["codex-app-server", "codex-jsonl", "terminal-output"]);
   a.appServerAvailable = false;
-  assert.equal(a.describe().runtime, null);
-  assert.deepEqual(a.describe().structuredSources, ["terminal-output"]);
+  assert.equal(a.describe().runtime, "codex-pty");
+  assert.deepEqual(a.describe().structuredSources, ["codex-jsonl", "terminal-output"]);
+}
+
+// Remote-control-only native mode must not inject OriginRouter's model alias
+// or OPENAI_MODEL into an installed Codex configuration.
+{
+  const launch = new CodexAdapter({
+    args: ["resume", "session-123"],
+    nativeConfig: true,
+  }).buildLaunch();
+  assert.deepEqual(launch, {
+    command: "codex",
+    args: ["resume", "session-123"],
+    env: {},
+  });
 }
 
 // Stage 8.4: when the app-server process exits, the adapter walks
