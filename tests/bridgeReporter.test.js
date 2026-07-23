@@ -7,10 +7,13 @@ import {
   createRuntimeEventReporter,
   createTerminalActivityReporter,
   pollResolvedApprovals,
+  reportAgentConversationMetadata,
   reportAgentSessionHeartbeat,
   reportLocalControlRuntime,
   reportRuntimeEvent,
   startApprovalDecisionPolling,
+  shouldSyncAgentActivitySnapshot,
+  updateAgentActivitySnapshot,
 } from "../src/agent/bridgeReporter.js";
 import { makeOAuthCredential } from "./support/oauthCredential.js";
 
@@ -43,10 +46,15 @@ test("buildAgentConversationMetadata excludes transcript prompt command and path
     provider: "originrouter-cloud",
     model: "gpt-codex",
     permissionProfile: "guarded",
+    summary: "Use token=or_at_secretvalue123 for the task",
+    firstPromptPreview: "Investigate Relay auth with api_key=sk-secretvalue123",
+    lastMessagePreview: "Authorization: Bearer or_at_anothersecret123",
     transcriptPath: "/private/transcript.jsonl",
     workspacePath: "/private/project",
     prompt: "private prompt",
     command: "rm -rf secret",
+    createdAt: 1782871200,
+    lastActivityAt: "2026-07-01T02:10:00Z",
   });
 
   assert.equal(payload.conversation_id, "conversation-1");
@@ -56,6 +64,91 @@ test("buildAgentConversationMetadata excludes transcript prompt command and path
   assert.equal("workspace_path" in payload, false);
   assert.equal("prompt" in payload, false);
   assert.equal("command" in payload, false);
+  assert.equal(payload.summary.includes("or_at_secretvalue123"), false);
+  assert.equal(payload.first_prompt_preview.includes("sk-secretvalue123"), false);
+  assert.equal(payload.last_message_preview.includes("or_at_anothersecret123"), false);
+  assert.equal(payload.created_at, "2026-07-01T02:00:00.000Z");
+  assert.equal(payload.last_activity_at, "2026-07-01T02:10:00.000Z");
+});
+
+test("Agent Activity snapshot preserves idea, result, and task summary", () => {
+  const snapshot = {};
+  updateAgentActivitySnapshot(snapshot, {
+    type: "user.text",
+    text: "Could Relay switch automatically?",
+  });
+  updateAgentActivitySnapshot(snapshot, {
+    type: "agent.text",
+    text: "Prefer LAN and fall back to cloud Relay.",
+  });
+  updateAgentActivitySnapshot(snapshot, {
+    type: "agent.task.complete",
+    summary: "Implemented automatic Relay selection.",
+  });
+
+  assert.equal(snapshot.firstPromptPreview, "Could Relay switch automatically?");
+  assert.equal(snapshot.lastMessagePreview, "Prefer LAN and fall back to cloud Relay.");
+  assert.equal(snapshot.summary, "Implemented automatic Relay selection.");
+});
+
+test("Agent Activity sync recognizes Claude SDK completion aliases", () => {
+  const snapshot = {};
+  const event = {
+    type: "agent.task.completed",
+    result: "Finished the Relay migration.",
+  };
+
+  assert.equal(shouldSyncAgentActivitySnapshot(event), true);
+  updateAgentActivitySnapshot(snapshot, event);
+  assert.equal(snapshot.summary, "Finished the Relay migration.");
+  assert.equal(
+    shouldSyncAgentActivitySnapshot({ type: "agent.tool_call.start" }),
+    false,
+  );
+});
+
+test("Agent Activity completion falls back to the last assistant answer", () => {
+  const snapshot = {};
+  updateAgentActivitySnapshot(snapshot, {
+    type: "agent.text",
+    text: "The migration and regression tests are complete.",
+  });
+  updateAgentActivitySnapshot(snapshot, {
+    type: "agent.task.complete",
+    status: "complete",
+  });
+  assert.equal(
+    snapshot.summary,
+    "The migration and regression tests are complete.",
+  );
+});
+
+test("Agent Activity metadata retries without source times for an old server", async () => {
+  const bodies = [];
+  const result = await reportAgentConversationMetadata(
+    {
+      conversationId: "conversation-legacy-server",
+      agentType: "claude",
+      createdAt: "2026-07-01T02:00:00Z",
+      lastActivityAt: "2026-07-01T02:10:00Z",
+    },
+    {
+      stateDir: "/tmp/originrouter-missing-auth",
+      ensureFreshAccessTokenFn: async () => makeOAuthCredential({ deviceId: "device-1" }),
+      fetchFn: async (_url, options) => {
+        bodies.push(JSON.parse(options.body));
+        return bodies.length === 1
+          ? { ok: false, status: 422 }
+          : { ok: true, status: 200 };
+      },
+    },
+  );
+  assert.equal(result.ok, true);
+  assert.equal(result.legacyFallback, true);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].created_at, "2026-07-01T02:00:00.000Z");
+  assert.equal("created_at" in bodies[1], false);
+  assert.equal("last_activity_at" in bodies[1], false);
 });
 
 test("reportRuntimeEvent fails closed without coding auth", async () => {
@@ -134,6 +227,23 @@ test("reportLocalControlRuntime posts display-safe daemon status", async () => {
       cliUptimeSeconds: 42,
       proxyRunning: true,
       proxyBaseUrl: "http://127.0.0.1:15432",
+      providers: [
+        {
+          name: "originrouter-cloud",
+          type: "originrouter",
+          model: "gpt-5.4",
+          apiKey: "must-not-leak",
+          baseUrl: "https://private.example.test",
+        },
+      ],
+      routes: [
+        {
+          agent: "codex",
+          slot: "main",
+          provider: "originrouter-cloud",
+          model: "gpt-5.4",
+        },
+      ],
     },
     {
       stateDir: "/tmp/originrouter-missing-auth",
@@ -158,7 +268,27 @@ test("reportLocalControlRuntime posts display-safe daemon status", async () => {
     remote_share_running: false,
     remote_share_base_url: "",
     remote_share_catalog: [],
+    remote_share_e2ee_policy: "off",
+    remote_share_e2ee_public_key: "",
     agent_detail_profile: "concise",
+    providers: [
+      {
+        name: "originrouter-cloud",
+        type: "originrouter",
+        litellmProvider: "",
+        model: "gpt-5.4",
+        target: "",
+        deviceId: "",
+      },
+    ],
+    routes: [
+      {
+        agent: "codex",
+        slot: "main",
+        provider: "originrouter-cloud",
+        model: "gpt-5.4",
+      },
+    ],
   });
 });
 

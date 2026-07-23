@@ -130,6 +130,14 @@ const fakeRelay = await new Promise((resolve) => {
   let pendingScript = [];
   const postedEnvelopes = [];   // 9.2.1: every envelope the proxy POSTs is captured here.
   const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url?.endsWith("/e2ee")) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        code: 0,
+        data: { policy: "off", protocol: null, public_key: null },
+      }));
+      return;
+    }
     if (req.method === "POST" && req.url === "/relay/v1/messages") {
       const chunks = [];
       req.on("data", (c) => chunks.push(c));
@@ -347,6 +355,11 @@ const fakeRelay2 = await new Promise((resolve) => {
   // requestId of the request that consumed the script.
   const scriptQueue = [];
   const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url?.endsWith("/e2ee")) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ code: 0, data: { policy: "off" } }));
+      return;
+    }
     if (req.method === "POST" && req.url === "/relay/v1/messages") {
       const chunks = [];
       req.on("data", (c) => chunks.push(c));

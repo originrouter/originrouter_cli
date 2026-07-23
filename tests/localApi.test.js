@@ -249,6 +249,7 @@ try {
     const { status, body } = await postJson("/remote-share/start", {
       providers: ["minimax", "deepseek"],
       port: 40124,
+      e2eePolicy: "required",
     });
     assert.equal(status, 200);
     assert.equal(body.ok, true);
@@ -257,6 +258,7 @@ try {
       port: 40124,
     });
     assert.deepEqual(body.catalog.map((item) => item.provider), ["minimax", "deepseek"]);
+    assert.equal(body.e2eePolicy, "required");
   }
 
   // ---------- POST /proxy/restart ----------

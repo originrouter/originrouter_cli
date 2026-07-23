@@ -819,6 +819,8 @@ async function handleRemoteShareStatusPayload(ctx) {
     enabled: configured.enabled === true,
     providers: providerNames,
     catalog,
+    e2eePolicy: configured.e2eePolicy === "required" ? "required" : "off",
+    e2eeSupported: true,
   };
 }
 
@@ -1031,7 +1033,7 @@ function remoteShareProviders(config, providerNames) {
     .filter(Boolean);
 }
 
-function writeRemoteShareConfig({ enabled, providers, port }) {
+function writeRemoteShareConfig({ enabled, providers, port, e2eePolicy }) {
   const config = readConfig();
   const next = {
     ...config,
@@ -1039,6 +1041,11 @@ function writeRemoteShareConfig({ enabled, providers, port }) {
       enabled: Boolean(enabled),
       providers: providers || config.remoteShare?.providers || [],
       port: port || config.remoteShare?.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
+      e2eePolicy: e2eePolicy === "required"
+        ? "required"
+        : config.remoteShare?.e2eePolicy === "required" && e2eePolicy == null
+          ? "required"
+          : "off",
     },
   };
   writeConfig(next);
@@ -1089,6 +1096,7 @@ async function handleRemoteShareControl(ctx, res, action, body) {
     enabled: true,
     providers: providerNames,
     port: parsedPort,
+    e2eePolicy: body.e2eePolicy === "required" ? "required" : "off",
   });
   return sendOk(res, {
     ...result,

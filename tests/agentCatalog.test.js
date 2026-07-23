@@ -90,10 +90,36 @@ assert.equal(detail.artifacts[0].display_value, "lib/checkout.dart");
 assert.equal(detail.first_prompt_preview, "Inspect the checkout callback and make it idempotent.");
 assert.equal(detail.summary, "Checkout callback fixed and tests passed.");
 
+catalog.upsertSession({
+  sessionId: "short-native-session",
+  conversationId: "short-native-conversation",
+  runId: "short-native-run",
+  agent: "codex",
+  deviceId: "server-2",
+  cwd: stateDir,
+  runtime: "codex-pty",
+});
+catalog.recordEvent("short-native-session", {
+  type: "user.text",
+  text: "Return a fixed smoke-test value.",
+});
+catalog.recordEvent("short-native-session", {
+  type: "agent.text",
+  text: "ORIGINROUTER_ACTIVITY_SMOKE_OK",
+});
+catalog.recordEvent("short-native-session", {
+  type: "agent.task.completed",
+  status: "complete",
+});
+assert.equal(
+  catalog.getConversation("short-native-conversation").summary,
+  "ORIGINROUTER_ACTIVITY_SMOKE_OK",
+);
+
 const workspaces = catalog.listWorkspaces({ deviceId: "server-2" });
 assert.equal(workspaces.length, 1);
-assert.equal(workspaces[0].conversation_count, 1);
-assert.equal(catalog.status().conversations, 2);
+assert.equal(workspaces[0].conversation_count, 2);
+assert.equal(catalog.status().conversations, 3);
 assert.equal(statSync(catalog.dbPath).mode & 0o777, 0o600);
 
 catalog.upsertSession({

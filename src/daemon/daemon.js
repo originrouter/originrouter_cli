@@ -1,15 +1,35 @@
 import process from "node:process";
 import { reportLocalControlRuntime } from "../agent/bridgeReporter.js";
-import { DEFAULT_DEVICE_ID, DEFAULT_EXECUTOR, DEFAULT_LOCAL_API_PORT, DEFAULT_RELAY_URL, DEFAULT_REMOTE_SHARE_PROXY_PORT, VERSION } from "../constants.js";
+import { syncAgentActivityCatalog } from "../agent/agentActivityCatalogSync.js";
+import {
+  DEFAULT_DEVICE_ID,
+  DEFAULT_EXECUTOR,
+  DEFAULT_LOCAL_API_PORT,
+  DEFAULT_RELAY_URL,
+  DEFAULT_REMOTE_SHARE_PROXY_PORT,
+  VERSION,
+} from "../constants.js";
 import { startLocalApi } from "../local/localApi.js";
 import { ProxyManager } from "../proxy/manager.js";
 import { apiTokenPath, ensureApiToken } from "../persistence/authToken.js";
-import { ensureDevice, ensureStateDir, readConfig, readLocalApiConfig, writeDaemonState } from "../persistence/state.js";
-import { buildRelayClientOptions } from "../relay/relayAuthBootstrap.js";
+import {
+  ensureDevice,
+  ensureStateDir,
+  readConfig,
+  readLocalApiConfig,
+  writeDaemonState,
+} from "../persistence/state.js";
+import {
+  buildAgentRelayPlan,
+  normalizeAgentRelayMode,
+  relayModeDescription,
+} from "../relay/agentRelayPolicy.js";
 import { RelayClient } from "../relay/relayClient.js";
 import { parseOptions } from "../utils/options.js";
 import { SessionManager } from "./sessionManager.js";
 import { agentDetailDefaultFromConfig } from "../runtime/agentDetailProfile.js";
+import { getAllRoutes } from "../config/routes.js";
+import { normalizeProviderForRead } from "../config/providers.js";
 import { LocalAuditStore } from "../persistence/localAuditStore.js";
 import { AgentCatalog } from "../persistence/agentCatalog.js";
 import { readSessions } from "../persistence/sessionLog.js";
@@ -18,6 +38,8 @@ import { ManagedAgentSupervisor } from "./managedAgentSupervisor.js";
 import { CollaborationStore } from "../collaboration/collaborationStore.js";
 import { PlanImplementVerifyCoordinator } from "../collaboration/planImplementVerifyCoordinator.js";
 import { CollaborationRuntime } from "../collaboration/collaborationRuntime.js";
+import { ExternalAgentRelayRouter } from "./externalAgentRelayRouter.js";
+import { ensureRemoteCodingIdentity } from "../crypto/remoteCodingE2ee.js";
 
 function httpHost(address) {
   return String(address).includes(":") && !String(address).startsWith("[")
@@ -29,7 +51,9 @@ function parsePort(value, label) {
   if (value == null || value === "") return undefined;
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isFinite(parsed) || parsed < 0 || parsed > 65535) {
-    throw new Error(`${label} must be an integer in [0, 65535] (got '${value}')`);
+    throw new Error(
+      `${label} must be an integer in [0, 65535] (got '${value}')`,
+    );
   }
   return parsed;
 }
@@ -39,21 +63,57 @@ function buildProxyBaseUrl(status) {
   return `http://${httpHost(status.host || "127.0.0.1")}:${status.port}`;
 }
 
+function localControlProviderSnapshot(config) {
+  return Object.entries(config?.providers || {}).map(([key, provider]) => {
+    const normalized = normalizeProviderForRead(provider) || {};
+    return {
+      name: normalized.name || key,
+      type: normalized.type || "proxy",
+      litellmProvider: normalized.litellmProvider || "",
+      model: normalized.model || "",
+      target: normalized.target || "",
+      deviceId: normalized.deviceId || "",
+    };
+  });
+}
+
+function localControlRouteSnapshot(config) {
+  const routes = getAllRoutes(config);
+  const result = [];
+  for (const [agent, slots] of Object.entries(routes)) {
+    for (const [slot, route] of Object.entries(slots || {})) {
+      if (!route?.provider) continue;
+      result.push({
+        agent,
+        slot,
+        provider: route.provider,
+        model: route.model || "",
+      });
+    }
+  }
+  return result;
+}
+
 async function tryBuildRelayClientOptions({
   stateDir,
   relayUrl,
   fallbackDeviceId,
-  forceAuth = false,
+  mode,
 }) {
   try {
+    const plan = await buildAgentRelayPlan({
+      stateDir,
+      relayUrl,
+      fallbackDeviceId,
+      mode,
+    });
+    if (!plan.enabled) {
+      return { ok: false, code: plan.reason, plan };
+    }
     return {
       ok: true,
-      options: await buildRelayClientOptions({
-        stateDir,
-        relayUrl,
-        fallbackDeviceId,
-        forceAuth,
-      }),
+      options: plan,
+      plan,
     };
   } catch (err) {
     return {
@@ -72,16 +132,31 @@ export async function startDaemon(args) {
   // If the file is missing, the local API would 503 every write — better
   // to mint a token up front so the daemon starts in a usable state.
   const apiToken = ensureApiToken(stateDir);
-  const apiTokenFile = process.env.ORIGINROUTER_API_TOKEN_PATH || apiTokenPath(stateDir);
+  const apiTokenFile =
+    process.env.ORIGINROUTER_API_TOKEN_PATH || apiTokenPath(stateDir);
 
-  const relayUrl = options.relay || process.env.ORIGINROUTER_RELAY || DEFAULT_RELAY_URL;
-  const device = ensureDevice(options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID);
+  const relayUrl =
+    options.relay ||
+    process.env.ORIGINROUTER_RELAY ||
+    localApiConfig.relayUrl ||
+    DEFAULT_RELAY_URL;
+  const relayMode = normalizeAgentRelayMode(
+    options.relayMode || localApiConfig.relayMode,
+    relayUrl,
+  );
+  const device = ensureDevice(
+    options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID,
+  );
   const executor = DEFAULT_EXECUTOR;
-  const bindAddress = options.bind || process.env.ORIGINROUTER_LOCAL_BIND || localApiConfig.bindAddress || "127.0.0.1";
+  const bindAddress =
+    options.bind ||
+    process.env.ORIGINROUTER_LOCAL_BIND ||
+    localApiConfig.bindAddress ||
+    "127.0.0.1";
   const allowLanControl = Boolean(
-    options.allowLan
-      || process.env.ORIGINROUTER_ALLOW_LAN === "1"
-      || localApiConfig.allowLan === true,
+    options.allowLan ||
+    process.env.ORIGINROUTER_ALLOW_LAN === "1" ||
+    localApiConfig.allowLan === true,
   );
 
   // The daemon is a local-first service. It must be able to boot and expose
@@ -98,10 +173,53 @@ export async function startDaemon(args) {
   });
   const auditStore = new LocalAuditStore({ stateDir });
   const collaborationStore = new CollaborationStore({ stateDir });
-  const collaborationCoordinator = new PlanImplementVerifyCoordinator({ store: collaborationStore });
+  const collaborationCoordinator = new PlanImplementVerifyCoordinator({
+    store: collaborationStore,
+  });
   const agentCatalog = new AgentCatalog({ stateDir });
   agentCatalog.migrateLegacySessions(readSessions());
-  const externalAgentRegistry = new ExternalAgentRegistry({ catalog: agentCatalog });
+  let agentActivitySyncInFlight = null;
+  let lastAgentActivitySyncError = null;
+  const syncAgentActivityHistory = () => {
+    if (agentActivitySyncInFlight) return agentActivitySyncInFlight;
+    agentActivitySyncInFlight = syncAgentActivityCatalog({
+      catalog: agentCatalog,
+      stateDir,
+    })
+      .then((result) => {
+        if (result.ok) {
+          if (result.synced > 0) {
+            console.log(
+              `[agent-activity] synced ${result.synced} display-safe conversation summaries`,
+            );
+          }
+          lastAgentActivitySyncError = null;
+        } else if (result.error !== lastAgentActivitySyncError) {
+          lastAgentActivitySyncError = result.error;
+          console.error(`[agent-activity] sync deferred: ${result.error}`);
+        }
+        return result;
+      })
+      .catch((error) => {
+        const code = error?.code || error?.message || "unknown";
+        if (code !== lastAgentActivitySyncError) {
+          lastAgentActivitySyncError = code;
+          console.error(`[agent-activity] sync deferred: ${code}`);
+        }
+        return { ok: false, error: code };
+      })
+      .finally(() => {
+        agentActivitySyncInFlight = null;
+      });
+    return agentActivitySyncInFlight;
+  };
+  const externalAgentRegistry = new ExternalAgentRegistry({
+    catalog: agentCatalog,
+  });
+  const externalAgentRelayRouter = new ExternalAgentRelayRouter({
+    registry: externalAgentRegistry,
+    relayClient,
+  });
   const managedAgentSupervisor = new ManagedAgentSupervisor({
     catalog: agentCatalog,
     deviceId: effectiveDeviceId,
@@ -127,12 +245,14 @@ export async function startDaemon(args) {
     stateDir,
     stateKey: "remote-share-proxy",
   });
+  const remoteCodingIdentity = ensureRemoteCodingIdentity(stateDir);
   const sessionManager = new SessionManager({
     relayClient,
     deviceId: effectiveDeviceId,
     defaultExecutor: executor,
     proxyManager,
     remoteShareProxyManager,
+    remoteCodingIdentity,
     auditStore,
     agentCatalog,
     managedAgentSupervisor,
@@ -143,6 +263,14 @@ export async function startDaemon(args) {
   // on every write.
   const startedAt = new Date().toISOString();
   let relayConnected = false;
+  externalAgentRegistry.subscribe((notification) => {
+    if (!relayConnected) return;
+    void externalAgentRelayRouter
+      .forwardRegistryNotification(notification)
+      .catch((error) => {
+        console.error(`[external-agent-relay] ${error.message}`);
+      });
+  });
   const localApiCtx = {
     sessionManager,
     auditStore,
@@ -164,25 +292,39 @@ export async function startDaemon(args) {
     bindAddress,
     allowLanControl,
     getProxyStatus: () => proxyManager.status(),
-    startProxy: ({ provider, providerName, mode, port }) => proxyManager.start({ providerName: providerName || provider, mode, port }),
+    startProxy: ({ provider, providerName, mode, port }) =>
+      proxyManager.start({
+        providerName: providerName || provider,
+        mode,
+        port,
+      }),
     stopProxy: () => proxyManager.stop(),
-    restartProxy: ({ provider, providerName, mode, port }) => proxyManager.restart({ providerName: providerName || provider, mode, port }),
+    restartProxy: ({ provider, providerName, mode, port }) =>
+      proxyManager.restart({
+        providerName: providerName || provider,
+        mode,
+        port,
+      }),
     getRemoteShareProxyStatus: () => remoteShareProxyManager.status(),
-    startRemoteShareProxy: ({ providerNames, port }) => remoteShareProxyManager.start({
-      providerNames,
-      mode: "share",
-      port,
-    }),
+    startRemoteShareProxy: ({ providerNames, port }) =>
+      remoteShareProxyManager.start({
+        providerNames,
+        mode: "share",
+        port,
+      }),
     stopRemoteShareProxy: () => remoteShareProxyManager.stop(),
-    restartRemoteShareProxy: ({ providerNames, port }) => remoteShareProxyManager.restart({
-      providerNames,
-      mode: "share",
-      port,
-    }),
+    restartRemoteShareProxy: ({ providerNames, port }) =>
+      remoteShareProxyManager.restart({
+        providerNames,
+        mode: "share",
+        port,
+      }),
   };
-  const configuredLocalPort = parsePort(process.env.ORIGINROUTER_LOCAL_PORT, "ORIGINROUTER_LOCAL_PORT")
-    ?? parsePort(localApiConfig.port, "local-api.json port");
-  const requestedLocalPort = options.localPort ?? configuredLocalPort ?? DEFAULT_LOCAL_API_PORT;
+  const configuredLocalPort =
+    parsePort(process.env.ORIGINROUTER_LOCAL_PORT, "ORIGINROUTER_LOCAL_PORT") ??
+    parsePort(localApiConfig.port, "local-api.json port");
+  const requestedLocalPort =
+    options.localPort ?? configuredLocalPort ?? DEFAULT_LOCAL_API_PORT;
   let localApi;
   try {
     localApi = await startLocalApi(localApiCtx, {
@@ -191,8 +333,15 @@ export async function startDaemon(args) {
       allowLan: allowLanControl,
     });
   } catch (err) {
-    if (options.localPort == null && configuredLocalPort == null && requestedLocalPort === DEFAULT_LOCAL_API_PORT && err?.code === "EADDRINUSE") {
-      console.warn(`[daemon] local API port ${DEFAULT_LOCAL_API_PORT} is busy; retrying with an OS-assigned port`);
+    if (
+      options.localPort == null &&
+      configuredLocalPort == null &&
+      requestedLocalPort === DEFAULT_LOCAL_API_PORT &&
+      err?.code === "EADDRINUSE"
+    ) {
+      console.warn(
+        `[daemon] local API port ${DEFAULT_LOCAL_API_PORT} is busy; retrying with an OS-assigned port`,
+      );
       localApi = await startLocalApi(localApiCtx, {
         port: 0,
         apiTokenPath: apiTokenFile,
@@ -217,18 +366,48 @@ export async function startDaemon(args) {
   // a running proxy after `kill originrouter-daemon` is surprising.
   let shuttingDown = false;
   let heartbeatTimer = null;
+  let agentActivitySyncTimer = null;
   const shutdown = async (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[daemon] received ${signal}, shutting down…`);
-    try { await sessionManager.shutdown(signal); } catch (e) { console.error(`[daemon] session stop: ${e.message}`); }
-    try { await proxyManager.stop(); } catch (e) { console.error(`[daemon] proxy stop: ${e.message}`); }
-    try { await remoteShareProxyManager.stop(); } catch (e) { console.error(`[daemon] remote share proxy stop: ${e.message}`); }
-    try { await localApi.close(); } catch (e) { console.error(`[daemon] local api close: ${e.message}`); }
-    try { collaborationRuntime.close(); } catch (e) { console.error(`[daemon] collaboration runtime close: ${e.message}`); }
-    try { collaborationStore.close(); } catch (e) { console.error(`[daemon] collaboration store close: ${e.message}`); }
-    try { agentCatalog.close(); } catch (e) { console.error(`[daemon] agent catalog close: ${e.message}`); }
     if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (agentActivitySyncTimer) clearInterval(agentActivitySyncTimer);
+    try {
+      await sessionManager.shutdown(signal);
+    } catch (e) {
+      console.error(`[daemon] session stop: ${e.message}`);
+    }
+    try {
+      await proxyManager.stop();
+    } catch (e) {
+      console.error(`[daemon] proxy stop: ${e.message}`);
+    }
+    try {
+      await remoteShareProxyManager.stop();
+    } catch (e) {
+      console.error(`[daemon] remote share proxy stop: ${e.message}`);
+    }
+    try {
+      await localApi.close();
+    } catch (e) {
+      console.error(`[daemon] local api close: ${e.message}`);
+    }
+    try {
+      collaborationRuntime.close();
+    } catch (e) {
+      console.error(`[daemon] collaboration runtime close: ${e.message}`);
+    }
+    try {
+      collaborationStore.close();
+    } catch (e) {
+      console.error(`[daemon] collaboration store close: ${e.message}`);
+    }
+    try {
+      agentCatalog.close();
+    } catch (e) {
+      console.error(`[daemon] agent catalog close: ${e.message}`);
+    }
     process.exit(0);
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
@@ -236,43 +415,75 @@ export async function startDaemon(args) {
   process.on("SIGHUP", () => shutdown("SIGHUP"));
 
   const localApiState = () => ({
+    relayMode,
     localApiPort: localApi.port,
     localApiBindAddress: localApi.bindAddress,
     localApiBaseUrl: `http://${httpHost(localApi.bindAddress)}:${localApi.port}`,
     localApiTokenPath: apiTokenFile,
     localApiAuthMode: "bearer",
-    localApiLanEnabled: !["127.0.0.1", "::1", "localhost"].includes(localApi.bindAddress),
+    localApiLanEnabled: !["127.0.0.1", "::1", "localhost"].includes(
+      localApi.bindAddress,
+    ),
     localApiDefaultPort: DEFAULT_LOCAL_API_PORT,
   });
 
   const reportLocalControlHeartbeat = async () => {
     const proxyStatus = await proxyManager.status().catch(() => null);
-    const remoteShareStatus = await remoteShareProxyManager.status().catch(() => null);
+    const remoteShareStatus = await remoteShareProxyManager
+      .status()
+      .catch(() => null);
     const config = readConfig();
     const remoteShareProviderNames = remoteShareStatus?.currentProviders?.length
       ? remoteShareStatus.currentProviders
       : config.remoteShare?.providers || [];
     const remoteShareCatalog = remoteShareProviderNames
       .map((name) => config.providers?.[name])
-      .filter((provider) => provider?.type === "proxy" && provider?.engine === "litellm")
-      .map((provider) => ({ provider: provider.name, model: provider.model || "" }));
-    return reportLocalControlRuntime({
-      cliRunning: true,
-      cliVersion: VERSION,
-      cliUptimeSeconds: Math.floor((Date.now() - Date.parse(startedAt)) / 1000),
-      proxyRunning: Boolean(proxyStatus && proxyStatus.state === "running"),
-      proxyBaseUrl: buildProxyBaseUrl(proxyStatus),
-      remoteShareRunning: Boolean(remoteShareStatus && remoteShareStatus.state === "running"),
-      remoteShareBaseUrl: buildProxyBaseUrl(remoteShareStatus),
-      remoteShareCatalog,
-      agentDetailProfile: agentDetailDefaultFromConfig(config),
-    }, { stateDir }).catch(() => ({ ok: false, error: "request_failed" }));
+      .filter(
+        (provider) =>
+          provider?.type === "proxy" && provider?.engine === "litellm",
+      )
+      .map((provider) => ({
+        provider: provider.name,
+        model: provider.model || "",
+      }));
+    return reportLocalControlRuntime(
+      {
+        cliRunning: true,
+        cliVersion: VERSION,
+        cliUptimeSeconds: Math.floor(
+          (Date.now() - Date.parse(startedAt)) / 1000,
+        ),
+        proxyRunning: Boolean(proxyStatus && proxyStatus.state === "running"),
+        proxyBaseUrl: buildProxyBaseUrl(proxyStatus),
+        remoteShareRunning: Boolean(
+          remoteShareStatus && remoteShareStatus.state === "running",
+        ),
+        remoteShareBaseUrl: buildProxyBaseUrl(remoteShareStatus),
+        remoteShareCatalog,
+        remoteShareE2eePolicy:
+          config.remoteShare?.e2eePolicy === "required" ? "required" : "off",
+        remoteShareE2eePublicKey: remoteCodingIdentity.publicKey,
+        agentDetailProfile: agentDetailDefaultFromConfig(config),
+        providers: localControlProviderSnapshot(config),
+        routes: localControlRouteSnapshot(config),
+      },
+      { stateDir },
+    ).catch(() => ({ ok: false, error: "request_failed" }));
+  };
+  sessionManager.onLocalControlChanged = async () => {
+    if (!relayConnected) return;
+    await reportLocalControlHeartbeat();
   };
   heartbeatTimer = setInterval(() => {
     if (!relayConnected) return;
     reportLocalControlHeartbeat().catch(() => {});
   }, 20_000);
   heartbeatTimer.unref?.();
+  agentActivitySyncTimer = setInterval(() => {
+    if (!relayConnected) return;
+    void syncAgentActivityHistory();
+  }, 5 * 60_000);
+  agentActivitySyncTimer.unref?.();
 
   writeDaemonState({
     pid: process.pid,
@@ -286,27 +497,67 @@ export async function startDaemon(args) {
 
   console.log("[daemon] starting");
   console.log(`[daemon] relay: ${relayUrl}`);
+  console.log(`[daemon] relay mode: ${relayMode}`);
   console.log(`[daemon] device: ${effectiveDeviceId}`);
   console.log(`[daemon] executor: ${executor}`);
-  console.log(`[daemon] local API: http://${httpHost(localApi.bindAddress)}:${localApi.port}`);
+  console.log(
+    `[daemon] local API: http://${httpHost(localApi.bindAddress)}:${localApi.port}`,
+  );
   console.log(`[daemon] local API auth: bearer token (${apiTokenFile})`);
   if (localApiState().localApiLanEnabled) {
-    console.warn("[daemon] LAN control is enabled. Keep the bearer token private and avoid exposing this port to the public internet.");
+    console.warn(
+      "[daemon] LAN control is enabled. Keep the bearer token private and avoid exposing this port to the public internet.",
+    );
   }
-  console.log(`[daemon] proxy manager: ${await proxyManager.status().then((s) => `${s.state}${s.port ? ` (port ${s.port})` : ""}`)}`);
-  console.log(`[daemon] remote share proxy: ${await remoteShareProxyManager.status().then((s) => `${s.state}${s.port ? ` (port ${s.port})` : ""}`)}`);
+  console.log(
+    `[daemon] proxy manager: ${await proxyManager.status().then((s) => `${s.state}${s.port ? ` (port ${s.port})` : ""}`)}`,
+  );
+  console.log(
+    `[daemon] remote share proxy: ${await remoteShareProxyManager.status().then((s) => `${s.state}${s.port ? ` (port ${s.port})` : ""}`)}`,
+  );
 
   const configuredRemoteShare = readConfig().remoteShare;
-  if (configuredRemoteShare?.enabled && configuredRemoteShare.providers?.length) {
-    remoteShareProxyManager.start({
-      mode: "share",
-      providerNames: configuredRemoteShare.providers,
-      port: configuredRemoteShare.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
-    }).then((result) => {
-      if (!result.ok) console.error(`[daemon] remote share restore failed: ${result.error}`);
-    }).catch((error) => {
-      console.error(`[daemon] remote share restore failed: ${error.message}`);
+  if (
+    configuredRemoteShare?.enabled &&
+    configuredRemoteShare.providers?.length
+  ) {
+    remoteShareProxyManager
+      .start({
+        mode: "share",
+        providerNames: configuredRemoteShare.providers,
+        port: configuredRemoteShare.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
+      })
+      .then((result) => {
+        if (!result.ok)
+          console.error(
+            `[daemon] remote share restore failed: ${result.error}`,
+          );
+      })
+      .catch((error) => {
+        console.error(`[daemon] remote share restore failed: ${error.message}`);
+      });
+  }
+
+  if (relayMode === "local") {
+    relayAuthState = "disabled";
+    relayAuthError = null;
+    writeDaemonState({
+      pid: process.pid,
+      relayUrl,
+      deviceId: effectiveDeviceId,
+      executor,
+      ...localApiState(),
+      version: VERSION,
+      status: "local-only",
+      relayMode,
     });
+    console.log(
+      "[daemon] Relay disabled; local and LAN control remain available.",
+    );
+    while (!shuttingDown) {
+      await new Promise((resolve) => setTimeout(resolve, 60_000));
+    }
+    return;
   }
 
   for (;;) {
@@ -315,18 +566,25 @@ export async function startDaemon(args) {
         stateDir,
         relayUrl,
         fallbackDeviceId: device.deviceId,
-        forceAuth: true,
+        mode: relayMode,
       });
       if (!relayOptionsResult.ok) {
         relayConnected = false;
         relayAuthState = "unavailable";
         relayAuthError = relayOptionsResult.code;
         writeDaemonState({
-          pid: process.pid, relayUrl, deviceId: effectiveDeviceId, executor,
-          ...localApiState(), version: VERSION,
-          status: "local-only", relayAuthError,
+          pid: process.pid,
+          relayUrl,
+          deviceId: effectiveDeviceId,
+          executor,
+          ...localApiState(),
+          version: VERSION,
+          status: "local-only",
+          relayAuthError,
         });
-        console.error(`[daemon] relay auth unavailable: code=${relayAuthError}`);
+        console.error(
+          `[daemon] Relay unavailable (${relayModeDescription(relayOptionsResult.plan)}): code=${relayAuthError}`,
+        );
         await new Promise((resolve) => setTimeout(resolve, 3000));
         continue;
       }
@@ -344,32 +602,64 @@ export async function startDaemon(args) {
 
       await relayClient.connectEvents(
         (payload) => {
-          void collaborationRuntime.handleRelayEvent(payload).then((handled) => {
-            if (!handled) sessionManager.handleEvent(payload);
-          }).catch((error) => {
-            console.error(`[collaboration-relay] ${error.message}`);
-          });
+          void collaborationRuntime
+            .handleRelayEvent(payload)
+            .then((handled) => {
+              if (handled) return true;
+              return externalAgentRelayRouter.handle(payload);
+            })
+            .then((handled) => {
+              if (!handled) sessionManager.handleEvent(payload);
+            })
+            .catch((error) => {
+              console.error(`[collaboration-relay] ${error.message}`);
+            });
         },
         {
           onOpen: () => {
             relayConnected = true;
             writeDaemonState({
-              pid: process.pid, relayUrl, deviceId: effectiveDeviceId, executor,
-              ...localApiState(), version: VERSION, status: "connected",
+              pid: process.pid,
+              relayUrl,
+              deviceId: effectiveDeviceId,
+              executor,
+              ...localApiState(),
+              version: VERSION,
+              status: "connected",
             });
             reportLocalControlHeartbeat().catch(() => {});
-            void collaborationRuntime.refreshAccountBudgetStatus().catch((error) => {
-              console.error(`[collaboration-budget] ${error.message}`);
-            });
+            void syncAgentActivityHistory();
+            void collaborationRuntime
+              .refreshAccountBudgetStatus()
+              .catch((error) => {
+                console.error(`[collaboration-budget] ${error.message}`);
+              });
           },
           onClose: () => {
             relayConnected = false;
           },
+          onAlive: () => {
+            if (!relayConnected) return;
+            writeDaemonState({
+              pid: process.pid,
+              relayUrl,
+              deviceId: effectiveDeviceId,
+              executor,
+              ...localApiState(),
+              version: VERSION,
+              status: "connected",
+            });
+          },
         },
       );
       writeDaemonState({
-        pid: process.pid, relayUrl, deviceId: effectiveDeviceId, executor,
-        ...localApiState(), version: VERSION, status: "reconnecting",
+        pid: process.pid,
+        relayUrl,
+        deviceId: effectiveDeviceId,
+        executor,
+        ...localApiState(),
+        version: VERSION,
+        status: "reconnecting",
       });
     } catch (error) {
       relayConnected = false;
@@ -379,12 +669,17 @@ export async function startDaemon(args) {
       // updating only the token would leave a stale deviceId and the
       // relay would return 403 device_mismatch.
       try {
-        const relayOptions = await buildRelayClientOptions({
+        const relayOptions = await buildAgentRelayPlan({
           stateDir,
           relayUrl,
           fallbackDeviceId: device.deviceId,
-          forceAuth: true,
+          mode: relayMode,
         });
+        if (!relayOptions.enabled) {
+          const error = new Error(relayOptions.reason || "relay_auth_unavailable");
+          error.code = relayOptions.reason || "relay_auth_unavailable";
+          throw error;
+        }
         relayClient.deviceId = relayOptions.deviceId;
         relayClient.setAuthToken(relayOptions.authToken);
         effectiveDeviceId = relayOptions.deviceId;
@@ -395,12 +690,19 @@ export async function startDaemon(args) {
       } catch (reErr) {
         relayAuthState = "unavailable";
         relayAuthError = reErr?.code || "unknown";
-        console.error(`[daemon] relay auth re-acquire failed: code=${reErr?.code || "unknown"}`);
+        console.error(
+          `[daemon] relay auth re-acquire failed: code=${reErr?.code || "unknown"}`,
+        );
       }
       writeDaemonState({
-        pid: process.pid, relayUrl, deviceId: effectiveDeviceId, executor,
-        ...localApiState(), version: VERSION,
-        status: "reconnecting", error: error.message,
+        pid: process.pid,
+        relayUrl,
+        deviceId: effectiveDeviceId,
+        executor,
+        ...localApiState(),
+        version: VERSION,
+        status: "reconnecting",
+        error: error.message,
       });
       await new Promise((resolve) => setTimeout(resolve, 1500));
     }

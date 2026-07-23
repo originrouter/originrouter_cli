@@ -9,6 +9,11 @@ export function parseOptions(args) {
       index += 1;
       continue;
     }
+    if (item === "--relay-mode") {
+      options.relayMode = args[index + 1];
+      index += 1;
+      continue;
+    }
     if (item === "--device") {
       options.device = args[index + 1];
       index += 1;

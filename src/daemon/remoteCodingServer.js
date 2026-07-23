@@ -12,6 +12,12 @@
 // `relayClient` (whose `send` is captured) and a `localProxyUrl` (a
 // `node:http` mock or `null` for the "no local proxy" path).
 
+import {
+  decryptRemoteCodingRequest,
+  encryptRemoteCodingResponse,
+  REMOTE_CODING_E2EE_PROTOCOL,
+} from "../crypto/remoteCodingE2ee.js";
+
 const CREDENTIAL_TRANSPORT_HEADERS = new Set([
   "authorization",
   "x-api-key",
@@ -63,7 +69,15 @@ function responseHeadersStripped(headers) {
  * @returns {Promise<{ ok: boolean, status?: number, code?: string, message?: string }>}
  */
 export async function handleRemoteCodingRequest(envelope, deps) {
-  const { relayClient, localProxyUrl, fetchFn = globalThis.fetch, signal } = deps;
+  const {
+    relayClient,
+    localProxyUrl,
+    fetchFn = globalThis.fetch,
+    signal,
+    deviceId = null,
+    e2eePolicy = "off",
+    e2eeIdentity = null,
+  } = deps;
 
   if (!envelope || typeof envelope !== "object") {
     return { ok: false, code: "upstream_error", message: "invalid envelope" };
@@ -72,8 +86,59 @@ export async function handleRemoteCodingRequest(envelope, deps) {
   if (!requestId) {
     return { ok: false, code: "upstream_error", message: "missing requestId" };
   }
-  if (!localProxyUrl) {
+  if (deviceId && envelope.targetDeviceId && envelope.targetDeviceId !== deviceId) {
     await relayClient.send("remote.coding.response.error", {
+      requestId,
+      code: "e2ee_wrong_device",
+      message: "remote coding request was addressed to another device",
+    });
+    return { ok: false, code: "e2ee_wrong_device" };
+  }
+
+  let requestEnvelope = envelope;
+  let e2eeContext = null;
+  if (envelope.protocol === REMOTE_CODING_E2EE_PROTOCOL) {
+    if (!e2eeIdentity?.privateKey) {
+      await relayClient.send("remote.coding.response.error", {
+        requestId,
+        code: "e2ee_target_incompatible",
+        message: "target device has no end-to-end encryption identity",
+      });
+      return { ok: false, code: "e2ee_target_incompatible" };
+    }
+    try {
+      const decrypted = decryptRemoteCodingRequest(envelope, e2eeIdentity);
+      requestEnvelope = {
+        ...decrypted.payload,
+        requestId,
+        sourceDeviceId: envelope.sourceDeviceId,
+        targetDeviceId: envelope.targetDeviceId,
+      };
+      e2eeContext = decrypted.context;
+    } catch (error) {
+      await relayClient.send("remote.coding.response.error", {
+        requestId,
+        code: error?.code || "e2ee_decryption_failed",
+        message: error?.message || "encrypted request could not be verified",
+      });
+      return { ok: false, code: error?.code || "e2ee_decryption_failed" };
+    }
+  } else if (e2eePolicy === "required") {
+    await relayClient.send("remote.coding.response.error", {
+      requestId,
+      code: "e2ee_required",
+      message: "target requires end-to-end encryption; plaintext was rejected",
+    });
+    return { ok: false, code: "e2ee_required" };
+  }
+
+  const sendResponse = async (type, payload) => {
+    if (!e2eeContext) return relayClient.send(type, payload);
+    const encrypted = encryptRemoteCodingResponse(e2eeContext, type, payload);
+    return relayClient.send(type, encrypted);
+  };
+  if (!localProxyUrl) {
+    await sendResponse("remote.coding.response.error", {
       requestId,
       code: "upstream_error",
       message: "local proxy is not running",
@@ -81,20 +146,20 @@ export async function handleRemoteCodingRequest(envelope, deps) {
     return { ok: false, code: "upstream_error", message: "local proxy is not running" };
   }
 
-  const headers = stripCredentialTransportHeaders(envelope.headers);
-  const body = decodeBase64Body(envelope.body);
-  const url = `${localProxyUrl}${envelope.path || ""}`;
+  const headers = stripCredentialTransportHeaders(requestEnvelope.headers);
+  const body = decodeBase64Body(requestEnvelope.body);
+  const url = `${localProxyUrl}${requestEnvelope.path || ""}`;
 
   let response;
   try {
     response = await fetchFn(url, {
-      method: envelope.method || "POST",
+      method: requestEnvelope.method || "POST",
       headers,
       body: body == null ? undefined : body,
       signal,
     });
   } catch (err) {
-    await relayClient.send("remote.coding.response.error", {
+    await sendResponse("remote.coding.response.error", {
       requestId,
       code: "upstream_error",
       message: `fetch threw: ${err && err.message ? err.message : String(err)}`,
@@ -104,7 +169,7 @@ export async function handleRemoteCodingRequest(envelope, deps) {
 
   // Upstream 5xx: surface as upstream_error, no start/chunk/end.
   if (response.status >= 500) {
-    await relayClient.send("remote.coding.response.error", {
+    await sendResponse("remote.coding.response.error", {
       requestId,
       code: "upstream_error",
       status: response.status,
@@ -114,14 +179,14 @@ export async function handleRemoteCodingRequest(envelope, deps) {
   }
 
   // Happy path: send start, then chunks, then end.
-  await relayClient.send("remote.coding.response.start", {
+  await sendResponse("remote.coding.response.start", {
     requestId,
     status: response.status,
     headers: responseHeadersStripped(Object.fromEntries(response.headers.entries())),
   });
 
   if (!response.body) {
-    await relayClient.send("remote.coding.response.end", { requestId });
+    await sendResponse("remote.coding.response.end", { requestId });
     return { ok: true, status: response.status };
   }
 
@@ -130,15 +195,15 @@ export async function handleRemoteCodingRequest(envelope, deps) {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      await relayClient.send("remote.coding.response.chunk", {
+      await sendResponse("remote.coding.response.chunk", {
         requestId,
         chunk: Buffer.from(value).toString("base64"),
       });
     }
-    await relayClient.send("remote.coding.response.end", { requestId });
+    await sendResponse("remote.coding.response.end", { requestId });
     return { ok: true, status: response.status };
   } catch (err) {
-    await relayClient.send("remote.coding.response.error", {
+    await sendResponse("remote.coding.response.error", {
       requestId,
       code: "upstream_error",
       message: `stream threw: ${err && err.message ? err.message : String(err)}`,

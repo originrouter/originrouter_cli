@@ -146,6 +146,19 @@ assert.equal(findCodexTranscript({
   sessionId: "managed-thread-1",
   originators: null,
 }), managedPath);
+const execPath = join(sessionDir, "exec.jsonl");
+writeFileSync(execPath, JSON.stringify({
+  type: "session_meta",
+  payload: {
+    session_id: "exec-thread-1",
+    cwd: "/exec/repo",
+    originator: "codex_exec",
+  },
+}));
+assert.equal(findCodexTranscript({
+  cwd: "/exec/repo",
+  startedAt: Date.now() - 5000,
+}), execPath);
 if (originalCodexHome == null) delete process.env.CODEX_HOME;
 else process.env.CODEX_HOME = originalCodexHome;
 

@@ -28,10 +28,23 @@ export async function postJson(url, body, options = {}) {
 }
 
 export class RelayClient {
-  constructor({ relayUrl, deviceId, authToken = null }) {
+  constructor({
+    relayUrl,
+    deviceId,
+    authToken = null,
+    heartbeatIntervalMs = 15_000,
+    heartbeatTimeoutMs = 45_000,
+    now = () => Date.now(),
+  }) {
     this.relayUrl = relayUrl;
     this.deviceId = deviceId;
     this.authToken = authToken;
+    this.heartbeatIntervalMs = Math.max(10, Number(heartbeatIntervalMs) || 15_000);
+    this.heartbeatTimeoutMs = Math.max(
+      this.heartbeatIntervalMs * 2,
+      Number(heartbeatTimeoutMs) || 45_000,
+    );
+    this.now = now;
     this._aborted = false;
     this._ws = null;
   }
@@ -67,7 +80,7 @@ export class RelayClient {
     );
   }
 
-  async connectEvents(onEvent, { onOpen, onClose } = {}) {
+  async connectEvents(onEvent, { onOpen, onClose, onAlive } = {}) {
     const url = new URL(`${this.relayUrl.replace(/\/+$/, "")}/relay/v1/devices/${encodeURIComponent(this.deviceId)}/ws`);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const headers = {};
@@ -76,24 +89,51 @@ export class RelayClient {
     }
     await new Promise((resolve, reject) => {
       const ws = new WebSocket(url, { headers });
+      let heartbeatTimer = null;
+      let lastActivityAt = this.now();
+      const markActivity = () => {
+        lastActivityAt = this.now();
+        try { onAlive?.(); } catch {}
+      };
+      const stopHeartbeat = () => {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      };
       this._ws = ws;
       ws.once("open", () => {
+        markActivity();
+        heartbeatTimer = setInterval(() => {
+          if (this._ws !== ws || ws.readyState !== WebSocket.OPEN) {
+            stopHeartbeat();
+            return;
+          }
+          if (this.now() - lastActivityAt >= this.heartbeatTimeoutMs) {
+            ws.terminate();
+            return;
+          }
+          try { ws.ping(); } catch { ws.terminate(); }
+        }, this.heartbeatIntervalMs);
+        heartbeatTimer.unref?.();
         try { onOpen?.(); } catch {}
         resolve();
       });
       ws.once("error", reject);
+      ws.on("pong", markActivity);
       ws.on("message", (data) => {
         if (this._aborted) return;
+        markActivity();
         try {
           onEvent(JSON.parse(String(data)));
         } catch {}
       });
       ws.once("close", () => {
+        stopHeartbeat();
         if (this._ws === ws) this._ws = null;
         try { onClose?.(); } catch {}
       });
     });
-    while (!this._aborted && this._ws) {
+    const connectedSocket = this._ws;
+    while (!this._aborted && this._ws === connectedSocket) {
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
   }

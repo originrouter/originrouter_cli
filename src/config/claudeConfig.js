@@ -198,6 +198,13 @@ function assertClaudeRemoteRoutes(config, eff, remoteCodingProbe) {
     err.code = "PROVIDER_UNSUPPORTED";
     throw err;
   }
+  if (smallProvider?.deviceId && smallProvider.deviceId !== mainProvider.deviceId) {
+    const err = new Error(
+      "Claude remote main and small routes must use the same target device.",
+    );
+    err.code = "PROVIDER_UNSUPPORTED";
+    throw err;
+  }
   if (!remoteCodingProbe || remoteCodingProbe.state !== "running") {
     const err = new Error(
       "Remote-coding relay proxy is not running. The local wrapper or " +
@@ -223,6 +230,20 @@ export function willRouteRemoteCoding(config, agent) {
   const provider = routeProvider(config, mainEntry);
   if (!provider) return false;
   return provider.type === "remote" && (provider.target || "proxy") === "proxy";
+}
+
+export function remoteCodingRouteTarget(config, agent) {
+  const routes = getRoutes(config);
+  const agentRoutes = agent === "codex"
+    ? getAgentRoutes(config, "codex")
+    : effectiveRoutes(routes);
+  const mainEntry = agentRoutes?.main;
+  if (!mainEntry?.provider) return null;
+  const provider = routeProvider(config, mainEntry);
+  if (!provider || provider.type !== "remote" || (provider.target || "proxy") !== "proxy") {
+    return null;
+  }
+  return provider.deviceId || null;
 }
 
 export function setClaudeConfigValue(config, key, value) {

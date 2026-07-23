@@ -1,7 +1,10 @@
 import process from "node:process";
 import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
-import { CodexAppServerClient, isCodexAppServerAvailable } from "../adapters/codex/appServerClient.js";
+import {
+  CodexAppServerClient,
+  isCodexAppServerAvailable,
+} from "../adapters/codex/appServerClient.js";
 import { mapCodexAppServerEvent } from "../adapters/codex/eventMapper.js";
 import {
   findCodexTranscript,
@@ -10,12 +13,26 @@ import {
 import {
   createRuntimeEventReporter,
   reportAgentConversationMetadata,
+  shouldSyncAgentActivitySnapshot,
   startAgentSessionHeartbeat,
+  updateAgentActivitySnapshot,
 } from "../agent/bridgeReporter.js";
-import { buildAgentProviderEnv, willRouteRemoteCoding } from "../config/claudeConfig.js";
+import {
+  buildAgentProviderEnv,
+  remoteCodingRouteTarget,
+  willRouteRemoteCoding,
+} from "../config/claudeConfig.js";
 import { DEFAULT_DEVICE_ID, DEFAULT_RELAY_URL } from "../constants.js";
-import { appendSessionStart, patchSessionExit } from "../persistence/sessionLog.js";
-import { ensureDevice, ensureStateDir, readConfig } from "../persistence/state.js";
+import {
+  appendSessionStart,
+  patchSessionExit,
+} from "../persistence/sessionLog.js";
+import {
+  ensureDevice,
+  ensureStateDir,
+  readConfig,
+  readLocalApiConfig,
+} from "../persistence/state.js";
 import { RemoteCodingProxyManager } from "../proxy/remoteCodingProxyManager.js";
 import {
   NOOP_REMOTE_CODING_SNAPSHOT,
@@ -23,7 +40,11 @@ import {
   snapshotRemoteCodingStatus,
   staticProxyStatusFn,
 } from "../proxy/snapshot.js";
-import { buildRelayClientOptions } from "../relay/relayAuthBootstrap.js";
+import {
+  buildAgentRelayPlan,
+  normalizeAgentRelayMode,
+  relayModeDescription,
+} from "../relay/agentRelayPolicy.js";
 import { RelayClient } from "../relay/relayClient.js";
 import { LocalAgentBridgeClient } from "../local/localAgentBridgeClient.js";
 import {
@@ -40,7 +61,10 @@ import {
 } from "./agentAutonomyPolicy.js";
 import { protectOriginrouterCodingEnv } from "./originrouterCodingAuthProxy.js";
 import { PendingInteractionRegistry } from "./pendingInteractionRegistry.js";
-import { displaySafeToolInput, toolInputContainsSecret } from "./displaySafeToolInput.js";
+import {
+  displaySafeToolInput,
+  toolInputContainsSecret,
+} from "./displaySafeToolInput.js";
 import {
   AGENT_DETAIL_PROFILES,
   resolveAgentDetailProfile,
@@ -75,6 +99,7 @@ function extractOptions(args) {
       index += 1;
     };
     if (arg === "--originrouter-relay") take("relay");
+    else if (arg === "--originrouter-relay-mode") take("relayMode");
     else if (arg === "--originrouter-device") take("device");
     else if (arg === "--originrouter-session") take("session");
     else if (arg === "--originrouter-conversation") take("conversationId");
@@ -87,32 +112,29 @@ function extractOptions(args) {
     else if (arg === "--resume") take("resume");
     else if (arg.startsWith("--resume=")) {
       options.resume = arg.slice("--resume=".length);
-    }
-    else if (arg === "--originrouter-autonomy") take("autonomyProfile");
+    } else if (arg === "--originrouter-autonomy") take("autonomyProfile");
     else if (arg === "--originrouter-detail") take("detailProfile");
-    else if (arg === "--originrouter-auto-approve") options.autonomyProfile = "guarded";
+    else if (arg === "--originrouter-auto-approve")
+      options.autonomyProfile = "guarded";
     else if (arg === "--originrouter-auto-allow") {
       options.autonomyAllowedScopes = [
         ...(options.autonomyAllowedScopes || []),
         ...String(args[index + 1] || "").split(","),
       ];
       index += 1;
-    }
-    else if (arg.startsWith("--originrouter-autonomy=")) {
+    } else if (arg.startsWith("--originrouter-autonomy=")) {
       options.autonomyProfile = arg.slice("--originrouter-autonomy=".length);
-    }
-    else if (arg.startsWith("--originrouter-detail=")) {
+    } else if (arg.startsWith("--originrouter-detail=")) {
       options.detailProfile = arg.slice("--originrouter-detail=".length);
-    }
-    else if (arg.startsWith("--originrouter-auto-allow=")) {
+    } else if (arg.startsWith("--originrouter-auto-allow=")) {
       options.autonomyAllowedScopes = [
         ...(options.autonomyAllowedScopes || []),
         ...arg.slice("--originrouter-auto-allow=".length).split(","),
       ];
-    }
-    else if (!arg.startsWith("-")) prompt.push(arg);
+    } else if (!arg.startsWith("-")) prompt.push(arg);
   }
-  if (!options.initialMessage && prompt.length) options.initialMessage = prompt.join(" ");
+  if (!options.initialMessage && prompt.length)
+    options.initialMessage = prompt.join(" ");
   return options;
 }
 
@@ -126,38 +148,52 @@ function requestInteractionId(method, params, id) {
 
 export function codexQuestions(params) {
   return {
-    questions: (Array.isArray(params?.questions) ? params.questions : []).slice(0, 8).map((question, index) => ({
-      id: String(question?.id || `q${index + 1}`).slice(0, 128),
-      header: String(question?.header || "Question").slice(0, 64),
-      question: String(question?.question || "").slice(0, 2048),
-      multiple: Boolean(question?.multiSelect || question?.multiple),
-      allow_other: question?.allowOther !== false,
-      secret: Boolean(question?.isSecret),
-      options: (Array.isArray(question?.options) ? question.options : []).slice(0, 16).map((option, index) => ({
-        id: `o${index + 1}`,
-        label: String(option?.label || "").slice(0, 128),
-        description: String(option?.description || "").slice(0, 512),
+    questions: (Array.isArray(params?.questions) ? params.questions : [])
+      .slice(0, 8)
+      .map((question, index) => ({
+        id: String(question?.id || `q${index + 1}`).slice(0, 128),
+        header: String(question?.header || "Question").slice(0, 64),
+        question: String(question?.question || "").slice(0, 2048),
+        multiple: Boolean(question?.multiSelect || question?.multiple),
+        allow_other: question?.allowOther !== false,
+        secret: Boolean(question?.isSecret),
+        options: (Array.isArray(question?.options) ? question.options : [])
+          .slice(0, 16)
+          .map((option, index) => ({
+            id: `o${index + 1}`,
+            label: String(option?.label || "").slice(0, 128),
+            description: String(option?.description || "").slice(0, 512),
+          })),
       })),
-    })),
-    auto_resolution_ms: Number.isFinite(params?.autoResolutionMs) ? params.autoResolutionMs : null,
+    auto_resolution_ms: Number.isFinite(params?.autoResolutionMs)
+      ? params.autoResolutionMs
+      : null,
   };
 }
 
 export function codexQuestionResponse(params, response) {
-  const answers = response?.answers && typeof response.answers === "object" ? response.answers : {};
+  const answers =
+    response?.answers && typeof response.answers === "object"
+      ? response.answers
+      : {};
   const mapped = {};
-  (Array.isArray(params?.questions) ? params.questions : []).forEach((question, index) => {
-    const id = String(question?.id || `q${index + 1}`);
-    const raw = answers[id];
-    mapped[id] = {
-      answers: (Array.isArray(raw) ? raw : raw == null ? [] : [raw]).map(String),
-    };
-  });
+  (Array.isArray(params?.questions) ? params.questions : []).forEach(
+    (question, index) => {
+      const id = String(question?.id || `q${index + 1}`);
+      const raw = answers[id];
+      mapped[id] = {
+        answers: (Array.isArray(raw) ? raw : raw == null ? [] : [raw]).map(
+          String,
+        ),
+      };
+    },
+  );
   return { answers: mapped };
 }
 
 function decisionFor(action, remember) {
-  if (action === "allow" || action === "submit") return remember ? "acceptForSession" : "accept";
+  if (action === "allow" || action === "submit")
+    return remember ? "acceptForSession" : "accept";
   if (action === "cancel") return "cancel";
   return "decline";
 }
@@ -165,8 +201,10 @@ function decisionFor(action, remember) {
 function codexDecisionLabel(decision) {
   if (decision === "accept") return "Allow once";
   if (decision === "acceptForSession") return "Allow for this session";
-  if (decision?.acceptWithExecpolicyAmendment) return "Allow and apply the suggested command rule";
-  if (decision?.applyNetworkPolicyAmendment) return "Apply the suggested network rule";
+  if (decision?.acceptWithExecpolicyAmendment)
+    return "Allow and apply the suggested command rule";
+  if (decision?.applyNetworkPolicyAmendment)
+    return "Apply the suggested network rule";
   return null;
 }
 
@@ -194,16 +232,21 @@ export function codexCommandApprovalPresentation(params = {}) {
 
 export function codexCommandApprovalDecision(params = {}, resolved = {}) {
   if (resolved.action === "cancel") return "cancel";
-  if (resolved.action !== "allow" && resolved.action !== "submit") return "decline";
+  if (resolved.action !== "allow" && resolved.action !== "submit")
+    return "decline";
   const available = Array.isArray(params.availableDecisions)
     ? params.availableDecisions
     : null;
   if (!available) {
-    return decisionFor(resolved.action, Boolean(resolved.response?.remember_for_session));
+    return decisionFor(
+      resolved.action,
+      Boolean(resolved.response?.remember_for_session),
+    );
   }
   const selected = String(resolved.response?.approval_option || "");
   const selectedIndex = /^decision-(\d+)$/.exec(selected)?.[1];
-  const decision = selectedIndex == null ? null : available[Number(selectedIndex)];
+  const decision =
+    selectedIndex == null ? null : available[Number(selectedIndex)];
   if (codexDecisionLabel(decision)) return decision;
   return available.find((item) => item === "accept") || "decline";
 }
@@ -218,21 +261,41 @@ export async function runCodexAppServerSession(rawArgs) {
   const stateDir = ensureStateDir();
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
   const options = extractOptions(rawArgs);
-  if (!await isCodexAppServerAvailable()) {
-    throw new Error("Codex app-server is unavailable. Upgrade Codex or use `originrouter codex-terminal`.");
+  if (!(await isCodexAppServerAvailable())) {
+    throw new Error(
+      "Codex app-server is unavailable. Upgrade Codex or use `originrouter codex-terminal`.",
+    );
   }
 
-  const relayUrl = options.relay || process.env.ORIGINROUTER_RELAY || DEFAULT_RELAY_URL;
-  const device = ensureDevice(options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID);
+  const relayConfig = readLocalApiConfig();
+  const relayUrl =
+    options.relay ||
+    process.env.ORIGINROUTER_RELAY ||
+    relayConfig.relayUrl ||
+    DEFAULT_RELAY_URL;
+  const relayMode = normalizeAgentRelayMode(
+    options.relayMode || relayConfig.relayMode,
+    relayUrl,
+  );
+  const device = ensureDevice(
+    options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID,
+  );
   const sessionId = options.session || `codex-${Date.now()}`;
   const cwd = process.cwd();
   const startedAt = Date.now();
-  const relayOptions = await buildRelayClientOptions({
+  let relayPlan = await buildAgentRelayPlan({
     stateDir,
     relayUrl,
     fallbackDeviceId: device.deviceId,
+    mode: relayMode,
   });
-  const relayClient = new RelayClient(relayOptions);
+  let relayClient = relayPlan.enabled ? new RelayClient(relayPlan) : null;
+  let effectiveDeviceId = relayPlan.deviceId || device.deviceId;
+  if (!relayPlan.enabled) {
+    process.stderr.write(
+      `[originrouter] ${relayModeDescription(relayPlan)}; local and LAN control remain available.\n`,
+    );
+  }
   const config = readConfig();
   const detail = resolveAgentDetailProfile({
     config,
@@ -244,11 +307,17 @@ export async function runCodexAppServerSession(rawArgs) {
     remoteCodingProxyManager = new RemoteCodingProxyManager({
       stateDir,
       relayUrl,
-      deviceId: relayOptions.deviceId,
+      deviceId: effectiveDeviceId,
+      targetDeviceId: remoteCodingRouteTarget(config, "codex"),
     });
     const started = await remoteCodingProxyManager.start();
-    if (!started.ok) throw new Error(`Failed to start remote-coding relay proxy: ${started.error}`);
-    remoteCodingStatus = staticProxyStatusFn(await snapshotRemoteCodingStatus(remoteCodingProxyManager));
+    if (!started.ok)
+      throw new Error(
+        `Failed to start remote-coding relay proxy: ${started.error}`,
+      );
+    remoteCodingStatus = staticProxyStatusFn(
+      await snapshotRemoteCodingStatus(remoteCodingProxyManager),
+    );
   }
   let providerResult = await buildAgentProviderEnv("codex", config, {
     provider: options.provider,
@@ -257,13 +326,16 @@ export async function runCodexAppServerSession(rawArgs) {
   });
   let originrouterCodingProxy = null;
   let localAgentBridge = null;
-  ({ providerResult, proxy: originrouterCodingProxy } = await protectOriginrouterCodingEnv(
-    "codex",
-    providerResult,
-    { stateDir },
-  ));
-  const model = options.model || providerResult.env.OPENAI_MODEL || providerResult.provider?.model;
-  const sessionTitle = String(options.title || "Codex session").trim().slice(0, 191);
+  let relayViaDaemon = false;
+  ({ providerResult, proxy: originrouterCodingProxy } =
+    await protectOriginrouterCodingEnv("codex", providerResult, { stateDir }));
+  const model =
+    options.model ||
+    providerResult.env.OPENAI_MODEL ||
+    providerResult.provider?.model;
+  const sessionTitle = String(options.title || "Codex session")
+    .trim()
+    .slice(0, 191);
   const client = new CodexAppServerClient();
   const recentEvents = [];
   const runtimeReporter = createRuntimeEventReporter({
@@ -281,38 +353,66 @@ export async function runCodexAppServerSession(rawArgs) {
   if (invalidScopes.length) {
     throw new Error(`Unknown unattended scope(s): ${invalidScopes.join(", ")}`);
   }
-  if (options.autonomyProfile && !normalizeAutonomyProfile(options.autonomyProfile, "")) {
+  if (
+    options.autonomyProfile &&
+    !normalizeAutonomyProfile(options.autonomyProfile, "")
+  ) {
     throw new Error(`Unknown unattended profile: ${options.autonomyProfile}`);
   }
-  if (options.autonomyAllowedScopes?.length && options.autonomyProfile && options.autonomyProfile !== "custom") {
-    throw new Error("--originrouter-auto-allow requires --originrouter-autonomy custom or no explicit profile");
+  if (
+    options.autonomyAllowedScopes?.length &&
+    options.autonomyProfile &&
+    options.autonomyProfile !== "custom"
+  ) {
+    throw new Error(
+      "--originrouter-auto-allow requires --originrouter-autonomy custom or no explicit profile",
+    );
   }
-  let autonomyAllowedScopes = normalizeAutonomyScopes(options.autonomyAllowedScopes);
+  let autonomyAllowedScopes = normalizeAutonomyScopes(
+    options.autonomyAllowedScopes,
+  );
   let autonomyProfile = normalizeAutonomyProfile(
-    options.autonomyProfile || (autonomyAllowedScopes.length ? "custom" : "manual"),
+    options.autonomyProfile ||
+      (autonomyAllowedScopes.length ? "custom" : "manual"),
   );
   let stopped = false;
+  const activitySnapshot = {
+    summary: "",
+    firstPromptPreview: "",
+    lastMessagePreview: "",
+  };
   let stopHeartbeat = () => {};
   const signalHandlers = new Map();
-  const syncCatalog = (status) => reportAgentConversationMetadata({
-    conversationId: options.conversationId || sessionId,
-    agentType: "codex",
-    nativeSessionId: threadId,
-    title: sessionTitle,
-    status,
-    workspaceId: options.workspaceId,
-    workspaceName: basename(cwd),
-    runtime: "codex-app-server",
-    provider: providerResult.provider?.name,
-    model,
-    permissionProfile: autonomyProfile,
-  }, { stateDir }).catch(() => ({ ok: false }));
+  const syncCatalog = (status) =>
+    reportAgentConversationMetadata(
+      {
+        conversationId: options.conversationId || sessionId,
+        agentType: "codex",
+        nativeSessionId: threadId,
+        title: sessionTitle,
+        status,
+        workspaceId: options.workspaceId,
+        workspaceName: basename(cwd),
+        runtime: "codex-app-server",
+        provider: providerResult.provider?.name,
+        model,
+        permissionProfile: autonomyProfile,
+        ...activitySnapshot,
+      },
+      { stateDir },
+    ).catch(() => ({ ok: false }));
 
-  const send = (type, extra = {}) => relayClient.send(type, {
-    sessionId,
-    localStarted: true,
-    ...extra,
-  }).catch(() => {});
+  const send = (type, extra = {}) => {
+    if (relayViaDaemon || !relayClient)
+      return Promise.resolve({ accepted: false, localOnly: true });
+    return relayClient
+      .send(type, {
+        sessionId,
+        localStarted: true,
+        ...extra,
+      })
+      .catch(() => {});
+  };
   const report = (type, extra = {}) => runtimeReporter.report(type, extra);
   const refreshTranscriptPath = async () => {
     if (transcriptPath || !threadId) return transcriptPath;
@@ -332,12 +432,17 @@ export async function runCodexAppServerSession(rawArgs) {
       eventId: event.eventId || `ate_${randomUUID()}`,
       createdAt: event.createdAt || Math.floor(Date.now() / 1000),
     };
+    updateAgentActivitySnapshot(activitySnapshot, transientEvent);
     recentEvents.push(transientEvent);
-    if (recentEvents.length > 100) recentEvents.splice(0, recentEvents.length - 100);
+    if (recentEvents.length > 100)
+      recentEvents.splice(0, recentEvents.length - 100);
     await Promise.all([
       send("agent.stream.event", { event: transientEvent }),
       report("agent.event", { event: transientEvent }),
       localAgentBridge?.sendEvent(transientEvent),
+      shouldSyncAgentActivitySnapshot(transientEvent)
+        ? syncCatalog("running")
+        : Promise.resolve(),
     ]);
   };
   const agentEventQueue = createSerialAgentEventQueue(sendAgentEvent);
@@ -352,7 +457,10 @@ export async function runCodexAppServerSession(rawArgs) {
     onResult: async (result) => {
       await Promise.all([
         send("agent.interaction.result", result),
-        localAgentBridge?.sendEvent({ type: "agent.interaction.result", ...result }),
+        localAgentBridge?.sendEvent({
+          type: "agent.interaction.result",
+          ...result,
+        }),
         report("agent.event", {
           event: {
             type: `agent.interaction.${result.status}`,
@@ -363,188 +471,253 @@ export async function runCodexAppServerSession(rawArgs) {
       ]);
     },
   });
-  const reportMode = (requestId = null) => sendAgentEvent({
-    type: "agent.mode.status",
-    provider: "codex",
-    runtime: "codex-app-server",
-    mode: currentMode,
-    modeControl: "supported",
-    availableModes: CODEX_MODES,
-    requestId,
-  });
-  const reportAutonomy = (requestId = null) => sendAgentEvent(buildAutonomyStatusEvent({
-    provider: "codex",
-    runtime: "codex-app-server",
-    profile: autonomyProfile,
-    allowedScopes: autonomyAllowedScopes,
-    requestId,
-  }));
-  const reportDetail = () => sendAgentEvent({
-    type: "agent.detail.status",
-    provider: "codex",
-    detailProfile: detail.profile,
-    detailSource: detail.source,
-    detailControl: "read_only",
-    availableDetailProfiles: AGENT_DETAIL_PROFILES,
-  });
-
-  const requestRemoteInteraction = (request) => resolveWithAutonomy({
-    request,
-    profile: autonomyProfile,
-    allowedScopes: autonomyAllowedScopes,
-    workspaceRoot: cwd,
-    aiReviewer: aiApprovalReviewer,
-    runtime: "codex-app-server",
-    requestInteraction: (item) => interactions.request(item),
-    onAutoResolved: ({ request: item, resolved }) => sendAgentEvent({
-      type: "agent.interaction.auto_resolved",
+  const reportMode = (requestId = null) =>
+    sendAgentEvent({
+      type: "agent.mode.status",
       provider: "codex",
-      interactionId: item.interactionId,
-      kind: item.kind,
-      title: item.title,
-      autonomyProfile,
-      autonomyScope: resolved.scope,
-      reason: resolved.reason,
-      decisionSource: resolved.decisionSource || "autonomy_policy",
-      aiReview: resolved.aiReview || null,
-      decision: resolved.action,
-    }),
-  });
+      runtime: "codex-app-server",
+      mode: currentMode,
+      modeControl: "supported",
+      availableModes: CODEX_MODES,
+      requestId,
+    });
+  const reportAutonomy = (requestId = null) =>
+    sendAgentEvent(
+      buildAutonomyStatusEvent({
+        provider: "codex",
+        runtime: "codex-app-server",
+        profile: autonomyProfile,
+        allowedScopes: autonomyAllowedScopes,
+        requestId,
+      }),
+    );
+  const reportDetail = () =>
+    sendAgentEvent({
+      type: "agent.detail.status",
+      provider: "codex",
+      detailProfile: detail.profile,
+      detailSource: detail.source,
+      detailControl: "read_only",
+      availableDetailProfiles: AGENT_DETAIL_PROFILES,
+    });
 
-  const markInteractionApplied = (resolved) => resolved.autoResolved
-    ? Promise.resolve()
-    : interactions.markResult(
-        resolved.interactionId,
-        "applied",
-        { responseId: resolved.responseId },
-      );
+  const requestRemoteInteraction = (request) =>
+    resolveWithAutonomy({
+      request,
+      profile: autonomyProfile,
+      allowedScopes: autonomyAllowedScopes,
+      workspaceRoot: cwd,
+      aiReviewer: aiApprovalReviewer,
+      runtime: "codex-app-server",
+      requestInteraction: (item) => interactions.request(item),
+      onAutoResolved: ({ request: item, resolved }) =>
+        sendAgentEvent({
+          type: "agent.interaction.auto_resolved",
+          provider: "codex",
+          interactionId: item.interactionId,
+          kind: item.kind,
+          title: item.title,
+          autonomyProfile,
+          autonomyScope: resolved.scope,
+          reason: resolved.reason,
+          decisionSource: resolved.decisionSource || "autonomy_policy",
+          aiReview: resolved.aiReview || null,
+          decision: resolved.action,
+        }),
+    });
+
+  const markInteractionApplied = (resolved) =>
+    resolved.autoResolved
+      ? Promise.resolve()
+      : interactions.markResult(resolved.interactionId, "applied", {
+          responseId: resolved.responseId,
+        });
 
   client.onServerRequest(async ({ id, method, params }) => {
     const interactionId = requestInteractionId(method, params, id);
     if (method === "item/tool/requestUserInput") {
       let resolved;
       try {
-        resolved = await requestRemoteInteraction(buildInteractionRequest({
-          provider: "codex",
-          runtime: "codex-app-server",
-          sessionId,
-          interactionId,
-          source: INTERACTION_SOURCES.APP_SERVER,
-          kind: INTERACTION_KINDS.QUESTIONS,
-          title: "Codex needs input",
-          prompt: "Answer the questions to continue.",
-          payload: codexQuestions(params),
-          containsSecret: (params.questions || []).some((question) => question?.isSecret),
-          expiresAt: params.autoResolutionMs
-            ? Math.ceil((Date.now() + params.autoResolutionMs) / 1000)
-            : null,
-        }));
+        resolved = await requestRemoteInteraction(
+          buildInteractionRequest({
+            provider: "codex",
+            runtime: "codex-app-server",
+            sessionId,
+            interactionId,
+            source: INTERACTION_SOURCES.APP_SERVER,
+            kind: INTERACTION_KINDS.QUESTIONS,
+            title: "Codex needs input",
+            prompt: "Answer the questions to continue.",
+            payload: codexQuestions(params),
+            containsSecret: (params.questions || []).some(
+              (question) => question?.isSecret,
+            ),
+            expiresAt: params.autoResolutionMs
+              ? Math.ceil((Date.now() + params.autoResolutionMs) / 1000)
+              : null,
+          }),
+        );
       } catch {
         return { answers: {} };
       }
       await markInteractionApplied(resolved);
-      if (resolved.action !== "submit" && resolved.action !== "allow") return { answers: {} };
+      if (resolved.action !== "submit" && resolved.action !== "allow")
+        return { answers: {} };
       return codexQuestionResponse(params, resolved.response);
     }
 
     if (method === "mcpServer/elicitation/request") {
       const isUrl = params.mode === "url";
-      const resolved = await requestRemoteInteraction(buildInteractionRequest({
-        provider: "codex",
-        runtime: "codex-app-server",
-        sessionId,
-        interactionId,
-        source: INTERACTION_SOURCES.APP_SERVER,
-        kind: isUrl ? INTERACTION_KINDS.URL : INTERACTION_KINDS.FORM,
-        title: params.serverName || "MCP request",
-        prompt: params.message || "The MCP server needs input.",
-        payload: isUrl
-          ? { url: params.url || "", server_name: params.serverName || "" }
-          : { schema: params.requestedSchema || {}, server_name: params.serverName || "" },
-        containsSecret: containsSecretSchema(params.requestedSchema),
-      }));
+      const resolved = await requestRemoteInteraction(
+        buildInteractionRequest({
+          provider: "codex",
+          runtime: "codex-app-server",
+          sessionId,
+          interactionId,
+          source: INTERACTION_SOURCES.APP_SERVER,
+          kind: isUrl ? INTERACTION_KINDS.URL : INTERACTION_KINDS.FORM,
+          title: params.serverName || "MCP request",
+          prompt: params.message || "The MCP server needs input.",
+          payload: isUrl
+            ? { url: params.url || "", server_name: params.serverName || "" }
+            : {
+                schema: params.requestedSchema || {},
+                server_name: params.serverName || "",
+              },
+          containsSecret: containsSecretSchema(params.requestedSchema),
+        }),
+      );
       await markInteractionApplied(resolved);
       if (resolved.action === "submit" || resolved.action === "allow") {
-        return { action: "accept", content: resolved.response?.values || resolved.response || {}, _meta: null };
+        return {
+          action: "accept",
+          content: resolved.response?.values || resolved.response || {},
+          _meta: null,
+        };
       }
-      return { action: resolved.action === "cancel" ? "cancel" : "decline", content: null, _meta: null };
+      return {
+        action: resolved.action === "cancel" ? "cancel" : "decline",
+        content: null,
+        _meta: null,
+      };
     }
 
-    if ([
-      "item/commandExecution/requestApproval",
-      "item/fileChange/requestApproval",
-      "execCommandApproval",
-      "applyPatchApproval",
-    ].includes(method)) {
-      const tool = method.includes("fileChange") || method.includes("Patch") ? "file_change" : "command";
-      const commandPresentation = tool === "command" && !method.startsWith("execCommand")
-        ? codexCommandApprovalPresentation(params)
-        : { remember_allowed: true };
-      const resolved = await requestRemoteInteraction(buildInteractionRequest({
-        provider: "codex",
-        runtime: "codex-app-server",
-        sessionId,
-        interactionId,
-        source: INTERACTION_SOURCES.APP_SERVER,
-        kind: INTERACTION_KINDS.PERMISSION,
-        title: tool === "command" ? "Run this command?" : "Apply these file changes?",
-        prompt: params.reason || "Review this action before continuing.",
-        payload: {
-          tool,
-          command: typeof params.command === "string" ? params.command.slice(0, 2048) : "",
-          cwd: String(params.cwd || "").slice(0, 1024),
-          file_changes: tool === "file_change"
-            ? displaySafeToolInput(params.fileChanges || params.changes || {}, { maxEncodedLength: 32_768 })
-            : undefined,
-          additional_permissions: tool === "command"
-            ? displaySafeToolInput(params.additionalPermissions || {})
-            : undefined,
-          network_approval_context: tool === "command"
-            ? displaySafeToolInput(params.networkApprovalContext || {})
-            : undefined,
-          ...commandPresentation,
-        },
-        containsSecret: toolInputContainsSecret(params),
-      }));
+    if (
+      [
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "execCommandApproval",
+        "applyPatchApproval",
+      ].includes(method)
+    ) {
+      const tool =
+        method.includes("fileChange") || method.includes("Patch")
+          ? "file_change"
+          : "command";
+      const commandPresentation =
+        tool === "command" && !method.startsWith("execCommand")
+          ? codexCommandApprovalPresentation(params)
+          : { remember_allowed: true };
+      const resolved = await requestRemoteInteraction(
+        buildInteractionRequest({
+          provider: "codex",
+          runtime: "codex-app-server",
+          sessionId,
+          interactionId,
+          source: INTERACTION_SOURCES.APP_SERVER,
+          kind: INTERACTION_KINDS.PERMISSION,
+          title:
+            tool === "command"
+              ? "Run this command?"
+              : "Apply these file changes?",
+          prompt: params.reason || "Review this action before continuing.",
+          payload: {
+            tool,
+            command:
+              typeof params.command === "string"
+                ? params.command.slice(0, 2048)
+                : "",
+            cwd: String(params.cwd || "").slice(0, 1024),
+            file_changes:
+              tool === "file_change"
+                ? displaySafeToolInput(
+                    params.fileChanges || params.changes || {},
+                    { maxEncodedLength: 32_768 },
+                  )
+                : undefined,
+            additional_permissions:
+              tool === "command"
+                ? displaySafeToolInput(params.additionalPermissions || {})
+                : undefined,
+            network_approval_context:
+              tool === "command"
+                ? displaySafeToolInput(params.networkApprovalContext || {})
+                : undefined,
+            ...commandPresentation,
+          },
+          containsSecret: toolInputContainsSecret(params),
+        }),
+      );
       await markInteractionApplied(resolved);
-      const legacy = method === "execCommandApproval" || method === "applyPatchApproval";
-      let decision = tool === "command" && !legacy
-        ? codexCommandApprovalDecision(params, resolved)
-        : decisionFor(resolved.action, Boolean(resolved.response?.remember_for_session));
+      const legacy =
+        method === "execCommandApproval" || method === "applyPatchApproval";
+      let decision =
+        tool === "command" && !legacy
+          ? codexCommandApprovalDecision(params, resolved)
+          : decisionFor(
+              resolved.action,
+              Boolean(resolved.response?.remember_for_session),
+            );
       if (legacy) {
-        decision = ({ accept: "approved", acceptForSession: "approved_for_session", decline: "denied", cancel: "abort" })[decision];
+        decision = {
+          accept: "approved",
+          acceptForSession: "approved_for_session",
+          decline: "denied",
+          cancel: "abort",
+        }[decision];
       }
       return { decision };
     }
 
     if (method === "item/permissions/requestApproval") {
-      const resolved = await requestRemoteInteraction(buildInteractionRequest({
-        provider: "codex",
-        runtime: "codex-app-server",
-        sessionId,
-        interactionId,
-        source: INTERACTION_SOURCES.APP_SERVER,
-        kind: INTERACTION_KINDS.PERMISSION,
-        title: "Grant additional permissions?",
-        prompt: params.reason || "Codex requested additional sandbox permissions.",
-        payload: {
-          tool: "permissions",
-          cwd: String(params.cwd || "").slice(0, 1024),
-          requested: displaySafeToolInput(params.permissions || {}),
-          remember_allowed: true,
-        },
-        containsSecret: toolInputContainsSecret(params.permissions),
-      }));
+      const resolved = await requestRemoteInteraction(
+        buildInteractionRequest({
+          provider: "codex",
+          runtime: "codex-app-server",
+          sessionId,
+          interactionId,
+          source: INTERACTION_SOURCES.APP_SERVER,
+          kind: INTERACTION_KINDS.PERMISSION,
+          title: "Grant additional permissions?",
+          prompt:
+            params.reason || "Codex requested additional sandbox permissions.",
+          payload: {
+            tool: "permissions",
+            cwd: String(params.cwd || "").slice(0, 1024),
+            requested: displaySafeToolInput(params.permissions || {}),
+            remember_allowed: true,
+          },
+          containsSecret: toolInputContainsSecret(params.permissions),
+        }),
+      );
       await markInteractionApplied(resolved);
-      const allowed = resolved.action === "allow" || resolved.action === "submit";
+      const allowed =
+        resolved.action === "allow" || resolved.action === "submit";
       return {
         permissions: allowed
           ? {
-              ...(params.permissions?.network ? { network: params.permissions.network } : {}),
-              ...(params.permissions?.fileSystem ? { fileSystem: params.permissions.fileSystem } : {}),
+              ...(params.permissions?.network
+                ? { network: params.permissions.network }
+                : {}),
+              ...(params.permissions?.fileSystem
+                ? { fileSystem: params.permissions.fileSystem }
+                : {}),
             }
           : {},
-        scope: allowed && resolved.response?.remember_for_session ? "session" : "turn",
+        scope:
+          allowed && resolved.response?.remember_for_session
+            ? "session"
+            : "turn",
       };
     }
 
@@ -555,8 +728,10 @@ export async function runCodexAppServerSession(rawArgs) {
     // The app-server transport is initialized before the managed thread and
     // OriginRouter session exist. Emit one ready event only after thread/start.
     if (rawEvent.type === "codex.initialized") return;
-    if (rawEvent.type === "task_started") currentTurnId = rawEvent.turn_id || currentTurnId;
-    if (rawEvent.type === "task_complete" || rawEvent.type === "turn_aborted") currentTurnId = null;
+    if (rawEvent.type === "task_started")
+      currentTurnId = rawEvent.turn_id || currentTurnId;
+    if (rawEvent.type === "task_complete" || rawEvent.type === "turn_aborted")
+      currentTurnId = null;
     for (const event of mapCodexAppServerEvent(rawEvent)) {
       void agentEventQueue.enqueue(event);
     }
@@ -584,7 +759,11 @@ export async function runCodexAppServerSession(rawArgs) {
       input: textInput(text),
       collaborationMode: {
         mode: currentMode,
-        settings: { model, reasoning_effort: null, developer_instructions: null },
+        settings: {
+          model,
+          reasoning_effort: null,
+          developer_instructions: null,
+        },
       },
     });
     currentTurnId = result?.turn?.id || currentTurnId;
@@ -597,9 +776,12 @@ export async function runCodexAppServerSession(rawArgs) {
     stopHeartbeat();
     await agentEventQueue.drain();
     await interactions.cancelAll("session_stopped");
-    await localAgentBridge?.close(signal ? "stopped" : code === 0 ? "completed" : "failed");
+    await localAgentBridge?.close(
+      signal ? "stopped" : code === 0 ? "completed" : "failed",
+    );
     localAgentBridge = null;
-    if (currentTurnId && threadId) await client.interruptTurn(threadId, currentTurnId).catch(() => {});
+    if (currentTurnId && threadId)
+      await client.interruptTurn(threadId, currentTurnId).catch(() => {});
     client.disconnect();
     await remoteCodingProxyManager?.stop().catch(() => {});
     await originrouterCodingProxy?.stop().catch(() => {});
@@ -622,7 +804,9 @@ export async function runCodexAppServerSession(rawArgs) {
   const handleRemoteEvent = async (payload) => {
     if (!payload) return false;
     if (payload.type === "agent.interactions.snapshot.request") {
-      const sessionIds = Array.isArray(payload.sessionIds) ? payload.sessionIds : [];
+      const sessionIds = Array.isArray(payload.sessionIds)
+        ? payload.sessionIds
+        : [];
       if (!sessionIds.includes(sessionId)) return false;
       await send("agent.interactions.snapshot", {
         requestId: payload.requestId,
@@ -677,12 +861,17 @@ export async function runCodexAppServerSession(rawArgs) {
     }
     if (payload.type === "agent.mode.set") {
       const mode = String(payload.mode || "");
-      if (!CODEX_MODES.some((item) => item.id === mode) || !threadId) return false;
+      if (!CODEX_MODES.some((item) => item.id === mode) || !threadId)
+        return false;
       await client.updateThreadSettings({
         threadId,
         collaborationMode: {
           mode,
-          settings: { model, reasoning_effort: null, developer_instructions: null },
+          settings: {
+            model,
+            reasoning_effort: null,
+            developer_instructions: null,
+          },
         },
       });
       currentMode = mode;
@@ -693,9 +882,12 @@ export async function runCodexAppServerSession(rawArgs) {
       const requested = normalizeAutonomyProfile(payload.profile, "");
       if (!requested) return false;
       autonomyProfile = requested;
-      autonomyAllowedScopes = requested === "custom"
-        ? normalizeAutonomyScopes(payload.allowedScopes || payload.allowed_scopes)
-        : [];
+      autonomyAllowedScopes =
+        requested === "custom"
+          ? normalizeAutonomyScopes(
+              payload.allowedScopes || payload.allowed_scopes,
+            )
+          : [];
       await reportAutonomy(payload.requestId || null);
       return true;
     }
@@ -712,19 +904,31 @@ export async function runCodexAppServerSession(rawArgs) {
 
   const eventLoop = async () => {
     while (!stopped) {
+      if (relayViaDaemon) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        continue;
+      }
+      if (!relayClient) {
+        relayPlan = await buildAgentRelayPlan({
+          stateDir,
+          relayUrl,
+          fallbackDeviceId: device.deviceId,
+          mode: relayMode,
+        });
+        if (!relayPlan.enabled) {
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          continue;
+        }
+        relayClient = new RelayClient(relayPlan);
+        effectiveDeviceId = relayPlan.deviceId || effectiveDeviceId;
+      }
       try {
-        await relayClient.connectEvents((payload) => void handleRemoteEvent(payload));
+        await relayClient.connectEvents((payload) => {
+          if (!relayViaDaemon) void handleRemoteEvent(payload);
+        });
       } catch {
         if (stopped) break;
-        try {
-          const refreshed = await buildRelayClientOptions({
-            stateDir,
-            relayUrl,
-            fallbackDeviceId: device.deviceId,
-          });
-          relayClient.deviceId = refreshed.deviceId;
-          relayClient.setAuthToken(refreshed.authToken);
-        } catch {}
+        relayClient = null;
         await new Promise((resolve) => setTimeout(resolve, 1500));
       }
     }
@@ -754,7 +958,8 @@ export async function runCodexAppServerSession(rawArgs) {
       ? await client.resumeThread(options.resume, threadOptions)
       : await client.startThread({ ...threadOptions, ephemeral: false });
     threadId = thread?.thread?.id;
-    if (!threadId) throw new Error("Codex app-server did not return a thread id.");
+    if (!threadId)
+      throw new Error("Codex app-server did not return a thread id.");
     await refreshTranscriptPath();
 
     await send("session.started", {
@@ -766,10 +971,16 @@ export async function runCodexAppServerSession(rawArgs) {
       executor: "app-server",
       startedBy: options.resume ? "app-resume" : "local-app-server",
     });
-    await report("session.started", { runtime: "codex-app-server", executor: "app-server" });
+    await report("session.started", {
+      runtime: "codex-app-server",
+      executor: "app-server",
+    });
     localAgentBridge = new LocalAgentBridgeClient({
       stateDir,
       sessionId,
+      onConnectionChange: (connected) => {
+        relayViaDaemon = connected;
+      },
       onCommand: async (payload) => {
         const applied = await handleRemoteEvent(payload);
         if (payload?.type === "agent.message") {
@@ -782,13 +993,13 @@ export async function runCodexAppServerSession(rawArgs) {
         return applied;
       },
     });
-    await localAgentBridge.start({
+    relayViaDaemon = await localAgentBridge.start({
       sessionId,
       conversationId: options.conversationId || sessionId,
       runId: options.runId || sessionId,
       agent: "codex",
       title: sessionTitle,
-      deviceId: relayOptions.deviceId,
+      deviceId: effectiveDeviceId,
       deviceName: device.host,
       cwd,
       workspaceTrusted: true,
@@ -814,7 +1025,7 @@ export async function runCodexAppServerSession(rawArgs) {
     await syncCatalog("running");
     appendSessionStart({
       sessionId,
-      deviceId: relayOptions.deviceId,
+      deviceId: effectiveDeviceId,
       agent: "codex",
       command: "codex app-server",
       args: rawArgs,
@@ -835,7 +1046,10 @@ export async function runCodexAppServerSession(rawArgs) {
     if (options.initialMessage) await sendMessage(options.initialMessage);
 
     for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
-      const handler = () => void stopSession(signal).finally(() => process.exit(signal === "SIGINT" ? 130 : 0));
+      const handler = () =>
+        void stopSession(signal).finally(() =>
+          process.exit(signal === "SIGINT" ? 130 : 0),
+        );
       signalHandlers.set(signal, handler);
       process.on(signal, handler);
     }
@@ -858,7 +1072,8 @@ export async function runCodexAppServerSession(rawArgs) {
     throw error;
   } finally {
     await originrouterCodingProxy?.stop().catch(() => {});
-    for (const [signal, handler] of signalHandlers) process.off(signal, handler);
-    relayClient._aborted = true;
+    for (const [signal, handler] of signalHandlers)
+      process.off(signal, handler);
+    if (relayClient) relayClient._aborted = true;
   }
 }

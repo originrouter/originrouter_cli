@@ -1,20 +1,45 @@
 import process from "node:process";
 import { randomUUID } from "node:crypto";
+import { basename } from "node:path";
 import {
   startAgentSessionHeartbeat,
   createRuntimeEventReporter,
   createTerminalActivityReporter,
+  reportAgentConversationMetadata,
+  shouldSyncAgentActivitySnapshot,
   startApprovalDecisionPolling,
+  updateAgentActivitySnapshot,
 } from "../agent/bridgeReporter.js";
 import { createAdapter } from "../adapters/createAdapter.js";
-import { buildAgentProviderEnv, willRouteRemoteCoding } from "../config/claudeConfig.js";
+import {
+  buildAgentProviderEnv,
+  remoteCodingRouteTarget,
+  willRouteRemoteCoding,
+} from "../config/claudeConfig.js";
 import { DEFAULT_DEVICE_ID, DEFAULT_RELAY_URL } from "../constants.js";
 import { createExecutor } from "../executors/createExecutor.js";
-import { appendSessionStart, patchSessionExit } from "../persistence/sessionLog.js";
-import { ensureDevice, ensureStateDir, readConfig } from "../persistence/state.js";
+import {
+  appendSessionStart,
+  patchSessionExit,
+} from "../persistence/sessionLog.js";
+import {
+  ensureDevice,
+  ensureStateDir,
+  readConfig,
+  readLocalApiConfig,
+} from "../persistence/state.js";
 import { RemoteCodingProxyManager } from "../proxy/remoteCodingProxyManager.js";
-import { readLocalProxySnapshot, NOOP_REMOTE_CODING_SNAPSHOT, snapshotRemoteCodingStatus, staticProxyStatusFn } from "../proxy/snapshot.js";
-import { buildRelayClientOptions } from "../relay/relayAuthBootstrap.js";
+import {
+  readLocalProxySnapshot,
+  NOOP_REMOTE_CODING_SNAPSHOT,
+  snapshotRemoteCodingStatus,
+  staticProxyStatusFn,
+} from "../proxy/snapshot.js";
+import {
+  buildAgentRelayPlan,
+  normalizeAgentRelayMode,
+  relayModeDescription,
+} from "../relay/agentRelayPolicy.js";
 import { RelayClient } from "../relay/relayClient.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 import { PendingInteractionRegistry } from "../runtime/pendingInteractionRegistry.js";
@@ -26,7 +51,10 @@ import {
   normalizeAutonomyScopes,
 } from "../runtime/agentAutonomyPolicy.js";
 import { protectOriginrouterCodingEnv } from "../runtime/originrouterCodingAuthProxy.js";
-import { displaySafeToolInput, toolInputContainsSecret } from "../runtime/displaySafeToolInput.js";
+import {
+  displaySafeToolInput,
+  toolInputContainsSecret,
+} from "../runtime/displaySafeToolInput.js";
 import {
   AGENT_DETAIL_PROFILES,
   resolveAgentDetailProfile,
@@ -118,7 +146,10 @@ export function handleRemoteEvent(payload, ctx) {
       ctx.executor.write(payload.data);
     }
   }
-  if (payload.type === "agent.autonomy.set" && typeof ctx.applyAutonomy === "function") {
+  if (
+    payload.type === "agent.autonomy.set" &&
+    typeof ctx.applyAutonomy === "function"
+  ) {
     return ctx.applyAutonomy(payload);
   }
   if (payload.type === "session.stop") {
@@ -152,13 +183,10 @@ function permissionDecision(resolved) {
 function normalizePtyInteraction(event, sessionId) {
   const createdAt = Number(event?.createdAt || Date.now());
   const tool = String(event?.tool || event?.kind || "permission").slice(0, 64);
-  const rawToolInput = event?.input && typeof event.input === "object" ? event.input : {};
+  const rawToolInput =
+    event?.input && typeof event.input === "object" ? event.input : {};
   const toolInput = displaySafeToolInput(rawToolInput);
-  const {
-    input: _rawInput,
-    raw: _rawEvent,
-    ...displaySafeEvent
-  } = event || {};
+  const { input: _rawInput, raw: _rawEvent, ...displaySafeEvent } = event || {};
   return {
     ...displaySafeEvent,
     sessionId,
@@ -168,17 +196,23 @@ function normalizePtyInteraction(event, sessionId) {
       tool,
       display_name: tool,
       tool_input: toolInput,
-      command: typeof toolInput.command === "string"
-        ? toolInput.command.slice(0, 8192)
-        : "",
-      cwd: typeof toolInput.cwd === "string" ? toolInput.cwd.slice(0, 1024) : "",
-      remember_allowed: Array.isArray(event?.permissionSuggestions)
-        && event.permissionSuggestions.length > 0,
+      command:
+        typeof toolInput.command === "string"
+          ? toolInput.command.slice(0, 8192)
+          : "",
+      cwd:
+        typeof toolInput.cwd === "string" ? toolInput.cwd.slice(0, 1024) : "",
+      remember_allowed:
+        Array.isArray(event?.permissionSuggestions) &&
+        event.permissionSuggestions.length > 0,
     },
-    containsSecret: Boolean(event?.containsSecret || toolInputContainsSecret(rawToolInput)),
-    createdAt: createdAt > 10_000_000_000
-      ? Math.floor(createdAt / 1000)
-      : Math.floor(createdAt),
+    containsSecret: Boolean(
+      event?.containsSecret || toolInputContainsSecret(rawToolInput),
+    ),
+    createdAt:
+      createdAt > 10_000_000_000
+        ? Math.floor(createdAt / 1000)
+        : Math.floor(createdAt),
   };
 }
 
@@ -190,6 +224,11 @@ export function extractOriginRouterOptions(args) {
     const arg = args[index];
     if (arg === "--originrouter-relay") {
       options.relay = args[index + 1];
+      index += 1;
+      continue;
+    }
+    if (arg === "--originrouter-relay-mode") {
+      options.relayMode = args[index + 1];
       index += 1;
       continue;
     }
@@ -256,8 +295,8 @@ export function extractOriginRouterOptions(args) {
       continue;
     }
     if (
-      arg === "--originrouter-native-config"
-      || arg === "--originrouter-native"
+      arg === "--originrouter-native-config" ||
+      arg === "--originrouter-native"
     ) {
       options.nativeConfig = true;
       continue;
@@ -276,29 +315,41 @@ export async function runLocalAgentSession(agent, rawArgs) {
   const stateDir = ensureStateDir();
 
   const { options, passthrough } = extractOriginRouterOptions(rawArgs);
-  const relayUrl = options.relay || process.env.ORIGINROUTER_RELAY || DEFAULT_RELAY_URL;
-  const device = ensureDevice(options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID);
+  const relayConfig = readLocalApiConfig();
+  const relayUrl =
+    options.relay ||
+    process.env.ORIGINROUTER_RELAY ||
+    relayConfig.relayUrl ||
+    DEFAULT_RELAY_URL;
+  const relayMode = normalizeAgentRelayMode(
+    options.relayMode || relayConfig.relayMode,
+    relayUrl,
+  );
+  const device = ensureDevice(
+    options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID,
+  );
   const sessionId = options.session || `${agent}-${Date.now()}`;
+  const conversationId = options.conversationId || sessionId;
+  const sessionStartedAt = new Date().toISOString();
   const cwd = process.cwd();
-  // Stage 9.5 — when ORIGINROUTER_RELAY_AUTH=on, acquire a Surety token
-  // and use the effective deviceId (from coding-key.json) for the relay.
-  let relayClient;
-  let effectiveDeviceId;
-  try {
-    const relayOptions = await buildRelayClientOptions({
-      stateDir,
-      relayUrl,
-      fallbackDeviceId: device.deviceId,
-    });
-    relayClient = new RelayClient(relayOptions);
-    effectiveDeviceId = relayOptions.deviceId;
-  } catch (err) {
-    console.error(`[local-session] relay auth bootstrap failed: code=${err?.code || "unknown"}`);
-    throw err;
+  let relayPlan = await buildAgentRelayPlan({
+    stateDir,
+    relayUrl,
+    fallbackDeviceId: device.deviceId,
+    mode: relayMode,
+  });
+  let relayClient = relayPlan.enabled ? new RelayClient(relayPlan) : null;
+  let effectiveDeviceId = relayPlan.deviceId || device.deviceId;
+  if (!relayPlan.enabled) {
+    process.stderr.write(
+      `[originrouter] ${relayModeDescription(relayPlan)}; local and LAN control remain available.\n`,
+    );
   }
   const useNativeConfig = options.nativeConfig === true;
   if (useNativeConfig && options.provider) {
-    throw new Error("--provider cannot be combined with --originrouter-native-config");
+    throw new Error(
+      "--provider cannot be combined with --originrouter-native-config",
+    );
   }
   const adapter = createAdapter({
     agent,
@@ -329,13 +380,16 @@ export async function runLocalAgentSession(agent, rawArgs) {
       stateDir,
       relayUrl,
       deviceId: effectiveDeviceId,
+      targetDeviceId: remoteCodingRouteTarget(localConfig, agent),
     });
     const startResult = await remoteCodingProxyManager.start();
     if (!startResult.ok) {
-      throw new Error(`Failed to start remote-coding relay proxy: ${startResult.error}`);
+      throw new Error(
+        `Failed to start remote-coding relay proxy: ${startResult.error}`,
+      );
     }
     remoteCodingStatus = staticProxyStatusFn(
-      await snapshotRemoteCodingStatus(remoteCodingProxyManager)
+      await snapshotRemoteCodingStatus(remoteCodingProxyManager),
     );
   }
 
@@ -352,11 +406,8 @@ export async function runLocalAgentSession(agent, rawArgs) {
       });
   let originrouterCodingProxy = null;
   if (!useNativeConfig) {
-    ({ providerResult, proxy: originrouterCodingProxy } = await protectOriginrouterCodingEnv(
-      agent,
-      providerResult,
-      { stateDir },
-    ));
+    ({ providerResult, proxy: originrouterCodingProxy } =
+      await protectOriginrouterCodingEnv(agent, providerResult, { stateDir }));
   }
   const providerEnv = providerResult.env;
   const resolvedProvider = providerResult.provider;
@@ -370,42 +421,57 @@ export async function runLocalAgentSession(agent, rawArgs) {
   let stopApprovalPolling = () => {};
   let stopSessionHeartbeat = () => {};
   let localAgentBridge = null;
+  let relayViaDaemon = false;
   const autonomySupported = agent === "claude";
   const invalidScopes = invalidAutonomyScopes(options.autonomyAllowedScopes);
   if (invalidScopes.length) {
     throw new Error(`Unknown unattended scope(s): ${invalidScopes.join(", ")}`);
   }
-  if (options.autonomyProfile && !normalizeAutonomyProfile(options.autonomyProfile, "")) {
+  if (
+    options.autonomyProfile &&
+    !normalizeAutonomyProfile(options.autonomyProfile, "")
+  ) {
     throw new Error(`Unknown unattended profile: ${options.autonomyProfile}`);
   }
-  if (options.autonomyAllowedScopes?.length && options.autonomyProfile && options.autonomyProfile !== "custom") {
-    throw new Error("--originrouter-auto-allow requires --originrouter-autonomy custom or no explicit profile");
+  if (
+    options.autonomyAllowedScopes?.length &&
+    options.autonomyProfile &&
+    options.autonomyProfile !== "custom"
+  ) {
+    throw new Error(
+      "--originrouter-auto-allow requires --originrouter-autonomy custom or no explicit profile",
+    );
   }
   let autonomyAllowedScopes = autonomySupported
     ? normalizeAutonomyScopes(options.autonomyAllowedScopes)
     : [];
   let autonomyProfile = autonomySupported
     ? normalizeAutonomyProfile(
-        options.autonomyProfile || (autonomyAllowedScopes.length ? "custom" : "manual"),
+        options.autonomyProfile ||
+          (autonomyAllowedScopes.length ? "custom" : "manual"),
       )
     : "manual";
   if (
-    !autonomySupported
-    && (options.autonomyProfile || (options.autonomyAllowedScopes || []).length)
+    !autonomySupported &&
+    (options.autonomyProfile || (options.autonomyAllowedScopes || []).length)
   ) {
     process.stderr.write(
-      "warning: native Codex cannot expose structured approval requests; "
-      + "unattended settings are ignored. Use `originrouter codex-terminal`.\n",
+      "warning: native Codex cannot expose structured approval requests; " +
+        "unattended settings are ignored. Use `originrouter codex-terminal`.\n",
     );
   }
   const signalHandlers = new Map();
 
   const send = (type, extra = {}) => {
-    return relayClient.send(type, {
-      sessionId,
-      localStarted: true,
-      ...extra,
-    }).catch(() => {});
+    if (relayViaDaemon || !relayClient)
+      return Promise.resolve({ accepted: false, localOnly: true });
+    return relayClient
+      .send(type, {
+        sessionId,
+        localStarted: true,
+        ...extra,
+      })
+      .catch(() => {});
   };
   const runtimeReporter = createRuntimeEventReporter({
     sessionId,
@@ -415,28 +481,55 @@ export async function runLocalAgentSession(agent, rawArgs) {
     stateDir: ensureStateDir(),
   });
   const report = (type, extra = {}) => {
-    if (type !== "session.started" && type !== "session.exited" && type !== "session.error" && type !== "agent.event") {
+    if (
+      type !== "session.started" &&
+      type !== "session.exited" &&
+      type !== "session.error" &&
+      type !== "agent.event"
+    ) {
       return Promise.resolve();
     }
     return runtimeReporter.report(type, extra);
   };
   const recentEvents = [];
   let controlReady = false;
+  const activitySnapshot = {
+    summary: "",
+    firstPromptPreview: "",
+    lastMessagePreview: "",
+    lastAgentPreview: "",
+  };
+  let activityLastAt = sessionStartedAt;
+  let nativeSessionId = "";
+  let catalogSyncTail = Promise.resolve({ ok: true, skipped: true });
+  let syncCatalog = () => Promise.resolve({ ok: false, skipped: true });
   const sendTransientEvent = async (event) => {
     const transientEvent = {
       ...event,
       eventId: event.eventId || `ate_${randomUUID()}`,
       createdAt: event.createdAt || Math.floor(Date.now() / 1000),
     };
+    if (transientEvent.type === "agent.session_id" && transientEvent.sessionId) {
+      nativeSessionId = String(transientEvent.sessionId).slice(0, 191);
+    }
+    activityLastAt = transientEvent.createdAt || activityLastAt;
+    updateAgentActivitySnapshot(activitySnapshot, transientEvent);
     recentEvents.push(transientEvent);
     if (recentEvents.length > 100) {
       recentEvents.splice(0, recentEvents.length - 100);
     }
-    if (!controlReady) return;
+    const catalogSync = shouldSyncAgentActivitySnapshot(transientEvent)
+      ? syncCatalog("running")
+      : Promise.resolve();
+    if (!controlReady) {
+      await catalogSync;
+      return;
+    }
     await Promise.all([
       send("agent.stream.event", { event: transientEvent }),
       report("agent.event", { event: transientEvent }),
       localAgentBridge?.sendEvent(transientEvent),
+      catalogSync,
     ]);
   };
   const interactions = new PendingInteractionRegistry({
@@ -465,17 +558,18 @@ export async function runLocalAgentSession(agent, rawArgs) {
       ]);
     },
   });
-  const autonomyStatus = (requestId = null) => buildAutonomyStatusEvent({
-    provider: agent,
-    runtime: agent === "claude" ? "claude-pty" : "codex-pty",
-    profile: autonomyProfile,
-    allowedScopes: autonomyAllowedScopes,
-    control: autonomySupported ? "supported" : "unsupported",
-    requestId,
-    reason: autonomySupported
-      ? null
-      : "Native Codex does not expose its blocking approval channel. Use originrouter codex-terminal.",
-  });
+  const autonomyStatus = (requestId = null) =>
+    buildAutonomyStatusEvent({
+      provider: agent,
+      runtime: agent === "claude" ? "claude-pty" : "codex-pty",
+      profile: autonomyProfile,
+      allowedScopes: autonomyAllowedScopes,
+      control: autonomySupported ? "supported" : "unsupported",
+      requestId,
+      reason: autonomySupported
+        ? null
+        : "Native Codex does not expose its blocking approval channel. Use originrouter codex-terminal.",
+    });
   const detailStatus = () => ({
     type: "agent.detail.status",
     provider: agent,
@@ -492,9 +586,12 @@ export async function runLocalAgentSession(agent, rawArgs) {
     const requested = normalizeAutonomyProfile(payload?.profile, "");
     if (!requested) return false;
     autonomyProfile = requested;
-    autonomyAllowedScopes = requested === "custom"
-      ? normalizeAutonomyScopes(payload?.allowedScopes || payload?.allowed_scopes)
-      : [];
+    autonomyAllowedScopes =
+      requested === "custom"
+        ? normalizeAutonomyScopes(
+            payload?.allowedScopes || payload?.allowed_scopes,
+          )
+        : [];
     await sendTransientEvent(autonomyStatus(payload?.requestId || null));
     return true;
   };
@@ -526,33 +623,79 @@ export async function runLocalAgentSession(agent, rawArgs) {
         title: request.title,
         autonomyProfile,
         autonomyScope: automatic.scope,
-        reason: applied === false ? "native_interaction_not_pending" : automatic.reason,
+        reason:
+          applied === false
+            ? "native_interaction_not_pending"
+            : automatic.reason,
         status: applied === false ? "failed" : "applied",
       });
       return;
     }
     registeredInteractions.add(request.interactionId);
-    void interactions.request(request).then(async (resolved) => {
-      const applied = adapter.resolvePermission({
-        callId: resolved.interactionId,
-        interactionId: resolved.interactionId,
-        decision: permissionDecision(resolved),
-        reason: resolved.action,
-        action: resolved.action,
-        response: resolved.response,
+    void interactions
+      .request(request)
+      .then(async (resolved) => {
+        const applied = adapter.resolvePermission({
+          callId: resolved.interactionId,
+          interactionId: resolved.interactionId,
+          decision: permissionDecision(resolved),
+          reason: resolved.action,
+          action: resolved.action,
+          response: resolved.response,
+        });
+        await interactions.markResult(
+          resolved.interactionId,
+          applied === false ? "failed" : "applied",
+          {
+            responseId: resolved.responseId,
+            reason: applied === false ? "native_interaction_not_pending" : "",
+          },
+        );
+        registeredInteractions.delete(resolved.interactionId);
+      })
+      .catch(() => {
+        registeredInteractions.delete(request.interactionId);
       });
-      await interactions.markResult(
-        resolved.interactionId,
-        applied === false ? "failed" : "applied",
-        {
-          responseId: resolved.responseId,
-          reason: applied === false ? "native_interaction_not_pending" : "",
-        },
-      );
-      registeredInteractions.delete(resolved.interactionId);
-    }).catch(() => {
-      registeredInteractions.delete(request.interactionId);
+  };
+  let structuredScanTail = Promise.resolve();
+  const drainStructuredEvents = () => {
+    const pending = structuredScanTail.then(async () => {
+      if (typeof adapter.scanStructuredEvents !== "function") return;
+      for (const event of adapter.scanStructuredEvents()) {
+        let displayEvent = event;
+        if (event.type === "agent.session.start" && event.transcriptPath) {
+          await localAgentBridge?.update({
+            transcriptPath: event.transcriptPath,
+          });
+          const {
+            transcriptPath: _transcriptPath,
+            raw: _raw,
+            ...safeEvent
+          } = event;
+          displayEvent = safeEvent;
+        }
+        if (event.type === "agent.permission.request.detected") continue;
+        if (event.type === "agent.interaction.requested") {
+          registerInteraction(event);
+          continue;
+        }
+        if (event.type === "agent.permission.resolved") {
+          const interactionId = event.callId || event.interactionId;
+          if (interactionId && registeredInteractions.has(interactionId)) {
+            const expired = /timeout|expired/i.test(String(event.reason || ""));
+            await interactions.markResult(
+              interactionId,
+              expired ? "expired" : "canceled",
+              { reason: event.reason || "native_interaction_resolved" },
+            );
+            registeredInteractions.delete(interactionId);
+          }
+        }
+        await sendTransientEvent(displayEvent);
+      }
     });
+    structuredScanTail = pending.catch(() => {});
+    return pending;
   };
   const terminalActivityReporter = createTerminalActivityReporter({
     sessionId,
@@ -560,10 +703,8 @@ export async function runLocalAgentSession(agent, rawArgs) {
     title: `${agent} local session`,
     deviceName: device.host,
     stateDir: ensureStateDir(),
-    reportRuntimeEventFn: (payload) => runtimeReporter.report(
-      "terminal.activity",
-      { summary: payload.summary },
-    ),
+    reportRuntimeEventFn: (payload) =>
+      runtimeReporter.report("terminal.activity", { summary: payload.summary }),
   });
 
   const cleanup = () => {
@@ -608,6 +749,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
       clearTimeout(signalFallbackTimer);
       signalFallbackTimer = null;
     }
+    await drainStructuredEvents().catch(() => {});
     await terminalActivityReporter.flush().catch(() => {});
     await interactions.cancelAll("session_stopped");
     cleanup();
@@ -621,6 +763,10 @@ export async function runLocalAgentSession(agent, rawArgs) {
     }
     send("session.exited", { code, signal });
     await report("session.exited", { code, signal });
+    activityLastAt = exitedAt;
+    await syncCatalog(signal ? "stopped" : code === 0 ? "completed" : "failed")
+      .catch(() => ({ ok: false }));
+    await catalogSyncTail.catch(() => ({ ok: false }));
   };
 
   if (typeof adapter.beforeStart === "function") {
@@ -637,7 +783,11 @@ export async function runLocalAgentSession(agent, rawArgs) {
     sessionId,
     stateDir: ensureStateDir(),
     onDecision: async (payload) => {
-      const applied = handleRemoteEvent(payload, { sessionId, adapter, executor });
+      const applied = handleRemoteEvent(payload, {
+        sessionId,
+        adapter,
+        executor,
+      });
       if (applied !== false) {
         await report("agent.event", {
           event: {
@@ -658,6 +808,30 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // adapter's describe() returns `runtime: "codex-app-server"` when
   // the structured app-server path is active, `null` otherwise.
   const runtime = metadata.runtime ?? null;
+  syncCatalog = (status) => {
+    const snapshot = {
+      conversationId,
+      agentType: agent,
+      nativeSessionId,
+      title: `${agent} session`,
+      status,
+      workspaceId: options.workspaceId,
+      workspaceName: basename(cwd),
+      runtime: runtime || "native-pty",
+      provider: resolvedProvider?.name,
+      model: resolvedProvider?.model,
+      permissionProfile: autonomyProfile,
+      createdAt: sessionStartedAt,
+      lastActivityAt: activityLastAt,
+      ...activitySnapshot,
+    };
+    const pending = catalogSyncTail.then(
+      () => reportAgentConversationMetadata(snapshot, { stateDir }),
+      () => reportAgentConversationMetadata(snapshot, { stateDir }),
+    );
+    catalogSyncTail = pending.catch(() => ({ ok: false }));
+    return pending;
+  };
   const started = await executor.start({
     command: launch.command,
     args: launch.args,
@@ -695,9 +869,10 @@ export async function runLocalAgentSession(agent, rawArgs) {
     // Stage 8.4: top-level runtime field mirrors metadata.runtime so
     // relay/UI consumers that only read top-level fields see it.
     runtime,
-    providerConfig: agent === "claude" && !useNativeConfig
-      ? buildProviderConfigEvent(resolvedProvider, providerSource)
-      : undefined,
+    providerConfig:
+      agent === "claude" && !useNativeConfig
+        ? buildProviderConfigEvent(resolvedProvider, providerSource)
+        : undefined,
     nativeConfig: useNativeConfig,
     executor: started.executor,
     pid: started.pid,
@@ -710,6 +885,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
   localAgentBridge = new LocalAgentBridgeClient({
     stateDir,
     sessionId,
+    onConnectionChange: (connected) => {
+      relayViaDaemon = connected;
+    },
     onCommand: async (payload) => {
       let applied;
       if (payload?.type === "agent.interaction.resolve") {
@@ -733,9 +911,10 @@ export async function runLocalAgentSession(agent, rawArgs) {
             type: "user.text",
             provider: agent,
             text: message,
-            eventId: payload.messageId || payload.commandId
-              ? `local-message-${payload.messageId || payload.commandId}`
-              : undefined,
+            eventId:
+              payload.messageId || payload.commandId
+                ? `local-message-${payload.messageId || payload.commandId}`
+                : undefined,
           });
         }
         await localAgentBridge?.sendEvent({
@@ -747,9 +926,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
       return applied;
     },
   });
-  await localAgentBridge.start({
+  relayViaDaemon = await localAgentBridge.start({
     sessionId,
-    conversationId: options.conversationId || sessionId,
+    conversationId,
     runId: options.runId || sessionId,
     agent,
     title: `${agent} session`,
@@ -758,7 +937,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     cwd,
     workspaceTrusted: true,
     pid: started.pid,
-    startedAt: new Date().toISOString(),
+    startedAt: sessionStartedAt,
     runtime,
     provider: resolvedProvider?.name,
     model: resolvedProvider?.model,
@@ -769,11 +948,13 @@ export async function runLocalAgentSession(agent, rawArgs) {
     allowedAutonomyScopes: autonomyAllowedScopes,
     detailProfile: detail.profile,
     detailSource: detail.source,
-    transcriptPath: typeof adapter.getTranscriptPath === "function"
-      ? adapter.getTranscriptPath()
-      : null,
+    transcriptPath:
+      typeof adapter.getTranscriptPath === "function"
+        ? adapter.getTranscriptPath()
+        : null,
   });
   controlReady = true;
+  void syncCatalog("running");
   stopSessionHeartbeat = startAgentSessionHeartbeat({
     sessionId,
     stateDir: ensureStateDir(),
@@ -784,13 +965,17 @@ export async function runLocalAgentSession(agent, rawArgs) {
     shutdownRequested = true;
     process.exitCode = 1;
     signalFallbackTimer = setTimeout(() => {
-      void finalizeSession({ code: null, signal }).finally(() => process.exit(1));
+      void finalizeSession({ code: null, signal }).finally(() =>
+        process.exit(1),
+      );
     }, 1000);
     try {
       if (signal === "SIGINT") executor.interrupt();
       else executor.stop();
     } catch {
-      void finalizeSession({ code: null, signal }).finally(() => process.exit(1));
+      void finalizeSession({ code: null, signal }).finally(() =>
+        process.exit(1),
+      );
     }
   };
   for (const signal of ["SIGHUP", "SIGTERM", "SIGINT"]) {
@@ -804,7 +989,8 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // explicitly; the runtime tag is the same value session.started
   // already carries. modeControl: "unsupported" — 8.9 supports
   // viewing mode/status only. Remote mode switching is Stage 9.0+.
-  const modeList = agent === "codex" ? CODEX_AVAILABLE_MODES : CLAUDE_AVAILABLE_MODES;
+  const modeList =
+    agent === "codex" ? CODEX_AVAILABLE_MODES : CLAUDE_AVAILABLE_MODES;
   send("agent.event", {
     event: buildModeStatusEvent({
       sessionId,
@@ -821,12 +1007,14 @@ export async function runLocalAgentSession(agent, rawArgs) {
       availableModes: modeList,
     }),
   });
-  void localAgentBridge?.sendEvent(buildModeStatusEvent({
-    sessionId,
-    provider: agent === "codex" ? "codex" : "claude",
-    runtime,
-    availableModes: modeList,
-  }));
+  void localAgentBridge?.sendEvent(
+    buildModeStatusEvent({
+      sessionId,
+      provider: agent === "codex" ? "codex" : "claude",
+      runtime,
+      availableModes: modeList,
+    }),
+  );
   void sendTransientEvent(autonomyStatus());
   void sendTransientEvent(detailStatus());
 
@@ -845,7 +1033,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
       // sessions, null otherwise. Existing schema field.
       runtime,
       startedBy: "local-wrapper",
-      startedAt: new Date().toISOString(),
+      startedAt: sessionStartedAt,
       status: "running",
     });
   } catch (error) {
@@ -854,32 +1042,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
 
   if (typeof adapter.scanStructuredEvents === "function") {
     scanTimer = setInterval(() => {
-      for (const event of adapter.scanStructuredEvents()) {
-        let displayEvent = event;
-        if (event.type === "agent.session.start" && event.transcriptPath) {
-          void localAgentBridge?.update({ transcriptPath: event.transcriptPath });
-          const { transcriptPath: _transcriptPath, raw: _raw, ...safeEvent } = event;
-          displayEvent = safeEvent;
-        }
-        if (event.type === "agent.permission.request.detected") continue;
-        if (event.type === "agent.interaction.requested") {
-          registerInteraction(event);
-          continue;
-        }
-        if (event.type === "agent.permission.resolved") {
-          const interactionId = event.callId || event.interactionId;
-          if (interactionId && registeredInteractions.has(interactionId)) {
-            const expired = /timeout|expired/i.test(String(event.reason || ""));
-            void interactions.markResult(
-              interactionId,
-              expired ? "expired" : "canceled",
-              { reason: event.reason || "native_interaction_resolved" },
-            );
-            registeredInteractions.delete(interactionId);
-          }
-        }
-        void sendTransientEvent(displayEvent);
-      }
+      void drainStructuredEvents();
     }, 1000);
   }
 
@@ -901,12 +1064,13 @@ export async function runLocalAgentSession(agent, rawArgs) {
 
   const handleRemoteEventBound = async (payload) => {
     if (payload?.type === "agent.history.request") {
-      const history = typeof adapter.readConversationHistory === "function"
-        ? adapter.readConversationHistory({
-            beforeCursor: payload.beforeCursor,
-            limit: payload.limit,
-          })
-        : { messages: [], nextCursor: null, hasMore: false };
+      const history =
+        typeof adapter.readConversationHistory === "function"
+          ? adapter.readConversationHistory({
+              beforeCursor: payload.beforeCursor,
+              limit: payload.limit,
+            })
+          : { messages: [], nextCursor: null, hasMore: false };
       await send("agent.history.page", {
         requestId: payload.requestId,
         messages: history.messages,
@@ -918,7 +1082,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
       return true;
     }
     if (payload?.type === "agent.interactions.snapshot.request") {
-      const sessionIds = Array.isArray(payload.sessionIds) ? payload.sessionIds : [];
+      const sessionIds = Array.isArray(payload.sessionIds)
+        ? payload.sessionIds
+        : [];
       if (!sessionIds.includes(sessionId)) return false;
       await send("agent.interactions.snapshot", {
         requestId: payload.requestId,
@@ -956,7 +1122,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
           type: "user.text",
           provider: agent,
           text: message,
-          eventId: payload.messageId ? `local-message-${payload.messageId}` : undefined,
+          eventId: payload.messageId
+            ? `local-message-${payload.messageId}`
+            : undefined,
         });
       }
       await send("agent.message.result", {
@@ -968,23 +1136,32 @@ export async function runLocalAgentSession(agent, rawArgs) {
   };
 
   while (!exited) {
-    try {
-      await relayClient.connectEvents(handleRemoteEventBound);
-    } catch {
-      // Stage 9.5 — re-acquire a fresh token before reconnecting. BOTH
-      // relayClient.deviceId and relayClient.authToken must be updated.
-      try {
-        const relayOptions = await buildRelayClientOptions({
-          stateDir: ensureStateDir(),
-          relayUrl,
-          fallbackDeviceId: device.deviceId,
-        });
-        relayClient.deviceId = relayOptions.deviceId;
-        relayClient.setAuthToken(relayOptions.authToken);
-        effectiveDeviceId = relayOptions.deviceId;
-      } catch (reErr) {
-        console.error(`[local-session] relay auth re-acquire failed: code=${reErr?.code || "unknown"}`);
+    if (relayViaDaemon) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      continue;
+    }
+    if (!relayClient) {
+      relayPlan = await buildAgentRelayPlan({
+        stateDir: ensureStateDir(),
+        relayUrl,
+        fallbackDeviceId: device.deviceId,
+        mode: relayMode,
+      });
+      if (relayPlan.enabled) {
+        relayClient = new RelayClient(relayPlan);
+        effectiveDeviceId = relayPlan.deviceId || effectiveDeviceId;
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        continue;
       }
+    }
+    try {
+      await relayClient.connectEvents((payload) => {
+        if (!relayViaDaemon) return handleRemoteEventBound(payload);
+        return false;
+      });
+    } catch {
+      relayClient = null;
       await new Promise((resolve) => setTimeout(resolve, 1500));
     }
   }

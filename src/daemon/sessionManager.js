@@ -25,6 +25,7 @@ export class SessionManager {
     defaultExecutor,
     proxyManager = null,
     remoteShareProxyManager = null,
+    remoteCodingIdentity = null,
     startApprovalDecisionPollingFn = startApprovalDecisionPolling,
     createAdapterFn = createAdapter,
     createExecutorFn = createExecutor,
@@ -32,12 +33,14 @@ export class SessionManager {
     auditStore = null,
     agentCatalog = null,
     managedAgentSupervisor = null,
+    onLocalControlChanged = null,
   }) {
     this.relayClient = relayClient;
     this.deviceId = deviceId;
     this.defaultExecutor = defaultExecutor;
     this.proxyManager = proxyManager;
     this.remoteShareProxyManager = remoteShareProxyManager;
+    this.remoteCodingIdentity = remoteCodingIdentity;
     this.startApprovalDecisionPollingFn = startApprovalDecisionPollingFn;
     this.createAdapterFn = createAdapterFn;
     this.createExecutorFn = createExecutorFn;
@@ -45,11 +48,13 @@ export class SessionManager {
     this.auditStore = auditStore;
     this.agentCatalog = agentCatalog;
     this.managedAgentSupervisor = managedAgentSupervisor;
+    this.onLocalControlChanged = onLocalControlChanged;
     this.sessions = new Map();
     // Stage 9.2: per-requestId abort controllers for in-flight remote
     // coding fetches. The cancel event aborts the underlying fetch so
     // the worker's local proxy can clean up.
     this.activeRemoteRequests = new Map();
+    this.recentRemoteRequests = new Map();
   }
 
   async resolveLocalProxyUrl() {
@@ -62,16 +67,34 @@ export class SessionManager {
   }
 
   async handleRemoteCodingEvent(envelope) {
+    const requestId = String(envelope?.requestId || "");
+    const now = Date.now();
+    for (const [seenRequestId, expiresAt] of this.recentRemoteRequests) {
+      if (expiresAt <= now) this.recentRemoteRequests.delete(seenRequestId);
+    }
+    if (!requestId || this.activeRemoteRequests.has(requestId) || this.recentRemoteRequests.has(requestId)) {
+      await this.relayClient.send("remote.coding.response.error", {
+        requestId,
+        code: "e2ee_replay_detected",
+        message: "duplicate remote coding request rejected",
+      });
+      return;
+    }
     const controller = new AbortController();
-    this.activeRemoteRequests.set(envelope.requestId, controller);
+    this.activeRemoteRequests.set(requestId, controller);
     try {
+      const config = readConfig();
       await handleRemoteCodingRequest(envelope, {
         relayClient: this.relayClient,
         localProxyUrl: await this.resolveLocalProxyUrl(),
         signal: controller.signal,
+        deviceId: this.deviceId,
+        e2eePolicy: config.remoteShare?.e2eePolicy === "required" ? "required" : "off",
+        e2eeIdentity: this.remoteCodingIdentity,
       });
     } finally {
-      this.activeRemoteRequests.delete(envelope.requestId);
+      this.activeRemoteRequests.delete(requestId);
+      this.recentRemoteRequests.set(requestId, Date.now() + 5 * 60_000);
     }
   }
 
@@ -137,6 +160,7 @@ export class SessionManager {
           enabled: true,
           providers: payload.providers,
           port: payload.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
+          e2eePolicy: payload.e2eePolicy === "required" ? "required" : "off",
         },
       });
       return;
@@ -170,6 +194,7 @@ export class SessionManager {
           enabled: true,
           providers: payload.providers,
           port: payload.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
+          e2eePolicy: payload.e2eePolicy === "required" ? "required" : "off",
         },
       });
       return;
@@ -184,6 +209,7 @@ export class SessionManager {
       });
       writeConfig(next);
       await this.restartRouteModeProxyIfRunning();
+      await this.onLocalControlChanged?.();
       return;
     }
     if (payload.type === "local_control.route.clear") {
@@ -191,6 +217,7 @@ export class SessionManager {
       const next = clearRoute(config, String(payload.agent || ""), String(payload.slot || ""));
       writeConfig(next);
       await this.restartRouteModeProxyIfRunning();
+      await this.onLocalControlChanged?.();
       return;
     }
     if (payload.type === "local_control.agent_detail.set") {

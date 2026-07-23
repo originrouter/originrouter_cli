@@ -29,11 +29,13 @@ export class RemoteCodingProxyManager {
     stateDir,
     relayUrl,
     deviceId,
+    targetDeviceId,
     fetchFn = globalThis.fetch,
   }) {
     this.stateDir = stateDir;
     this.relayUrl = relayUrl;
     this.deviceId = deviceId;
+    this.targetDeviceId = targetDeviceId;
     this.fetchFn = fetchFn;
     this._proxy = null;
     this._refreshTimer = null;
@@ -110,7 +112,9 @@ export class RemoteCodingProxyManager {
 
     const proxy = new RemoteCodingRelayProxy({
       relayUrl: this.relayUrl,
+      stateDir: this.stateDir,
       deviceId: this.deviceId,
+      targetDeviceId: this.targetDeviceId,
       authToken,
       fetchFn: this.fetchFn,
     });

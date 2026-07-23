@@ -129,15 +129,47 @@ try {
       deviceId: "d1",
       authToken: "or_at_ws",
     });
-    const connPromise = c.connectEvents(() => {});
+    let alive = 0;
+    const connPromise = c.connectEvents(() => {}, { onAlive: () => { alive += 1; } });
     await delay(150);
     const wsReq = captured.requests.find((r) => r.url.startsWith("/relay/v1/devices/d1/ws"));
     assert.ok(wsReq, "expected a WebSocket request to be captured");
     assert.equal(wsReq.headers.authorization, "Bearer or_at_ws");
     await connPromise;
+    assert.ok(alive >= 1, "open/message activity should refresh connection liveness");
     server.close();
   }
   console.log("[5] connectEvents -> Authorization bearer ok");
+
+  // 6. A half-open WebSocket that never returns pong is terminated so the
+  // daemon can refresh auth and reconnect instead of reporting stale online.
+  {
+    const captured = { requests: [] };
+    const wss = new WebSocketServer({ noServer: true, autoPong: false });
+    const server = http.createServer();
+    server.on("upgrade", (req, socket, head) => {
+      captured.requests.push({ url: req.url, headers: req.headers });
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+    });
+    await new Promise((resolve) => server.listen(PORT, "127.0.0.1", resolve));
+    let closed = 0;
+    const c = new RelayClient({
+      relayUrl: `http://127.0.0.1:${PORT}`,
+      deviceId: "watchdog-device",
+      authToken: "or_at_watchdog",
+      heartbeatIntervalMs: 10,
+      heartbeatTimeoutMs: 30,
+    });
+    await Promise.race([
+      c.connectEvents(() => {}, { onClose: () => { closed += 1; } }),
+      delay(1000).then(() => { throw new Error("relay heartbeat watchdog timed out"); }),
+    ]);
+    assert.equal(closed, 1);
+    assert.ok(captured.requests.some((item) => item.url.includes("watchdog-device")));
+    await new Promise((resolve) => server.close(resolve));
+    wss.close();
+  }
+  console.log("[6] half-open WebSocket watchdog reconnect trigger ok");
 
   console.log("relay client auth ok");
 } catch (err) {

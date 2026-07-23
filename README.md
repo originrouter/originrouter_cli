@@ -7,6 +7,15 @@ Agent approval and external-change audit history is stored locally in an
 append-only, hash-linked ledger. See `docs/agent-local-audit.md` for storage,
 filtering, redaction, and App/Relay behavior.
 
+Signed-in installations also maintain a display-safe Agent Activity index for
+cross-device recall. Native `originrouter claude` / `originrouter codex` and
+managed terminal sessions upload only a redacted title, task summary, first
+prompt preview, latest message preview, device/workspace labels, and source
+timestamps. Full transcripts, tool output, commands, source code, filesystem
+paths, and credentials remain on the CLI device. The daemon incrementally
+backfills eligible local Catalog records after login and retries from its last
+successful cursor after transient failures.
+
 ## Install and test
 
 ```bash

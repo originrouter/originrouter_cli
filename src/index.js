@@ -7,6 +7,7 @@ import {
   CLAUDE_CONFIG_KEYS,
   buildAgentProviderEnv,
   maskSecret,
+  remoteCodingRouteTarget,
   setClaudeConfigValue,
   summarizeClaudeConfig,
   unsetClaudeConfigValue,
@@ -158,7 +159,7 @@ Local API auth (Stage 6):
   originrouter local key show                        Alias for token show
   originrouter local key rotate                      Alias for token rotate
   originrouter local config show                     Print persisted local API bind/port settings
-  originrouter local config set [--port <p>] [--bind <addr>] [--allow-lan on|off]
+  originrouter local config set [--port <p>] [--bind <addr>] [--allow-lan on|off] [--relay-mode auto|cloud|local|custom] [--relay-url <url>]
 
 Legacy config commands (deprecated, prefer 'originrouter provider add'):
   originrouter config show
@@ -167,7 +168,7 @@ Legacy config commands (deprecated, prefer 'originrouter provider add'):
   originrouter claude-config --base-url <url> --api-key <key> --model <model> --small-fast-model <model> [legacy]
 
 Other:
-  originrouter daemon [--relay https://app.easytransnote.com] [--device local-dev] [--local-port <p>]
+  originrouter daemon [--relay https://app.easytransnote.com] [--relay-mode auto|cloud|local|custom] [--device local-dev] [--local-port <p>]
                       [--bind 127.0.0.1|0.0.0.0] [--allow-lan]
   originrouter daemon-port                           Print the running daemon's local API URL (reads daemon.state.json)
   originrouter service install|start|stop|restart|status|uninstall
@@ -233,6 +234,7 @@ OriginRouter OAuth login:
 OriginRouter wrapper options for claude/codex:
   --provider <name>                              Deprecated for claude; use 'originrouter route set'. Reserved for legacy/debug paths.
   --originrouter-relay https://app.easytransnote.com
+  --originrouter-relay-mode auto|cloud|local|custom  auto uses authenticated cloud when signed in, otherwise local-only
   --originrouter-device local-dev
   --originrouter-session session-id
   --originrouter-autonomy manual|guarded|unrestricted|custom
@@ -1304,6 +1306,8 @@ function handleLocalConfigCommand(args) {
     console.log(`port:        ${config.port ?? DEFAULT_LOCAL_API_PORT}`);
     console.log(`bindAddress: ${config.bindAddress || "127.0.0.1"}`);
     console.log(`allowLan:    ${config.allowLan === true ? "on" : "off"}`);
+    console.log(`relayMode:   ${config.relayMode || "auto"}`);
+    console.log(`relayUrl:    ${config.relayUrl || DEFAULT_RELAY_URL}`);
     if (state?.localApiPort) {
       console.log(`running:     ${state.localApiBaseUrl || `http://127.0.0.1:${state.localApiPort}`}`);
     }
@@ -1313,18 +1317,33 @@ function handleLocalConfigCommand(args) {
     const port = parseLocalConfigPort(_parseFlag(args, "port"));
     const bindAddress = _parseFlag(args, "bind");
     const allowLan = parseOnOff(_parseFlag(args, "allow-lan"), "--allow-lan");
+    const relayModeRaw = _parseFlag(args, "relay-mode");
+    const relayUrl = _parseFlag(args, "relay-url");
+    const relayMode = relayModeRaw
+      ? String(relayModeRaw).trim().toLowerCase()
+      : undefined;
+    if (
+      relayMode &&
+      !["auto", "cloud", "local", "custom"].includes(relayMode)
+    ) {
+      throw new Error("--relay-mode must be auto|cloud|local|custom");
+    }
     const patch = {};
     if (port !== undefined) patch.port = port;
     if (bindAddress) patch.bindAddress = bindAddress;
     if (allowLan !== undefined) patch.allowLan = allowLan;
+    if (relayMode) patch.relayMode = relayMode;
+    if (relayUrl) patch.relayUrl = relayUrl;
     if (Object.keys(patch).length === 0) {
-      throw new Error("Usage: originrouter local config set [--port <p>] [--bind <addr>] [--allow-lan on|off]");
+      throw new Error("Usage: originrouter local config set [--port <p>] [--bind <addr>] [--allow-lan on|off] [--relay-mode auto|cloud|local|custom] [--relay-url <url>]");
     }
     const next = writeLocalApiConfig(patch);
     console.log("Local API config updated.");
     console.log(`port:        ${next.port ?? DEFAULT_LOCAL_API_PORT}`);
     console.log(`bindAddress: ${next.bindAddress || "127.0.0.1"}`);
     console.log(`allowLan:    ${next.allowLan === true ? "on" : "off"}`);
+    console.log(`relayMode:   ${next.relayMode || "auto"}`);
+    console.log(`relayUrl:    ${next.relayUrl || DEFAULT_RELAY_URL}`);
     console.log("Restart `originrouter daemon` for changes to take effect.");
     return;
   }
@@ -1545,6 +1564,7 @@ async function handleEnvPrint(args) {
           stateDir,
           relayUrl,
           deviceId: device.deviceId,
+          targetDeviceId: remoteCodingRouteTarget(config, agent),
         });
         const startResult = await remoteCodingProxyManager.start();
         if (startResult.ok) {

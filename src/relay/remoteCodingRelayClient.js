@@ -10,6 +10,7 @@
 
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
+import { decryptRemoteCodingResponse } from "../crypto/remoteCodingE2ee.js";
 
 function relayWsUrl(relayUrl, deviceId) {
   const url = new URL(`${relayUrl.replace(/\/+$/, "")}/relay/v1/devices/${encodeURIComponent(deviceId)}/ws`);
@@ -24,6 +25,7 @@ export class RemoteCodingRelayClient {
     this.authToken = authToken;
     this.fetchFn = fetchFn;
     this._waiters = new Map();
+    this._cryptoContexts = new Map();
     this._closed = false;
     this._ws = null;
     this._connectPromise = null;
@@ -76,6 +78,25 @@ export class RemoteCodingRelayClient {
   _dispatch(evt) {
     const w = this._waiters.get(evt.requestId);
     if (!w) return;
+    const cryptoContext = this._cryptoContexts.get(evt.requestId);
+    if (cryptoContext) {
+      const serverControlError = evt.type === "remote.coding.response.error"
+        && !evt.protocol
+        && ["target_offline", "timeout"].includes(evt.code);
+      if (!serverControlError) {
+        try {
+          evt = decryptRemoteCodingResponse(cryptoContext, evt);
+        } catch (error) {
+          w.onError?.({
+            code: error?.code || "e2ee_decryption_failed",
+            message: error?.message || "encrypted response could not be verified",
+          });
+          this._waiters.delete(evt.requestId);
+          this._cryptoContexts.delete(evt.requestId);
+          return;
+        }
+      }
+    }
     if (evt.type === "remote.coding.response.start") {
       w.onStart?.(evt);
       return;
@@ -87,11 +108,13 @@ export class RemoteCodingRelayClient {
     if (evt.type === "remote.coding.response.end") {
       w.onEnd?.(evt);
       this._waiters.delete(evt.requestId);
+      this._cryptoContexts.delete(evt.requestId);
       return;
     }
     if (evt.type === "remote.coding.response.error") {
       w.onError?.(evt);
       this._waiters.delete(evt.requestId);
+      this._cryptoContexts.delete(evt.requestId);
     }
   }
 
@@ -105,6 +128,29 @@ export class RemoteCodingRelayClient {
       } catch {}
     }
     this._waiters.clear();
+    this._cryptoContexts.clear();
+  }
+
+  setCryptoContext(requestId, context) {
+    if (context) this._cryptoContexts.set(requestId, context);
+    else this._cryptoContexts.delete(requestId);
+  }
+
+  async getTargetE2ee(targetDeviceId) {
+    const headers = {};
+    if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
+    const response = await this.fetchFn(
+      `${this.relayUrl}/relay/v1/devices/${encodeURIComponent(targetDeviceId)}/e2ee`,
+      { method: "GET", headers },
+    );
+    let body = {};
+    try { body = await response.json(); } catch {}
+    if (!response.ok) {
+      const error = new Error(body?.detail?.code || body?.error || `e2ee directory returned ${response.status}`);
+      error.code = body?.detail?.code || "e2ee_directory_unavailable";
+      throw error;
+    }
+    return body?.data || body;
   }
 
   async publishRequest(envelope) {
@@ -161,6 +207,7 @@ export class RemoteCodingRelayClient {
       if (this._waiters.get(requestId) === callbacks) {
         this._waiters.delete(requestId);
       }
+      this._cryptoContexts.delete(requestId);
     };
   }
 

@@ -60,7 +60,10 @@ function normalizeStatus(value, fallback = "running") {
 }
 
 function eventText(event) {
-  return safeText(event?.text || event?.detail || event?.summary, 4096);
+  return safeText(
+    event?.text || event?.detail || event?.summary || event?.result || event?.reason,
+    4096,
+  );
 }
 
 function collectArtifactPaths(value, key = "", result = []) {
@@ -224,6 +227,20 @@ export class AgentCatalog {
 
   close() {
     if (this.db?.open) this.db.close();
+  }
+
+  getMeta(key) {
+    const row = this.db.prepare(
+      "SELECT value FROM catalog_meta WHERE key = ?",
+    ).get(safeText(key, 191));
+    return row?.value ?? null;
+  }
+
+  setMeta(key, value) {
+    this.db.prepare(`
+      INSERT INTO catalog_meta(key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(safeText(key, 191), String(value ?? ""));
   }
 
   getLaunchReceipt(launchId) {
@@ -507,8 +524,11 @@ export class AgentCatalog {
     if (!run) return false;
     const conversationId = run.conversation_id;
     const createdAt = iso(event.createdAt || this.now());
-    const type = safeText(event.type || event.eventType, 96);
-    const text = eventText(event);
+    const rawType = safeText(event.type || event.eventType, 96);
+    const type = rawType === "agent.task.completed"
+      ? "agent.task.complete"
+      : rawType;
+    let text = eventText(event);
     const updates = [];
     const values = [];
     if (type === "user.text" && text) {
@@ -519,9 +539,20 @@ export class AgentCatalog {
     } else if (type === "agent.text" && text) {
       updates.push("last_message_preview = ?");
       values.push(text.slice(0, 1024));
-    } else if (["agent.task.started", "agent.task.complete"].includes(type) && text) {
-      updates.push("summary = ?");
-      values.push(text.slice(0, 4096));
+    } else if (["agent.task.started", "agent.task.complete"].includes(type)) {
+      if (
+        type === "agent.task.complete"
+        && (!text || /^(?:complete|completed|done|success)$/i.test(text))
+      ) {
+        const current = this.db.prepare(
+          "SELECT last_message_preview FROM agent_conversations WHERE conversation_id = ?",
+        ).get(conversationId);
+        text = safeText(current?.last_message_preview, 4096);
+      }
+      if (text) {
+        updates.push("summary = ?");
+        values.push(text.slice(0, 4096));
+      }
     }
     if (type === "agent.session_id" && event.sessionId) {
       updates.push("native_session_id = ?");

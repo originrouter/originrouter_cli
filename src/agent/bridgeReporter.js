@@ -25,8 +25,109 @@ function safeText(value, maxLen = 512) {
   return text.slice(0, maxLen);
 }
 
+function safeLocalControlProviders(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  const providers = [];
+  for (const item of value.slice(0, 128)) {
+    if (!item || typeof item !== "object") continue;
+    const name = safeText(item.name, 64);
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    providers.push({
+      name,
+      type: safeText(item.type, 32) || "proxy",
+      litellmProvider: safeText(item.litellmProvider, 64),
+      model: safeText(item.model, 256),
+      target: safeText(item.target, 32),
+      deviceId: safeText(item.deviceId, 128),
+    });
+  }
+  return providers;
+}
+
+function safeLocalControlRoutes(value) {
+  if (!Array.isArray(value)) return [];
+  const routes = [];
+  for (const item of value.slice(0, 16)) {
+    if (!item || typeof item !== "object") continue;
+    const agent = safeText(item.agent, 32);
+    const slot = safeText(item.slot, 32);
+    const provider = safeText(item.provider, 64);
+    if (!agent || !slot || !provider) continue;
+    routes.push({
+      agent,
+      slot,
+      provider,
+      model: safeText(item.model, 256),
+    });
+  }
+  return routes;
+}
+
 function compactText(value, maxLen = 512) {
   return safeText(value, maxLen).replace(/\s+/g, " ");
+}
+
+export function redactAgentActivityText(value, maxLen = 4096) {
+  return compactText(value, maxLen)
+    .replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g, "[REDACTED_KEY]")
+    .replace(/\b(?:sk[-_]|or_at_|or_rt_|ghp_|github_pat_|xox[baprs]-)[A-Za-z0-9._~-]{8,}\b/g, "[REDACTED_TOKEN]")
+    .replace(/(authorization\s*:\s*bearer\s+)[^\s,;]+/gi, "$1[REDACTED]")
+    .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]");
+}
+
+export function normalizeAgentActivityEventType(event = {}) {
+  const type = String(event.type || event.eventType || "").trim();
+  return ({
+    agent_message: "agent.text",
+    user_message: "user.text",
+    task_started: "agent.task.started",
+    "agent.task.completed": "agent.task.complete",
+  })[type] || type;
+}
+
+export function shouldSyncAgentActivitySnapshot(event = {}) {
+  return ["user.text", "agent.text", "agent.task.complete"].includes(
+    normalizeAgentActivityEventType(event),
+  );
+}
+
+export function updateAgentActivitySnapshot(snapshot, event = {}) {
+  const target = snapshot && typeof snapshot === "object" ? snapshot : {};
+  const normalizedType = normalizeAgentActivityEventType(event);
+  let text = redactAgentActivityText(
+    event.text || event.message || event.content || event.result || event.detail
+      || event.summary || event.reason,
+    normalizedType === "agent.task.complete" ? 4096 : 1024,
+  );
+  if (
+    normalizedType === "agent.task.complete"
+    && (!text || /^(?:complete|completed|done|success)$/i.test(text))
+  ) {
+    text = target.lastAgentPreview || "";
+  }
+  if (!text) return target;
+  if (normalizedType === "user.text") {
+    if (!target.firstPromptPreview) target.firstPromptPreview = text;
+    target.lastMessagePreview = text;
+  } else if (normalizedType === "agent.text") {
+    target.lastMessagePreview = text;
+    target.lastAgentPreview = text;
+  } else if (["agent.task.started", "agent.task.complete"].includes(normalizedType)) {
+    target.summary = text;
+  }
+  return target;
+}
+
+function safeIsoTimestamp(value) {
+  if (value == null || value === "") return "";
+  const normalized = typeof value === "number" && value > 0 && value < 1e12
+    ? value * 1000
+    : value;
+  const parsed = normalized instanceof Date ? normalized : new Date(normalized);
+  if (!Number.isFinite(parsed.getTime())) return "";
+  return parsed.toISOString();
 }
 
 function approvalInteractionId(event) {
@@ -469,11 +570,25 @@ export async function reportRuntimeEvent(payload, {
 }
 
 export function buildAgentConversationMetadata(payload = {}) {
+  const createdAt = safeIsoTimestamp(payload.createdAt || payload.created_at);
+  const lastActivityAt = safeIsoTimestamp(
+    payload.lastActivityAt || payload.last_activity_at,
+  );
+  const archivedAt = safeIsoTimestamp(payload.archivedAt || payload.archived_at);
   return {
     conversation_id: safeText(payload.conversationId || payload.conversation_id, 96),
     agent_type: safeText(payload.agentType || payload.agent_type, 32) || "unknown",
     native_session_id: safeText(payload.nativeSessionId || payload.native_session_id, 191),
-    title: safeText(payload.title, 191) || "Agent session",
+    title: redactAgentActivityText(payload.title, 191) || "Agent session",
+    summary: redactAgentActivityText(payload.summary, 4096),
+    first_prompt_preview: redactAgentActivityText(
+      payload.firstPromptPreview || payload.first_prompt_preview,
+      1024,
+    ),
+    last_message_preview: redactAgentActivityText(
+      payload.lastMessagePreview || payload.last_message_preview,
+      1024,
+    ),
     status: safeText(payload.status, 32) || "running",
     workspace_id: safeText(payload.workspaceId || payload.workspace_id, 96),
     workspace_name: safeText(payload.workspaceName || payload.workspace_name, 191),
@@ -485,6 +600,9 @@ export function buildAgentConversationMetadata(payload = {}) {
       64,
     ),
     artifact_count: Math.max(0, Number.parseInt(String(payload.artifactCount || 0), 10) || 0),
+    ...(createdAt ? { created_at: createdAt } : {}),
+    ...(lastActivityAt ? { last_activity_at: lastActivityAt } : {}),
+    ...(archivedAt ? { archived_at: archivedAt } : {}),
   };
 }
 
@@ -508,17 +626,33 @@ export async function reportAgentConversationMetadata(payload, {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const resp = await fetchFn(`${apiBase()}/cli/v1/agent/catalog/conversations`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-        "X-OriginRouter-Device-Id": auth.deviceId,
+    const send = (candidate) => fetchFn(
+      `${apiBase()}/cli/v1/agent/catalog/conversations`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "X-OriginRouter-Device-Id": auth.deviceId,
+        },
+        body: JSON.stringify(candidate),
+        signal: controller.signal,
       },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    return { ok: resp.ok, status: resp.status };
+    );
+    let resp = await send(body);
+    let legacyFallback = false;
+    if (
+      resp.status === 422
+      && (body.created_at || body.last_activity_at || body.archived_at)
+    ) {
+      const legacyBody = { ...body };
+      delete legacyBody.created_at;
+      delete legacyBody.last_activity_at;
+      delete legacyBody.archived_at;
+      resp = await send(legacyBody);
+      legacyFallback = resp.ok;
+    }
+    return { ok: resp.ok, status: resp.status, legacyFallback };
   } catch {
     return { ok: false, error: "request_failed" };
   } finally {
@@ -631,7 +765,12 @@ export async function reportLocalControlRuntime(payload, {
     remote_share_running: Boolean(payload?.remoteShareRunning),
     remote_share_base_url: safeText(payload?.remoteShareBaseUrl, 255),
     remote_share_catalog: safeRemoteShareCatalog(payload?.remoteShareCatalog),
+    remote_share_e2ee_policy:
+      payload?.remoteShareE2eePolicy === "required" ? "required" : "off",
+    remote_share_e2ee_public_key: safeText(payload?.remoteShareE2eePublicKey, 256),
     agent_detail_profile: safeText(payload?.agentDetailProfile, 16) || "concise",
+    providers: safeLocalControlProviders(payload?.providers),
+    routes: safeLocalControlRoutes(payload?.routes),
   };
 
   const controller = new AbortController();

@@ -15,6 +15,10 @@
 //   relay_disconnected → 502 (this proxy's own SSE to the relay dropped)
 
 import http from "node:http";
+import {
+  encryptRemoteCodingRequest,
+  verifyAndPinRemotePublicKey,
+} from "../crypto/remoteCodingE2ee.js";
 import { newRequestId, RemoteCodingRelayClient } from "../relay/remoteCodingRelayClient.js";
 
 function translateErrorToHttp(evt) {
@@ -26,14 +30,26 @@ function translateErrorToHttp(evt) {
   if (code === "target_offline") {
     return { status: 502, body: { error: "target_offline", code, message } };
   }
+  if (code.startsWith("e2ee_")) {
+    return { status: 426, body: { error: code, code, message } };
+  }
   // upstream_error, relay_disconnected, anything else.
   return { status: 502, body: { error: code, code, message } };
 }
 
 export class RemoteCodingRelayProxy {
-  constructor({ relayUrl, deviceId, authToken = null, fetchFn = globalThis.fetch }) {
+  constructor({
+    relayUrl,
+    stateDir,
+    deviceId,
+    targetDeviceId = null,
+    authToken = null,
+    fetchFn = globalThis.fetch,
+  }) {
     this.relayUrl = relayUrl;
+    this.stateDir = stateDir;
     this.deviceId = deviceId;
+    this.targetDeviceId = targetDeviceId;
     this.fetchFn = fetchFn;
     this._client = new RemoteCodingRelayClient({ relayUrl, deviceId, authToken, fetchFn });
     this._server = null;
@@ -129,21 +145,68 @@ export class RemoteCodingRelayProxy {
         const forwardedHeaders = {};
         for (const [k, v] of Object.entries(req.headers)) {
           const lk = k.toLowerCase();
-          if (lk === "host" || lk === "content-length" || lk === "connection") continue;
+          if (
+            lk === "host"
+            || lk === "content-length"
+            || lk === "connection"
+            || lk === "x-originrouter-target-device"
+            || lk === "x-originrouter-runtime"
+          ) continue;
           forwardedHeaders[k] = v;
         }
 
-        const envelope = {
-          type: "remote.coding.request",
-          requestId,
-          sourceDeviceId: this.deviceId,
-          targetDeviceId: req.headers["x-originrouter-target-device"] || this._resolveTargetDeviceId(),
+        const targetDeviceId = req.headers["x-originrouter-target-device"]
+          || this._resolveTargetDeviceId();
+        if (!targetDeviceId) {
+          throw Object.assign(new Error("remote provider target device is missing"), {
+            code: "e2ee_target_missing",
+          });
+        }
+        const plaintextPayload = {
           runtime: req.headers["x-originrouter-runtime"] === "codex" ? "codex" : "claude",
           method: req.method,
           path: req.url,
           headers: forwardedHeaders,
           body: base64Body,
         };
+        let envelope = {
+          type: "remote.coding.request",
+          requestId,
+          sourceDeviceId: this.deviceId,
+          targetDeviceId,
+          ...plaintextPayload,
+        };
+
+        let e2ee;
+        try {
+          e2ee = await this._client.getTargetE2ee(targetDeviceId);
+        } catch (error) {
+          throw Object.assign(
+            new Error(`cannot verify target encryption policy: ${error?.message || String(error)}`),
+            { code: "e2ee_directory_unavailable" },
+          );
+        }
+        if (e2ee.policy === "required") {
+          if (!e2ee.public_key || e2ee.protocol !== "e2ee-v1") {
+            throw Object.assign(
+              new Error("target requires end-to-end encryption but has no compatible public key"),
+              { code: "e2ee_target_incompatible" },
+            );
+          }
+          const encrypted = encryptRemoteCodingRequest({
+            sourceDeviceId: this.deviceId,
+            targetDeviceId,
+            requestId,
+            targetPublicKey: verifyAndPinRemotePublicKey(
+              this.stateDir,
+              targetDeviceId,
+              e2ee.public_key,
+            ),
+            payload: plaintextPayload,
+          });
+          envelope = encrypted.envelope;
+          this._client.setCryptoContext(requestId, encrypted.context);
+        }
 
         // Publish first; 400/413/202 from the relay. We also have to
         // register the waiter BEFORE publishing so a fast worker
@@ -182,11 +245,13 @@ export class RemoteCodingRelayProxy {
           return;
         }
         if (publishResult.body?.accepted === false) {
-          // target_offline.
           dispose();
+          const code = publishResult.body?.reason || "target_offline";
           onError({
-            code: "target_offline",
-            message: "worker is not online on the relay",
+            code,
+            message: code === "target_offline"
+              ? "worker is not online on the relay"
+              : `relay rejected remote coding request: ${code}`,
           });
           return;
         }
@@ -215,7 +280,13 @@ export class RemoteCodingRelayProxy {
         });
       } catch (err) {
         if (!res.headersSent) {
-          res.writeHead(500, { "Content-Type": "application/json" });
+          const translated = translateErrorToHttp({
+            code: err?.code || "internal",
+            message: err?.message || String(err),
+          });
+          res.writeHead(translated.status, { "Content-Type": "application/json" });
+          try { res.end(JSON.stringify(translated.body)); } catch {}
+          return;
         }
         try { res.end(JSON.stringify({ error: "internal", message: err?.message || String(err) })); } catch {}
       }
@@ -234,7 +305,7 @@ export class RemoteCodingRelayProxy {
    * `target_offline` since the caller isn't listening as a worker.
    */
   _resolveTargetDeviceId() {
-    return this.deviceId;
+    return this.targetDeviceId;
   }
 
   _registerWaiter(requestId, res) {

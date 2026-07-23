@@ -213,7 +213,7 @@ export function findCodexTranscript({
   cwd,
   startedAt,
   sessionId = null,
-  originators = ["codex-tui"],
+  originators = ["codex-tui", "codex_exec"],
 }) {
   const candidates = [];
   for (const offset of [0, -1]) {

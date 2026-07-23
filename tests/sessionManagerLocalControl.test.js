@@ -22,6 +22,7 @@ test("SessionManager applies local-control route updates from relay events", asy
   const home = mkdtempSync(join(tmpdir(), "originrouter-local-control-test-"));
   process.env.ORIGINROUTER_HOME = home;
   const restarts = [];
+  let snapshotReports = 0;
   try {
     writeConfig({ providers: PROVIDERS });
     const manager = new SessionManager({
@@ -36,6 +37,9 @@ test("SessionManager applies local-control route updates from relay events", asy
           restarts.push(args);
           return { ok: true };
         },
+      },
+      onLocalControlChanged: async () => {
+        snapshotReports += 1;
       },
     });
 
@@ -63,6 +67,7 @@ test("SessionManager applies local-control route updates from relay events", asy
     config = readConfig();
     assert.equal(config.routes?.claude?.main, undefined);
     assert.equal(restarts.length, 2);
+    assert.equal(snapshotReports, 2);
   } finally {
     if (prevHome === undefined) delete process.env.ORIGINROUTER_HOME;
     else process.env.ORIGINROUTER_HOME = prevHome;
@@ -135,6 +140,7 @@ test("SessionManager starts Remote Share with an explicit Provider allow-list", 
       type: "local_control.remote_share.start",
       providers: ["deepseek", "glm"],
       port: 40124,
+      e2eePolicy: "required",
     });
 
     assert.deepEqual(starts, [{
@@ -146,6 +152,7 @@ test("SessionManager starts Remote Share with an explicit Provider allow-list", 
       enabled: true,
       providers: ["deepseek", "glm"],
       port: 40124,
+      e2eePolicy: "required",
     });
   } finally {
     if (previousHome === undefined) delete process.env.ORIGINROUTER_HOME;

@@ -4,13 +4,27 @@ import { basename } from "node:path";
 import {
   createRuntimeEventReporter,
   reportAgentConversationMetadata,
+  shouldSyncAgentActivitySnapshot,
   startAgentSessionHeartbeat,
+  updateAgentActivitySnapshot,
 } from "../agent/bridgeReporter.js";
 import { buildAgentProviderEnv } from "../config/claudeConfig.js";
 import { DEFAULT_DEVICE_ID, DEFAULT_RELAY_URL } from "../constants.js";
-import { readLocalProxySnapshot, staticProxyStatusFn } from "../proxy/snapshot.js";
-import { ensureDevice, ensureStateDir, readConfig } from "../persistence/state.js";
-import { buildRelayClientOptions } from "../relay/relayAuthBootstrap.js";
+import {
+  readLocalProxySnapshot,
+  staticProxyStatusFn,
+} from "../proxy/snapshot.js";
+import {
+  ensureDevice,
+  ensureStateDir,
+  readConfig,
+  readLocalApiConfig,
+} from "../persistence/state.js";
+import {
+  buildAgentRelayPlan,
+  normalizeAgentRelayMode,
+  relayModeDescription,
+} from "../relay/agentRelayPolicy.js";
 import { RelayClient } from "../relay/relayClient.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 import { LocalAgentBridgeClient } from "../local/localAgentBridgeClient.js";
@@ -34,7 +48,10 @@ import {
 import { mapClaudeSdkMessage } from "./claudeSdkEvents.js";
 import { PendingInteractionRegistry } from "./pendingInteractionRegistry.js";
 import { protectOriginrouterCodingEnv } from "./originrouterCodingAuthProxy.js";
-import { displaySafeToolInput, toolInputContainsSecret } from "./displaySafeToolInput.js";
+import {
+  displaySafeToolInput,
+  toolInputContainsSecret,
+} from "./displaySafeToolInput.js";
 import {
   AGENT_DETAIL_PROFILES,
   resolveAgentDetailProfile,
@@ -65,6 +82,7 @@ function extractOriginRouterOptions(args) {
       index += 1;
     };
     if (arg === "--originrouter-relay") take("relay");
+    else if (arg === "--originrouter-relay-mode") take("relayMode");
     else if (arg === "--originrouter-device") take("device");
     else if (arg === "--originrouter-session") take("session");
     else if (arg === "--originrouter-conversation") take("conversationId");
@@ -78,27 +96,24 @@ function extractOriginRouterOptions(args) {
     else if (arg === "--prompt") take("initialMessage");
     else if (arg === "--originrouter-autonomy") take("autonomyProfile");
     else if (arg === "--originrouter-detail") take("detailProfile");
-    else if (arg === "--originrouter-auto-approve") options.autonomyProfile = "guarded";
+    else if (arg === "--originrouter-auto-approve")
+      options.autonomyProfile = "guarded";
     else if (arg === "--originrouter-auto-allow") {
       options.autonomyAllowedScopes = [
         ...(options.autonomyAllowedScopes || []),
         ...String(args[index + 1] || "").split(","),
       ];
       index += 1;
-    }
-    else if (arg.startsWith("--originrouter-autonomy=")) {
+    } else if (arg.startsWith("--originrouter-autonomy=")) {
       options.autonomyProfile = arg.slice("--originrouter-autonomy=".length);
-    }
-    else if (arg.startsWith("--originrouter-detail=")) {
+    } else if (arg.startsWith("--originrouter-detail=")) {
       options.detailProfile = arg.slice("--originrouter-detail=".length);
-    }
-    else if (arg.startsWith("--originrouter-auto-allow=")) {
+    } else if (arg.startsWith("--originrouter-auto-allow=")) {
       options.autonomyAllowedScopes = [
         ...(options.autonomyAllowedScopes || []),
         ...arg.slice("--originrouter-auto-allow=".length).split(","),
       ];
-    }
-    else if (arg === "--resume") {
+    } else if (arg === "--resume") {
       const value = args[index + 1];
       if (value && !value.startsWith("--")) {
         options.resume = value;
@@ -122,11 +137,15 @@ function toUserMessage(text) {
 }
 
 function safeLaunchMessage(value) {
-  return String(value || "").trim().slice(0, 8192);
+  return String(value || "")
+    .trim()
+    .slice(0, 8192);
 }
 
 function normalizeRemoteText(data) {
-  return String(data || "").replace(/[\r\n]+$/g, "").trim();
+  return String(data || "")
+    .replace(/[\r\n]+$/g, "")
+    .trim();
 }
 
 function permissionResult({ action, input, response, suggestions, reason }) {
@@ -147,7 +166,9 @@ function permissionResult({ action, input, response, suggestions, reason }) {
 }
 
 function questionPayload(input) {
-  const questions = Array.isArray(input?.questions) ? input.questions.slice(0, 4) : [];
+  const questions = Array.isArray(input?.questions)
+    ? input.questions.slice(0, 4)
+    : [];
   return {
     questions: questions.map((question, index) => ({
       id: `q${index + 1}`,
@@ -155,26 +176,33 @@ function questionPayload(input) {
       question: String(question?.question || "").slice(0, 2048),
       multiple: Boolean(question?.multiSelect),
       allow_other: true,
-      options: (Array.isArray(question?.options) ? question.options : []).slice(0, 8).map((option, optionIndex) => ({
-        id: `o${optionIndex + 1}`,
-        label: String(option?.label || "").slice(0, 128),
-        description: String(option?.description || "").slice(0, 512),
-        preview: String(option?.preview || "").slice(0, 4096),
-      })),
+      options: (Array.isArray(question?.options) ? question.options : [])
+        .slice(0, 8)
+        .map((option, optionIndex) => ({
+          id: `o${optionIndex + 1}`,
+          label: String(option?.label || "").slice(0, 128),
+          description: String(option?.description || "").slice(0, 512),
+          preview: String(option?.preview || "").slice(0, 4096),
+        })),
     })),
   };
 }
 
 function claudeQuestionAnswers(input, response) {
-  const answers = response?.answers && typeof response.answers === "object"
-    ? response.answers
-    : {};
+  const answers =
+    response?.answers && typeof response.answers === "object"
+      ? response.answers
+      : {};
   const result = {};
-  (Array.isArray(input?.questions) ? input.questions : []).slice(0, 4).forEach((question, index) => {
-    const raw = answers[`q${index + 1}`];
-    const values = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
-    result[String(question?.question || `Question ${index + 1}`)] = values.map(String).join(", ");
-  });
+  (Array.isArray(input?.questions) ? input.questions : [])
+    .slice(0, 4)
+    .forEach((question, index) => {
+      const raw = answers[`q${index + 1}`];
+      const values = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
+      result[String(question?.question || `Question ${index + 1}`)] = values
+        .map(String)
+        .join(", ");
+    });
   return result;
 }
 
@@ -192,16 +220,34 @@ export async function runClaudeSdkSession(rawArgs) {
   const stateDir = ensureStateDir();
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
   const options = extractOriginRouterOptions(rawArgs);
-  const relayUrl = options.relay || process.env.ORIGINROUTER_RELAY || DEFAULT_RELAY_URL;
-  const device = ensureDevice(options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID);
+  const relayConfig = readLocalApiConfig();
+  const relayUrl =
+    options.relay ||
+    process.env.ORIGINROUTER_RELAY ||
+    relayConfig.relayUrl ||
+    DEFAULT_RELAY_URL;
+  const relayMode = normalizeAgentRelayMode(
+    options.relayMode || relayConfig.relayMode,
+    relayUrl,
+  );
+  const device = ensureDevice(
+    options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID,
+  );
   const sessionId = options.session || `claude-${Date.now()}`;
   const cwd = process.cwd();
-  const relayOptions = await buildRelayClientOptions({
+  let relayPlan = await buildAgentRelayPlan({
     stateDir,
     relayUrl,
     fallbackDeviceId: device.deviceId,
+    mode: relayMode,
   });
-  const relayClient = new RelayClient(relayOptions);
+  let relayClient = relayPlan.enabled ? new RelayClient(relayPlan) : null;
+  let effectiveDeviceId = relayPlan.deviceId || device.deviceId;
+  if (!relayPlan.enabled) {
+    process.stderr.write(
+      `[originrouter] ${relayModeDescription(relayPlan)}; local and LAN control remain available.\n`,
+    );
+  }
   const config = readConfig();
   const detail = resolveAgentDetailProfile({
     config,
@@ -213,13 +259,13 @@ export async function runClaudeSdkSession(rawArgs) {
   });
   let originrouterCodingProxy = null;
   let localAgentBridge = null;
-  ({ providerResult, proxy: originrouterCodingProxy } = await protectOriginrouterCodingEnv(
-    "claude",
-    providerResult,
-    { stateDir },
-  ));
+  let relayViaDaemon = false;
+  ({ providerResult, proxy: originrouterCodingProxy } =
+    await protectOriginrouterCodingEnv("claude", providerResult, { stateDir }));
   const messageQueue = new AsyncMessageQueue();
-  const sessionTitle = String(options.title || "Claude session").trim().slice(0, 191);
+  const sessionTitle = String(options.title || "Claude session")
+    .trim()
+    .slice(0, 191);
   const initialMessage = safeLaunchMessage(options.initialMessage);
   if (initialMessage) messageQueue.push(toUserMessage(initialMessage));
   const recentEvents = [];
@@ -232,7 +278,8 @@ export async function runClaudeSdkSession(rawArgs) {
     stateDir,
   });
   let queryRef = null;
-  let claudeSessionId = typeof options.resume === "string" ? options.resume : null;
+  let claudeSessionId =
+    typeof options.resume === "string" ? options.resume : null;
   let transcriptPath = claudeTranscriptPathForSession(cwd, claudeSessionId);
   let stopped = false;
   let currentMode = options.permissionMode || "default";
@@ -240,38 +287,66 @@ export async function runClaudeSdkSession(rawArgs) {
   if (invalidScopes.length) {
     throw new Error(`Unknown unattended scope(s): ${invalidScopes.join(", ")}`);
   }
-  if (options.autonomyProfile && !normalizeAutonomyProfile(options.autonomyProfile, "")) {
+  if (
+    options.autonomyProfile &&
+    !normalizeAutonomyProfile(options.autonomyProfile, "")
+  ) {
     throw new Error(`Unknown unattended profile: ${options.autonomyProfile}`);
   }
-  if (options.autonomyAllowedScopes?.length && options.autonomyProfile && options.autonomyProfile !== "custom") {
-    throw new Error("--originrouter-auto-allow requires --originrouter-autonomy custom or no explicit profile");
+  if (
+    options.autonomyAllowedScopes?.length &&
+    options.autonomyProfile &&
+    options.autonomyProfile !== "custom"
+  ) {
+    throw new Error(
+      "--originrouter-auto-allow requires --originrouter-autonomy custom or no explicit profile",
+    );
   }
-  let autonomyAllowedScopes = normalizeAutonomyScopes(options.autonomyAllowedScopes);
+  let autonomyAllowedScopes = normalizeAutonomyScopes(
+    options.autonomyAllowedScopes,
+  );
   let autonomyProfile = normalizeAutonomyProfile(
-    options.autonomyProfile || (autonomyAllowedScopes.length ? "custom" : "manual"),
+    options.autonomyProfile ||
+      (autonomyAllowedScopes.length ? "custom" : "manual"),
   );
   let pendingModePayload = null;
+  const activitySnapshot = {
+    summary: "",
+    firstPromptPreview: "",
+    lastMessagePreview: "",
+  };
   let stopHeartbeat = () => {};
   const signalHandlers = new Map();
-  const syncCatalog = (status) => reportAgentConversationMetadata({
-    conversationId: options.conversationId || sessionId,
-    agentType: "claude",
-    nativeSessionId: claudeSessionId,
-    title: sessionTitle,
-    status,
-    workspaceId: options.workspaceId,
-    workspaceName: basename(cwd),
-    runtime: "claude-sdk",
-    provider: providerResult.provider?.name,
-    model: options.model || providerResult.provider?.model,
-    permissionProfile: autonomyProfile,
-  }, { stateDir }).catch(() => ({ ok: false }));
+  const syncCatalog = (status) =>
+    reportAgentConversationMetadata(
+      {
+        conversationId: options.conversationId || sessionId,
+        agentType: "claude",
+        nativeSessionId: claudeSessionId,
+        title: sessionTitle,
+        status,
+        workspaceId: options.workspaceId,
+        workspaceName: basename(cwd),
+        runtime: "claude-sdk",
+        provider: providerResult.provider?.name,
+        model: options.model || providerResult.provider?.model,
+        permissionProfile: autonomyProfile,
+        ...activitySnapshot,
+      },
+      { stateDir },
+    ).catch(() => ({ ok: false }));
 
-  const send = (type, extra = {}) => relayClient.send(type, {
-    sessionId,
-    localStarted: true,
-    ...extra,
-  }).catch(() => {});
+  const send = (type, extra = {}) => {
+    if (relayViaDaemon || !relayClient)
+      return Promise.resolve({ accepted: false, localOnly: true });
+    return relayClient
+      .send(type, {
+        sessionId,
+        localStarted: true,
+        ...extra,
+      })
+      .catch(() => {});
+  };
   const report = (type, extra = {}) => runtimeReporter.report(type, extra);
   const sendAgentEvent = async (event) => {
     const transientEvent = {
@@ -279,12 +354,17 @@ export async function runClaudeSdkSession(rawArgs) {
       eventId: event.eventId || `ate_${randomUUID()}`,
       createdAt: event.createdAt || Math.floor(Date.now() / 1000),
     };
+    updateAgentActivitySnapshot(activitySnapshot, transientEvent);
     recentEvents.push(transientEvent);
-    if (recentEvents.length > 100) recentEvents.splice(0, recentEvents.length - 100);
+    if (recentEvents.length > 100)
+      recentEvents.splice(0, recentEvents.length - 100);
     await Promise.all([
       send("agent.stream.event", { event: transientEvent }),
       report("agent.event", { event: transientEvent }),
       localAgentBridge?.sendEvent(transientEvent),
+      shouldSyncAgentActivitySnapshot(transientEvent)
+        ? syncCatalog("running")
+        : Promise.resolve(),
     ]);
   };
   const interactions = new PendingInteractionRegistry({
@@ -298,7 +378,10 @@ export async function runClaudeSdkSession(rawArgs) {
     onResult: async (result) => {
       await Promise.all([
         send("agent.interaction.result", result),
-        localAgentBridge?.sendEvent({ type: "agent.interaction.result", ...result }),
+        localAgentBridge?.sendEvent({
+          type: "agent.interaction.result",
+          ...result,
+        }),
         report("agent.event", {
           event: {
             type: `agent.interaction.${result.status}`,
@@ -309,37 +392,45 @@ export async function runClaudeSdkSession(rawArgs) {
       ]);
     },
   });
-  const reportMode = (requestId = null) => sendAgentEvent({
-    type: "agent.mode.status",
-    provider: "claude",
-    runtime: "claude-sdk",
-    mode: currentMode,
-    modeControl: "supported",
-    availableModes: CLAUDE_MODES,
-    requestId,
-  });
-  const reportAutonomy = (requestId = null) => sendAgentEvent(buildAutonomyStatusEvent({
-    provider: "claude",
-    runtime: "claude-sdk",
-    profile: autonomyProfile,
-    allowedScopes: autonomyAllowedScopes,
-    requestId,
-  }));
-  const reportDetail = () => sendAgentEvent({
-    type: "agent.detail.status",
-    provider: "claude",
-    detailProfile: detail.profile,
-    detailSource: detail.source,
-    detailControl: "read_only",
-    availableDetailProfiles: AGENT_DETAIL_PROFILES,
-  });
+  const reportMode = (requestId = null) =>
+    sendAgentEvent({
+      type: "agent.mode.status",
+      provider: "claude",
+      runtime: "claude-sdk",
+      mode: currentMode,
+      modeControl: "supported",
+      availableModes: CLAUDE_MODES,
+      requestId,
+    });
+  const reportAutonomy = (requestId = null) =>
+    sendAgentEvent(
+      buildAutonomyStatusEvent({
+        provider: "claude",
+        runtime: "claude-sdk",
+        profile: autonomyProfile,
+        allowedScopes: autonomyAllowedScopes,
+        requestId,
+      }),
+    );
+  const reportDetail = () =>
+    sendAgentEvent({
+      type: "agent.detail.status",
+      provider: "claude",
+      detailProfile: detail.profile,
+      detailSource: detail.source,
+      detailControl: "read_only",
+      availableDetailProfiles: AGENT_DETAIL_PROFILES,
+    });
   const applyAutonomy = async (payload) => {
     const requested = normalizeAutonomyProfile(payload?.profile, "");
     if (!requested) return false;
     autonomyProfile = requested;
-    autonomyAllowedScopes = requested === "custom"
-      ? normalizeAutonomyScopes(payload?.allowedScopes || payload?.allowed_scopes)
-      : [];
+    autonomyAllowedScopes =
+      requested === "custom"
+        ? normalizeAutonomyScopes(
+            payload?.allowedScopes || payload?.allowed_scopes,
+          )
+        : [];
     await reportAutonomy(payload?.requestId || null);
     return true;
   };
@@ -366,33 +457,34 @@ export async function runClaudeSdkSession(rawArgs) {
     }
   };
 
-  const markInteractionApplied = (resolved) => interactions.markResult(
-    resolved.interactionId,
-    "applied",
-    { responseId: resolved.responseId },
-  );
-  const requestInteraction = (request, signal) => resolveWithAutonomy({
-    request,
-    profile: autonomyProfile,
-    allowedScopes: autonomyAllowedScopes,
-    workspaceRoot: cwd,
-    aiReviewer: aiApprovalReviewer,
-    runtime: "claude-sdk",
-    requestInteraction: (item) => interactions.request(item, signal),
-    onAutoResolved: ({ request: item, resolved }) => sendAgentEvent({
-      type: "agent.interaction.auto_resolved",
-      provider: "claude",
-      interactionId: item.interactionId,
-      kind: item.kind,
-      title: item.title,
-      autonomyProfile,
-      autonomyScope: resolved.scope,
-      reason: resolved.reason,
-      decisionSource: resolved.decisionSource || "autonomy_policy",
-      aiReview: resolved.aiReview || null,
-      decision: resolved.action,
-    }),
-  });
+  const markInteractionApplied = (resolved) =>
+    interactions.markResult(resolved.interactionId, "applied", {
+      responseId: resolved.responseId,
+    });
+  const requestInteraction = (request, signal) =>
+    resolveWithAutonomy({
+      request,
+      profile: autonomyProfile,
+      allowedScopes: autonomyAllowedScopes,
+      workspaceRoot: cwd,
+      aiReviewer: aiApprovalReviewer,
+      runtime: "claude-sdk",
+      requestInteraction: (item) => interactions.request(item, signal),
+      onAutoResolved: ({ request: item, resolved }) =>
+        sendAgentEvent({
+          type: "agent.interaction.auto_resolved",
+          provider: "claude",
+          interactionId: item.interactionId,
+          kind: item.kind,
+          title: item.title,
+          autonomyProfile,
+          autonomyScope: resolved.scope,
+          reason: resolved.reason,
+          decisionSource: resolved.decisionSource || "autonomy_policy",
+          aiReview: resolved.aiReview || null,
+          decision: resolved.action,
+        }),
+    });
 
   const stopSession = async (signal = null) => {
     if (stopped) return;
@@ -414,7 +506,9 @@ export async function runClaudeSdkSession(rawArgs) {
   const handleRemoteEvent = async (payload) => {
     if (!payload) return false;
     if (payload.type === "agent.interactions.snapshot.request") {
-      const sessionIds = Array.isArray(payload.sessionIds) ? payload.sessionIds : [];
+      const sessionIds = Array.isArray(payload.sessionIds)
+        ? payload.sessionIds
+        : [];
       if (!sessionIds.includes(sessionId)) return false;
       await send("agent.interactions.snapshot", {
         requestId: payload.requestId,
@@ -470,9 +564,10 @@ export async function runClaudeSdkSession(rawArgs) {
         type: "user.text",
         provider: "claude",
         text,
-        eventId: payload.messageId || payload.commandId
-          ? `local-message-${payload.messageId || payload.commandId}`
-          : undefined,
+        eventId:
+          payload.messageId || payload.commandId
+            ? `local-message-${payload.messageId || payload.commandId}`
+            : undefined,
       });
       return true;
     }
@@ -508,19 +603,31 @@ export async function runClaudeSdkSession(rawArgs) {
 
   const eventLoop = async () => {
     while (!stopped) {
+      if (relayViaDaemon) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        continue;
+      }
+      if (!relayClient) {
+        relayPlan = await buildAgentRelayPlan({
+          stateDir,
+          relayUrl,
+          fallbackDeviceId: device.deviceId,
+          mode: relayMode,
+        });
+        if (!relayPlan.enabled) {
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          continue;
+        }
+        relayClient = new RelayClient(relayPlan);
+        effectiveDeviceId = relayPlan.deviceId || effectiveDeviceId;
+      }
       try {
-        await relayClient.connectEvents((payload) => void handleRemoteEvent(payload));
+        await relayClient.connectEvents((payload) => {
+          if (!relayViaDaemon) void handleRemoteEvent(payload);
+        });
       } catch {
         if (stopped) break;
-        try {
-          const refreshed = await buildRelayClientOptions({
-            stateDir,
-            relayUrl,
-            fallbackDeviceId: device.deviceId,
-          });
-          relayClient.deviceId = refreshed.deviceId;
-          relayClient.setAuthToken(refreshed.authToken);
-        } catch {}
+        relayClient = null;
         await new Promise((resolve) => setTimeout(resolve, 1500));
       }
     }
@@ -530,20 +637,29 @@ export async function runClaudeSdkSession(rawArgs) {
   const canUseTool = async (toolName, input, toolOptions = {}) => {
     const interactionId = toolOptions.toolUseID || `${toolName}-${Date.now()}`;
     if (toolName === "AskUserQuestion") {
-      const resolved = await requestInteraction(buildInteractionRequest({
-        provider: "claude",
-        runtime: "claude-sdk",
-        sessionId,
-        interactionId,
-        source: INTERACTION_SOURCES.HOOK,
-        kind: INTERACTION_KINDS.QUESTIONS,
-        title: toolOptions.title || "Claude has questions",
-        prompt: toolOptions.description || "Answer the questions to continue.",
-        payload: questionPayload(input),
-      }), toolOptions.signal).catch(() => ({ action: "cancel", response: {} }));
-      if (resolved.interactionId && !resolved.autoResolved) await markInteractionApplied(resolved);
+      const resolved = await requestInteraction(
+        buildInteractionRequest({
+          provider: "claude",
+          runtime: "claude-sdk",
+          sessionId,
+          interactionId,
+          source: INTERACTION_SOURCES.HOOK,
+          kind: INTERACTION_KINDS.QUESTIONS,
+          title: toolOptions.title || "Claude has questions",
+          prompt:
+            toolOptions.description || "Answer the questions to continue.",
+          payload: questionPayload(input),
+        }),
+        toolOptions.signal,
+      ).catch(() => ({ action: "cancel", response: {} }));
+      if (resolved.interactionId && !resolved.autoResolved)
+        await markInteractionApplied(resolved);
       if (resolved.action !== "submit" && resolved.action !== "allow") {
-        return permissionResult({ action: resolved.action, input, reason: "The user canceled the questions." });
+        return permissionResult({
+          action: resolved.action,
+          input,
+          reason: "The user canceled the questions.",
+        });
       }
       return {
         behavior: "allow",
@@ -554,42 +670,68 @@ export async function runClaudeSdkSession(rawArgs) {
       };
     }
 
-    const isPlanConfirmation = toolName === "ExitPlanMode" || toolName === "exit_plan_mode";
+    const isPlanConfirmation =
+      toolName === "ExitPlanMode" || toolName === "exit_plan_mode";
     const safeInput = displaySafeToolInput(input);
-    const resolved = await requestInteraction(buildInteractionRequest({
-      provider: "claude",
-      runtime: "claude-sdk",
-      sessionId,
-      interactionId,
-      source: INTERACTION_SOURCES.HOOK,
-      kind: isPlanConfirmation ? INTERACTION_KINDS.CONFIRM : INTERACTION_KINDS.PERMISSION,
-      title: toolOptions.title || (isPlanConfirmation ? "Implement this plan?" : `${toolName} needs permission`),
-      prompt: toolOptions.description || toolOptions.decisionReason || "Review this action before continuing.",
-      payload: {
-        tool: toolName,
-        display_name: toolOptions.displayName || toolName,
-        blocked_path: toolOptions.blockedPath || "",
-        tool_input: safeInput,
-        command: typeof input?.command === "string" ? input.command.slice(0, 8192) : "",
-        cwd: typeof input?.cwd === "string" ? input.cwd.slice(0, 1024) : cwd,
-        ...(isPlanConfirmation
-          ? {
-              plan: typeof input?.plan === "string" ? input.plan.slice(0, 65_536) : "",
-              approval_options: PLAN_APPROVAL_OPTIONS,
-              default_approval_option: "default",
-            }
-          : {}),
-        remember_allowed: Array.isArray(toolOptions.suggestions) && toolOptions.suggestions.length > 0,
-      },
-      containsSecret: toolInputContainsSecret(input),
-    }), toolOptions.signal).catch(() => ({ action: "cancel", response: {} }));
-    if (resolved.interactionId && !resolved.autoResolved) await markInteractionApplied(resolved);
+    const resolved = await requestInteraction(
+      buildInteractionRequest({
+        provider: "claude",
+        runtime: "claude-sdk",
+        sessionId,
+        interactionId,
+        source: INTERACTION_SOURCES.HOOK,
+        kind: isPlanConfirmation
+          ? INTERACTION_KINDS.CONFIRM
+          : INTERACTION_KINDS.PERMISSION,
+        title:
+          toolOptions.title ||
+          (isPlanConfirmation
+            ? "Implement this plan?"
+            : `${toolName} needs permission`),
+        prompt:
+          toolOptions.description ||
+          toolOptions.decisionReason ||
+          "Review this action before continuing.",
+        payload: {
+          tool: toolName,
+          display_name: toolOptions.displayName || toolName,
+          blocked_path: toolOptions.blockedPath || "",
+          tool_input: safeInput,
+          command:
+            typeof input?.command === "string"
+              ? input.command.slice(0, 8192)
+              : "",
+          cwd: typeof input?.cwd === "string" ? input.cwd.slice(0, 1024) : cwd,
+          ...(isPlanConfirmation
+            ? {
+                plan:
+                  typeof input?.plan === "string"
+                    ? input.plan.slice(0, 65_536)
+                    : "",
+                approval_options: PLAN_APPROVAL_OPTIONS,
+                default_approval_option: "default",
+              }
+            : {}),
+          remember_allowed:
+            Array.isArray(toolOptions.suggestions) &&
+            toolOptions.suggestions.length > 0,
+        },
+        containsSecret: toolInputContainsSecret(input),
+      }),
+      toolOptions.signal,
+    ).catch(() => ({ action: "cancel", response: {} }));
+    if (resolved.interactionId && !resolved.autoResolved)
+      await markInteractionApplied(resolved);
     if (
-      isPlanConfirmation
-      && (resolved.action === "allow" || resolved.action === "submit")
+      isPlanConfirmation &&
+      (resolved.action === "allow" || resolved.action === "submit")
     ) {
-      const requestedMode = String(resolved.response?.permission_mode || "default");
-      const nextMode = PLAN_APPROVAL_OPTIONS.some((item) => item.id === requestedMode)
+      const requestedMode = String(
+        resolved.response?.permission_mode || "default",
+      );
+      const nextMode = PLAN_APPROVAL_OPTIONS.some(
+        (item) => item.id === requestedMode,
+      )
         ? requestedMode
         : "default";
       await queryRef?.setPermissionMode(nextMode);
@@ -607,24 +749,45 @@ export async function runClaudeSdkSession(rawArgs) {
   const onElicitation = async (request, { signal }) => {
     const interactionId = request.elicitationId || `claude-mcp-${Date.now()}`;
     const isUrl = request.mode === "url";
-    const resolved = await requestInteraction(buildInteractionRequest({
-      provider: "claude",
-      runtime: "claude-sdk",
-      sessionId,
-      interactionId,
-      source: INTERACTION_SOURCES.APP_SERVER,
-      kind: isUrl ? INTERACTION_KINDS.URL : INTERACTION_KINDS.FORM,
-      title: request.title || request.displayName || request.serverName || "MCP request",
-      prompt: request.description || request.message || "The MCP server needs input.",
-      payload: isUrl
-        ? { url: request.url || "", server_name: request.serverName || "" }
-        : { schema: request.requestedSchema || {}, server_name: request.serverName || "" },
-      containsSecret: Boolean(request.requestedSchema?.properties
-        && Object.values(request.requestedSchema.properties).some((field) => field?.writeOnly || field?.format === "password")),
-    }), signal).catch(() => ({ action: "cancel", response: {} }));
-    if (resolved.interactionId && !resolved.autoResolved) await markInteractionApplied(resolved);
+    const resolved = await requestInteraction(
+      buildInteractionRequest({
+        provider: "claude",
+        runtime: "claude-sdk",
+        sessionId,
+        interactionId,
+        source: INTERACTION_SOURCES.APP_SERVER,
+        kind: isUrl ? INTERACTION_KINDS.URL : INTERACTION_KINDS.FORM,
+        title:
+          request.title ||
+          request.displayName ||
+          request.serverName ||
+          "MCP request",
+        prompt:
+          request.description ||
+          request.message ||
+          "The MCP server needs input.",
+        payload: isUrl
+          ? { url: request.url || "", server_name: request.serverName || "" }
+          : {
+              schema: request.requestedSchema || {},
+              server_name: request.serverName || "",
+            },
+        containsSecret: Boolean(
+          request.requestedSchema?.properties &&
+          Object.values(request.requestedSchema.properties).some(
+            (field) => field?.writeOnly || field?.format === "password",
+          ),
+        ),
+      }),
+      signal,
+    ).catch(() => ({ action: "cancel", response: {} }));
+    if (resolved.interactionId && !resolved.autoResolved)
+      await markInteractionApplied(resolved);
     if (resolved.action === "submit" || resolved.action === "allow") {
-      return { action: "accept", content: resolved.response?.values || resolved.response || {} };
+      return {
+        action: "accept",
+        content: resolved.response?.values || resolved.response || {},
+      };
     }
     return { action: resolved.action === "cancel" ? "cancel" : "decline" };
   };
@@ -638,14 +801,23 @@ export async function runClaudeSdkSession(rawArgs) {
     runtime: "claude-sdk",
     executor: "sdk",
     startedBy: "local-sdk",
-    providerConfig: buildProviderConfigEvent(providerResult.provider, providerResult.source),
-    metadata: { adapter: "claude-sdk", structuredSources: ["claude-agent-sdk"] },
+    providerConfig: buildProviderConfigEvent(
+      providerResult.provider,
+      providerResult.source,
+    ),
+    metadata: {
+      adapter: "claude-sdk",
+      structuredSources: ["claude-agent-sdk"],
+    },
   });
   await report("session.started", { runtime: "claude-sdk", executor: "sdk" });
   stopHeartbeat = startAgentSessionHeartbeat({ sessionId, stateDir });
 
   for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
-    const handler = () => void stopSession(signal).finally(() => process.exit(signal === "SIGINT" ? 130 : 0));
+    const handler = () =>
+      void stopSession(signal).finally(() =>
+        process.exit(signal === "SIGINT" ? 130 : 0),
+      );
     signalHandlers.set(signal, handler);
     process.on(signal, handler);
   }
@@ -662,15 +834,21 @@ export async function runClaudeSdkSession(rawArgs) {
         permissionMode: currentMode,
         allowDangerouslySkipPermissions: true,
         model: options.model || providerResult.provider?.model,
-        fallbackModel: options.fallbackModel || providerResult.provider?.smallFastModel,
+        fallbackModel:
+          options.fallbackModel || providerResult.provider?.smallFastModel,
         includeHookEvents: true,
         forwardSubagentText: true,
-        ...(typeof options.resume === "string" ? { resume: options.resume } : {}),
+        ...(typeof options.resume === "string"
+          ? { resume: options.resume }
+          : {}),
       },
     });
     localAgentBridge = new LocalAgentBridgeClient({
       stateDir,
       sessionId,
+      onConnectionChange: (connected) => {
+        relayViaDaemon = connected;
+      },
       onCommand: async (payload) => {
         const applied = await handleRemoteEvent(payload);
         if (payload?.type === "agent.message") {
@@ -683,13 +861,13 @@ export async function runClaudeSdkSession(rawArgs) {
         return applied;
       },
     });
-    await localAgentBridge.start({
+    relayViaDaemon = await localAgentBridge.start({
       sessionId,
       conversationId: options.conversationId || sessionId,
       runId: options.runId || sessionId,
       agent: "claude",
       title: sessionTitle,
-      deviceId: relayOptions.deviceId,
+      deviceId: effectiveDeviceId,
       deviceName: device.host,
       cwd,
       workspaceTrusted: true,
@@ -755,7 +933,8 @@ export async function runClaudeSdkSession(rawArgs) {
     throw error;
   } finally {
     await originrouterCodingProxy?.stop().catch(() => {});
-    for (const [signal, handler] of signalHandlers) process.off(signal, handler);
-    relayClient._aborted = true;
+    for (const [signal, handler] of signalHandlers)
+      process.off(signal, handler);
+    if (relayClient) relayClient._aborted = true;
   }
 }

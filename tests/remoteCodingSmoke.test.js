@@ -79,6 +79,11 @@ function startRelay() {
     };
 
     const server = http.createServer((req, res) => {
+      if (req.method === "GET" && req.url?.endsWith("/e2ee")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ code: 0, data: { policy: "off" } }));
+        return;
+      }
       if (req.method === "GET" && req.url === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
@@ -562,7 +567,8 @@ try {
   // -----------------------------------------------------------------
   // §C.5 — relay disconnect mid-stream. We kill the relay and try
   // to send. The bridge's SSE will drop; the next publishRequest
-  // will fail. We assert 502 with a relay-related error code.
+  // will fail before any plaintext request is published. We assert
+  // the fail-closed E2EE directory error.
   // -----------------------------------------------------------------
   {
     // Build a fresh bridge so the SSE is fresh.
@@ -578,15 +584,9 @@ try {
         "x-originrouter-target-device": "worker-anything",
         "x-originrouter-runtime": "claude",
       }, {});
-      assert.equal(r.status, 502, `expected 502, got ${r.status}: ${r.raw}`);
-      // Acceptable: upstream_error (the publishRequest itself failed)
-      // or relay_disconnected (the SSE was torn down before the
-      // publish landed). Both are surfaced as 502.
-      assert.ok(
-        r.body.code === "upstream_error" || r.body.code === "relay_disconnected",
-        `expected upstream_error or relay_disconnected, got ${r.body.code}: ${r.raw}`
-      );
-      console.log(`[smoke] C.5 relay disconnect → 502 ${r.body.code} ok`);
+      assert.equal(r.status, 426, `expected 426, got ${r.status}: ${r.raw}`);
+      assert.equal(r.body.code, "e2ee_directory_unavailable");
+      console.log(`[smoke] C.5 relay disconnect → 426 ${r.body.code} ok`);
     } finally {
       await bridge.stop();
     }
