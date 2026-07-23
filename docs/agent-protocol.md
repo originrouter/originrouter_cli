@@ -962,7 +962,7 @@ AWS secret keys / GCP service-account JSON paths are persisted to `~/.originrout
 
 Stage 7.5 introduced a **Route** layer. Stage 7.6 collapses the entire provider system to a single path: every Claude Code session goes through the local LiteLLM proxy and two fixed alias names that never change. There is no direct path for Claude.
 
-Stage 8.0 extends this contract to **Codex** with a third alias `originrouter-codex-model`. Codex 8.0 has only one slot (`main`); `codex.small` is a hard error. Codex and Claude routes do not share, do not fallback into each other, and do not inherit each other's slots. The proxy YAML renders whichever aliases are configured — if only Codex routes exist, only the Codex alias appears.
+Stage 8.0 extends this contract to **Codex** with a third alias `gpt-5.4`. Codex 8.0 has only one slot (`main`); `codex.small` is a hard error. Codex and Claude routes do not share, do not fallback into each other, and do not inherit each other's slots. The proxy YAML renders whichever aliases are configured — if only Codex routes exist, only the Codex alias appears.
 
 ```
 Claude Code  →  ANTHROPIC_MODEL=originrouter-claude-model
@@ -1006,8 +1006,8 @@ Claude Code  →  ANTHROPIC_MODEL=originrouter-claude-model
 - Alias names are **hardcoded**: `originrouter-claude-model` (main) and `originrouter-claude-fast-model` (small). Not stored in config; not user-editable. The CLI storage slot is `claude.small`; the UI display label is "Claude Fast Model".
 - **Stage 7.8:** `provider use` writes ONLY `routes.claude.main`. The fast route is owned by the routes layer. To set it, use `POST /routes/claude/small` (or the UI's "Set as Claude Fast route" button on the provider detail). `provider use` no longer seeds `small` from the provider's `smallFastModel`; that field is [legacy] and the form no longer surfaces it.
 - **Stage 7.9:** the browser console exposes `/routes/claude/main` and `/routes/claude/small` as form selects on the new Routes tab — full-screen editor for both slots. Codex remained a UI placeholder (disabled `<select>` + "Codex routing is not wired yet." banner) at this point; Stage 8.2 wired it. The left Routes sidebar showed the compact `main` / `small` summary.
-- **Stage 8.2:** the browser console's Routes tab now exposes a real Codex routing block — `routes.codex.main` as a `<select>` populated from `GET /providers` filtered to `type=litellm && model && model !== "(unset)"`, an `alias:` line (`originrouter-codex-model`), a `current:` indicator showing `(unset; Codex will not start until set)` when no route is set, and `Save Codex Model` / `Clear Codex Model` buttons that POST/DELETE `/routes/codex/main`. A banner note (`Codex has one route in Stage 8.x. It does not use Claude Model or Fast Model.`) makes the isolation explicit. The Provider-detail view adds a `Set as Codex Model route` button next to the Claude buttons. The Routes sidebar groups rows under `Claude` / `Codex` section labels, with `clear-codex-route` mirroring `clear-fast-route`. Codex never falls back to Claude.
-- **Stage 8.0:** Codex rides the same routes contract with a third fixed alias `originrouter-codex-model` (`routes.codex.main`). Codex 8.0 has **only `main`** — `codex.small` is a hard error from `setRoute` / `clearRoute` and the API returns 400 on `POST /routes/codex/small`. **Codex never falls back to Claude**, even when Claude routes are configured. There is no `currentProvider.codex` fallback in Stage 8.0: `originrouter codex` errors with `Codex requires routes.codex.main. Run originrouter route set codex.main --provider <name> --model <model>.` if the route is unset. `provider use --agent codex` writes `routes.codex.main` (it no longer writes `currentProvider.codex`). The `CodexAdapter` injects `--model originrouter-codex-model` (plus `OPENAI_MODEL` env as a defensive fallback) unless the user passed `--model` / `-m` in any form (`--model X`, `--model=X`, `-m X`, `-m=X`), in which case it warns and passes args through. Codex env at launch: `OPENAI_BASE_URL=http://127.0.0.1:<proxy-port>/v1`, `OPENAI_API_KEY=sk-noop-litellm-passthrough`, `OPENAI_MODEL=originrouter-codex-model`.
+- **Stage 8.2:** the browser console's Routes tab now exposes a real Codex routing block — `routes.codex.main` as a `<select>` populated from `GET /providers` filtered to `type=litellm && model && model !== "(unset)"`, an `alias:` line (`gpt-5.4`), a `current:` indicator showing `(unset; Codex will not start until set)` when no route is set, and `Save Codex Model` / `Clear Codex Model` buttons that POST/DELETE `/routes/codex/main`. A banner note (`Codex has one route in Stage 8.x. It does not use Claude Model or Fast Model.`) makes the isolation explicit. The Provider-detail view adds a `Set as Codex Model route` button next to the Claude buttons. The Routes sidebar groups rows under `Claude` / `Codex` section labels, with `clear-codex-route` mirroring `clear-fast-route`. Codex never falls back to Claude.
+- **Stage 8.0:** Codex rides the same routes contract with a third fixed alias `gpt-5.4` (`routes.codex.main`). Codex 8.0 has **only `main`** — `codex.small` is a hard error from `setRoute` / `clearRoute` and the API returns 400 on `POST /routes/codex/small`. **Codex never falls back to Claude**, even when Claude routes are configured. There is no `currentProvider.codex` fallback in Stage 8.0: `originrouter codex` errors with `Codex requires routes.codex.main. Run originrouter route set codex.main --provider <name> --model <model>.` if the route is unset. `provider use --agent codex` writes `routes.codex.main` (it no longer writes `currentProvider.codex`). The `CodexAdapter` injects `--model gpt-5.4` (plus `OPENAI_MODEL` env as a defensive fallback) unless the user passed `--model` / `-m` in any form (`--model X`, `--model=X`, `-m X`, `-m=X`), in which case it warns and passes args through. Codex env at launch: `OPENAI_BASE_URL=http://127.0.0.1:<proxy-port>/v1`, `OPENAI_API_KEY=sk-noop-litellm-passthrough`, `OPENAI_MODEL=gpt-5.4`.
 
 ### 10.3 Provider type collapse (Stage 7.6)
 
@@ -1131,7 +1131,7 @@ vars:
 
 - `OPENAI_BASE_URL=http://127.0.0.1:<port>/v1`
 - `OPENAI_API_KEY=sk-noop-litellm-passthrough`
-- `OPENAI_MODEL=originrouter-codex-model`
+- `OPENAI_MODEL=gpt-5.4`
 
 `originrouter env print --agent codex` renders these for human
 inspection. **Verifying env print proves env injection only.** It
@@ -1141,7 +1141,7 @@ does not prove the `--model` CLI argument is injected.
 `CodexAdapter.buildLaunch()` in `src/adapters/codexAdapter.js:38-58`.
 Unless the user passed `--model` / `-m` in any of the four accepted
 forms (`--model X`, `--model=X`, `-m X`, `-m=X`), the adapter
-prepends `["--model", "originrouter-codex-model"]` to the child argv.
+prepends `["--model", "gpt-5.4"]` to the child argv.
 When the user did pass a model flag, the adapter leaves argv
 unchanged and writes a stderr warning pointing at
 `route set codex.main`.
@@ -1159,7 +1159,7 @@ Codex Code actually use the configured route" is the LiteLLM proxy
 log file (path stored in `proxy.state.json.logPath`, default
 `~/.originrouter/logs/litellm.log`). Look for an inbound request to
 the OpenAI-compatible endpoint with
-`"model": "originrouter-codex-model"` and a successful upstream
+`"model": "gpt-5.4"` and a successful upstream
 dispatch.
 
 The model name that Codex Code self-reports in its UI is **not** a

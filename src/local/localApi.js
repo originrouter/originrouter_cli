@@ -54,6 +54,10 @@ import {
   setAgentDetailDefault,
 } from "../runtime/agentDetailProfile.js";
 import { ExternalAgentRegistry } from "./externalAgentRegistry.js";
+import { LocalAuditStore } from "../persistence/localAuditStore.js";
+import { buildAuditEvidenceBundle } from "../inquiry/auditEvidenceAdapter.js";
+import { CollaborationStore } from "../collaboration/collaborationStore.js";
+import { PlanImplementVerifyCoordinator } from "../collaboration/planImplementVerifyCoordinator.js";
 
 // Exported so CLI subcommands (e.g. `local api set-host`) can apply
 // the same gating as the runtime auth layer. Keep the set in lock-
@@ -107,6 +111,10 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
   // at start time. The daemon patches `localApiPort` onto the returned
   // handle immediately after binding, so the handler sees the bound port on
   // its first request.
+  const auditStore = ctx.auditStore || new LocalAuditStore();
+  const collaborationStore = ctx.collaborationStore || new CollaborationStore();
+  const collaborationCoordinator = ctx.collaborationCoordinator
+    || new PlanImplementVerifyCoordinator({ store: collaborationStore });
   const liveCtx = {
     bindAddress,
     isLoopback,
@@ -121,7 +129,15 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
     stopRemoteShareProxy: ctx.stopRemoteShareProxy,
     restartRemoteShareProxy: ctx.restartRemoteShareProxy,
     sessionManager: ctx.sessionManager,
-    externalAgentRegistry: ctx.externalAgentRegistry || new ExternalAgentRegistry(),
+    auditStore,
+    collaborationStore,
+    collaborationCoordinator,
+    collaborationRuntime: ctx.collaborationRuntime || null,
+    agentCatalog: ctx.agentCatalog || null,
+    managedAgentSupervisor: ctx.managedAgentSupervisor || null,
+    externalAgentRegistry:
+      ctx.externalAgentRegistry ||
+      new ExternalAgentRegistry({ catalog: ctx.agentCatalog || null }),
     startedAt: ctx.startedAt || new Date().toISOString(),
     pid: ctx.pid || process.pid,
     version: ctx.version || "0.1.0",
@@ -242,7 +258,10 @@ function requireAuth(req, ctx) {
   const path = url.split("?")[0];
   const isAuthRequiredGetPath = AUTH_REQUIRED_GET_PATHS.has(path)
     || path === "/routes"
-    || path.startsWith("/routes/");
+    || path.startsWith("/routes/")
+    || path === "/agent/catalog"
+    || path.startsWith("/agent/catalog/")
+    || path.startsWith("/collaboration/");
   const needsAuth = !(req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS")
     || isAuthRequiredGetPath;
   if (!needsAuth) return { ok: true };
@@ -395,6 +414,122 @@ async function dispatch(ctx, req, res) {
     if (req.method === "GET" && pathname === "/agent/local/sessions") {
       return sendOk(res, { sessions: ctx.externalAgentRegistry.list() });
     }
+    if (pathname === "/collaboration/local/runs") {
+      if (req.method === "GET") {
+        const runs = ctx.collaborationStore.listRuns({ limit: url.searchParams.get("limit") })
+          .map((run) => ctx.collaborationStore.getRun(run.run_id));
+        return sendOk(res, { runs });
+      }
+      if (req.method === "POST") {
+        const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+        if (body.__error) return sendError(res, 400, body.__error);
+        try {
+          return sendOk(res, { run: ctx.collaborationCoordinator.create(body) });
+        } catch (error) {
+          return sendError(res, 400, error.message || "invalid collaboration run");
+        }
+      }
+      return sendError(res, 405, `method ${req.method} not allowed`);
+    }
+    const collaborationMatch = pathname.match(
+      /^\/collaboration\/local\/runs\/([^/]+)(?:\/(start|begin-planning|begin-implementation|cancel|messages|budget))?$/,
+    );
+    if (collaborationMatch) {
+      const runId = decodeURIComponent(collaborationMatch[1]);
+      const action = collaborationMatch[2] || "";
+      if (req.method === "GET" && !action) {
+        const run = ctx.collaborationStore.getRun(runId);
+        return run ? sendOk(res, { run }) : sendError(res, 404, "collaboration run not found");
+      }
+      if (req.method !== "POST" || !action) {
+        return sendError(res, 405, `method ${req.method} not allowed`);
+      }
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      try {
+        const result = action === "start"
+          ? { run: ctx.collaborationRuntime
+              ? await ctx.collaborationRuntime.start(runId)
+              : ctx.collaborationCoordinator.start(runId) }
+          : action === "begin-planning"
+            ? { run: ctx.collaborationCoordinator.beginPlanning(runId) }
+            : action === "begin-implementation"
+              ? { run: ctx.collaborationCoordinator.beginImplementation(runId) }
+              : action === "cancel"
+                ? { run: ctx.collaborationRuntime
+                    ? await ctx.collaborationRuntime.cancel(runId)
+                    : ctx.collaborationCoordinator.cancel(runId) }
+                : action === "budget"
+                  ? { run: ctx.collaborationRuntime
+                      ? await ctx.collaborationRuntime.updateBudget(runId, body)
+                      : ctx.collaborationStore.updateBudget(runId, body) }
+                  : ctx.collaborationCoordinator.receive(runId, body);
+        return sendOk(res, result);
+      } catch (error) {
+        return sendError(res, 409, error.message || "collaboration action rejected", {
+          reason: error.code || "collaboration_action_rejected",
+        });
+      }
+    }
+    if (req.method === "GET" && pathname === "/agent/catalog/status") {
+      if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
+      return sendOk(res, { catalog: ctx.agentCatalog.status() });
+    }
+    if (req.method === "GET" && pathname === "/agent/catalog/conversations") {
+      if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
+      return sendOk(res, {
+        conversations: ctx.agentCatalog.listConversations({
+          search: url.searchParams.get("search") || "",
+          agent: url.searchParams.get("agent") || "",
+          deviceId: url.searchParams.get("device_id") || "",
+          workspaceId: url.searchParams.get("workspace_id") || "",
+          status: url.searchParams.get("status") || "",
+          limit: url.searchParams.get("limit"),
+          offset: url.searchParams.get("offset"),
+          includeArchived: url.searchParams.get("archived") === "true",
+        }),
+      });
+    }
+    if (req.method === "GET" && pathname === "/agent/catalog/workspaces") {
+      if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
+      return sendOk(res, {
+        workspaces: ctx.agentCatalog.listWorkspaces({
+          search: url.searchParams.get("search") || "",
+          deviceId: url.searchParams.get("device_id") || "",
+          limit: url.searchParams.get("limit"),
+        }),
+      });
+    }
+    if (req.method === "POST" && pathname === "/agent/local/launch") {
+      if (!ctx.managedAgentSupervisor) {
+        return sendError(res, 503, "managed Agent launcher unavailable");
+      }
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      try {
+        const result = await ctx.managedAgentSupervisor.start(body);
+        return sendOk(res, { launch: result });
+      } catch (error) {
+        return sendError(
+          res,
+          ["WORKSPACE_NOT_FOUND", "WORKSPACE_NOT_TRUSTED"].includes(error.code)
+            ? 409
+            : 400,
+          error.message || "Agent launch failed",
+          { reason: error.code || "launch_failed" },
+        );
+      }
+    }
+    const catalogConversationMatch = pathname.match(
+      /^\/agent\/catalog\/conversations\/([^/]+)$/,
+    );
+    if (req.method === "GET" && catalogConversationMatch) {
+      if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
+      const conversationId = decodeURIComponent(catalogConversationMatch[1]);
+      const conversation = ctx.agentCatalog.getConversation(conversationId);
+      if (!conversation) return sendError(res, 404, "agent conversation not found");
+      return sendOk(res, { conversation });
+    }
     if (pathname === "/agent/local/settings/detail") {
       if (req.method === "GET") {
         const config = readConfig();
@@ -428,8 +563,33 @@ async function dispatch(ctx, req, res) {
       return sendOk(res, { session: ctx.externalAgentRegistry.register(body) });
     }
 
+    const localInquiryMatch = pathname.match(
+      /^\/agent\/local\/sessions\/([^/]+)\/inquiries\/(approval|change)\/query$/,
+    );
+    if (localInquiryMatch) {
+      if (req.method !== "POST") {
+        return sendError(res, 405, `method ${req.method} not allowed`);
+      }
+      const sessionId = decodeURIComponent(localInquiryMatch[1]);
+      const domain = localInquiryMatch[2];
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      try {
+        const evidenceBundle = buildAuditEvidenceBundle({
+          auditStore: ctx.auditStore,
+          sessionId,
+          request: { ...body, domain },
+        });
+        return sendOk(res, { evidence_bundle: evidenceBundle });
+      } catch (error) {
+        return sendError(res, 400, error.message || "invalid inquiry request", {
+          reason: error.code || "invalid_inquiry_request",
+        });
+      }
+    }
+
     const localAgentMatch = pathname.match(
-      /^\/agent\/local\/sessions\/([^/]+)\/(update|unregister|events|commands|history|message|interrupt|stop|interaction|mode|autonomy)$/,
+      /^\/agent\/local\/sessions\/([^/]+)\/(update|unregister|events|commands|history|audit|message|interrupt|stop|interaction|mode|autonomy)$/,
     );
     if (localAgentMatch) {
       const sessionId = decodeURIComponent(localAgentMatch[1]);
@@ -448,6 +608,16 @@ async function dispatch(ctx, req, res) {
           return sendOk(
             res,
             ctx.externalAgentRegistry.history(sessionId, {
+              beforeCursor: url.searchParams.get("before"),
+              limit: url.searchParams.get("limit"),
+            }),
+          );
+        }
+        if (req.method === "GET" && action === "audit") {
+          return sendOk(
+            res,
+            ctx.auditStore.list(sessionId, {
+              category: url.searchParams.get("category") || "",
               beforeCursor: url.searchParams.get("before"),
               limit: url.searchParams.get("limit"),
             }),
@@ -527,7 +697,7 @@ async function dispatch(ctx, req, res) {
         }
         if (action === "autonomy") {
           const profile = String(body.profile || "").trim();
-          if (!['manual', 'guarded', 'unrestricted', 'custom'].includes(profile)) {
+          if (!['manual', 'guarded', 'ai_review', 'unrestricted', 'custom'].includes(profile)) {
             return sendError(res, 400, "invalid agent autonomy profile");
           }
           const rawScopes = Array.isArray(body.allowedScopes)

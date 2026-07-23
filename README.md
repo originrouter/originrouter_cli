@@ -3,6 +3,10 @@
 OriginRouter CLI manages local LiteLLM routes and connects a CLI installation
 to OriginRouter Cloud, remote devices, and Proxy Control.
 
+Agent approval and external-change audit history is stored locally in an
+append-only, hash-linked ledger. See `docs/agent-local-audit.md` for storage,
+filtering, redaction, and App/Relay behavior.
+
 ## Install and test
 
 ```bash

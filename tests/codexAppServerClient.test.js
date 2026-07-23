@@ -15,12 +15,27 @@
 import assert from "node:assert/strict";
 import { CodexAppServerClient } from "../src/adapters/codex/appServerClient.js";
 import { mapCodexApprovalRequest } from "../src/adapters/codex/eventMapper.js";
+import { createSerialAgentEventQueue } from "../src/runtime/codexAppServerSession.js";
 import {
   permissionEventToInteraction,
   INTERACTION_SOURCES,
 } from "../src/runtime/agentInteractionContract.js";
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+{
+  const delivered = [];
+  const queue = createSerialAgentEventQueue(async (event) => {
+    if (event.type === "agent.text") {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    delivered.push(event.type);
+  });
+  void queue.enqueue({ type: "agent.text" });
+  void queue.enqueue({ type: "agent.task.complete" });
+  await queue.drain();
+  assert.deepEqual(delivered, ["agent.text", "agent.task.complete"]);
+}
 
 function makeFakeChild({ killed = false } = {}) {
   const handlers = {};
@@ -659,6 +674,45 @@ async function captureSpawnEnv(env) {
 }
 
 // ---- 35. Stage 8.9: structural round-trip via permissionEventToInteraction ----
+
+{
+  let capturedArgs = null;
+  const fakeChild = makeFakeChild();
+  const c = new CodexAppServerClient({
+    spawnFn: (_cmd, args) => {
+      capturedArgs = args;
+      return fakeChild;
+    },
+    createInterfaceFn: () => ({ on() {}, close() {} }),
+  });
+  fakeChild.stdin = { writable: true, write() {} };
+  const connectPromise = c.connect({
+    env: { OPENAI_API_KEY: "test-key" },
+    modelProvider: {
+      id: "originrouter_proxy",
+      name: "OriginRouter Route",
+      baseUrl: "http://127.0.0.1:40123/v1",
+      envKey: "OPENAI_API_KEY",
+      wireApi: "responses",
+    },
+  });
+  await flush();
+  c.handleLine(JSON.stringify({
+    jsonrpc: "2.0", id: 1, result: { protocolVersion: "v1" },
+  }));
+  await connectPromise;
+  assert.deepEqual(capturedArgs.slice(0, 3), [
+    "app-server",
+    "-c",
+    'model_provider="originrouter_proxy"',
+  ]);
+  assert.ok(capturedArgs.includes('model_providers.originrouter_proxy.base_url="http://127.0.0.1:40123/v1"'));
+  assert.ok(capturedArgs.includes('model_providers.originrouter_proxy.wire_api="responses"'));
+  assert.deepEqual(capturedArgs.slice(-2), ["--listen", "stdio://"]);
+  c.disconnect();
+}
+
+// ---- 36. Stage 8.9: structural round-trip via permissionEventToInteraction ----
 
 {
   const legacy = mapCodexApprovalRequest({

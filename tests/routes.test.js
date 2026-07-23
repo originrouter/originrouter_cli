@@ -43,7 +43,7 @@ assert.deepEqual([...ROUTE_AGENTS], ["claude", "codex"]);
 assert.deepEqual([...ROUTE_SLOTS], ["main", "small"]);
 assert.equal(MAIN_ALIAS,       "originrouter-claude-model");
 assert.equal(SMALL_ALIAS,      "originrouter-claude-fast-model");
-assert.equal(CODEX_MAIN_ALIAS, "originrouter-codex-model");
+assert.equal(CODEX_MAIN_ALIAS, "gpt-5.4");
 
 // ---- getRoutes ----
 
@@ -309,7 +309,7 @@ assert.throws(
 
   const resolved = resolveAgentRoutes(cfg1, "codex");
   assert.equal(Object.keys(resolved).length, 1);
-  assert.equal(resolved[CODEX_MAIN_ALIAS].alias, "originrouter-codex-model");
+  assert.equal(resolved[CODEX_MAIN_ALIAS].alias, "gpt-5.4");
   assert.equal(resolved[CODEX_MAIN_ALIAS].slot, "main");
 
   const cfg2 = clearRoute(cfg1, "codex", "main");
@@ -357,7 +357,7 @@ assert.throws(
   assert.equal(ROUTE_DEFS.codex.slots.length, 1);
   assert.equal(ROUTE_DEFS.codex.slots[0], "main");
   assert.equal(ROUTE_DEFS.codex.fallbackSmallToMain, false);
-  assert.equal(ROUTE_DEFS.codex.aliases.main, "originrouter-codex-model");
+  assert.equal(ROUTE_DEFS.codex.aliases.main, "gpt-5.4");
   assert.equal(ROUTE_DEFS.claude.slots.length, 2);
   assert.equal(ROUTE_DEFS.claude.fallbackSmallToMain, true);
 }

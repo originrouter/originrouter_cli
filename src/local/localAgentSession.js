@@ -203,6 +203,16 @@ export function extractOriginRouterOptions(args) {
       index += 1;
       continue;
     }
+    if (arg === "--originrouter-conversation") {
+      options.conversationId = args[index + 1];
+      index += 1;
+      continue;
+    }
+    if (arg === "--originrouter-run") {
+      options.runId = args[index + 1];
+      index += 1;
+      continue;
+    }
     if (arg === "--provider") {
       options.provider = args[index + 1];
       index += 1;
@@ -739,13 +749,21 @@ export async function runLocalAgentSession(agent, rawArgs) {
   });
   await localAgentBridge.start({
     sessionId,
+    conversationId: options.conversationId || sessionId,
+    runId: options.runId || sessionId,
     agent,
     title: `${agent} session`,
     deviceId: effectiveDeviceId,
     deviceName: device.host,
     cwd,
+    workspaceTrusted: true,
     pid: started.pid,
     startedAt: new Date().toISOString(),
+    runtime,
+    provider: resolvedProvider?.name,
+    model: resolvedProvider?.model,
+    permissionProfile: autonomyProfile,
+    startedBy: "local-wrapper",
     autonomyProfile,
     autonomyControl: autonomySupported ? "supported" : "unsupported",
     allowedAutonomyScopes: autonomyAllowedScopes,

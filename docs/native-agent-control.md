@@ -34,7 +34,7 @@ In native configuration mode OriginRouter does not:
 - start the LiteLLM or Remote Coding proxy;
 - acquire or inject an OriginRouter Coding token;
 - override the agent's Base URL, API key, auth token, or model;
-- inject `originrouter-codex-model` or `OPENAI_MODEL` into Codex.
+- inject `gpt-5.4` or `OPENAI_MODEL` into Codex.
 
 OriginRouter still owns the wrapper PTY, session reporting, App message input,
 conversation/history mirroring, interrupt/stop, and supported approval control.

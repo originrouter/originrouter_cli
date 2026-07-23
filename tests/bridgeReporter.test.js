@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildRuntimeEventEnvelope,
+  buildAgentConversationMetadata,
   createRuntimeEventReporter,
   createTerminalActivityReporter,
   pollResolvedApprovals,
@@ -27,6 +28,34 @@ test("buildRuntimeEventEnvelope normalizes and truncates strings", () => {
   assert.equal(payload.device_name, "Mac Studio");
   assert.equal(payload.title.length, 191);
   assert.equal(payload.summary.length, 512);
+});
+
+test("buildAgentConversationMetadata excludes transcript prompt command and path data", () => {
+  const payload = buildAgentConversationMetadata({
+    conversationId: "conversation-1",
+    agentType: "codex",
+    nativeSessionId: "thread-1",
+    title: "Fix checkout",
+    status: "running",
+    workspaceId: "workspace-1",
+    workspaceName: "originrouter_app",
+    runtime: "codex-app-server",
+    provider: "originrouter-cloud",
+    model: "gpt-codex",
+    permissionProfile: "guarded",
+    transcriptPath: "/private/transcript.jsonl",
+    workspacePath: "/private/project",
+    prompt: "private prompt",
+    command: "rm -rf secret",
+  });
+
+  assert.equal(payload.conversation_id, "conversation-1");
+  assert.equal(payload.native_session_id, "thread-1");
+  assert.equal(payload.workspace_name, "originrouter_app");
+  assert.equal("transcript_path" in payload, false);
+  assert.equal("workspace_path" in payload, false);
+  assert.equal("prompt" in payload, false);
+  assert.equal("command" in payload, false);
 });
 
 test("reportRuntimeEvent fails closed without coding auth", async () => {
@@ -234,6 +263,7 @@ test("startApprovalDecisionPolling emits mapped permission resolves once", async
       callId: "call-1",
       interactionId: "call-1",
       decision: "approved_for_session",
+      decisionSource: "app_remote",
     },
   ]);
 });

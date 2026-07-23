@@ -38,8 +38,8 @@ For `providerType: "proxy"`:
 | `claude` | `/v1/messages` | `originrouter-claude-model` |
 | `claude-sdk` | `/v1/messages` | `originrouter-claude-model` |
 | `claude-fast` | `/v1/messages` | `originrouter-claude-fast-model` |
-| `codex` | `/v1/responses` | `originrouter-codex-model` |
-| `codex-app-server` | `/v1/responses` | `originrouter-codex-model` |
+| `codex` | `/v1/responses` | `gpt-5.4` |
+| `codex-app-server` | `/v1/responses` | `gpt-5.4` |
 
 For `providerType: "remote"`:
 
@@ -64,7 +64,7 @@ not need to re-derive it.
 ```
 originrouter-claude-model         (Claude main slot, full-strength)
 originrouter-claude-fast-model    (Claude small slot, fast variant)
-originrouter-codex-model          (Codex main slot)
+gpt-5.4          (Codex main slot)
 ```
 
 These are the **only** model strings the proxy transport

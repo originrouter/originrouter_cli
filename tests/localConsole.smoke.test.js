@@ -155,7 +155,7 @@ const routePageAssertions = [
   { name: "routes-codex-main-clear id",        re: /`\$\{idPrefix\}-clear`/ },
   { name: "sidebar clear-codex-route button",  re: /clearBtn\.id\s*=\s*["']clear-codex-route["']/ },
   { name: "sidebar Clear Codex route label",   re: /Clear Codex route/ },
-  { name: "codex alias literal",               re: /originrouter-codex-model/ },
+  { name: "codex alias literal",               re: /gpt-5.4/ },
   { name: "codex no Claude fallback note",     re: /does not use Claude Model or Fast Model/ },
   { name: "codex unset current copy",          re: /Codex will not start until set/ },
   { name: "routes.codex.main path read",       re: /routes\.codex\?\.main|routes\.codex\.main/ },

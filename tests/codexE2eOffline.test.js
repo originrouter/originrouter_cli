@@ -12,7 +12,7 @@
 //      no cross-agent leakage).
 //   5. `route clear codex.main` followed by `env print --agent codex`
 //      exits 1 with the "Codex requires routes.codex.main" message.
-//   6. CodexAdapter.buildLaunch() injects --model originrouter-codex-model
+//   6. CodexAdapter.buildLaunch() injects --model gpt-5.4
 //      unless the user passed --model or -m in any of the four accepted
 //      forms (--model X, --model=X, -m X, -m=X), in which case the args
 //      pass through and a warning is written to stderr.
@@ -147,7 +147,7 @@ try {
     const r = await runCli(["env", "print", "--agent", "codex"], { env });
     assert.equal(r.code, 0, `env print exited ${r.code}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
     assert.match(r.stdout, /Codex routes:/);
-    assert.match(r.stdout, /model\s+originrouter-codex-model\s+->\s+openai_codex\s*\/\s*gpt-5-codex/);
+    assert.match(r.stdout, /model\s+gpt-5.4\s+->\s+openai_codex\s*\/\s*gpt-5-codex/);
     assert.match(r.stdout, /\(Codex 8\.0 has no small\/fast slot; Codex does not fall back to Claude\.\)/);
     // Stage 9.1B: env print header is agent-aware. The agent here is
     // codex, so the header must read "what codex will see" — not "what
@@ -160,7 +160,7 @@ try {
     assert.ok(!r.stdout.includes("sk-noop-litellm-passthrough"),
       "raw proxy noop key must never appear in env print output");
     assert.match(r.stdout, /OPENAI_API_KEY=sk-n\.\.\.gh/);
-    assert.match(r.stdout, /OPENAI_MODEL=originrouter-codex-model/);
+    assert.match(r.stdout, /OPENAI_MODEL=gpt-5.4/);
   }
 
   // ---- 6. route show codex ----
@@ -168,7 +168,7 @@ try {
     const r = await runCli(["route", "show", "codex"], { env });
     assert.equal(r.code, 0);
     assert.match(r.stdout, /Routes for codex:/);
-    assert.match(r.stdout, /originrouter-codex-model/);
+    assert.match(r.stdout, /gpt-5.4/);
     assert.match(r.stdout, /openai_codex/);
     assert.match(r.stdout, /gpt-5-codex/);
     assert.match(r.stdout, /routesHash:\s+[0-9a-f]{16}/);
@@ -184,7 +184,7 @@ try {
     assert.match(r.stdout, /Routes for claude:/);
     // isolation: Claude view must not leak Codex provider or alias
     assert.doesNotMatch(r.stdout, /openai_codex/);
-    assert.doesNotMatch(r.stdout, /originrouter-codex-model/);
+    assert.doesNotMatch(r.stdout, /gpt-5.4/);
   }
 
   // ---- 8. route clear codex.main ----

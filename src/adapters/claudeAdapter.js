@@ -398,6 +398,7 @@ export class ClaudeAdapter extends TerminalAdapter {
         provider: "claude",
         callId,
         decision: action === "accept" ? "approved" : action === "cancel" ? "abort" : "denied",
+        decisionSource: payload.decisionSource || undefined,
       });
       return true;
     }
@@ -425,6 +426,7 @@ export class ClaudeAdapter extends TerminalAdapter {
       provider: "claude",
       callId,
       decision,
+      decisionSource: payload.decisionSource || undefined,
       // Claude only supplies session-rule suggestions for some prompts.
       // Mark the fallback so the App does not claim a rule was installed.
       sessionRulePending: decision === "approved_for_session"

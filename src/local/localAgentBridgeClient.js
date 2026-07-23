@@ -1,5 +1,6 @@
 import { readApiToken } from "../persistence/authToken.js";
 import { readDaemonState } from "../persistence/state.js";
+import { LocalAuditStore } from "../persistence/localAuditStore.js";
 
 const DEFAULT_POLL_MS = 250;
 
@@ -29,6 +30,8 @@ export class LocalAgentBridgeClient {
   constructor({ stateDir, sessionId, onCommand, pollIntervalMs = DEFAULT_POLL_MS }) {
     this.stateDir = stateDir;
     this.sessionId = sessionId;
+    this.auditStore = new LocalAuditStore({ stateDir });
+    this.sessionMetadata = { sessionId };
     this.onCommand = onCommand;
     this.pollIntervalMs = pollIntervalMs;
     this.endpoint = null;
@@ -40,24 +43,29 @@ export class LocalAgentBridgeClient {
   }
 
   async start(metadata) {
-    this.endpoint = daemonEndpoint(this.stateDir);
-    if (!this.endpoint) return false;
+    this.sessionMetadata = { ...metadata, sessionId: this.sessionId };
+    this.pollTimer = setInterval(() => void this.pollCommands(), this.pollIntervalMs);
+    this.heartbeatTimer = setInterval(() => void this.heartbeat(), 20_000);
+    return this.connect();
+  }
+
+  async connect() {
+    if (this.closed) return false;
+    if (this.endpoint) return true;
+    const endpoint = daemonEndpoint(this.stateDir);
+    if (!endpoint) return false;
     try {
-      await request(this.endpoint, "POST", "/agent/local/sessions/register", {
-        ...metadata,
-        sessionId: this.sessionId,
-      });
+      await request(endpoint, "POST", "/agent/local/sessions/register", this.sessionMetadata);
+      this.endpoint = endpoint;
+      return true;
     } catch {
       this.endpoint = null;
       return false;
     }
-    this.pollTimer = setInterval(() => void this.pollCommands(), this.pollIntervalMs);
-    this.heartbeatTimer = setInterval(() => void this.heartbeat(), 20_000);
-    return true;
   }
 
   async update(payload) {
-    if (!this.endpoint || this.closed) return false;
+    if (this.closed || !await this.connect()) return false;
     try {
       await request(
         this.endpoint,
@@ -65,14 +73,18 @@ export class LocalAgentBridgeClient {
         `/agent/local/sessions/${encodeURIComponent(this.sessionId)}/update`,
         payload,
       );
+      this.sessionMetadata = { ...this.sessionMetadata, ...payload };
       return true;
     } catch {
+      this.endpoint = null;
       return false;
     }
   }
 
   async sendEvent(event) {
-    if (!this.endpoint || this.closed) return false;
+    if (this.closed) return false;
+    this.auditStore.appendEvent(this.sessionMetadata, event);
+    if (!await this.connect()) return false;
     try {
       await request(
         this.endpoint,
@@ -82,12 +94,13 @@ export class LocalAgentBridgeClient {
       );
       return true;
     } catch {
+      this.endpoint = null;
       return false;
     }
   }
 
   async pollCommands() {
-    if (!this.endpoint || this.closed || this.pollingCommands) return;
+    if (this.closed || this.pollingCommands || !await this.connect()) return;
     this.pollingCommands = true;
     try {
       const result = await request(
@@ -109,12 +122,14 @@ export class LocalAgentBridgeClient {
       this.commandCursor = Math.max(this.commandCursor, Number(data.cursor || 0));
     } catch {
       // The daemon may be restarting. Remote Relay remains independent.
+      this.endpoint = null;
     } finally {
       this.pollingCommands = false;
     }
   }
 
   async heartbeat() {
+    if (!await this.connect()) return false;
     return this.update({ status: "running" });
   }
 

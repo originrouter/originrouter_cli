@@ -237,7 +237,7 @@ try {
     const r = await runCli(["route", "show", "codex"], { env });
     assert.equal(r.code, 0);
     assert.match(r.stdout, /Routes for codex:/);
-    assert.match(r.stdout, /originrouter-codex-model/);
+    assert.match(r.stdout, /gpt-5.4/);
     assert.match(r.stdout, /openai_codex/);
     assert.match(r.stdout, /gpt-5-codex/);
   }
@@ -248,7 +248,7 @@ try {
     assert.equal(r.code, 0);
     assert.match(r.stdout, /claude:/);
     assert.match(r.stdout, /codex:/);
-    assert.match(r.stdout, /originrouter-codex-model/);
+    assert.match(r.stdout, /gpt-5.4/);
   }
 
   // route set codex.small is a hard error.
@@ -264,7 +264,7 @@ try {
     const r = await runCli(["provider", "use", "openai_codex", "--agent", "codex"], { env });
     assert.equal(r.code, 0);
     assert.match(r.stdout, /Codex main route updated/);
-    assert.match(r.stdout, /originrouter-codex-model/);
+    assert.match(r.stdout, /gpt-5.4/);
     const cfg = readConfig(home);
     assert.equal(cfg.routes.codex.main.provider, "openai_codex");
     // Stage 8.0: provider use --agent codex does NOT write currentProvider.codex.

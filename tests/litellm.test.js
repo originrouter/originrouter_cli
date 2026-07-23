@@ -398,14 +398,14 @@ const ROUTE_PROVIDERS = {
   // Empty route set throws.
   assert.throws(
     () => renderLitellmRoutesConfigYaml({}, ROUTE_PROVIDERS),
-    /no routes configured/,
+    /no local LiteLLM routes configured/,
   );
   assert.throws(
     () => renderLitellmRoutesConfigYaml(
       { claude: { main: null, small: null } },
       ROUTE_PROVIDERS,
     ),
-    /no routes configured/,
+    /no local LiteLLM routes configured/,
   );
 }
 
@@ -589,6 +589,7 @@ const ROUTE_PROVIDERS = {
 const CODEX_PROVIDERS = {
   ...ROUTE_PROVIDERS,
   openai_codex: { name: "openai_codex", type: "litellm", litellmProvider: "openai", apiKey: "sk-oai", model: "gpt-5-codex" },
+  originrouter_cloud: { name: "originrouter_cloud", type: "originrouter", model: "grok-4.5" },
 };
 
 {
@@ -597,10 +598,37 @@ const CODEX_PROVIDERS = {
     { codex: { main: { provider: "openai_codex", model: "gpt-5-codex" } } },
     CODEX_PROVIDERS,
   );
-  assert.match(yaml, /model_name: originrouter-codex-model/);
+  assert.match(yaml, /model_name: gpt-5.4/);
   assert.match(yaml, /model: openai\/gpt-5-codex/);
   assert.doesNotMatch(yaml, /originrouter-claude-model/);
   assert.doesNotMatch(yaml, /originrouter-claude-fast-model/);
+}
+
+{
+  // Mixed Cloud + local proxy routes render only aliases that need LiteLLM.
+  const yaml = renderLitellmRoutesConfigYaml(
+    {
+      claude: {
+        main: { provider: "originrouter_cloud", model: "grok-4.5" },
+        small: { provider: "originrouter_cloud", model: "grok-4.5" },
+      },
+      codex: { main: { provider: "openai_codex", model: "gpt-5-codex" } },
+    },
+    CODEX_PROVIDERS,
+  );
+  assert.match(yaml, /model_name: gpt-5.4/);
+  assert.doesNotMatch(yaml, /originrouter-claude-model/);
+  assert.doesNotMatch(yaml, /originrouter-claude-fast-model/);
+}
+
+{
+  assert.throws(
+    () => renderLitellmRoutesConfigYaml(
+      { claude: { main: { provider: "originrouter_cloud", model: "grok-4.5" } } },
+      CODEX_PROVIDERS,
+    ),
+    /no local LiteLLM routes configured/,
+  );
 }
 
 {
@@ -617,10 +645,10 @@ const CODEX_PROVIDERS = {
   );
   assert.match(yaml, /model_name: originrouter-claude-model/);
   assert.match(yaml, /model_name: originrouter-claude-fast-model/);
-  assert.match(yaml, /model_name: originrouter-codex-model/);
+  assert.match(yaml, /model_name: gpt-5.4/);
   // Codex alias appears after the Claude aliases (ROUTE_AGENTS order).
   const claudeMainIdx = yaml.indexOf("originrouter-claude-model");
-  const codexIdx = yaml.indexOf("originrouter-codex-model");
+  const codexIdx = yaml.indexOf("gpt-5.4");
   assert.ok(claudeMainIdx >= 0 && codexIdx > claudeMainIdx, "codex must appear after claude aliases");
 }
 
@@ -648,7 +676,7 @@ const CODEX_PROVIDERS = {
     CODEX_PROVIDERS,
   );
   // Exactly one Codex alias; no Codex fast alias.
-  const codexAliasMatches = yaml.match(/model_name: originrouter-codex-model/g) || [];
+  const codexAliasMatches = yaml.match(/model_name: gpt-5.4/g) || [];
   assert.equal(codexAliasMatches.length, 1, "Codex 8.0 emits exactly one alias; small is ignored");
 }
 

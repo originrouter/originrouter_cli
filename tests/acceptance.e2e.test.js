@@ -308,7 +308,7 @@ try {
   // The proxy is not running here, so env will carry the error message,
   // but the route table at the top of the output must mention codex.
   assertStep("step 12e: env print --agent codex shows codex route",
-    codexEnvResult.stdout.includes("originrouter-codex-model") &&
+    codexEnvResult.stdout.includes("gpt-5.4") &&
     codexEnvResult.stdout.includes("deepseek-chat"));
 
   // Step 12b: legacy anthropic provider add is rejected in Stage 7.6.

@@ -14,6 +14,11 @@ export const AGENT_AUTONOMY_PROFILES = Object.freeze([
     description: "Continue routine workspace work, but stop for elevated or destructive actions.",
   },
   {
+    id: "ai_review",
+    label: "AI review",
+    description: "Let an independent AI reviewer decide routine actions; high-risk or uncertain requests still require you.",
+  },
+  {
     id: "unrestricted",
     label: "Full",
     description: "Allow all permission and continue prompts, including destructive, elevated, and network actions.",
@@ -199,7 +204,7 @@ function hasMeaningfulValue(value) {
   return true;
 }
 
-function classifyPermissionScope(request, workspaceRoot) {
+export function classifyPermissionScope(request, workspaceRoot) {
   if (request?.containsSecret) {
     return { scope: null, reason: "secret_input" };
   }
@@ -408,7 +413,63 @@ export async function resolveWithAutonomy({
   workspaceRoot,
   requestInteraction,
   onAutoResolved,
+  aiReviewer,
+  runtime,
 }) {
+  const normalizedProfile = normalizeAutonomyProfile(profile);
+  if (normalizedProfile === "ai_review") {
+    if (
+      !aiReviewer
+      || request?.containsSecret
+      || [INTERACTION_KINDS.QUESTIONS, INTERACTION_KINDS.FORM, INTERACTION_KINDS.URL].includes(request?.kind)
+    ) {
+      return requestInteraction(request);
+    }
+    const classification = request?.kind === INTERACTION_KINDS.PERMISSION
+      ? classifyPermissionScope(request, workspaceRoot)
+      : { scope: request?.kind === INTERACTION_KINDS.CONFIRM ? "plan_continue" : null, reason: "unsupported_interaction_kind" };
+    let review;
+    try {
+      review = await aiReviewer.review({ request, classification, runtime, workspaceRoot });
+    } catch {
+      return requestInteraction(request);
+    }
+    if (!review || !["allow", "deny", "escalate"].includes(review.decision)) {
+      return requestInteraction(request);
+    }
+    const highRisk = AGENT_AUTONOMY_SCOPES.find((item) => item.id === classification.scope)?.risk === "high";
+    if (
+      review.decision === "escalate"
+      || (review.decision === "allow" && (highRisk || review.risk === "high"))
+    ) {
+      return requestInteraction(request);
+    }
+    const action = review.decision === "allow" ? "allow" : "deny";
+    const resolved = {
+      interactionId: request.interactionId,
+      responseId: `ai:${request.interactionId}`,
+      action,
+      response: {
+        remember_for_session: false,
+        ai_reviewed: true,
+        ...(action === "allow" && request?.payload?.default_approval_option
+          ? { approval_option: request.payload.default_approval_option }
+          : {}),
+      },
+      autoResolved: true,
+      reason: review.reason || `ai_review_${review.decision}`,
+      scope: classification.scope || null,
+      decisionSource: "ai_reviewer",
+      aiReview: {
+        decision: review.decision,
+        risk: review.risk,
+        confidence: review.confidence,
+        reviewer: review.reviewer,
+      },
+    };
+    await onAutoResolved?.({ request, resolved });
+    return resolved;
+  }
   const decision = evaluateAutonomyInteraction(request, {
     profile,
     allowedScopes,

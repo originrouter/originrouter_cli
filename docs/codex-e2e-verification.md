@@ -21,7 +21,7 @@ Read these before starting. They are non-negotiable.
    `buildAgentProviderEnv("codex", config, ...)` would inject into the
    Codex child process's environment: `OPENAI_BASE_URL`,
    `OPENAI_API_KEY`, `OPENAI_MODEL`. It does **not** prove the
-   `--model originrouter-codex-model` CLI argument is injected —
+   `--model gpt-5.4` CLI argument is injected —
    that is `CodexAdapter.buildLaunch()`'s job, and it is locked by
    the CodexAdapter block of `tests/codexE2eOffline.test.js` and
    verified manually in section E.
@@ -77,13 +77,13 @@ originrouter route show codex
 
 ```
 Routes for codex:
-  main (alias originrouter-codex-model):
+  main (alias gpt-5.4):
     provider: openai_codex
     model:    gpt-5-codex
   routesHash: <16 hex chars>
 ```
 
-If `routes.codex.main` shows `(unset; alias originrouter-codex-model
+If `routes.codex.main` shows `(unset; alias gpt-5.4
 will not be emitted)`, the `route set` did not stick — check that
 `openai_codex` exists in `provider list`.
 
@@ -113,7 +113,7 @@ Expected fields:
 - `mode: "route"`
 - `port: 40123`
 - `host: "127.0.0.1"`
-- `aliases` includes `"originrouter-codex-model"`
+- `aliases` includes `"gpt-5.4"`
 - `routesHash` matches the value printed by `route show codex` above
 
 If `routesHash` does not match, the proxy was started before the
@@ -131,7 +131,7 @@ contains all three of:
 ```
 OPENAI_BASE_URL=http://127.0.0.1:40123/v1
 OPENAI_API_KEY=sk-noop-litellm-passthrough
-OPENAI_MODEL=originrouter-codex-model
+OPENAI_MODEL=gpt-5.4
 ```
 
 The `OPENAI_API_KEY` is intentionally a no-op bearer — the local
@@ -142,7 +142,7 @@ argument to the Codex child process is not exercised by `env print`.
 
 ## E. `--model` argv injection (CodexAdapter)
 
-CodexAdapter.buildLaunch() injects `--model originrouter-codex-model`
+CodexAdapter.buildLaunch() injects `--model gpt-5.4`
 unless the user passed `--model` / `-m` in any of four accepted
 forms. Verify all five behaviors:
 
@@ -154,7 +154,7 @@ node -e '
     console.log(JSON.stringify({ args, env }));
   });
 '
-# expected: {"args":["--model","originrouter-codex-model"],"env":{"OPENAI_MODEL":"originrouter-codex-model"}}
+# expected: {"args":["--model","gpt-5.4"],"env":{"OPENAI_MODEL":"gpt-5.4"}}
 ```
 
 For the four pass-through cases, wrap `originrouter codex --help` in
@@ -220,10 +220,10 @@ grep -E "model|chat/completions|responses" "$LOG" | tail -20
 **Expected:** an inbound HTTP request to the OpenAI-compatible
 endpoint (`/v1/chat/completions` or `/v1/responses` depending on
 the Codex wiring) with a JSON body containing
-`"model": "originrouter-codex-model"` and a successful upstream
+`"model": "gpt-5.4"` and a successful upstream
 dispatch. The exact upstream model name depends on what
 `openai_codex` is configured to point at; only the **alias**
-`originrouter-codex-model` is required to appear in the request.
+`gpt-5.4` is required to appear in the request.
 
 If the log shows a different model name (e.g. `gpt-4` or
 `gpt-5-codex`), the proxy was started with stale state — see
@@ -278,7 +278,7 @@ route or the stopped proxy, depending on which check fires first.
 - **`originrouter codex` ignores `OPENAI_MODEL`.** Some Codex CLI
   versions read only the `--model` flag and ignore the env var.
   This is fine — `CodexAdapter.buildLaunch()` always injects
-  `--model originrouter-codex-model` unless the user passed one.
+  `--model gpt-5.4` unless the user passed one.
   Verify with section E.
 
 - **Permission card never resolves.** Codex app-server expects a

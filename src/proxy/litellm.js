@@ -260,6 +260,8 @@ export const NOOP_ANTHROPIC_API_KEY = "sk-noop-litellm-passthrough";
 // slot so it never falls back. Apply routeProviderForRead() to providers
 // so legacy type=anthropic / type=openai-compatible records (which the
 // validator already projects at write time) render successfully here.
+// Login-backed Cloud and remote-device routes do not need this local process,
+// so mixed route configurations skip them and render only proxy aliases.
 export function renderLitellmRoutesConfigYaml(allRoutes, providers) {
   const esc = (s) => String(s).replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 
@@ -290,10 +292,7 @@ export function renderLitellmRoutesConfigYaml(allRoutes, providers) {
       const isLitellm = provider.type === "litellm"
         || (provider.type === "proxy" && provider.engine === "litellm");
       if (!isLitellm) {
-        throw new Error(
-          `routes.${agent}.${slot} points at provider type='${provider.type}' engine='${provider.engine}'. ` +
-          `routes only accept type=litellm or type=proxy(engine=litellm) providers; re-save the route via 'route set'.`
-        );
+        continue;
       }
       const profile = getLitellmProfile(provider.litellmProvider);
       const prefix = prefixFor(profile.id);
@@ -335,7 +334,10 @@ export function renderLitellmRoutesConfigYaml(allRoutes, providers) {
   }
 
   if (!emittedAny) {
-    throw new Error("renderLitellmRoutesConfigYaml: no routes configured. Set claude.main or codex.main first.");
+    throw new Error(
+      "renderLitellmRoutesConfigYaml: no local LiteLLM routes configured. "
+      + "Set claude.main or codex.main to a proxy(engine=litellm) provider first.",
+    );
   }
 
   lines.push("litellm_settings:");

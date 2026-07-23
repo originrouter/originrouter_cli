@@ -2,7 +2,7 @@
 // Stage 8.0: Multi-agent routes (Claude + Codex).
 //
 // A route binds an agent alias (e.g. originrouter-claude-model,
-// originrouter-codex-model) to a provider name + model. The daemon uses
+// gpt-5.4) to a provider name + model. The daemon uses
 // routes to render the LiteLLM proxy config at startup / on route change.
 // Routes point at LiteLLM-renderable providers. Legacy type=anthropic and
 // type=openai-compatible records are read-projected into type=litellm for
@@ -44,7 +44,7 @@ export const ROUTE_DEFS = Object.freeze({
   codex: {
     slots: Object.freeze(["main"]),
     aliases: Object.freeze({
-      main: "originrouter-codex-model",
+      main: "gpt-5.4",
     }),
     fallbackSmallToMain: false,
   },
@@ -56,7 +56,7 @@ export const MAIN_ALIAS  = "originrouter-claude-model";
 export const SMALL_ALIAS = "originrouter-claude-fast-model";
 
 // Stage 8.0: Codex main alias.
-export const CODEX_MAIN_ALIAS = "originrouter-codex-model";
+export const CODEX_MAIN_ALIAS = "gpt-5.4";
 
 // ROUTE_SLOTS stays the Claude-slot list for backward compat with existing
 // callers. New code should use ROUTE_DEFS[agent].slots.

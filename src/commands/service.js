@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, platform, userInfo } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { getStateDir, readDaemonState } from "../persistence/state.js";
@@ -55,7 +55,44 @@ function powershellEncodedCommand(script) {
   return Buffer.from(script, "utf16le").toString("base64");
 }
 
-export function buildLaunchdPlist({ nodePath, cliPath, stdoutPath, stderrPath }) {
+export function buildServiceEnvironmentPath({
+  nodePath,
+  cliPath,
+  inheritedPath = process.env.PATH,
+  currentPlatform = platform(),
+} = {}) {
+  const separator = currentPlatform === "win32" ? ";" : delimiter;
+  const inherited = String(inheritedPath || "")
+    .split(separator)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const fallbacks = currentPlatform === "win32"
+    ? []
+    : [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        join(homedir(), ".local", "bin"),
+        join(homedir(), ".npm-global", "bin"),
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+      ];
+  return [...new Set([
+    nodePath ? dirname(nodePath) : "",
+    cliPath ? dirname(cliPath) : "",
+    ...inherited,
+    ...fallbacks,
+  ].filter(Boolean))].join(separator);
+}
+
+export function buildLaunchdPlist({
+  nodePath,
+  cliPath,
+  stdoutPath,
+  stderrPath,
+  environmentPath = buildServiceEnvironmentPath({ nodePath, cliPath, currentPlatform: "darwin" }),
+}) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -72,6 +109,11 @@ export function buildLaunchdPlist({ nodePath, cliPath, stdoutPath, stderrPath })
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${xmlEscape(environmentPath)}</string>
+  </dict>
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
@@ -85,7 +127,13 @@ export function buildLaunchdPlist({ nodePath, cliPath, stdoutPath, stderrPath })
 `;
 }
 
-export function buildSystemdUnit({ nodePath, cliPath, stdoutPath, stderrPath }) {
+export function buildSystemdUnit({
+  nodePath,
+  cliPath,
+  stdoutPath,
+  stderrPath,
+  environmentPath = buildServiceEnvironmentPath({ nodePath, cliPath, currentPlatform: "linux" }),
+}) {
   return `[Unit]
 Description=OriginRouter daemon
 After=network-online.target
@@ -94,6 +142,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=${systemdQuote(nodePath)} ${systemdQuote(cliPath)} daemon
+Environment=${systemdQuote(`PATH=${environmentPath}`)}
 Restart=on-failure
 RestartSec=5
 WorkingDirectory=${systemdQuote(homedir())}
@@ -105,9 +154,15 @@ WantedBy=default.target
 `;
 }
 
-export function buildWindowsTaskXml({ nodePath, cliPath, stdoutPath, stderrPath }) {
+export function buildWindowsTaskXml({
+  nodePath,
+  cliPath,
+  stdoutPath,
+  stderrPath,
+  environmentPath = buildServiceEnvironmentPath({ nodePath, cliPath, currentPlatform: "win32" }),
+}) {
   const args = `"${cliPath}" daemon`;
-  const logCommand = `$p = Start-Process -FilePath ${JSON.stringify(nodePath)} -ArgumentList ${JSON.stringify(args)} -NoNewWindow -PassThru -RedirectStandardOutput ${JSON.stringify(stdoutPath)} -RedirectStandardError ${JSON.stringify(stderrPath)}; $p.WaitForExit(); exit $p.ExitCode`;
+  const logCommand = `$env:PATH = ${JSON.stringify(environmentPath)}; $p = Start-Process -FilePath ${JSON.stringify(nodePath)} -ArgumentList ${JSON.stringify(args)} -NoNewWindow -PassThru -RedirectStandardOutput ${JSON.stringify(stdoutPath)} -RedirectStandardError ${JSON.stringify(stderrPath)}; $p.WaitForExit(); exit $p.ExitCode`;
   const encoded = powershellEncodedCommand(logCommand);
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -204,6 +259,11 @@ function serviceConfigForPlatform(currentPlatform = platform()) {
     stdoutPath: paths.stdout,
     stderrPath: paths.stderr,
   };
+  common.environmentPath = buildServiceEnvironmentPath({
+    nodePath: common.nodePath,
+    cliPath: common.cliPath,
+    currentPlatform,
+  });
   if (currentPlatform === "darwin") {
     return { paths, body: buildLaunchdPlist(common) };
   }

@@ -1,5 +1,6 @@
 import process from "node:process";
 import { randomUUID } from "node:crypto";
+import { basename } from "node:path";
 import { CodexAppServerClient, isCodexAppServerAvailable } from "../adapters/codex/appServerClient.js";
 import { mapCodexAppServerEvent } from "../adapters/codex/eventMapper.js";
 import {
@@ -8,6 +9,7 @@ import {
 } from "../adapters/codex/jsonlScanner.js";
 import {
   createRuntimeEventReporter,
+  reportAgentConversationMetadata,
   startAgentSessionHeartbeat,
 } from "../agent/bridgeReporter.js";
 import { buildAgentProviderEnv, willRouteRemoteCoding } from "../config/claudeConfig.js";
@@ -43,11 +45,25 @@ import {
   AGENT_DETAIL_PROFILES,
   resolveAgentDetailProfile,
 } from "./agentDetailProfile.js";
+import { AiApprovalReviewer } from "./aiApprovalReviewer.js";
 
 const CODEX_MODES = Object.freeze([
   { id: "default", label: "Default" },
   { id: "plan", label: "Plan" },
 ]);
+
+export function createSerialAgentEventQueue(handler) {
+  let tail = Promise.resolve();
+  return {
+    enqueue(event) {
+      tail = tail.then(() => handler(event)).catch(() => {});
+      return tail;
+    },
+    drain() {
+      return tail;
+    },
+  };
+}
 
 function extractOptions(args) {
   const options = {};
@@ -61,9 +77,17 @@ function extractOptions(args) {
     if (arg === "--originrouter-relay") take("relay");
     else if (arg === "--originrouter-device") take("device");
     else if (arg === "--originrouter-session") take("session");
+    else if (arg === "--originrouter-conversation") take("conversationId");
+    else if (arg === "--originrouter-run") take("runId");
+    else if (arg === "--originrouter-workspace") take("workspaceId");
+    else if (arg === "--originrouter-title") take("title");
     else if (arg === "--provider") take("provider");
     else if (arg === "--model" || arg === "-m") take("model");
     else if (arg === "--prompt") take("initialMessage");
+    else if (arg === "--resume") take("resume");
+    else if (arg.startsWith("--resume=")) {
+      options.resume = arg.slice("--resume=".length);
+    }
     else if (arg === "--originrouter-autonomy") take("autonomyProfile");
     else if (arg === "--originrouter-detail") take("detailProfile");
     else if (arg === "--originrouter-auto-approve") options.autonomyProfile = "guarded";
@@ -192,6 +216,7 @@ function containsSecretSchema(schema) {
 
 export async function runCodexAppServerSession(rawArgs) {
   const stateDir = ensureStateDir();
+  const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
   const options = extractOptions(rawArgs);
   if (!await isCodexAppServerAvailable()) {
     throw new Error("Codex app-server is unavailable. Upgrade Codex or use `originrouter codex-terminal`.");
@@ -238,12 +263,13 @@ export async function runCodexAppServerSession(rawArgs) {
     { stateDir },
   ));
   const model = options.model || providerResult.env.OPENAI_MODEL || providerResult.provider?.model;
+  const sessionTitle = String(options.title || "Codex session").trim().slice(0, 191);
   const client = new CodexAppServerClient();
   const recentEvents = [];
   const runtimeReporter = createRuntimeEventReporter({
     sessionId,
     agentType: "codex",
-    title: "Codex session",
+    title: sessionTitle,
     deviceName: device.host,
     stateDir,
   });
@@ -268,6 +294,19 @@ export async function runCodexAppServerSession(rawArgs) {
   let stopped = false;
   let stopHeartbeat = () => {};
   const signalHandlers = new Map();
+  const syncCatalog = (status) => reportAgentConversationMetadata({
+    conversationId: options.conversationId || sessionId,
+    agentType: "codex",
+    nativeSessionId: threadId,
+    title: sessionTitle,
+    status,
+    workspaceId: options.workspaceId,
+    workspaceName: basename(cwd),
+    runtime: "codex-app-server",
+    provider: providerResult.provider?.name,
+    model,
+    permissionProfile: autonomyProfile,
+  }, { stateDir }).catch(() => ({ ok: false }));
 
   const send = (type, extra = {}) => relayClient.send(type, {
     sessionId,
@@ -301,6 +340,7 @@ export async function runCodexAppServerSession(rawArgs) {
       localAgentBridge?.sendEvent(transientEvent),
     ]);
   };
+  const agentEventQueue = createSerialAgentEventQueue(sendAgentEvent);
   const interactions = new PendingInteractionRegistry({
     onRequested: async (request) => {
       await Promise.all([
@@ -353,6 +393,8 @@ export async function runCodexAppServerSession(rawArgs) {
     profile: autonomyProfile,
     allowedScopes: autonomyAllowedScopes,
     workspaceRoot: cwd,
+    aiReviewer: aiApprovalReviewer,
+    runtime: "codex-app-server",
     requestInteraction: (item) => interactions.request(item),
     onAutoResolved: ({ request: item, resolved }) => sendAgentEvent({
       type: "agent.interaction.auto_resolved",
@@ -363,6 +405,9 @@ export async function runCodexAppServerSession(rawArgs) {
       autonomyProfile,
       autonomyScope: resolved.scope,
       reason: resolved.reason,
+      decisionSource: resolved.decisionSource || "autonomy_policy",
+      aiReview: resolved.aiReview || null,
+      decision: resolved.action,
     }),
   });
 
@@ -512,7 +557,9 @@ export async function runCodexAppServerSession(rawArgs) {
     if (rawEvent.type === "codex.initialized") return;
     if (rawEvent.type === "task_started") currentTurnId = rawEvent.turn_id || currentTurnId;
     if (rawEvent.type === "task_complete" || rawEvent.type === "turn_aborted") currentTurnId = null;
-    for (const event of mapCodexAppServerEvent(rawEvent)) void sendAgentEvent(event);
+    for (const event of mapCodexAppServerEvent(rawEvent)) {
+      void agentEventQueue.enqueue(event);
+    }
   });
 
   const sendMessage = async (message, messageId = null) => {
@@ -548,6 +595,7 @@ export async function runCodexAppServerSession(rawArgs) {
     if (stopped) return;
     stopped = true;
     stopHeartbeat();
+    await agentEventQueue.drain();
     await interactions.cancelAll("session_stopped");
     await localAgentBridge?.close(signal ? "stopped" : code === 0 ? "completed" : "failed");
     localAgentBridge = null;
@@ -567,6 +615,7 @@ export async function runCodexAppServerSession(rawArgs) {
     } catch {}
     await send("session.exited", { code, signal });
     await report("session.exited", { code, signal });
+    await syncCatalog(signal ? "stopped" : code === 0 ? "completed" : "failed");
     await runtimeReporter.flush();
   };
 
@@ -682,14 +731,28 @@ export async function runCodexAppServerSession(rawArgs) {
   };
 
   try {
-    await client.connect({ cwd, env: { ...process.env, ...providerResult.env } });
-    const thread = await client.startThread({
+    await client.connect({
+      cwd,
+      env: { ...process.env, ...providerResult.env },
+      modelProvider: providerResult.env.OPENAI_BASE_URL
+        ? {
+            id: "originrouter_proxy",
+            name: "OriginRouter Route",
+            baseUrl: providerResult.env.OPENAI_BASE_URL,
+            envKey: "OPENAI_API_KEY",
+            wireApi: "responses",
+          }
+        : null,
+    });
+    const threadOptions = {
       cwd,
       model,
       approvalPolicy: "on-request",
       sandbox: "workspace-write",
-      ephemeral: false,
-    });
+    };
+    const thread = options.resume
+      ? await client.resumeThread(options.resume, threadOptions)
+      : await client.startThread({ ...threadOptions, ephemeral: false });
     threadId = thread?.thread?.id;
     if (!threadId) throw new Error("Codex app-server did not return a thread id.");
     await refreshTranscriptPath();
@@ -701,7 +764,7 @@ export async function runCodexAppServerSession(rawArgs) {
       agent: "codex",
       runtime: "codex-app-server",
       executor: "app-server",
-      startedBy: "local-app-server",
+      startedBy: options.resume ? "app-resume" : "local-app-server",
     });
     await report("session.started", { runtime: "codex-app-server", executor: "app-server" });
     localAgentBridge = new LocalAgentBridgeClient({
@@ -721,13 +784,22 @@ export async function runCodexAppServerSession(rawArgs) {
     });
     await localAgentBridge.start({
       sessionId,
+      conversationId: options.conversationId || sessionId,
+      runId: options.runId || sessionId,
       agent: "codex",
-      title: "Codex session",
+      title: sessionTitle,
       deviceId: relayOptions.deviceId,
       deviceName: device.host,
       cwd,
+      workspaceTrusted: true,
       pid: client.child?.pid || process.pid,
       startedAt: new Date().toISOString(),
+      nativeSessionId: threadId,
+      runtime: "codex-app-server",
+      provider: providerResult.provider?.name,
+      model,
+      permissionProfile: "workspace-write:on-request",
+      startedBy: options.resume ? "app-resume" : "local-app-server",
       mode: currentMode,
       modeControl: "supported",
       availableModes: CODEX_MODES,
@@ -739,6 +811,7 @@ export async function runCodexAppServerSession(rawArgs) {
       transcriptPath,
     });
     stopHeartbeat = startAgentSessionHeartbeat({ sessionId, stateDir });
+    await syncCatalog("running");
     appendSessionStart({
       sessionId,
       deviceId: relayOptions.deviceId,

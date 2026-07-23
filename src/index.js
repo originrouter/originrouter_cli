@@ -45,6 +45,7 @@ import { readLocalProxySnapshot, NOOP_REMOTE_CODING_SNAPSHOT, snapshotRemoteCodi
 import { RemoteCodingProxyManager } from "./proxy/remoteCodingProxyManager.js";
 import { runLocalAgentSession } from "./local/localAgentSession.js";
 import { readSessions } from "./persistence/sessionLog.js";
+import { AgentCatalog } from "./persistence/agentCatalog.js";
 import { readApiToken, rotateApiToken } from "./persistence/authToken.js";
 import {
   ensureStateDir,
@@ -100,6 +101,8 @@ Usage:
   originrouter sessions [--json]
   originrouter env print [--provider <name>] [--agent claude|codex]
   originrouter agent detail [set concise|standard|detailed]
+  originrouter agent history [--search <text>] [--agent claude|codex] [--device <id>] [--status <status>] [--json]
+  originrouter agent history show <conversation-id> [--json]
 
 Local LiteLLM provider management:
   originrouter provider add <name> [--type proxy] [--base-url <u>] [--model <m>]
@@ -124,15 +127,15 @@ originrouter provider update <name> [same flags as add]
 
 Model routes (Stage 7.5 / 7.6):
   originrouter route list
-  originrouter route show [claude]
+  originrouter route show [claude|codex]
   originrouter route set <agent>.<slot> --provider <name> [--model <m>]
-                                 agent ∈ { claude }   slot ∈ { main, small }
+                                 claude slots: main, small; codex slot: main
   originrouter route clear <agent>.<slot>
   originrouter route cloud models
   originrouter route cloud set <agent>.<slot> [--model <id>]
   originrouter route remote devices
   originrouter route remote set <agent>.<slot> [--device <id>] [--model <id>]
-  Aliases are fixed: originrouter-claude-model (main) and originrouter-claude-fast-model (small).
+  Aliases are fixed: originrouter-claude-model, originrouter-claude-fast-model, and gpt-5.4.
 
 LiteLLM proxy (Stage 4 + Stage 7.5 + 7.6 + 7.7):
   originrouter proxy install [--version <v>]      default version 1.83.0
@@ -409,10 +412,72 @@ function handleConfig(args) {
   throw new Error(`Unknown config action: ${action}`);
 }
 
+function printAgentHistory(records) {
+  if (records.length === 0) {
+    console.log("(no Agent history recorded yet)");
+    return;
+  }
+  console.log([
+    pad("CONVERSATION", 26),
+    pad("AGENT", 10),
+    pad("STATUS", 14),
+    pad("UPDATED", 21),
+    pad("WORKSPACE", 24),
+    "TITLE",
+  ].join(""));
+  for (const item of records) {
+    console.log([
+      pad(item.conversation_id, 26),
+      pad(item.agent_type, 10),
+      pad(item.status, 14),
+      pad(formatTimestamp(item.last_activity_at), 21),
+      pad(item.workspace_name || "-", 24),
+      item.title || "-",
+    ].join(""));
+  }
+}
+
+function argumentValue(args, name) {
+  const index = args.indexOf(name);
+  return index >= 0 ? args[index + 1] : undefined;
+}
+
 function handleAgentSettings(args) {
   const [section, action, value] = args;
+  if (section === "history") {
+    const catalog = new AgentCatalog({ stateDir: ensureStateDir() });
+    try {
+      catalog.migrateLegacySessions(readSessions());
+      if (action === "show") {
+        if (!value) {
+          throw new Error("Usage: originrouter agent history show <conversation-id> [--json]");
+        }
+        const conversation = catalog.getConversation(value);
+        if (!conversation) throw new Error(`Agent conversation not found: ${value}`);
+        if (args.includes("--json")) console.log(JSON.stringify(conversation, null, 2));
+        else printAgentHistory([conversation]);
+        return;
+      }
+      const records = catalog.listConversations({
+        search: argumentValue(args, "--search") || "",
+        agent: argumentValue(args, "--agent") || "",
+        deviceId: argumentValue(args, "--device") || "",
+        workspaceId: argumentValue(args, "--workspace") || "",
+        status: argumentValue(args, "--status") || "",
+        limit: argumentValue(args, "--limit") || 50,
+        includeArchived: args.includes("--archived"),
+      });
+      if (args.includes("--json")) console.log(JSON.stringify(records, null, 2));
+      else printAgentHistory(records);
+    } finally {
+      catalog.close();
+    }
+    return;
+  }
   if (section !== "detail") {
-    throw new Error("Usage: originrouter agent detail [set concise|standard|detailed]");
+    throw new Error(
+      "Usage: originrouter agent detail [set concise|standard|detailed] | originrouter agent history [options]",
+    );
   }
   if (!action || action === "show") {
     console.log(agentDetailDefaultFromConfig(readConfig()));

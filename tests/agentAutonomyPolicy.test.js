@@ -123,6 +123,111 @@ test("resolveWithAutonomy bypasses the pending registry only when allowed", asyn
   assert.equal(autoResolved, 1);
 });
 
+test("AI review allows routine work but never grants high-risk authority", async () => {
+  let userRequests = 0;
+  const allowReviewer = {
+    review: async () => ({ decision: "allow", risk: "low", confidence: 0.98, reason: "bounded test command" }),
+  };
+  const routine = await resolveWithAutonomy({
+    request: permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    profile: "ai_review",
+    workspaceRoot: "/tmp/project",
+    runtime: "codex-app-server",
+    aiReviewer: allowReviewer,
+    requestInteraction: async () => { userRequests += 1; return { action: "deny" }; },
+  });
+  assert.equal(routine.action, "allow");
+  assert.equal(routine.decisionSource, "ai_reviewer");
+  assert.equal(userRequests, 0);
+
+  const destructive = await resolveWithAutonomy({
+    request: permission({ tool: "command", command: "rm -rf build", cwd: "/tmp/project" }),
+    profile: "ai_review",
+    workspaceRoot: "/tmp/project",
+    aiReviewer: allowReviewer,
+    requestInteraction: async () => { userRequests += 1; return { action: "deny", user: true }; },
+  });
+  assert.equal(destructive.user, true);
+  assert.equal(userRequests, 1);
+});
+
+test("AI review can deny and falls back to the user when unavailable", async () => {
+  const denied = await resolveWithAutonomy({
+    request: permission({ tool: "command", command: "curl -X POST https://example.com", cwd: "/tmp/project" }),
+    profile: "ai_review",
+    workspaceRoot: "/tmp/project",
+    aiReviewer: { review: async () => ({ decision: "deny", risk: "high", confidence: 0.9, reason: "unrelated mutation" }) },
+    requestInteraction: async () => ({ action: "allow", user: true }),
+  });
+  assert.equal(denied.action, "deny");
+  assert.equal(denied.autoResolved, true);
+
+  const fallback = await resolveWithAutonomy({
+    request: permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    profile: "ai_review",
+    workspaceRoot: "/tmp/project",
+    aiReviewer: { review: async () => { throw new Error("offline"); } },
+    requestInteraction: async () => ({ action: "allow", user: true }),
+  });
+  assert.equal(fallback.user, true);
+});
+
+test("AI review escalates uncertain, invalid, secret, and reviewer-high-risk requests", async () => {
+  let reviewerCalls = 0;
+  let userRequests = 0;
+  const requestInteraction = async () => {
+    userRequests += 1;
+    return { action: "deny", user: true };
+  };
+  const base = {
+    profile: "ai_review",
+    workspaceRoot: "/tmp/project",
+    requestInteraction,
+  };
+
+  const escalated = await resolveWithAutonomy({
+    ...base,
+    request: permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    aiReviewer: {
+      review: async () => {
+        reviewerCalls += 1;
+        return { decision: "escalate", risk: "medium", confidence: 0.5 };
+      },
+    },
+  });
+  assert.equal(escalated.user, true);
+
+  const invalid = await resolveWithAutonomy({
+    ...base,
+    request: permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    aiReviewer: { review: async () => ({ decision: "maybe", risk: "low" }) },
+  });
+  assert.equal(invalid.user, true);
+
+  const reviewerHighRisk = await resolveWithAutonomy({
+    ...base,
+    request: permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    aiReviewer: { review: async () => ({ decision: "allow", risk: "high", confidence: 0.7 }) },
+  });
+  assert.equal(reviewerHighRisk.user, true);
+
+  const secretRequest = permission({ tool: "command", command: "npm test", cwd: "/tmp/project" });
+  secretRequest.containsSecret = true;
+  const secret = await resolveWithAutonomy({
+    ...base,
+    request: secretRequest,
+    aiReviewer: {
+      review: async () => {
+        reviewerCalls += 1;
+        return { decision: "allow", risk: "low" };
+      },
+    },
+  });
+  assert.equal(secret.user, true);
+  assert.equal(reviewerCalls, 1, "secret requests never leave the device for AI review");
+  assert.equal(userRequests, 4);
+});
+
 test("custom autonomy allows only explicitly selected scopes", () => {
   const edit = evaluateAutonomyInteraction(
     permission({ tool: "Edit", tool_input: { file_path: "src/app.js" } }),
@@ -189,7 +294,7 @@ test("autonomy status is display-safe and profile normalization is strict", () =
     profile: "guarded",
   });
   assert.equal(status.autonomyProfile, "guarded");
-  assert.equal(status.availableAutonomyProfiles.length, 4);
+  assert.equal(status.availableAutonomyProfiles.length, 5);
   assert.deepEqual(status.allowedAutonomyScopes, [
     "plan_continue",
     "read_tools",

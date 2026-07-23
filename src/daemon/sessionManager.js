@@ -16,6 +16,7 @@ import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 import { handleRemoteCodingRequest } from "./remoteCodingServer.js";
 import { protectOriginrouterCodingEnv } from "../runtime/originrouterCodingAuthProxy.js";
 import { setAgentDetailDefault } from "../runtime/agentDetailProfile.js";
+import { buildAuditEvidenceBundle } from "../inquiry/auditEvidenceAdapter.js";
 
 export class SessionManager {
   constructor({
@@ -28,6 +29,9 @@ export class SessionManager {
     createAdapterFn = createAdapter,
     createExecutorFn = createExecutor,
     buildAgentProviderEnvFn = buildAgentProviderEnv,
+    auditStore = null,
+    agentCatalog = null,
+    managedAgentSupervisor = null,
   }) {
     this.relayClient = relayClient;
     this.deviceId = deviceId;
@@ -38,6 +42,9 @@ export class SessionManager {
     this.createAdapterFn = createAdapterFn;
     this.createExecutorFn = createExecutorFn;
     this.buildAgentProviderEnvFn = buildAgentProviderEnvFn;
+    this.auditStore = auditStore;
+    this.agentCatalog = agentCatalog;
+    this.managedAgentSupervisor = managedAgentSupervisor;
     this.sessions = new Map();
     // Stage 9.2: per-requestId abort controllers for in-flight remote
     // coding fetches. The cancel event aborts the underlying fetch so
@@ -286,6 +293,16 @@ export class SessionManager {
       } catch (error) {
         console.error(`[session-log] ${error.message}`);
       }
+      try {
+        this.agentCatalog?.finishSession(sessionId, {
+          status: code === 0 && !signal ? "completed" : "stopped",
+          exitCode: code,
+          exitSignal: signal,
+          exitedAt: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.error(`[agent-catalog] ${error.message}`);
+      }
       send("session.exited", { code, signal });
       this.sessions.delete(sessionId);
       try {
@@ -369,6 +386,8 @@ export class SessionManager {
           send("terminal.output", { data });
           terminalActivityReporter.ingest(data);
           for (const event of adapter.handleOutput(data)) {
+            this.auditStore?.appendEvent({ sessionId, cwd, agent }, event);
+            this.agentCatalog?.recordEvent(sessionId, event);
             send("agent.event", { event });
             report("agent.event", { event });
           }
@@ -436,10 +455,33 @@ export class SessionManager {
       } catch (error) {
         console.error(`[session-log] ${error.message}`);
       }
+      try {
+        this.agentCatalog?.upsertSession({
+          sessionId,
+          conversationId: payload.conversationId || sessionId,
+          runId: payload.runId || sessionId,
+          deviceId: this.deviceId,
+          agent,
+          title: payload.title || `${agent} session`,
+          cwd,
+          pid: started.pid,
+          runtime: metadata?.runtime,
+          provider: resolvedProvider?.name,
+          model: payload.model || resolvedProvider?.model,
+          permissionProfile: payload.permissionProfile || "manual",
+          startedBy: payload.startedBy || "remote",
+          startedAt: session.createdAt,
+          status: "running",
+        });
+      } catch (error) {
+        console.error(`[agent-catalog] ${error.message}`);
+      }
 
       if (typeof adapter.scanStructuredEvents === "function") {
         session.scanTimer = setInterval(() => {
           for (const event of adapter.scanStructuredEvents()) {
+            this.auditStore?.appendEvent({ sessionId, cwd, agent }, event);
+            this.agentCatalog?.recordEvent(sessionId, event);
             send("agent.event", { event });
             report("agent.event", { event });
           }
@@ -447,6 +489,12 @@ export class SessionManager {
       }
     } catch (error) {
       session.status = "error";
+      try {
+        this.agentCatalog?.finishSession(sessionId, {
+          status: "failed",
+          exitedAt: new Date().toISOString(),
+        });
+      } catch {}
       cleanupSession();
       send("session.error", { message: error.message });
       report("session.error", { message: error.message }).finally(() => {
@@ -487,6 +535,13 @@ export class SessionManager {
   }
 
   handleEvent(payload) {
+    if (payload.type === "agent.launch.request") {
+      if (!this.managedAgentSupervisor) return false;
+      this.managedAgentSupervisor.start(payload).catch((error) => {
+        console.error(`[agent-launch] ${error.code || "launch_failed"}: ${error.message}`);
+      });
+      return true;
+    }
     if (payload.type === "session.start") {
       this.startSession(payload);
       return;
@@ -502,6 +557,70 @@ export class SessionManager {
     if (payload.type === "remote.coding.request.cancel") {
       this.cancelRemoteCodingRequest(payload.requestId);
       return;
+    }
+
+    if (payload.type === "agent.audit.request") {
+      const sessionId = String(payload.sessionId || "").slice(0, 64);
+      const requestId = String(payload.requestId || "").slice(0, 96);
+      const category = ["approval", "change"].includes(payload.category)
+        ? payload.category
+        : "";
+      if (!sessionId || !requestId || !this.auditStore) return false;
+      const page = this.auditStore.list(sessionId, {
+        category,
+        beforeCursor: payload.beforeCursor,
+        limit: payload.limit,
+      });
+      this.relayClient.send("agent.audit.page", {
+        sessionId,
+        requestId,
+        category,
+        ...page,
+      }).catch((error) => {
+        console.error(`[audit] ${error.message}`);
+      });
+      return true;
+    }
+
+    if (payload.type === "agent.inquiry.request") {
+      const sessionId = String(payload.sessionId || "").slice(0, 64);
+      const requestId = String(payload.requestId || "").slice(0, 96);
+      if (!sessionId || !requestId || !this.auditStore) return false;
+      try {
+        const evidenceBundle = buildAuditEvidenceBundle({
+          auditStore: this.auditStore,
+          sessionId,
+          request: {
+            protocol_version: payload.protocol_version,
+            query_id: payload.query_id,
+            domain: payload.domain,
+            query: payload.query,
+            scope: payload.scope,
+            top_k: payload.top_k,
+            token_budget: payload.token_budget,
+          },
+        });
+        this.relayClient.send("agent.inquiry.page", {
+          sessionId,
+          requestId,
+          domain: evidenceBundle.domain,
+          queryId: evidenceBundle.query_id,
+          evidenceBundle,
+        }).catch((error) => {
+          console.error(`[inquiry] ${error.message}`);
+        });
+      } catch (error) {
+        this.relayClient.send("agent.inquiry.page", {
+          sessionId,
+          requestId,
+          domain: String(payload.domain || ""),
+          queryId: String(payload.query_id || ""),
+          error: error.code || error.message || "invalid_inquiry_request",
+        }).catch((sendError) => {
+          console.error(`[inquiry] ${sendError.message}`);
+        });
+      }
+      return true;
     }
 
     if (typeof payload.type === "string" && payload.type.startsWith("local_control.")) {

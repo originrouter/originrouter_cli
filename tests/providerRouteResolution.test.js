@@ -7,7 +7,7 @@
 //   - originrouter with no runtime -> defaults to /coding/v1/messages
 //   - proxy Claude / Claude SDK -> /v1/messages + originrouter-claude-model
 //   - proxy Claude fast -> /v1/messages + originrouter-claude-fast-model
-//   - proxy Codex / Codex app-server -> /v1/responses + originrouter-codex-model
+//   - proxy Codex / Codex app-server -> /v1/responses + gpt-5.4
 //   - remote requires deviceId
 //   - remote target defaults to "proxy", can be set to "agent"
 //   - unknown providerType throws
@@ -67,10 +67,10 @@ cases.push({
 });
 
 cases.push({
-  name: "proxy codex-app-server -> /v1/responses + originrouter-codex-model",
+  name: "proxy codex-app-server -> /v1/responses + gpt-5.4",
   run: () => {
     const r = resolveRoute({ providerType: "proxy", runtime: "codex-app-server" });
-    assert.deepEqual(r, { transport: "proxy", endpoint: "/v1/responses", model: "originrouter-codex-model" });
+    assert.deepEqual(r, { transport: "proxy", endpoint: "/v1/responses", model: "gpt-5.4" });
   },
 });
 

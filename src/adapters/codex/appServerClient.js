@@ -106,7 +106,7 @@ export class CodexAppServerClient {
     this.serverRequestHandler = handler;
   }
 
-  async connect({ cwd = process.cwd(), env = process.env } = {}) {
+  async connect({ cwd = process.cwd(), env = process.env, modelProvider = null } = {}) {
     // Stage 8.0A: pass `--listen stdio://` to match happy's reference
     // (codexAppServerClient.ts:394). Pre-0.100 Codex CLIs never reach
     // this line because isCodexAppServerAvailable() returns false.
@@ -122,7 +122,22 @@ export class CodexAppServerClient {
     const epoch = this.processEpoch;
     this.disconnecting = false;
     this.childExited = false;
-    this.child = this.spawnFn("codex", ["app-server", "--listen", "stdio://"], {
+    const args = ["app-server"];
+    if (modelProvider?.id && modelProvider?.baseUrl) {
+      const id = String(modelProvider.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+      const config = [
+        ["model_provider", id],
+        [`model_providers.${id}.name`, modelProvider.name || "OriginRouter Proxy"],
+        [`model_providers.${id}.base_url`, modelProvider.baseUrl],
+        [`model_providers.${id}.env_key`, modelProvider.envKey || "OPENAI_API_KEY"],
+        [`model_providers.${id}.wire_api`, modelProvider.wireApi || "responses"],
+      ];
+      for (const [key, value] of config) {
+        args.push("-c", `${key}=${JSON.stringify(String(value))}`);
+      }
+    }
+    args.push("--listen", "stdio://");
+    this.child = this.spawnFn("codex", args, {
       cwd,
       env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
@@ -268,6 +283,10 @@ export class CodexAppServerClient {
 
   startThread(params = {}) {
     return this.request("thread/start", params);
+  }
+
+  resumeThread(threadId, params = {}) {
+    return this.request("thread/resume", { threadId, ...params });
   }
 
   startTurn(params = {}) {

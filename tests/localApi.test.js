@@ -13,6 +13,8 @@ import { addProvider, setCurrentProvider } from "../src/config/providers.js";
 import { setRoute } from "../src/config/routes.js";
 import { readConfig, writeConfig } from "../src/persistence/state.js";
 import { ensureApiToken } from "../src/persistence/authToken.js";
+import { LocalAuditStore } from "../src/persistence/localAuditStore.js";
+import { AgentCatalog } from "../src/persistence/agentCatalog.js";
 
 const home = mkdtempSync(join(tmpdir(), "originrouter-localapi-test-"));
 process.env.ORIGINROUTER_HOME = home;
@@ -23,6 +25,7 @@ const TOKEN = ensureApiToken(home);
 const AUTH = { Authorization: `Bearer ${TOKEN}` };
 
 let serverHandle;
+let agentCatalog;
 try {
   // ---------- Seed a config + spy sessionManager ----------
 
@@ -147,6 +150,8 @@ try {
     deviceId: "local-dev",
     relayConnected: () => relayConnected,
   };
+  agentCatalog = new AgentCatalog({ stateDir: home });
+  liveCtx.agentCatalog = agentCatalog;
   serverHandle = await startLocalApi(liveCtx, { port: 0 });
   // The server's liveCtx reads `ctx.localApiPort` lazily; we patch the bound
   // port onto the SAME ctx object we passed in.
@@ -188,6 +193,34 @@ try {
   // ============================================================
   // Read endpoints
   // ============================================================
+
+  // ---------- CLI-only Collaboration Coordinator ----------
+  {
+    const created = await postJson("/collaboration/local/runs", {
+      objective: "Plan, implement, and verify export support.",
+      agents: {
+        lead: {
+          runtime: "codex",
+          device_id: "local-dev",
+          responsibilities: ["research", "review_plan", "verify_result"],
+        },
+        worker: {
+          runtime: "claude",
+          device_id: "local-dev",
+          responsibilities: ["propose_plan", "implement", "rework"],
+        },
+      },
+    });
+    assert.equal(created.status, 200);
+    assert.equal(created.body.run.state, "created");
+    const runId = created.body.run.run_id;
+    const started = await postJson(`/collaboration/local/runs/${runId}/start`, {});
+    assert.equal(started.body.run.state, "researching");
+    const planning = await postJson(`/collaboration/local/runs/${runId}/begin-planning`, {});
+    assert.equal(planning.body.run.state, "planning");
+    const detail = await getJson(`/collaboration/local/runs/${runId}`);
+    assert.equal(detail.body.run.agents.worker.runtime, "claude");
+  }
 
   // ---------- GET /local/status ----------
   {
@@ -381,7 +414,7 @@ try {
     assert.equal(body.aliases.main,  "originrouter-claude-model");
     assert.equal(body.aliases.small, "originrouter-claude-fast-model");
     // Nested per-agent aliases (Stage 8.0).
-    assert.equal(body.aliases.codex.main, "originrouter-codex-model");
+    assert.equal(body.aliases.codex.main, "gpt-5.4");
     assert.equal(body.aliases.claude.main, "originrouter-claude-model");
   }
   {
@@ -1090,10 +1123,31 @@ try {
       agent: "claude",
       title: "Claude local session",
       deviceId: "local-dev",
+      cwd: home,
       transcriptPath,
     });
     assert.equal(registered.status, 200);
     assert.equal(registered.body.session.session_id, "external-claude-1");
+
+    const catalogStatus = await getJson("/agent/catalog/status");
+    assert.equal(catalogStatus.status, 200);
+    assert.equal(catalogStatus.body.catalog.conversations, 1);
+    const catalogList = await getJson("/agent/catalog/conversations?search=Claude");
+    assert.equal(catalogList.status, 200);
+    assert.equal(catalogList.body.conversations.length, 1);
+    assert.equal(
+      catalogList.body.conversations[0].conversation_id,
+      "external-claude-1",
+    );
+    assert.equal(catalogList.body.conversations[0].transcript_available, true);
+    const catalogDetail = await getJson(
+      "/agent/catalog/conversations/external-claude-1",
+    );
+    assert.equal(catalogDetail.status, 200);
+    assert.equal(catalogDetail.body.conversation.runs.length, 1);
+    const catalogWorkspaces = await getJson("/agent/catalog/workspaces");
+    assert.equal(catalogWorkspaces.status, 200);
+    assert.equal(catalogWorkspaces.body.workspaces.length, 1);
 
     const sessions = await getJson("/agent/local/sessions");
     assert.equal(sessions.body.sessions.length, 1);
@@ -1105,6 +1159,56 @@ try {
       "hello from terminal",
       "hello from Claude",
     ]);
+
+    const localAudit = new LocalAuditStore({ stateDir: home });
+    localAudit.appendEvent(
+      { sessionId: "external-claude-1", cwd: home, agent: "claude" },
+      {
+        type: "agent.interaction.requested",
+        interactionId: "audit-approval-1",
+        kind: "permission",
+        title: "Run migration?",
+        payload: {
+          tool: "Bash",
+          command: "mysql -e \"ALTER TABLE users ADD COLUMN flag INT\"",
+          cwd: home,
+        },
+      },
+    );
+    localAudit.appendEvent(
+      { sessionId: "external-claude-1", cwd: home, agent: "claude" },
+      {
+        type: "agent.interaction.result",
+        interactionId: "audit-approval-1",
+        status: "applied",
+        action: "allow",
+        decisionSource: "app_local",
+      },
+    );
+    const audit = await getJson(
+      "/agent/local/sessions/external-claude-1/audit?category=approval&limit=20",
+    );
+    assert.equal(audit.status, 200);
+    assert.equal(audit.body.records.length, 1);
+    assert.equal(audit.body.records[0].outcome, "allowed");
+    assert.equal(audit.body.records[0].decisionSource, "app_local");
+
+    const inquiry = await postJson(
+      "/agent/local/sessions/external-claude-1/inquiries/approval/query",
+      {
+        protocol_version: "1",
+        query_id: "inq_localapi0001",
+        query: "Who approved this request?",
+      },
+    );
+    assert.equal(inquiry.status, 200);
+    assert.equal(inquiry.body.evidence_bundle.domain, "approval");
+    assert.equal(inquiry.body.evidence_bundle.evidence.length, 1);
+    assert.equal(
+      inquiry.body.evidence_bundle.evidence[0].source_type,
+      "approval_decision",
+    );
+    assert.equal(inquiry.body.evidence_bundle.policy.allow_actions, false);
 
     const sent = await postJson("/agent/local/sessions/external-claude-1/message", {
       message: "continue",
@@ -1152,11 +1256,12 @@ try {
       event: { type: "agent.text", text: "live reply" },
     });
     const events = await getJson("/agent/local/events?after=0");
-    assert.equal(events.body.events[0].text, "live reply");
+    assert.ok(events.body.events.some((event) => event.text === "live reply"));
   }
 
   console.log("local api smoke ok");
 } finally {
   if (serverHandle) await serverHandle.close();
+  if (agentCatalog) agentCatalog.close();
   rmSync(home, { recursive: true, force: true });
 }

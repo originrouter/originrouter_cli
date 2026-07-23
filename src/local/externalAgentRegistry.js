@@ -16,10 +16,24 @@ function safeText(value, maxLength) {
 }
 
 export class ExternalAgentRegistry {
-  constructor({ now = () => Date.now() } = {}) {
+  constructor({ now = () => Date.now(), catalog = null } = {}) {
     this.now = now;
+    this.catalog = catalog;
     this.sessions = new Map();
     this.eventCursor = 0;
+    this.listeners = new Set();
+  }
+
+  subscribe(listener) {
+    if (typeof listener !== "function") return () => {};
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  notify(type, sessionId, payload = {}) {
+    for (const listener of this.listeners) {
+      try { listener({ type, sessionId, payload }); } catch {}
+    }
   }
 
   register(payload) {
@@ -64,6 +78,8 @@ export class ExternalAgentRegistry {
       currentStep: existing?.currentStep || "Running locally",
     };
     this.sessions.set(sessionId, session);
+    try { this.catalog?.upsertSession(payload); } catch {}
+    this.notify("registered", sessionId, { ...payload, session: this.project(session) });
     return this.project(session);
   }
 
@@ -74,6 +90,8 @@ export class ExternalAgentRegistry {
     }
     if (payload.status) session.status = safeText(payload.status, 32);
     session.lastSeenAtMs = this.now();
+    try { this.catalog?.updateSession(sessionId, payload); } catch {}
+    this.notify("updated", sessionId, payload);
     return this.project(session);
   }
 
@@ -88,7 +106,14 @@ export class ExternalAgentRegistry {
     if (!session) return false;
     session.status = safeText(status, 32) || "stopped";
     session.lastSeenAtMs = this.now();
+    try {
+      this.catalog?.finishSession(sessionId, {
+        status: session.status,
+        exitedAt: new Date(this.now()).toISOString(),
+      });
+    } catch {}
     this.sessions.delete(sessionId);
+    this.notify("unregistered", sessionId, { status: session.status });
     return true;
   }
 
@@ -97,14 +122,15 @@ export class ExternalAgentRegistry {
     session.eventSequence += 1;
     this.eventCursor += 1;
     session.lastSeenAtMs = this.now();
-    session.events.push({
+    const storedEvent = {
       ...event,
       eventId: safeText(event?.eventId, 96) || `local_event_${randomUUID()}`,
       sessionId,
       localSequence: session.eventSequence,
       localCursor: this.eventCursor,
       createdAt: event?.createdAt || Math.floor(this.now() / 1000),
-    });
+    };
+    session.events.push(storedEvent);
     const interactionId = String(event?.interactionId || event?.callId || "");
     if (event?.type === "agent.interaction.requested" && interactionId) {
       session.pendingInteractions.add(interactionId);
@@ -153,9 +179,11 @@ export class ExternalAgentRegistry {
       session.detailSource = safeText(event?.detailSource, 32) || session.detailSource;
     }
     session.currentStep = this.stepForEvent(event, session.currentStep);
+    try { this.catalog?.recordEvent(sessionId, event); } catch {}
     if (session.events.length > MAX_EVENTS) {
       session.events.splice(0, session.events.length - MAX_EVENTS);
     }
+    this.notify("event", sessionId, storedEvent);
     return session.eventSequence;
   }
 
@@ -236,6 +264,12 @@ export class ExternalAgentRegistry {
     for (const session of this.sessions.values()) {
       if (session.status === "running" && session.lastSeenAtMs < cutoff) {
         session.status = "stopped";
+        try {
+          this.catalog?.finishSession(session.sessionId, {
+            status: "stopped",
+            exitedAt: new Date(this.now()).toISOString(),
+          });
+        } catch {}
       }
     }
   }

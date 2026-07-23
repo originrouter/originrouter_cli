@@ -73,7 +73,7 @@ export class CodexAdapter extends TerminalAdapter {
     if (!userProvidedModel(args)) {
       // Stage 8.0: routes.codex.main is the source of truth. Inject the
       // fixed alias so Codex Code's model lookup hits the local LiteLLM
-      // proxy, which renders originrouter-codex-model from the configured
+      // proxy, which renders gpt-5.4 from the configured
       // upstream provider.
       args = ["--model", CODEX_MAIN_ALIAS, ...args];
     } else {
@@ -205,7 +205,7 @@ export class CodexAdapter extends TerminalAdapter {
     return readCodexConversationHistory(this.getTranscriptPath(), options);
   }
 
-  resolvePermission({ callId, interactionId, decision, reason }) {
+  resolvePermission({ callId, interactionId, decision, reason, decisionSource }) {
     // Stage 8.9: accept interactionId as an alias for callId so the
     // new agent.interaction.resolve envelope (which carries
     // interactionId) flows through the same pendingApprovals map.
@@ -230,6 +230,7 @@ export class CodexAdapter extends TerminalAdapter {
       callId: key,
       decision: decision || "denied",
       reason: reason || undefined,
+      decisionSource: decisionSource || undefined,
     });
     return true;
   }

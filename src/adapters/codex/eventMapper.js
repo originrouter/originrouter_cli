@@ -243,6 +243,33 @@ export function mapCodexAppServerEvent(message) {
     return mapCodexAssistantText(message.message);
   }
 
+  if (type === "token_count") {
+    const total = message.total || message.info?.total || message.info || message;
+    const last = message.last || message.info?.last || {};
+    const totalTokens = Number(
+      total.totalTokens ?? total.total_tokens
+      ?? (Number(total.inputTokens ?? total.input_tokens ?? 0)
+        + Number(total.outputTokens ?? total.output_tokens ?? 0)
+        + Number(total.cachedInputTokens ?? total.cached_input_tokens ?? 0)
+        + Number(total.reasoningOutputTokens ?? total.reasoning_output_tokens ?? 0)),
+    );
+    const lastTokens = Number(
+      last.totalTokens ?? last.total_tokens
+      ?? (Number(last.inputTokens ?? last.input_tokens ?? 0)
+        + Number(last.outputTokens ?? last.output_tokens ?? 0)
+        + Number(last.cachedInputTokens ?? last.cached_input_tokens ?? 0)
+        + Number(last.reasoningOutputTokens ?? last.reasoning_output_tokens ?? 0)),
+    );
+    return [{
+      type: "agent.usage",
+      provider: "codex",
+      sampledTokens: Math.max(0, Number.isFinite(lastTokens) && lastTokens > 0 ? lastTokens : totalTokens),
+      amountMinor: 0,
+      elapsedSeconds: 0,
+      estimated: false,
+    }];
+  }
+
   if (type === "agent_reasoning" || type === "agent_reasoning_delta") {
     return [{ type: "agent.thinking", provider: "codex", text: message.text || message.delta || "" }];
   }
@@ -263,7 +290,8 @@ export function mapCodexAppServerEvent(message) {
       provider: "codex",
       callId: message.call_id || message.id,
       content: message.output || message.error || "",
-      isError: Boolean(message.error),
+      isError: Boolean(message.error)
+        || (Number.isFinite(Number(message.exit_code)) && Number(message.exit_code) !== 0),
     }];
   }
 

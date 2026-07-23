@@ -468,6 +468,64 @@ export async function reportRuntimeEvent(payload, {
   }
 }
 
+export function buildAgentConversationMetadata(payload = {}) {
+  return {
+    conversation_id: safeText(payload.conversationId || payload.conversation_id, 96),
+    agent_type: safeText(payload.agentType || payload.agent_type, 32) || "unknown",
+    native_session_id: safeText(payload.nativeSessionId || payload.native_session_id, 191),
+    title: safeText(payload.title, 191) || "Agent session",
+    status: safeText(payload.status, 32) || "running",
+    workspace_id: safeText(payload.workspaceId || payload.workspace_id, 96),
+    workspace_name: safeText(payload.workspaceName || payload.workspace_name, 191),
+    runtime: safeText(payload.runtime, 64),
+    provider: safeText(payload.provider, 191),
+    model: safeText(payload.model, 191),
+    permission_profile: safeText(
+      payload.permissionProfile || payload.permission_profile,
+      64,
+    ),
+    artifact_count: Math.max(0, Number.parseInt(String(payload.artifactCount || 0), 10) || 0),
+  };
+}
+
+export async function reportAgentConversationMetadata(payload, {
+  stateDir = getStateDir(),
+  fetchFn = globalThis.fetch,
+  readCodingAuthFn = readCodingAuth,
+  ensureFreshAccessTokenFn = ensureFreshAccessToken,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+  const body = buildAgentConversationMetadata(payload);
+  if (!body.conversation_id) return { ok: false, error: "invalid_conversation_id" };
+  const resolved = await resolveRelayAuth({
+    stateDir,
+    readCodingAuthFn,
+    ensureFreshAccessTokenFn,
+  });
+  if (resolved.error) return { ok: false, error: resolved.error };
+  const { credential: auth, token } = resolved;
+  if (typeof fetchFn !== "function") return { ok: false, error: "fetch_unavailable" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetchFn(`${apiBase()}/cli/v1/agent/catalog/conversations`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        "X-OriginRouter-Device-Id": auth.deviceId,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    return { ok: resp.ok, status: resp.status };
+  } catch {
+    return { ok: false, error: "request_failed" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function reportAgentSessionHeartbeat(sessionId, {
   stateDir = getStateDir(),
   fetchFn = globalThis.fetch,
@@ -803,6 +861,7 @@ export function startApprovalDecisionPolling({
             callId: approval.interactionId,
             interactionId: approval.interactionId,
             decision: approval.runtimeDecision,
+            decisionSource: "app_remote",
           });
           if (applied !== false) seen.add(approval.approvalId);
         } catch {

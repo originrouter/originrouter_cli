@@ -144,6 +144,7 @@ export function normalizeInteractionResolve(payload = {}) {
     kind: payload.kind || null,
     action,
     response: copyObject(payload.response),
+    decisionSource: payload.decisionSource || payload.decision_source || null,
   };
 }
 

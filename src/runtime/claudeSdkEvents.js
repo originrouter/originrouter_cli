@@ -129,6 +129,22 @@ export function mapClaudeSdkMessage(message) {
   }
 
   if (message.type === "result") {
+    const usage = message.usage && typeof message.usage === "object" ? message.usage : {};
+    const sampledTokens = Number(usage.input_tokens || 0)
+      + Number(usage.output_tokens || 0)
+      + Number(usage.cache_creation_input_tokens || 0)
+      + Number(usage.cache_read_input_tokens || 0);
+    if (sampledTokens > 0 || Number(message.total_cost_usd || 0) > 0 || Number(message.duration_ms || 0) > 0) {
+      events.push({
+        type: "agent.usage",
+        provider: "claude",
+        sampledTokens: Math.max(0, sampledTokens),
+        amountMinor: Math.max(0, Math.round(Number(message.total_cost_usd || 0) * 100)),
+        elapsedSeconds: Math.max(0, Math.ceil(Number(message.duration_ms || 0) / 1000)),
+        estimated: false,
+        eventId: messageEventId(message, "usage"),
+      });
+    }
     events.push({
       type: "agent.task.completed",
       provider: "claude",

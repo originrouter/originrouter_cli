@@ -1,7 +1,9 @@
 import process from "node:process";
 import { randomUUID } from "node:crypto";
+import { basename } from "node:path";
 import {
   createRuntimeEventReporter,
+  reportAgentConversationMetadata,
   startAgentSessionHeartbeat,
 } from "../agent/bridgeReporter.js";
 import { buildAgentProviderEnv } from "../config/claudeConfig.js";
@@ -37,6 +39,7 @@ import {
   AGENT_DETAIL_PROFILES,
   resolveAgentDetailProfile,
 } from "./agentDetailProfile.js";
+import { AiApprovalReviewer } from "./aiApprovalReviewer.js";
 
 const CLAUDE_MODES = Object.freeze([
   { id: "default", label: "Default" },
@@ -64,10 +67,15 @@ function extractOriginRouterOptions(args) {
     if (arg === "--originrouter-relay") take("relay");
     else if (arg === "--originrouter-device") take("device");
     else if (arg === "--originrouter-session") take("session");
+    else if (arg === "--originrouter-conversation") take("conversationId");
+    else if (arg === "--originrouter-run") take("runId");
+    else if (arg === "--originrouter-workspace") take("workspaceId");
+    else if (arg === "--originrouter-title") take("title");
     else if (arg === "--provider") take("provider");
     else if (arg === "--model") take("model");
     else if (arg === "--fallback-model") take("fallbackModel");
     else if (arg === "--permission-mode") take("permissionMode");
+    else if (arg === "--prompt") take("initialMessage");
     else if (arg === "--originrouter-autonomy") take("autonomyProfile");
     else if (arg === "--originrouter-detail") take("detailProfile");
     else if (arg === "--originrouter-auto-approve") options.autonomyProfile = "guarded";
@@ -111,6 +119,10 @@ function toUserMessage(text) {
     parent_tool_use_id: null,
     message: { role: "user", content: text },
   };
+}
+
+function safeLaunchMessage(value) {
+  return String(value || "").trim().slice(0, 8192);
 }
 
 function normalizeRemoteText(data) {
@@ -178,6 +190,7 @@ async function loadClaudeAgentSdk() {
 
 export async function runClaudeSdkSession(rawArgs) {
   const stateDir = ensureStateDir();
+  const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
   const options = extractOriginRouterOptions(rawArgs);
   const relayUrl = options.relay || process.env.ORIGINROUTER_RELAY || DEFAULT_RELAY_URL;
   const device = ensureDevice(options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID);
@@ -206,12 +219,15 @@ export async function runClaudeSdkSession(rawArgs) {
     { stateDir },
   ));
   const messageQueue = new AsyncMessageQueue();
+  const sessionTitle = String(options.title || "Claude session").trim().slice(0, 191);
+  const initialMessage = safeLaunchMessage(options.initialMessage);
+  if (initialMessage) messageQueue.push(toUserMessage(initialMessage));
   const recentEvents = [];
   const abortController = new AbortController();
   const runtimeReporter = createRuntimeEventReporter({
     sessionId,
     agentType: "claude",
-    title: "Claude session",
+    title: sessionTitle,
     deviceName: device.host,
     stateDir,
   });
@@ -237,6 +253,19 @@ export async function runClaudeSdkSession(rawArgs) {
   let pendingModePayload = null;
   let stopHeartbeat = () => {};
   const signalHandlers = new Map();
+  const syncCatalog = (status) => reportAgentConversationMetadata({
+    conversationId: options.conversationId || sessionId,
+    agentType: "claude",
+    nativeSessionId: claudeSessionId,
+    title: sessionTitle,
+    status,
+    workspaceId: options.workspaceId,
+    workspaceName: basename(cwd),
+    runtime: "claude-sdk",
+    provider: providerResult.provider?.name,
+    model: options.model || providerResult.provider?.model,
+    permissionProfile: autonomyProfile,
+  }, { stateDir }).catch(() => ({ ok: false }));
 
   const send = (type, extra = {}) => relayClient.send(type, {
     sessionId,
@@ -347,6 +376,8 @@ export async function runClaudeSdkSession(rawArgs) {
     profile: autonomyProfile,
     allowedScopes: autonomyAllowedScopes,
     workspaceRoot: cwd,
+    aiReviewer: aiApprovalReviewer,
+    runtime: "claude-sdk",
     requestInteraction: (item) => interactions.request(item, signal),
     onAutoResolved: ({ request: item, resolved }) => sendAgentEvent({
       type: "agent.interaction.auto_resolved",
@@ -357,6 +388,9 @@ export async function runClaudeSdkSession(rawArgs) {
       autonomyProfile,
       autonomyScope: resolved.scope,
       reason: resolved.reason,
+      decisionSource: resolved.decisionSource || "autonomy_policy",
+      aiReview: resolved.aiReview || null,
+      decision: resolved.action,
     }),
   });
 
@@ -373,6 +407,7 @@ export async function runClaudeSdkSession(rawArgs) {
     originrouterCodingProxy = null;
     await send("session.exited", { code: 0, signal });
     await report("session.exited", { code: 0, signal });
+    await syncCatalog(signal ? "stopped" : "completed");
     await runtimeReporter.flush();
   };
 
@@ -650,13 +685,22 @@ export async function runClaudeSdkSession(rawArgs) {
     });
     await localAgentBridge.start({
       sessionId,
+      conversationId: options.conversationId || sessionId,
+      runId: options.runId || sessionId,
       agent: "claude",
-      title: "Claude session",
+      title: sessionTitle,
       deviceId: relayOptions.deviceId,
       deviceName: device.host,
       cwd,
+      workspaceTrusted: true,
       pid: process.pid,
       startedAt: new Date().toISOString(),
+      nativeSessionId: claudeSessionId,
+      runtime: "claude-sdk",
+      provider: providerResult.provider?.name,
+      model: options.model || providerResult.provider?.model,
+      permissionProfile: currentMode,
+      startedBy: "local-sdk",
       mode: currentMode,
       modeControl: "supported",
       availableModes: CLAUDE_MODES,
@@ -672,6 +716,7 @@ export async function runClaudeSdkSession(rawArgs) {
       pendingModePayload = null;
       await applyMode(payload);
     }
+    await syncCatalog("running");
     await sendAgentEvent({ type: "agent.ready", provider: "claude" });
     await reportMode();
     await reportAutonomy();
@@ -682,7 +727,11 @@ export async function runClaudeSdkSession(rawArgs) {
         if (event.type === "agent.session_id" && event.sessionId) {
           claudeSessionId = event.sessionId;
           transcriptPath = claudeTranscriptPathForSession(cwd, claudeSessionId);
-          await localAgentBridge?.update({ transcriptPath });
+          await localAgentBridge?.update({
+            nativeSessionId: claudeSessionId,
+            transcriptPath,
+          });
+          await syncCatalog("running");
         }
         await sendAgentEvent(event);
       }

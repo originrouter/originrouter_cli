@@ -10,6 +10,14 @@ import { RelayClient } from "../relay/relayClient.js";
 import { parseOptions } from "../utils/options.js";
 import { SessionManager } from "./sessionManager.js";
 import { agentDetailDefaultFromConfig } from "../runtime/agentDetailProfile.js";
+import { LocalAuditStore } from "../persistence/localAuditStore.js";
+import { AgentCatalog } from "../persistence/agentCatalog.js";
+import { readSessions } from "../persistence/sessionLog.js";
+import { ExternalAgentRegistry } from "../local/externalAgentRegistry.js";
+import { ManagedAgentSupervisor } from "./managedAgentSupervisor.js";
+import { CollaborationStore } from "../collaboration/collaborationStore.js";
+import { PlanImplementVerifyCoordinator } from "../collaboration/planImplementVerifyCoordinator.js";
+import { CollaborationRuntime } from "../collaboration/collaborationRuntime.js";
 
 function httpHost(address) {
   return String(address).includes(":") && !String(address).startsWith("[")
@@ -88,6 +96,26 @@ export async function startDaemon(args) {
     deviceId: effectiveDeviceId,
     authToken: null,
   });
+  const auditStore = new LocalAuditStore({ stateDir });
+  const collaborationStore = new CollaborationStore({ stateDir });
+  const collaborationCoordinator = new PlanImplementVerifyCoordinator({ store: collaborationStore });
+  const agentCatalog = new AgentCatalog({ stateDir });
+  agentCatalog.migrateLegacySessions(readSessions());
+  const externalAgentRegistry = new ExternalAgentRegistry({ catalog: agentCatalog });
+  const managedAgentSupervisor = new ManagedAgentSupervisor({
+    catalog: agentCatalog,
+    deviceId: effectiveDeviceId,
+    relayUrl,
+  });
+  const collaborationRuntime = new CollaborationRuntime({
+    store: collaborationStore,
+    coordinator: collaborationCoordinator,
+    supervisor: managedAgentSupervisor,
+    registry: externalAgentRegistry,
+    catalog: agentCatalog,
+    relayClient,
+    deviceId: effectiveDeviceId,
+  });
 
   // Stage 4: ProxyManager owns the LiteLLM proxy lifecycle. The session
   // manager passes proxy status into buildAgentProviderEnv; the local API
@@ -105,6 +133,9 @@ export async function startDaemon(args) {
     defaultExecutor: executor,
     proxyManager,
     remoteShareProxyManager,
+    auditStore,
+    agentCatalog,
+    managedAgentSupervisor,
   });
 
   // Stage 3 + Stage 4 + Stage 6: start the local 127.0.0.1-only HTTP API.
@@ -114,6 +145,13 @@ export async function startDaemon(args) {
   let relayConnected = false;
   const localApiCtx = {
     sessionManager,
+    auditStore,
+    collaborationStore,
+    collaborationCoordinator,
+    collaborationRuntime,
+    agentCatalog,
+    managedAgentSupervisor,
+    externalAgentRegistry,
     configProvider: () => readConfig(),
     startedAt,
     pid: process.pid,
@@ -166,6 +204,9 @@ export async function startDaemon(args) {
   }
   // Patch the bound port onto the live ctx so /local/status reports it.
   localApiCtx.localApiPort = localApi.port;
+  void collaborationRuntime.recover().catch((error) => {
+    console.error(`[daemon] collaboration recovery: ${error.message}`);
+  });
   // We don't actually need the token here — startLocalApi reads the file —
   // but capturing it for the URL print below is convenient.
   void apiToken;
@@ -184,6 +225,9 @@ export async function startDaemon(args) {
     try { await proxyManager.stop(); } catch (e) { console.error(`[daemon] proxy stop: ${e.message}`); }
     try { await remoteShareProxyManager.stop(); } catch (e) { console.error(`[daemon] remote share proxy stop: ${e.message}`); }
     try { await localApi.close(); } catch (e) { console.error(`[daemon] local api close: ${e.message}`); }
+    try { collaborationRuntime.close(); } catch (e) { console.error(`[daemon] collaboration runtime close: ${e.message}`); }
+    try { collaborationStore.close(); } catch (e) { console.error(`[daemon] collaboration store close: ${e.message}`); }
+    try { agentCatalog.close(); } catch (e) { console.error(`[daemon] agent catalog close: ${e.message}`); }
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     process.exit(0);
   };
@@ -295,9 +339,17 @@ export async function startDaemon(args) {
       effectiveDeviceId = relayOptions.deviceId;
       localApiCtx.deviceId = effectiveDeviceId;
       sessionManager.deviceId = effectiveDeviceId;
+      managedAgentSupervisor.deviceId = effectiveDeviceId;
+      collaborationRuntime.deviceId = effectiveDeviceId;
 
       await relayClient.connectEvents(
-        (payload) => sessionManager.handleEvent(payload),
+        (payload) => {
+          void collaborationRuntime.handleRelayEvent(payload).then((handled) => {
+            if (!handled) sessionManager.handleEvent(payload);
+          }).catch((error) => {
+            console.error(`[collaboration-relay] ${error.message}`);
+          });
+        },
         {
           onOpen: () => {
             relayConnected = true;
@@ -306,6 +358,9 @@ export async function startDaemon(args) {
               ...localApiState(), version: VERSION, status: "connected",
             });
             reportLocalControlHeartbeat().catch(() => {});
+            void collaborationRuntime.refreshAccountBudgetStatus().catch((error) => {
+              console.error(`[collaboration-budget] ${error.message}`);
+            });
           },
           onClose: () => {
             relayConnected = false;

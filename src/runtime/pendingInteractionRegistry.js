@@ -136,6 +136,8 @@ export class PendingInteractionRegistry {
       responseId,
       status,
       reason: extra.reason || "",
+      action: extra.action || entry?.resolved?.action || null,
+      decisionSource: extra.decisionSource || entry?.resolved?.decisionSource || null,
     });
   }
 

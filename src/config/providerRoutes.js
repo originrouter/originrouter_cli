@@ -11,7 +11,7 @@
 //   - the /coding prefix on originrouter
 //   - the bare /v1 prefix on proxy
 //   - the proxy alias table (originrouter-claude-model,
-//     originrouter-claude-fast-model, originrouter-codex-model)
+//     originrouter-claude-fast-model, gpt-5.4)
 //   - the default originrouter base URL
 //
 // It does NOT exchange or refresh OAuth credentials, or perform
@@ -46,7 +46,7 @@ const PROXY_ENDPOINTS = Object.freeze({
 const ALIASES = Object.freeze({
   "claude":      "originrouter-claude-model",
   "claude-fast": "originrouter-claude-fast-model",
-  "codex":       "originrouter-codex-model",
+  "codex":       "gpt-5.4",
 });
 
 // Official OriginRouter Coding API gateway. All /coding/v1/messages,
