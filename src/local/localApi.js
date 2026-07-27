@@ -38,9 +38,18 @@ import {
   getAllRoutes,
   getRoutes,
   hashRoutes,
+  replaceAgentRoutes,
   setRoute,
 } from "../config/routes.js";
 import { LITELLM_PROVIDERS } from "../proxy/litellmCatalog.js";
+import { discoverProviderModels } from "../proxy/modelDiscovery.js";
+import { probeProviderModel } from "../proxy/modelProbe.js";
+import {
+  enabledProviderModelEntries,
+  hasRemoteEnabledModels,
+  normalizeProviderModels,
+  remoteShareModelEntries,
+} from "../config/providerModels.js";
 import { readApiToken } from "../persistence/authToken.js";
 import { getStateDir, readConfig, readProxyState, writeConfig } from "../persistence/state.js";
 import { DEFAULT_RELAY_URL, DEFAULT_REMOTE_SHARE_PROXY_PORT } from "../constants.js";
@@ -55,9 +64,11 @@ import {
 } from "../runtime/agentDetailProfile.js";
 import { ExternalAgentRegistry } from "./externalAgentRegistry.js";
 import { LocalAuditStore } from "../persistence/localAuditStore.js";
+import { ProxyRequestStore } from "../persistence/proxyRequestStore.js";
 import { buildAuditEvidenceBundle } from "../inquiry/auditEvidenceAdapter.js";
 import { CollaborationStore } from "../collaboration/collaborationStore.js";
 import { PlanImplementVerifyCoordinator } from "../collaboration/planImplementVerifyCoordinator.js";
+import { browseAgentWorkspaces } from "../daemon/workspaceBrowser.js";
 
 // Exported so CLI subcommands (e.g. `local api set-host`) can apply
 // the same gating as the runtime auth layer. Keep the set in lock-
@@ -112,6 +123,8 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
   // handle immediately after binding, so the handler sees the bound port on
   // its first request.
   const auditStore = ctx.auditStore || new LocalAuditStore();
+  const ownsProxyRequestStore = !ctx.proxyRequestStore;
+  const proxyRequestStore = ctx.proxyRequestStore || new ProxyRequestStore();
   const collaborationStore = ctx.collaborationStore || new CollaborationStore();
   const collaborationCoordinator = ctx.collaborationCoordinator
     || new PlanImplementVerifyCoordinator({ store: collaborationStore });
@@ -128,8 +141,10 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
     startRemoteShareProxy: ctx.startRemoteShareProxy,
     stopRemoteShareProxy: ctx.stopRemoteShareProxy,
     restartRemoteShareProxy: ctx.restartRemoteShareProxy,
+    discoverProviderModels: ctx.discoverProviderModels || discoverProviderModels,
     sessionManager: ctx.sessionManager,
     auditStore,
+    proxyRequestStore,
     collaborationStore,
     collaborationCoordinator,
     collaborationRuntime: ctx.collaborationRuntime || null,
@@ -175,7 +190,10 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
     port: actualPort,
     bindAddress,
     server,
-    close: () => new Promise((resolve) => server.close(() => resolve())),
+    close: () => new Promise((resolve) => server.close(() => {
+      if (ownsProxyRequestStore) proxyRequestStore.close();
+      resolve();
+    })),
   };
 }
 
@@ -250,6 +268,7 @@ function safeEqual(a, b) {
 // user PII / API keys.
 const AUTH_REQUIRED_GET_PATHS = new Set([
   "/proxy/logs",
+  "/proxy/requests",
 ]);
 
 function requireAuth(req, ctx) {
@@ -331,6 +350,9 @@ async function dispatch(ctx, req, res) {
     if (req.method === "GET" && pathname === "/proxy/logs") {
       return handleProxyLogs(ctx, res, url);
     }
+    if (req.method === "GET" && pathname === "/proxy/requests") {
+      return handleProxyRequests(ctx, res, url);
+    }
     if (req.method === "GET" && pathname === "/providers") {
       return sendOk(res, { providers: handleProvidersList(ctx) });
     }
@@ -339,6 +361,16 @@ async function dispatch(ctx, req, res) {
     // agent-protocol.md §9.
     if (req.method === "GET" && pathname === "/catalog/litellm-providers") {
       return sendOk(res, { providers: LITELLM_PROVIDERS });
+    }
+    if (req.method === "POST" && pathname === "/catalog/litellm-models") {
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      return handleProviderModelDiscovery(ctx, res, body);
+    }
+    if (req.method === "POST" && pathname === "/catalog/litellm-model-test") {
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      return handleProviderModelProbe(ctx, res, body);
     }
     // Stage 7.5: routes endpoints. ALL require bearer token (Stage 6
     // deny-by-default; routes are user state, not a static catalog).
@@ -477,6 +509,20 @@ async function dispatch(ctx, req, res) {
     }
     if (req.method === "GET" && pathname === "/agent/catalog/conversations") {
       if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
+      const pageSize = url.searchParams.get("page_size");
+      const view = url.searchParams.get("view");
+      if (pageSize || view === "history" || view === "archived") {
+        return sendOk(res, ctx.agentCatalog.listConversationPage({
+          collection: view || "history",
+          search: url.searchParams.get("search") || "",
+          agent: url.searchParams.get("agent") || "",
+          deviceId: url.searchParams.get("device_id") || "",
+          workspaceId: url.searchParams.get("workspace_id") || "",
+          page: url.searchParams.get("page"),
+          pageSize,
+          autoArchiveDays: url.searchParams.get("auto_archive_days"),
+        }));
+      }
       return sendOk(res, {
         conversations: ctx.agentCatalog.listConversations({
           search: url.searchParams.get("search") || "",
@@ -490,6 +536,19 @@ async function dispatch(ctx, req, res) {
         }),
       });
     }
+    const catalogArchiveMatch = pathname.match(
+      /^\/agent\/catalog\/conversations\/([^/]+)\/(archive|restore)$/,
+    );
+    if (req.method === "POST" && catalogArchiveMatch) {
+      if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
+      const conversationId = decodeURIComponent(catalogArchiveMatch[1]);
+      const conversation = ctx.agentCatalog.setConversationArchived(
+        conversationId,
+        catalogArchiveMatch[2] === "archive",
+      );
+      if (!conversation) return sendError(res, 404, "agent conversation not found");
+      return sendOk(res, { conversation });
+    }
     if (req.method === "GET" && pathname === "/agent/catalog/workspaces") {
       if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
       return sendOk(res, {
@@ -499,6 +558,38 @@ async function dispatch(ctx, req, res) {
           limit: url.searchParams.get("limit"),
         }),
       });
+    }
+    if (req.method === "GET" && pathname === "/agent/catalog/workspaces/browse") {
+      if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
+      try {
+        const page = await browseAgentWorkspaces({
+          path: url.searchParams.get("path") || "",
+          query: url.searchParams.get("query") || "",
+          limit: url.searchParams.get("limit"),
+          catalog: ctx.agentCatalog,
+          deviceId: ctx.deviceId,
+        });
+        return sendOk(res, page);
+      } catch (error) {
+        return sendError(res, 400, error.message || "workspace browse failed", {
+          reason: error.code || "workspace_browse_failed",
+        });
+      }
+    }
+    if (req.method === "POST" && pathname === "/agent/catalog/workspaces/trust") {
+      if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      try {
+        const workspace = ctx.agentCatalog.trustWorkspace(body.path, {
+          deviceId: ctx.deviceId,
+        });
+        return sendOk(res, { workspace });
+      } catch (error) {
+        return sendError(res, 400, error.message || "workspace trust failed", {
+          reason: error.code || "workspace_trust_failed",
+        });
+      }
     }
     if (req.method === "POST" && pathname === "/agent/local/launch") {
       if (!ctx.managedAgentSupervisor) {
@@ -810,10 +901,14 @@ async function handleRemoteShareStatusPayload(ctx) {
   const providerNames = Array.isArray(status.currentProviders) && status.currentProviders.length > 0
     ? status.currentProviders
     : configured.providers || [];
-  const catalog = remoteShareProviders(config, providerNames).map((provider) => ({
-    provider: provider.name,
-    model: provider.model || null,
-  }));
+  const catalog = remoteShareProviders(config, providerNames)
+    .flatMap((provider) => remoteShareModelEntries(provider))
+    .map(({ provider, model, sourceProvider, pricing }) => ({
+      provider,
+      model,
+      sourceProvider,
+      pricing,
+    }));
   return {
     ...status,
     enabled: configured.enabled === true,
@@ -865,6 +960,27 @@ function handleProxyLogs(ctx, res, url) {
   if (st.size > LOG_TAIL_MAX_BYTES) lines.shift();
   const tailLines = lines.slice(-tail);
   return sendOk(res, { path: logPath, lines: tailLines.length, content: tailLines.join("\n") });
+}
+
+function handleProxyRequests(ctx, res, url) {
+  const rawLimit = url.searchParams.get("limit");
+  if (rawLimit != null && !/^\d+$/.test(rawLimit)) {
+    return sendError(res, 400, "limit must be a positive integer");
+  }
+  const limit = rawLimit == null ? undefined : Number(rawLimit);
+  if (limit != null && limit < 1) {
+    return sendError(res, 400, "limit must be a positive integer");
+  }
+  try {
+    return sendOk(res, ctx.proxyRequestStore.listPage({
+      limit,
+      cursor: url.searchParams.get("cursor"),
+      status: url.searchParams.get("status") || "",
+      query: url.searchParams.get("q") || "",
+    }));
+  } catch (error) {
+    return sendError(res, 400, error?.message || "invalid request query");
+  }
 }
 
 function handleProvidersList(ctx) {
@@ -1019,11 +1135,17 @@ async function handleProxyControl(ctx, res, action, body) {
 
 function remoteShareProvider(config, providerName) {
   if (!providerName) return null;
-  return listProviders(config).find(
-    (provider) => provider.name === providerName
-      && provider.type === "proxy"
-      && provider.engine === "litellm",
-  ) || null;
+  const raw = config.providers?.[providerName];
+  if (!raw) return null;
+  const provider = normalizeProviderModels(raw, {
+    strict: false,
+    legacyRemoteEnabled: (config.remoteShare?.providers || []).includes(providerName),
+  });
+  return provider.type === "proxy"
+    && provider.engine === "litellm"
+    && remoteShareModelEntries(provider).length > 0
+    ? provider
+    : null;
 }
 
 function remoteShareProviders(config, providerNames) {
@@ -1052,6 +1174,20 @@ function writeRemoteShareConfig({ enabled, providers, port, e2eePolicy }) {
   return next.remoteShare;
 }
 
+function syncRemoteShareProviderSelection(config, providerName) {
+  const current = new Set(config.remoteShare?.providers || []);
+  const provider = config.providers?.[providerName];
+  if (provider && hasRemoteEnabledModels(provider)) current.add(providerName);
+  else current.delete(providerName);
+  return {
+    ...config,
+    remoteShare: {
+      ...(config.remoteShare || {}),
+      providers: [...current],
+    },
+  };
+}
+
 async function handleRemoteShareStatus(ctx, res) {
   return sendOk(res, await handleRemoteShareStatusPayload(ctx));
 }
@@ -1078,7 +1214,7 @@ async function handleRemoteShareControl(ctx, res, action, body) {
   }
   const providers = remoteShareProviders(config, providerNames);
   if (providers.length !== providerNames.length) {
-    return sendError(res, 400, "remote share contains an unknown or non-LiteLLM provider");
+    return sendError(res, 400, "remote share contains an unknown Provider or one with no remotely enabled model");
   }
   const parsedPort = Number.parseInt(body.port || config.remoteShare?.port || DEFAULT_REMOTE_SHARE_PROXY_PORT, 10);
   if (!Number.isFinite(parsedPort) || parsedPort < 1024 || parsedPort > 65535) {
@@ -1101,11 +1237,58 @@ async function handleRemoteShareControl(ctx, res, action, body) {
   return sendOk(res, {
     ...result,
     ...configured,
-    catalog: providers.map((provider) => ({
-      provider: provider.name,
-      model: provider.model || null,
-    })),
+    catalog: providers
+      .flatMap((provider) => remoteShareModelEntries(provider))
+      .map(({ provider, model, sourceProvider, pricing }) => ({
+        provider,
+        model,
+        sourceProvider,
+        pricing,
+      })),
   });
+}
+
+async function handleProviderModelDiscovery(ctx, res, body) {
+  const existingName = typeof body.existingName === "string"
+    ? body.existingName.trim()
+    : "";
+  const config = ctx.configProvider();
+  const existing = existingName ? config.providers?.[existingName] : null;
+  if (existingName && !existing) {
+    return sendError(res, 404, `unknown provider '${existingName}'`);
+  }
+  const draft = { ...(existing || {}) };
+  for (const key of ["litellmProvider", "baseUrl", "apiKey", "authToken"]) {
+    const value = body[key];
+    if (typeof value === "string" && value.trim()) draft[key] = value.trim();
+  }
+  try {
+    const result = await ctx.discoverProviderModels(draft);
+    return sendOk(res, result);
+  } catch (error) {
+    return sendError(res, 422, error?.message || "model discovery failed");
+  }
+}
+
+async function handleProviderModelProbe(ctx, res, body) {
+  const existingName = typeof body.existingName === "string"
+    ? body.existingName.trim()
+    : "";
+  const config = ctx.configProvider();
+  const existing = existingName ? config.providers?.[existingName] : null;
+  if (existingName && !existing) {
+    return sendError(res, 404, `unknown provider '${existingName}'`);
+  }
+  const draft = { ...(existing || {}) };
+  for (const key of ["litellmProvider", "baseUrl", "apiKey", "authToken"]) {
+    const value = body[key];
+    if (typeof value === "string" && value.trim()) draft[key] = value.trim();
+  }
+  try {
+    return sendOk(res, await probeProviderModel(draft, body.model));
+  } catch (error) {
+    return sendError(res, 422, error?.message || "model verification failed");
+  }
 }
 
 // ---------- /providers/use ----------
@@ -1150,7 +1333,9 @@ async function handleProvidersUse(ctx, res, body) {
   // currentProvider.codex write.
   let next;
   try {
-    next = setRoute(config, "codex", "main", { provider: name, model: target.model });
+    const model = enabledProviderModelEntries(target)[0]?.id;
+    if (!model) throw new Error(`provider '${name}' has no enabled model`);
+    next = setRoute(config, "codex", "main", { provider: name, model });
   } catch (err) {
     return sendError(res, 400, err.message);
   }
@@ -1179,6 +1364,7 @@ function handleProviderAdd(ctx, res, body) {
     return sendError(res, status, err.message);
   }
 
+  next = syncRemoteShareProviderSelection(next, body.name);
   try { writeConfig(next); }
   catch (err) { return sendError(res, 500, `writeConfig failed: ${err.message}`); }
 
@@ -1204,6 +1390,7 @@ function handleProviderUpdate(ctx, res, name, body) {
   // the side-channel field.
   const warnings = takeUpdateWarnings(next);
 
+  next = syncRemoteShareProviderSelection(next, name);
   try { writeConfig(next); }
   catch (err) { return sendError(res, 500, `writeConfig failed: ${err.message}`); }
 
@@ -1239,6 +1426,7 @@ async function handleProviderRemove(ctx, res, name) {
       }
     }
   }
+  next = syncRemoteShareProviderSelection(next, name);
 
   const result = await saveRoutesAndMaybeRestartProxy(ctx, next, config);
   if (!result.ok) return sendError(res, 500, result.error);
@@ -1374,22 +1562,9 @@ async function handleRoutesUpdate(ctx, res, agent, body) {
   }
 
   const config = ctx.configProvider();
-  let next = config;
+  let next;
   try {
-    if ("main" in body) {
-      if (body.main === null) {
-        next = clearRoute(next, agent, "main");
-      } else {
-        next = setRoute(next, agent, "main", body.main);
-      }
-    }
-    if ("small" in body) {
-      if (body.small === null) {
-        next = clearRoute(next, agent, "small");
-      } else {
-        next = setRoute(next, agent, "small", body.small);
-      }
-    }
+    next = replaceAgentRoutes(config, agent, body);
   } catch (err) {
     return sendError(res, 400, err.message);
   }

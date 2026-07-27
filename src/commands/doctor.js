@@ -18,7 +18,7 @@ import {
 } from "../runtime/authContract.js";
 import { getStateDir } from "../persistence/state.js";
 import { readConfig } from "../persistence/state.js";
-import { getRoutes } from "../config/routes.js";
+import { getAgentRoutes, getRoutes } from "../config/routes.js";
 import {
   DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
   DEFAULT_ORIGINROUTER_H5_BASE_URL,
@@ -220,14 +220,14 @@ function _checkRoutesConfig(config) {
     return { name: "Route config", status: "skip", detail: "no config found" };
   }
   const routes = getRoutes(config);
-  const hasClaude = routes && routes.claude && routes.claude.main;
-  const hasCodex = routes && routes.codex && routes.codex.main;
+  const codexRoutes = getAgentRoutes(config, "codex");
+  const hasClaude = Boolean(routes.main);
+  const hasCodex = Boolean(codexRoutes.main);
   if (!hasClaude && !hasCodex) {
     return {
       name: "Route config",
-      status: "warn",
-      detail: "no routes configured for claude or codex",
-      next: "Run `originrouter route set claude.main --provider <name> --model <model>`.",
+      status: "pass",
+      detail: "Claude inherits its environment; Codex route is unset",
     };
   }
   const summary = [];
@@ -272,12 +272,13 @@ function _checkWorkerConfigured(config) {
     return { name: "Worker", status: "skip", detail: "no config found" };
   }
   const routes = getRoutes(config);
+  const codexRoutes = getAgentRoutes(config, "codex");
   const remoteProviders = [];
-  if (routes && routes.claude && routes.claude.main && routes.claude.main.provider) {
-    remoteProviders.push(routes.claude.main.provider);
+  if (routes.main?.provider) {
+    remoteProviders.push(routes.main.provider);
   }
-  if (routes && routes.codex && routes.codex.main && routes.codex.main.provider) {
-    remoteProviders.push(routes.codex.main.provider);
+  if (codexRoutes.main?.provider) {
+    remoteProviders.push(codexRoutes.main.provider);
   }
   if (remoteProviders.length === 0) {
     return { name: "Worker", status: "skip", detail: "no remote routes configured" };

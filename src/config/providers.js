@@ -30,7 +30,12 @@ import {
   secretFieldKeysFor,
 } from "../proxy/litellmCatalog.js";
 import { ENV_REF_RE } from "../proxy/litellm.js";
-import { setRoute } from "./routes.js";
+import { replaceAgentRoutes } from "./routes.js";
+import {
+  enabledProviderModelEntries,
+  normalizeProviderModels,
+  providerModelIds,
+} from "./providerModels.js";
 
 // Stage 9.0: three canonical wire types. New writes only ever produce
 // one of these three. "litellm" is a CLI-input compatibility alias that
@@ -52,7 +57,8 @@ export const LEGACY_PROVIDER_TYPES = Object.freeze(["litellm", "anthropic", "ope
 // Stage 7.7: keys that may appear on a provider record but are not catalog
 // field keys. addProvider / applyProviderUpdate use this list to decide
 // whether a payload key is "unknown" (reject) or "expected" (allow).
-// - name, type, litellmProvider, model, smallFastModel: meta
+// - name, type, litellmProvider, model (legacy read only), models,
+//   smallFastModel: meta
 // - _legacy, _legacyType, migratedFrom: read-side projection; stripped on save
 // - inlineCreds: UI-only state; stripped on save (never persisted)
 // Stage 9.0 additions:
@@ -62,7 +68,7 @@ export const LEGACY_PROVIDER_TYPES = Object.freeze(["litellm", "anthropic", "ope
 //   - target:      remote.target = "proxy" | "agent"
 //   - baseUrl:     originrouter.baseUrl (optional; default applied at resolve time)
 export const KNOWN_PROVIDER_META_KEYS = Object.freeze(new Set([
-  "name", "type", "litellmProvider", "model", "smallFastModel",
+  "name", "type", "litellmProvider", "model", "models", "smallFastModel",
   "_legacy", "_legacyType", "migratedFrom",
   "inlineCreds",
   "engine", "auth", "deviceId", "target", "baseUrl",
@@ -134,22 +140,21 @@ function isEnvRef(value) {
 // NOT modified. `_legacyType` is a read-side hint for the UI; it is
 // never written to disk. Records that are already on a canonical 9.0
 // shape (originrouter / proxy / remote) pass through unchanged.
-export function normalizeProviderForRead(p) {
+export function normalizeProviderForRead(p, options = {}) {
   if (!p) return p;
+  let projected = p;
   if (p.type === "litellm") {
-    return { ...p, type: "proxy", engine: "litellm", _legacyType: "litellm" };
-  }
-  if (p.type === "anthropic") {
-    return {
+    projected = { ...p, type: "proxy", engine: "litellm", _legacyType: "litellm" };
+  } else if (p.type === "anthropic") {
+    projected = {
       ...p,
       type: "proxy",
       engine: "litellm",
       litellmProvider: "anthropic",
       _legacyType: "anthropic",
     };
-  }
-  if (p.type === LEGACY_PROVIDER_TYPE) {
-    return {
+  } else if (p.type === LEGACY_PROVIDER_TYPE) {
+    projected = {
       ...p,
       type: "proxy",
       engine: "litellm",
@@ -157,7 +162,7 @@ export function normalizeProviderForRead(p) {
       _legacyType: LEGACY_PROVIDER_TYPE,
     };
   }
-  return p;
+  return normalizeProviderModels(projected, { strict: false, ...options });
 }
 
 // ---------- write-side normalization ----------
@@ -225,7 +230,9 @@ function validateAnthropicRecord(p, { name }) {
     throw new Error(`provider '${name}' baseUrl must start with http:// or https:// (got '${p.baseUrl}')`);
   }
   if (!p.apiKey) throw new Error(`provider '${name}' apiKey is required`);
-  if (!p.model) throw new Error(`provider '${name}' model is required`);
+  if (providerModelIds(p).length === 0) {
+    throw new Error(`provider '${name}' requires at least one model`);
+  }
 }
 
 function validateLitellmRecord(p, { name }) {
@@ -253,7 +260,9 @@ function validateLitellmRecord(p, { name }) {
     }
     if (typeof v === "string") validateEnvRefShape(f.key, v);
   }
-  if (!p.model) throw new Error(`provider '${name}' model is required`);
+  if (providerModelIds(p).length === 0) {
+    throw new Error(`provider '${name}' requires at least one model`);
+  }
 }
 
 // Stage 9.0: originrouter record. baseUrl is OPTIONAL (default applied
@@ -366,7 +375,7 @@ export function addProvider(config, provider) {
   const writeNormalized = normalizeProviderForWrite(provider);
   // Default type only fires AFTER the write-normalize so an omitted
   // --type falls into the "proxy" default cleanly.
-  const normalized = explicitType == null
+  let normalized = explicitType == null
     ? (writeNormalized.type ? writeNormalized : { ...writeNormalized, type: "proxy", engine: "litellm" })
     : writeNormalized.type
       ? writeNormalized
@@ -378,6 +387,7 @@ export function addProvider(config, provider) {
   if (normalized.type === "proxy" && normalized.engine == null) {
     normalized.engine = "litellm";
   }
+  normalized = normalizeProviderModels(normalized);
 
   // Stage 7.7: validate env-ref shape across the whole payload up front.
   validateAllEnvRefShapes(normalized);
@@ -557,7 +567,13 @@ export function applyProviderUpdate(config, name, patch) {
 
   // Merge: project existing for legacy, apply patchForMerge, preserve
   // unknown keys from disk.
-  const merged = { ...normalizeProviderForRead(existing), ...patchForMerge, ...preservedUnknown };
+  const merged = normalizeProviderModels({
+    ...normalizeProviderForRead(existing, {
+      legacyRemoteEnabled: (config.remoteShare?.providers || []).includes(name),
+    }),
+    ...patchForMerge,
+    ...preservedUnknown,
+  });
   const { name: vName, type } = validateRecord(merged);
 
   // Stage 7.6: smallFastModel is stored on type=litellm providers. It is a
@@ -602,39 +618,47 @@ export function takeUpdateWarnings(result) {
   return ws;
 }
 
-// Stage 7.8: provider use for claude writes ONLY routes.claude.main.
-// routes.claude.small is independent state owned by the routes layer
-// (POST /routes/claude/small or `originrouter route set claude.small
-// --provider <name>`). The legacy smallFastModel field on the provider
-// is kept on disk for backward compat but is no longer read here.
+// Provider Use applies one coherent Claude routing profile. Main and small
+// share the same Provider; the first enabled model seeds both aliases. Users
+// can subsequently select two different models from that Provider through the
+// grouped route editor or PUT /routes/claude.
 //
 // Cleanup of routes that point at a removed provider lives in
 // handleProviderRemove (localApi.js) and `provider remove` (index.js).
-// Returns { next } — `next` is the new config with routes.claude.main
-// pointing at { provider: name, model: provider.model }.
 export function setClaudeRouteFromProvider(config, name) {
   const provider = (config.providers || {})[name];
   if (!provider) throw new Error(`unknown provider '${name}'`);
-  const next = setRoute(config, "claude", "main", { provider: name, model: provider.model });
+  const model = enabledProviderModelEntries(provider)[0]?.id;
+  if (!model) throw new Error(`provider '${name}' has no enabled model`);
+  const entry = { provider: name, model };
+  const next = replaceAgentRoutes(config, "claude", {
+    main: entry,
+    small: entry,
+  });
   return { next };
 }
 
 export function listProviders(config) {
   const providers = config.providers || {};
+  const legacyRemoteProviders = new Set(config.remoteShare?.providers || []);
   return Object.keys(providers)
     .sort()
-    .map((name) => summarizeProvider(providers[name]));
+    .map((name) => summarizeProvider(providers[name], {
+      legacyRemoteEnabled: legacyRemoteProviders.has(name),
+    }));
 }
 
 export function showProvider(config, name) {
   const providers = config.providers || {};
   const provider = providers[name];
   if (!provider) throw new Error(`unknown provider '${name}'`);
-  return summarizeProvider(provider);
+  return summarizeProvider(provider, {
+    legacyRemoteEnabled: (config.remoteShare?.providers || []).includes(name),
+  });
 }
 
-function summarizeProvider(provider) {
-  const norm = normalizeProviderForRead(provider);
+function summarizeProvider(provider, options = {}) {
+  const norm = normalizeProviderForRead(provider, options);
   // Stage 7.7: derive the set of secret keys from the catalog rather than
   // hardcoding a list. Every field with `secret: true` is masked.
   const secrets = secretFieldKeysFor(norm);
@@ -661,7 +685,11 @@ function summarizeProvider(provider) {
     engine: norm.type === "proxy" ? (norm.engine || "litellm") : null,
     baseUrl: norm.baseUrl || "(unset)",
     apiKey: maskSecret(norm.apiKey), // kept for backward-compat with existing tests
-    model: norm.model || "(unset)",
+    model: norm.type === "proxy" ? null : (norm.model || null),
+    models: ["proxy", "remote"].includes(norm.type)
+      ? norm.models
+      : providerModelIds(norm),
+    modelIds: providerModelIds(norm),
     smallFastModel: norm.smallFastModel || null,
     apiVersion: norm.apiVersion || null,
     awsRegion: norm.awsRegion || null,
@@ -696,7 +724,7 @@ function summarizeProvider(provider) {
 // Set of field keys that are explicitly handled in the static object above.
 // Used by summarizeProvider to avoid double-emitting a field.
 const outFields = new Set([
-  "baseUrl", "apiKey", "model", "smallFastModel", "apiVersion",
+  "baseUrl", "apiKey", "model", "models", "modelIds", "smallFastModel", "apiVersion",
   "awsRegion", "awsAccessKeyId", "awsSecretAccessKey", "awsSessionToken",
   "awsProfileName", "vertexProject", "vertexLocation",
   "googleApplicationCredentials", "hfToken", "authToken", "azureAdToken",
@@ -830,7 +858,7 @@ export function doctorProvider(provider) {
     } catch {
       errors.push(`unknown litellmProvider '${norm.litellmProvider}'`);
     }
-    if (!norm.model) errors.push("model is missing");
+    if (providerModelIds(norm).length === 0) errors.push("models are missing");
   } else if (norm.type === "remote") {
     if (!norm.deviceId) errors.push("deviceId is required");
     if (!norm.auth || norm.auth.type !== "oauth") {

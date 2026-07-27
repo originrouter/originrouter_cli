@@ -30,6 +30,7 @@ import { SessionManager } from "./sessionManager.js";
 import { agentDetailDefaultFromConfig } from "../runtime/agentDetailProfile.js";
 import { getAllRoutes } from "../config/routes.js";
 import { normalizeProviderForRead } from "../config/providers.js";
+import { remoteShareModelEntries } from "../config/providerModels.js";
 import { LocalAuditStore } from "../persistence/localAuditStore.js";
 import { AgentCatalog } from "../persistence/agentCatalog.js";
 import { readSessions } from "../persistence/sessionLog.js";
@@ -65,12 +66,15 @@ function buildProxyBaseUrl(status) {
 
 function localControlProviderSnapshot(config) {
   return Object.entries(config?.providers || {}).map(([key, provider]) => {
-    const normalized = normalizeProviderForRead(provider) || {};
+    const normalized = normalizeProviderForRead(provider, {
+      legacyRemoteEnabled: (config.remoteShare?.providers || []).includes(key),
+    }) || {};
     return {
       name: normalized.name || key,
       type: normalized.type || "proxy",
       litellmProvider: normalized.litellmProvider || "",
-      model: normalized.model || "",
+      model: normalized.type === "proxy" ? "" : (normalized.model || ""),
+      models: normalized.models || [],
       target: normalized.target || "",
       deviceId: normalized.deviceId || "",
     };
@@ -442,9 +446,8 @@ export async function startDaemon(args) {
         (provider) =>
           provider?.type === "proxy" && provider?.engine === "litellm",
       )
-      .map((provider) => ({
-        provider: provider.name,
-        model: provider.model || "",
+      .flatMap((provider) => remoteShareModelEntries(provider, {
+        legacyRemoteEnabled: true,
       }));
     return reportLocalControlRuntime(
       {

@@ -139,9 +139,20 @@ export function mapClaudeSdkMessage(message) {
         type: "agent.usage",
         provider: "claude",
         sampledTokens: Math.max(0, sampledTokens),
-        amountMinor: Math.max(0, Math.round(Number(message.total_cost_usd || 0) * 100)),
-        elapsedSeconds: Math.max(0, Math.ceil(Number(message.duration_ms || 0) / 1000)),
-        estimated: false,
+        tokenUsage: {
+          inputTokens: Math.max(0, Number(usage.input_tokens || 0)
+            + Number(usage.cache_creation_input_tokens || 0)
+            + Number(usage.cache_read_input_tokens || 0)),
+          outputTokens: Math.max(0, Number(usage.output_tokens || 0)),
+          reasoningTokens: 0,
+          cacheReadInputTokens: Math.max(0, Number(usage.cache_read_input_tokens || 0)),
+          cacheWriteInputTokens: Math.max(0, Number(usage.cache_creation_input_tokens || 0)),
+          cacheWrite5mInputTokens: Math.max(0, Number(usage.cache_creation?.ephemeral_5m_input_tokens || 0)),
+          cacheWrite1hInputTokens: Math.max(0, Number(usage.cache_creation?.ephemeral_1h_input_tokens || 0)),
+        },
+        amountMicros: null,
+        currency: null,
+        costSource: "unsupported",
         eventId: messageEventId(message, "usage"),
       });
     }

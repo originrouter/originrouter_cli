@@ -483,7 +483,7 @@ The console's relay-fallback path (no local daemon) re-uses
 `/client/permission` with the `interactionId` carried as
 `callId`. No new relay route is added in 8.9.
 
-### 11.5 `agent.mode.status` (read-only)
+### 11.5 `agent.mode.status` and native Claude mode control
 
 `localAgentSession.js` emits one `agent.mode.status` per session
 on `session.started`:
@@ -494,10 +494,9 @@ on `session.started`:
   "sessionId": "...",
   "provider": "claude | codex",
   "runtime": "...",
-  "availableModes": ["default", "acceptEdits", "bypassPermissions", "plan"],
+  "availableModes": ["default", "acceptEdits", "plan", "auto"],
   "mode": "default",
-  "modeControl": "unsupported",
-  "reason": "Live mode switching is not wired in Stage 8.9. Display only."
+  "modeControl": "supported"
 }
 ```
 
@@ -506,11 +505,19 @@ on `session.started`:
   local `agent` value verbatim. Future adapters will need to
   extend this mapping.
 - `runtime` is the same value `session.started` already carries.
-- `availableModes` is the documented Stage 9.0+ vocabulary.
-  Claude: `["default", "acceptEdits", "bypassPermissions", "plan"]`.
+- Native Claude advertises the modes reachable through its interactive
+  Shift+Tab control: `default`, `acceptEdits`, `plan`, and `auto`.
+  `bypassPermissions` is added only when the process was launched with the
+  corresponding dangerous-permissions flag.
   Codex: `["default", "read-only", "safe-yolo", "yolo"]`.
-- `modeControl: "unsupported"` for both providers. 8.9 supports
-  viewing only; remote mode switching is Stage 9.0+.
+- Native Claude processes `agent.mode.set` one Shift+Tab step at a time. Each
+  step must be confirmed by a Claude Hook `permission_mode` update or by the
+  rendered Claude mode footer before another key is sent.
+- Mode changes are rejected while Claude is handling a turn or a structured
+  interaction. Failure emits `agent.mode.status` with `accepted: false`, the
+  confirmed current mode, and a display-safe reason code.
+- Terminal runtimes without a structured controller keep
+  `modeControl: "unsupported"`.
 - The console renders this in the top-bar `Mode:` pill.
 
 ### 11.6 Test surface

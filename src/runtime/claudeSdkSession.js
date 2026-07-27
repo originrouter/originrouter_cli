@@ -9,6 +9,7 @@ import {
   updateAgentActivitySnapshot,
 } from "../agent/bridgeReporter.js";
 import { buildAgentProviderEnv } from "../config/claudeConfig.js";
+import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
 import { DEFAULT_DEVICE_ID, DEFAULT_RELAY_URL } from "../constants.js";
 import {
   readLocalProxySnapshot,
@@ -274,7 +275,7 @@ export async function runClaudeSdkSession(rawArgs) {
     sessionId,
     agentType: "claude",
     title: sessionTitle,
-    deviceName: device.host,
+    deviceName: device.displayName || device.host,
     stateDir,
   });
   let queryRef = null;
@@ -868,7 +869,7 @@ export async function runClaudeSdkSession(rawArgs) {
       agent: "claude",
       title: sessionTitle,
       deviceId: effectiveDeviceId,
-      deviceName: device.host,
+      deviceName: device.displayName || device.host,
       cwd,
       workspaceTrusted: true,
       pid: process.pid,
@@ -911,7 +912,11 @@ export async function runClaudeSdkSession(rawArgs) {
           });
           await syncCatalog("running");
         }
-        await sendAgentEvent(event);
+        await sendAgentEvent(applyConfiguredPricing(event, {
+          provider: providerResult.provider,
+          model: options.model || providerResult.routes?.main?.model || providerResult.provider?.model,
+          source: providerResult.source,
+        }));
       }
     }
     if (!stopped) await stopSession(null);

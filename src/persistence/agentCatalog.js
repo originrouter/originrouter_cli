@@ -2,16 +2,17 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   realpathSync,
   statSync,
 } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 
 import Database from "better-sqlite3";
 
 import { ensureStateDir } from "./state.js";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
 
@@ -52,6 +53,49 @@ function stableId(prefix, ...parts) {
     .digest("hex")
     .slice(0, 32);
   return `${prefix}_${hash}`;
+}
+
+function workspaceTrustError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function isWithinPath(candidate, parent) {
+  const rel = relative(parent, candidate);
+  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== "..");
+}
+
+function assertTrustableWorkspacePath(value) {
+  const requested = safeText(value, 4096);
+  if (!requested) {
+    throw workspaceTrustError("WORKSPACE_NOT_FOUND", "workspace path is required");
+  }
+  const absolute = resolve(requested);
+  let canonical;
+  let info;
+  try {
+    canonical = realpathSync.native(absolute);
+    info = statSync(canonical);
+  } catch {
+    throw workspaceTrustError("WORKSPACE_NOT_FOUND", "workspace directory does not exist");
+  }
+  if (!info.isDirectory()) {
+    throw workspaceTrustError("WORKSPACE_NOT_DIRECTORY", "workspace path is not a directory");
+  }
+  if (canonical === parse(canonical).root) {
+    throw workspaceTrustError("WORKSPACE_UNSAFE", "filesystem root cannot be trusted as a workspace");
+  }
+  const systemRoots = process.platform === "win32"
+    ? [join(parse(canonical).root, "Windows"), join(parse(canonical).root, "Program Files")]
+    : ["/bin", "/dev", "/etc", "/proc", "/sbin", "/sys", "/System", "/usr"];
+  if (systemRoots.some((root) => isWithinPath(canonical, root))) {
+    throw workspaceTrustError(
+      "WORKSPACE_UNSAFE",
+      "system directories cannot be trusted as Agent workspaces",
+    );
+  }
+  return canonical;
 }
 
 function normalizeStatus(value, fallback = "running") {
@@ -111,6 +155,7 @@ function publicConversation(row) {
     created_at: row.created_at,
     last_activity_at: row.last_activity_at,
     archived_at: row.archived_at || null,
+    restored_at: row.restored_at || null,
     artifact_count: Number(row.artifact_count || 0),
   };
 }
@@ -161,6 +206,7 @@ export class AgentCatalog {
         created_at TEXT NOT NULL,
         last_activity_at TEXT NOT NULL,
         archived_at TEXT,
+        restored_at TEXT,
         FOREIGN KEY(workspace_id) REFERENCES agent_workspaces(workspace_id)
       ) STRICT;
 
@@ -219,6 +265,13 @@ export class AgentCatalog {
       CREATE INDEX IF NOT EXISTS idx_agent_artifacts_conversation
         ON agent_artifacts(conversation_id, last_seen_at DESC);
     `);
+    const conversationColumns = new Set(
+      this.db.prepare("PRAGMA table_info(agent_conversations)").all()
+        .map((column) => column.name),
+    );
+    if (!conversationColumns.has("restored_at")) {
+      this.db.exec("ALTER TABLE agent_conversations ADD COLUMN restored_at TEXT");
+    }
     this.db.prepare(`
       INSERT INTO catalog_meta(key, value) VALUES ('schema_version', ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -660,6 +713,121 @@ export class AgentCatalog {
     return rows.map(publicConversation);
   }
 
+  listConversationPage({
+    collection = "history",
+    search = "",
+    agent = "",
+    deviceId = "",
+    workspaceId = "",
+    page = 1,
+    pageSize = 20,
+    autoArchiveDays = 30,
+  } = {}) {
+    const normalizedCollection = collection === "archived" ? "archived" : "history";
+    const normalizedPage = Math.max(1, Number(page) || 1);
+    const normalizedPageSize = Math.max(1, Math.min(100, Number(pageSize) || 20));
+    const normalizedArchiveDays = Math.max(0, Math.min(3650, Number(autoArchiveDays) || 0));
+    const offset = (normalizedPage - 1) * normalizedPageSize;
+    const clauses = [
+      "COALESCE(r.status, 'stopped') NOT IN ('running', 'waiting_approval', 'waiting_input', 'waiting_device', 'starting')",
+    ];
+    const params = {
+      pageSize: normalizedPageSize,
+      offset,
+      autoArchiveDays: normalizedArchiveDays,
+      archiveCutoff: new Date(
+        this.now().getTime() - normalizedArchiveDays * 86400000,
+      ).toISOString(),
+    };
+    if (safeText(agent, 32)) {
+      clauses.push("c.agent_type = @agent");
+      params.agent = safeText(agent, 32);
+    }
+    if (safeText(deviceId, 191)) {
+      clauses.push("r.device_id = @deviceId");
+      params.deviceId = safeText(deviceId, 191);
+    }
+    if (safeText(workspaceId, 96)) {
+      clauses.push("c.workspace_id = @workspaceId");
+      params.workspaceId = safeText(workspaceId, 96);
+    }
+    const query = safeText(search, 256);
+    if (query) {
+      clauses.push(`(
+        c.title LIKE @search ESCAPE '\\'
+        OR c.summary LIKE @search ESCAPE '\\'
+        OR c.first_prompt_preview LIKE @search ESCAPE '\\'
+        OR c.last_message_preview LIKE @search ESCAPE '\\'
+        OR w.display_name LIKE @search ESCAPE '\\'
+        OR EXISTS (
+          SELECT 1 FROM agent_artifacts a
+          WHERE a.conversation_id = c.conversation_id
+            AND a.display_value LIKE @search ESCAPE '\\'
+        )
+      )`);
+      params.search = `%${query.replace(/[\\%_]/g, (value) => `\\${value}`)}%`;
+    }
+    const restoredOverride = "(c.restored_at IS NOT NULL AND c.last_activity_at <= c.restored_at)";
+    const archivedExpression = `(NOT ${restoredOverride} AND (c.archived_at IS NOT NULL OR (@autoArchiveDays > 0 AND c.last_activity_at <= @archiveCutoff)))`;
+    clauses.push(
+      normalizedCollection === "archived"
+        ? archivedExpression
+        : `NOT ${archivedExpression}`,
+    );
+    const where = `WHERE ${clauses.join(" AND ")}`;
+    const joins = `
+      FROM agent_conversations c
+      LEFT JOIN agent_workspaces w ON w.workspace_id = c.workspace_id
+      LEFT JOIN agent_runs r ON r.run_id = (
+        SELECT r2.run_id FROM agent_runs r2
+        WHERE r2.conversation_id = c.conversation_id
+        ORDER BY r2.started_at DESC, r2.rowid DESC LIMIT 1
+      )
+    `;
+    const total = Number(
+      this.db.prepare(`SELECT COUNT(*) AS count ${joins} ${where}`).get(params)?.count || 0,
+    );
+    const rows = this.db.prepare(`
+      SELECT c.*, w.display_name AS workspace_name,
+             w.canonical_path AS workspace_path, w.repo_root,
+             r.device_id, r.runtime, r.provider, r.model,
+             r.permission_profile, r.status, r.started_at, r.exited_at,
+             (SELECT COUNT(*) FROM agent_artifacts a
+              WHERE a.conversation_id = c.conversation_id) AS artifact_count
+      ${joins}
+      ${where}
+      ORDER BY c.last_activity_at DESC
+      LIMIT @pageSize OFFSET @offset
+    `).all(params);
+    const totalPages = total > 0 ? Math.ceil(total / normalizedPageSize) : 0;
+    return {
+      conversations: rows.map(publicConversation),
+      pagination: {
+        page: normalizedPage,
+        page_size: normalizedPageSize,
+        total,
+        total_pages: totalPages,
+        has_more: normalizedPage < totalPages,
+      },
+    };
+  }
+
+  setConversationArchived(conversationId, archived) {
+    const id = safeText(conversationId, 96);
+    if (!id) return null;
+    const now = iso(this.now());
+    const result = this.db.prepare(`
+      UPDATE agent_conversations
+      SET archived_at = @archivedAt, restored_at = @restoredAt
+      WHERE conversation_id = @conversationId
+    `).run({
+      conversationId: id,
+      archivedAt: archived ? now : null,
+      restoredAt: archived ? null : now,
+    });
+    return result.changes > 0 ? this.getConversation(id) : null;
+  }
+
   getConversation(conversationId) {
     const id = safeText(conversationId, 96);
     const conversation = this.listConversations({ limit: MAX_LIMIT, includeArchived: true })
@@ -729,6 +897,38 @@ export class AgentCatalog {
       LIMIT 1
     `).get(params);
     return row ? { ...row, trusted: Boolean(row.trusted) } : null;
+  }
+
+  trustWorkspace(path, { deviceId = "" } = {}) {
+    const canonical = assertTrustableWorkspacePath(path);
+    // Resolve the final path before persisting it. Symlink aliases therefore
+    // converge on one trusted workspace and cannot be swapped after approval.
+    try { lstatSync(canonical); } catch {
+      throw workspaceTrustError("WORKSPACE_NOT_FOUND", "workspace directory does not exist");
+    }
+    const normalizedDeviceId = safeText(deviceId, 191);
+    const workspaceId = stableId("workspace", normalizedDeviceId, canonical);
+    const now = iso(this.now());
+    this.db.prepare(`
+      INSERT INTO agent_workspaces(
+        workspace_id, device_id, display_name, canonical_path, repo_root,
+        trusted, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+      ON CONFLICT(device_id, canonical_path) DO UPDATE SET
+        display_name = excluded.display_name,
+        repo_root = excluded.repo_root,
+        trusted = 1,
+        updated_at = excluded.updated_at
+    `).run(
+      workspaceId,
+      normalizedDeviceId,
+      basename(canonical) || canonical,
+      canonical,
+      repositoryRoot(canonical),
+      now,
+      now,
+    );
+    return this.getWorkspace(canonical, { deviceId: normalizedDeviceId });
   }
 
   status() {

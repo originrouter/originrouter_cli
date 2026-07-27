@@ -6,6 +6,7 @@ import {
   CODEX_MAIN_ALIAS,
   MAIN_ALIAS,
   SMALL_ALIAS,
+  assertAgentRouteConsistency,
   effectiveRoutes,
   getAgentRoutes,
   getAllRoutes,
@@ -291,6 +292,18 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
       ? options.remoteCodingStatus()
       : null;
     const routes = getRoutes(config);
+    assertAgentRouteConsistency("claude", routes);
+    // No OriginRouter route means no OriginRouter override. The empty overlay
+    // preserves the caller's ANTHROPIC_* variables and Claude Code's own
+    // Anthropic subscription/login behavior.
+    if (!routes.main && !routes.small) {
+      return {
+        env: {},
+        routes,
+        provider: null,
+        source: "inherited",
+      };
+    }
     const eff = effectiveRoutes(routes);
     // Stage 9.2: a route of type=remote, target=proxy is the third transport.
     // The runtime env points at a caller-side `RemoteCodingRelayProxy` on
@@ -348,7 +361,13 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
         ANTHROPIC_MODEL: MAIN_ALIAS,
         ANTHROPIC_SMALL_FAST_MODEL: SMALL_ALIAS,
       };
-      return { env, routes: eff, proxy: probe, source: "routes" };
+      return {
+        env,
+        routes: eff,
+        proxy: probe,
+        provider: routeProvider(config, eff.main),
+        source: "routes",
+      };
     }
 
     // Build a helpful error. Do not consult currentProvider.claude.
@@ -380,12 +399,12 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
       : null;
     const codexRoutes = getAgentRoutes(config, "codex");
     if (!codexRoutes.main) {
-      const err = new Error(
-        `Codex requires routes.codex.main. ` +
-        `Run \`originrouter route set codex.main --provider <name> --model <model>\`.`,
-      );
-      err.code = "PROVIDER_UNSUPPORTED";
-      throw err;
+      return {
+        env: {},
+        routes: codexRoutes,
+        provider: null,
+        source: "inherited",
+      };
     }
     const mainProvider = routeProvider(config, codexRoutes.main);
     // Stage 9.2: remote provider, target=proxy. Codex has no small slot.
@@ -451,7 +470,13 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
         OPENAI_API_KEY: NOOP_OPENAI_API_KEY,
         OPENAI_MODEL: CODEX_MAIN_ALIAS,
       };
-      return { env, routes: codexRoutes, proxy: probe, source: "routes" };
+      return {
+        env,
+        routes: codexRoutes,
+        proxy: probe,
+        provider: mainProvider,
+        source: "routes",
+      };
     }
     const detail = probe?.state === "running"
       ? "The local proxy is running, but its routes hash does not match the current config (it may be a stale routes-mode proxy from before a recent change)."

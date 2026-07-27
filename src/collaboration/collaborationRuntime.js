@@ -305,8 +305,9 @@ export class CollaborationRuntime {
         eventId: usageId,
         agentId: this.store.getRun(binding.run_id, { includeMessages: false })?.agents?.[binding.role]?.agent_id,
         sampledTokens: event.sampledTokens,
-        amountMinor: event.amountMinor,
-        elapsedSeconds: event.elapsedSeconds,
+        amountMicros: event.amountMicros,
+        currency: event.currency,
+        costSource: event.costSource,
       });
       void this.reportUsage(binding.run_id, usageId, event);
       await this.handleBudgetResult(binding.run_id, binding.role, notification.sessionId, usage);
@@ -440,8 +441,9 @@ export class CollaborationRuntime {
         eventId: `usage-${safeText(payload.usageId, 160)}`,
         agentId: run.agents[role].agent_id,
         sampledTokens: payload.sampledTokens,
-        amountMinor: payload.amountMinor,
-        elapsedSeconds: payload.elapsedSeconds,
+        amountMicros: payload.amountMicros,
+        currency: payload.currency,
+        costSource: payload.costSource,
       });
       void this.reportUsage(run.run_id, `usage-${safeText(payload.usageId, 160)}`, payload);
       await this.handleBudgetResult(run.run_id, role, null, usage);
@@ -586,8 +588,9 @@ export class CollaborationRuntime {
         role: assignment.role,
         usageId: `${notification.sessionId}-${event.eventId || event.localSequence}`,
         sampledTokens: Math.max(0, Math.floor(Number(event.sampledTokens) || 0)),
-        amountMinor: Math.max(0, Math.floor(Number(event.amountMinor) || 0)),
-        elapsedSeconds: Math.max(0, Math.floor(Number(event.elapsedSeconds) || 0)),
+        amountMicros: event.amountMicros == null ? null : Math.max(0, Math.floor(Number(event.amountMicros) || 0)),
+        currency: safeText(event.currency, 3).toUpperCase(),
+        costSource: safeText(event.costSource, 32),
       });
       return;
     }
@@ -745,8 +748,9 @@ export class CollaborationRuntime {
       usageId: safeText(usageId, 191),
       runId,
       sampledTokens: Math.max(0, Math.floor(Number(usage.sampledTokens) || 0)),
-      amountMinor: Math.max(0, Math.floor(Number(usage.amountMinor) || 0)),
-      elapsedSeconds: Math.max(0, Math.floor(Number(usage.elapsedSeconds) || 0)),
+      amountMicros: usage.amountMicros == null ? null : Math.max(0, Math.floor(Number(usage.amountMicros) || 0)),
+      currency: safeText(usage.currency, 3).toUpperCase(),
+      costSource: safeText(usage.costSource, 32),
     });
   }
 

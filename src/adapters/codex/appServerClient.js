@@ -10,11 +10,11 @@ import { mapDecisionToWire as mapDecisionToWireImpl } from "./decisionMapping.js
 // — fail closed.
 const CODEX_MIN_MINOR = 100;
 
-// Stage 8.1: RPC timeout bumped from 10s to 30s to match happy's reference.
-// Per-server-request approval timeout = 30s. RUST_LOG filter suppresses
-// codex_core::rollout::list noise unless the user has set their own value.
+// Ordinary RPCs remain short, while approvals allow enough time for a mobile
+// notification, app resume, WebSocket reconnect, and a deliberate user choice.
 const CODEX_RPC_TIMEOUT_MS = 30_000;
-const CODEX_APPROVAL_TIMEOUT_MS = 30_000;
+export const REMOTE_INTERACTION_DECISION_TIMEOUT_MS = 300_000;
+export const CODEX_APPROVAL_TIMEOUT_MS = 315_000;
 const CODEX_ROLLOUT_RUST_LOG = "codex_core::rollout::list=off";
 
 // Stage 8.4: SIGTERM → SIGKILL escalation window. After this many

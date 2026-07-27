@@ -43,15 +43,11 @@ try {
   writeConfig(config);
   assert.equal(readConfig().claude.model, "MiniMax-M3");
 
-  // ----- Stage 7.6: claude always needs the proxy (single path) -----
-  // The legacy `config.claude` block and `currentProvider.claude` are no
-  // longer consulted for claude. Without a running route-mode proxy,
-  // buildAgentProviderEnv throws.
-  await assert.rejects(
-    () => buildAgentProviderEnv("claude", config),
-    (err) => err.code === "PROVIDER_UNSUPPORTED",
-    "legacy block alone no longer drives the claude env",
-  );
+  // ----- Unset Claude routes inherit the launch environment -----
+  // The legacy config block is not copied into the overlay, but OriginRouter
+  // also does not inject a proxy route or block Claude Code from using its
+  // existing shell environment / Anthropic subscription.
+  assert.deepEqual((await buildAgentProviderEnv("claude", config)).env, {});
 
   // currentProvider[claude] is also ignored for claude.
   config = addProvider(config, {
@@ -64,11 +60,7 @@ try {
     smallFastModel: "MiniMax-M2.7",
   });
   config = setCurrentProvider(config, "claude", "minimax");
-  // Still throws — no proxy in the test fixture.
-  await assert.rejects(
-    () => buildAgentProviderEnv("claude", config),
-    (err) => err.code === "PROVIDER_UNSUPPORTED",
-  );
+  assert.equal((await buildAgentProviderEnv("claude", config)).source, "inherited");
 
   // Explicit --provider flag is also ignored for claude.
   config = addProvider(config, {
@@ -79,14 +71,12 @@ try {
     apiKey: "sk-alt-1234567890",
     model: "alt-model",
   });
-  // Stage 7.6: --provider is also ignored for claude. Without a running
-  // route-mode proxy, buildAgentProviderEnv throws.
-  await assert.rejects(
-    () => buildAgentProviderEnv("claude", config, { provider: "alt" }),
-    (err) => err.code === "PROVIDER_UNSUPPORTED",
+  assert.equal(
+    (await buildAgentProviderEnv("claude", config, { provider: "alt" })).source,
+    "inherited",
   );
 
-  // litellm provider for claude THROWS PROVIDER_UNSUPPORTED (proxy required).
+  // Merely defining a LiteLLM provider does not opt Claude into routing.
   config = addProvider(config, {
     name: "deepseek",
     type: "litellm",
@@ -94,10 +84,9 @@ try {
     apiKey: "sk-ds-1234567890",
     model: "deepseek-chat",
   });
-  await assert.rejects(
-    () => buildAgentProviderEnv("claude", config, { provider: "deepseek" }),
-    (err) => err.code === "PROVIDER_UNSUPPORTED",
-    "litellm provider without proxy must throw PROVIDER_UNSUPPORTED for claude",
+  assert.equal(
+    (await buildAgentProviderEnv("claude", config, { provider: "deepseek" })).source,
+    "inherited",
   );
 
   // ----- Stage 7.6: route-mode proxy with matching hash -> four fixed env vars -----
@@ -154,8 +143,8 @@ try {
 
   // (e) Stage 7.6: smallFastModel on the provider no longer affects the
   // injected env. Both aliases are always the fixed constants; the
-  // provider's smallFastModel is only a seed for routes.claude.small on
-  // `provider use`. This step is now a regression guard: the env still
+  // provider's smallFastModel is legacy metadata. This step is a regression
+  // guard: the env still
   // contains the fixed SMALL_ALIAS even though the provider has
   // smallFastModel set.
   config.providers.deepseek.smallFastModel = "deepseek-chat-small";

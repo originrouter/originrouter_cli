@@ -1,5 +1,8 @@
 import { TerminalAdapter } from "./terminalAdapter.js";
-import { startClaudeHookServer } from "./claude/hookServer.js";
+import {
+  CLAUDE_INTERACTION_DECISION_TIMEOUT_MS,
+  startClaudeHookServer,
+} from "./claude/hookServer.js";
 import { cleanupClaudeHookSettings, generateClaudeHookSettings } from "./claude/hookSettings.js";
 import { ClaudeJsonlScanner, getClaudeProjectPath } from "./claude/jsonlScanner.js";
 import {
@@ -18,6 +21,73 @@ const CLAUDE_NATIVE_MODES = Object.freeze([
   { id: "dontAsk", label: "Don't ask" },
   { id: "bypassPermissions", label: "Bypass permissions" },
 ]);
+
+// Claude Code exposes --permission-mode only at process start. Interactive
+// sessions can still cycle the modes through Shift+Tab. OriginRouter drives
+// that native control one step at a time and requires a Hook ACK before it
+// sends another key, so a UI/version mismatch cannot turn into blind input.
+const CLAUDE_REMOTE_MODE_IDS = new Set([
+  "default",
+  "acceptEdits",
+  "plan",
+  "auto",
+]);
+const CLAUDE_SHIFT_TAB = "\x1b[Z";
+const DEFAULT_MODE_CHANGE_TIMEOUT_MS = 3_000;
+const DEFAULT_MODE_CHANGE_MAX_STEPS = 8;
+const DEFAULT_MODE_OUTPUT_SETTLE_MS = 160;
+const claudeInteractionExpiresAt = () =>
+  Math.ceil((Date.now() + CLAUDE_INTERACTION_DECISION_TIMEOUT_MS) / 1000);
+
+function normalizeClaudeMode(value) {
+  const mode = safeText(value, 32);
+  if (mode === "manual") return "default";
+  return CLAUDE_NATIVE_MODES.some((item) => item.id === mode) ? mode : "";
+}
+
+function initialPermissionMode(args) {
+  for (let index = 0; index < args.length; index += 1) {
+    const value = String(args[index] || "");
+    if (value === "--permission-mode" && index + 1 < args.length) {
+      return normalizeClaudeMode(args[index + 1]);
+    }
+    if (value.startsWith("--permission-mode=")) {
+      return normalizeClaudeMode(value.slice("--permission-mode=".length));
+    }
+    if (value === "--dangerously-skip-permissions") {
+      return "bypassPermissions";
+    }
+  }
+  return "default";
+}
+
+function cleanTerminalText(value) {
+  return String(value || "")
+    .replace(/\x1b\][^\u0007]*(?:\u0007|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+    .toLowerCase();
+}
+
+function modeFromTerminalText(value) {
+  const text = cleanTerminalText(value);
+  const candidates = [
+    ["plan", /plan.{0,24}mod.{0,12}on.{0,40}shift.{0,12}tab/gis],
+    ["auto", /auto.{0,24}mod.{0,12}on.{0,40}shift.{0,12}tab/gis],
+    ["acceptEdits", /accept.{0,30}ed.{0,8}on.{0,40}shift.{0,12}tab/gis],
+  ];
+  let observed = "";
+  let observedAt = -1;
+  for (const [mode, pattern] of candidates) {
+    for (const match of text.matchAll(pattern)) {
+      if ((match.index ?? -1) > observedAt) {
+        observed = mode;
+        observedAt = match.index ?? -1;
+      }
+    }
+  }
+  return observed;
+}
 
 function safeText(value, maxLength = 512) {
   return String(value || "").slice(0, maxLength);
@@ -126,7 +196,14 @@ export function mapClaudeHookEvent(payload = {}) {
 }
 
 export class ClaudeAdapter extends TerminalAdapter {
-  constructor({ args = [], cwd = process.cwd(), hookServerFactory } = {}) {
+  constructor({
+    args = [],
+    cwd = process.cwd(),
+    hookServerFactory,
+    modeChangeTimeoutMs = DEFAULT_MODE_CHANGE_TIMEOUT_MS,
+    modeChangeMaxSteps = DEFAULT_MODE_CHANGE_MAX_STEPS,
+    modeOutputSettleMs = DEFAULT_MODE_OUTPUT_SETTLE_MS,
+  } = {}) {
     super({ command: "claude", args });
     this.kind = "claude";
     this.cwd = cwd;
@@ -143,7 +220,165 @@ export class ClaudeAdapter extends TerminalAdapter {
     // server and event mapper never see sessionId; we enrich here.
     this.sessionId = null;
     this.pendingInteractionInputs = new Map();
-    this.currentMode = "default";
+    this.currentMode = initialPermissionMode(args);
+    this.modeControl = this.isNonInteractive(args) ? "unsupported" : "supported";
+    this.modeChangeTimeoutMs = Math.max(10, Number(modeChangeTimeoutMs) || DEFAULT_MODE_CHANGE_TIMEOUT_MS);
+    this.modeChangeMaxSteps = Math.max(1, Number(modeChangeMaxSteps) || DEFAULT_MODE_CHANGE_MAX_STEPS);
+    this.modeOutputSettleMs = Math.max(10, Number(modeOutputSettleMs) || DEFAULT_MODE_OUTPUT_SETTLE_MS);
+    this.modeChangeWaiter = null;
+    this.modeOutputBuffer = "";
+    this.modeOutputTimer = null;
+    this.taskActive = false;
+    this.sessionReady = false;
+  }
+
+  availableModes() {
+    const modes = CLAUDE_NATIVE_MODES.filter((item) =>
+      CLAUDE_REMOTE_MODE_IDS.has(item.id),
+    );
+    if (
+      this.args.includes("--allow-dangerously-skip-permissions") ||
+      this.args.includes("--dangerously-skip-permissions") ||
+      this.currentMode === "bypassPermissions"
+    ) {
+      modes.push(
+        CLAUDE_NATIVE_MODES.find((item) => item.id === "bypassPermissions"),
+      );
+    }
+    return modes.filter(Boolean);
+  }
+
+  modeStatusEvent({ accepted, reason, requestId } = {}) {
+    return {
+      type: "agent.mode.status",
+      provider: "claude",
+      runtime: "claude-pty",
+      mode: this.currentMode,
+      modeControl: this.modeControl,
+      availableModes: this.availableModes(),
+      ...(accepted == null ? {} : { accepted: Boolean(accepted) }),
+      ...(reason ? { reason: safeText(reason, 128) } : {}),
+      ...(requestId ? { requestId: safeText(requestId, 96) } : {}),
+    };
+  }
+
+  observeMode(value) {
+    const mode = normalizeClaudeMode(value);
+    if (!mode) return false;
+    const changed = mode !== this.currentMode;
+    this.currentMode = mode;
+    if (changed) this.pendingEvents.push(this.modeStatusEvent());
+    const waiter = this.modeChangeWaiter;
+    if (waiter && mode !== waiter.previousMode) {
+      if (this.modeOutputTimer) clearTimeout(this.modeOutputTimer);
+      this.modeOutputTimer = null;
+      clearTimeout(waiter.timer);
+      this.modeChangeWaiter = null;
+      waiter.resolve(mode);
+    }
+    return changed;
+  }
+
+  waitForModeChange(previousMode) {
+    return new Promise((resolve) => {
+      if (this.modeOutputTimer) clearTimeout(this.modeOutputTimer);
+      this.modeOutputTimer = null;
+      this.modeOutputBuffer = "";
+      const timer = setTimeout(() => {
+        if (this.modeChangeWaiter?.resolve === resolve) {
+          this.modeChangeWaiter = null;
+        }
+        resolve(null);
+      }, this.modeChangeTimeoutMs);
+      this.modeChangeWaiter = { previousMode, resolve, timer };
+    });
+  }
+
+  handleOutput(data) {
+    if (!this.modeChangeWaiter) return [];
+    this.modeOutputBuffer = `${this.modeOutputBuffer}${data}`.slice(-12_000);
+    const observed = modeFromTerminalText(this.modeOutputBuffer);
+    if (observed && observed !== this.modeChangeWaiter.previousMode) {
+      this.observeMode(observed);
+      return [];
+    }
+    const footer = cleanTerminalText(this.modeOutputBuffer);
+    const footerCount = (footer.match(/for\s*agents|foragents/gi) || []).length;
+    const defaultFooter = /for\s*shortcuts|forshortcuts/i.test(footer);
+    if (!defaultFooter && footerCount === 0) return [];
+    // Claude removes the mode badge when it returns to Default. A redraw may
+    // first contain the previous badge and then the badge-free footer, so two
+    // footer occurrences confirm that transition without guessing from time.
+    if (observed && !defaultFooter && footerCount < 2) return [];
+    if (this.modeOutputTimer) clearTimeout(this.modeOutputTimer);
+    this.modeOutputTimer = setTimeout(() => {
+      this.modeOutputTimer = null;
+      if (!this.modeChangeWaiter) return;
+      const settledMode = modeFromTerminalText(this.modeOutputBuffer);
+      const settledFooter = cleanTerminalText(this.modeOutputBuffer);
+      const settledFooterCount = (
+        settledFooter.match(/for\s*agents|foragents/gi) || []
+      ).length;
+      const settledDefaultFooter = /for\s*shortcuts|forshortcuts/i.test(
+        settledFooter,
+      );
+      if (
+        settledMode &&
+        (settledMode !== this.modeChangeWaiter.previousMode ||
+          (!settledDefaultFooter && settledFooterCount < 2))
+      ) {
+        return;
+      }
+      this.observeMode("default");
+    }, this.modeOutputSettleMs);
+    return [];
+  }
+
+  async setMode(payload, executor) {
+    const requested = normalizeClaudeMode(payload?.mode);
+    const requestId = payload?.requestId || payload?.commandId || "";
+    const fail = (reason) => {
+      this.pendingEvents.push(
+        this.modeStatusEvent({ accepted: false, reason, requestId }),
+      );
+      return false;
+    };
+    if (this.modeControl !== "supported") return fail("mode_control_unsupported");
+    if (!this.sessionReady) return fail("mode_change_not_ready");
+    if (!this.availableModes().some((item) => item.id === requested)) {
+      return fail("mode_not_available");
+    }
+    if (!executor || typeof executor.write !== "function") {
+      return fail("mode_control_unavailable");
+    }
+    if (this.taskActive || this.pendingInteractionInputs.size > 0) {
+      return fail("mode_change_busy");
+    }
+    if (this.modeChangeWaiter) return fail("mode_change_in_progress");
+    if (requested === this.currentMode) {
+      this.pendingEvents.push(
+        this.modeStatusEvent({ accepted: true, requestId }),
+      );
+      return true;
+    }
+
+    const visited = new Set([this.currentMode]);
+    for (let step = 0; step < this.modeChangeMaxSteps; step += 1) {
+      const previousMode = this.currentMode;
+      const observedMode = this.waitForModeChange(previousMode);
+      executor.write(CLAUDE_SHIFT_TAB);
+      const nextMode = await observedMode;
+      if (!nextMode) return fail("mode_change_not_confirmed");
+      if (nextMode === requested) {
+        this.pendingEvents.push(
+          this.modeStatusEvent({ accepted: true, requestId }),
+        );
+        return true;
+      }
+      if (visited.has(nextMode)) return fail("mode_not_reachable");
+      visited.add(nextMode);
+    }
+    return fail("mode_not_reachable");
   }
 
   questionPayload(input) {
@@ -212,21 +447,10 @@ export class ClaudeAdapter extends TerminalAdapter {
     this.sessionId = sessionId ?? null;
     this.startedAt = Date.now();
     this.scanner = new ClaudeJsonlScanner({ transcriptPath: null, startedAt: this.startedAt });
-    const pushModeStatus = (mode) => {
-      const normalized = safeText(mode, 32);
-      if (!normalized || normalized === this.currentMode) return;
-      this.currentMode = normalized;
-      this.pendingEvents.push({
-        type: "agent.mode.status",
-        provider: "claude",
-        runtime: "claude-pty",
-        mode: normalized,
-        modeControl: "unsupported",
-        availableModes: CLAUDE_NATIVE_MODES,
-      });
-    };
     this.hookServer = await this.hookServerFactory({
       onSessionStart: (sessionId, payload) => {
+        this.sessionReady = true;
+        this.taskActive = false;
         const transcriptPath = payload.transcript_path || null;
         if (transcriptPath) {
           this.scanner.setTranscriptPath(transcriptPath, this.startedAt);
@@ -238,10 +462,10 @@ export class ClaudeAdapter extends TerminalAdapter {
           cwd: payload.cwd,
           transcriptPath,
         });
-        pushModeStatus(payload.permission_mode || payload.permissionMode);
+        this.observeMode(payload.permission_mode || payload.permissionMode);
       },
       onPermissionRequest: (callId, event) => {
-        pushModeStatus(event.permissionMode);
+        this.observeMode(event.permissionMode);
         // Stage 8.9: dual-emit. Legacy event first (the relay and
         // downstream consumers expect it); then the new
         // agent.interaction.requested envelope for the App card
@@ -268,6 +492,7 @@ export class ClaudeAdapter extends TerminalAdapter {
                 title: "Claude has questions",
                 prompt: "Answer the questions to continue.",
                 payload: this.questionPayload(event.input),
+                expiresAt: claudeInteractionExpiresAt(),
               })
             : event.tool === "ExitPlanMode" || event.tool === "exit_plan_mode"
               ? buildInteractionRequest({
@@ -284,12 +509,14 @@ export class ClaudeAdapter extends TerminalAdapter {
                     display_name: "Exit plan mode",
                     plan: typeof event.input?.plan === "string" ? event.input.plan.slice(0, 65_536) : "",
                   },
+                  expiresAt: claudeInteractionExpiresAt(),
                 })
               : permissionEventToInteraction(event, {
                   source: INTERACTION_SOURCES.HOOK,
                   runtime: "claude-pty",
                   sessionId: this.sessionId,
                   createdAt: Date.now(),
+                  expiresAt: claudeInteractionExpiresAt(),
                 });
           this.pendingEvents.push(interaction);
         } catch (err) {
@@ -301,7 +528,7 @@ export class ClaudeAdapter extends TerminalAdapter {
       },
       onPermissionTimeout: (callId, event) => {
         this.pendingInteractionInputs.delete(callId);
-        // The hook server's 55s timer fired without a remote decision. Tell
+        // The hook server's five-minute timer fired without a remote decision. Tell
         // the front end explicitly so it can show "Remote approval timed
         // out" rather than waiting for an agent.permission.resolved that
         // will never come.
@@ -331,6 +558,7 @@ export class ClaudeAdapter extends TerminalAdapter {
             ? { url: event.url, server_name: event.serverName }
             : { schema: event.requestedSchema, server_name: event.serverName },
           containsSecret: schemaContainsSecret(event.requestedSchema),
+          expiresAt: claudeInteractionExpiresAt(),
         }));
       },
       onElicitationTimeout: (interactionId) => {
@@ -344,6 +572,19 @@ export class ClaudeAdapter extends TerminalAdapter {
         });
       },
       onHookEvent: (payload) => {
+        const hookEvent = safeText(
+          payload.hook_event_name || payload.hookEventName,
+          64,
+        );
+        if (hookEvent === "UserPromptSubmit") this.taskActive = true;
+        if (
+          hookEvent === "Stop" ||
+          hookEvent === "StopFailure" ||
+          hookEvent === "SessionEnd"
+        ) {
+          this.taskActive = false;
+        }
+        this.observeMode(payload.permission_mode || payload.permissionMode);
         const event = mapClaudeHookEvent(payload);
         if (event) this.pendingEvents.push(event);
       },
@@ -436,6 +677,15 @@ export class ClaudeAdapter extends TerminalAdapter {
   }
 
   cleanup() {
+    if (this.modeOutputTimer) {
+      clearTimeout(this.modeOutputTimer);
+      this.modeOutputTimer = null;
+    }
+    if (this.modeChangeWaiter) {
+      clearTimeout(this.modeChangeWaiter.timer);
+      this.modeChangeWaiter.resolve(null);
+      this.modeChangeWaiter = null;
+    }
     this.hookServer?.stop();
     cleanupClaudeHookSettings(this.hookSettingsPath);
     this.pendingInteractionInputs.clear();

@@ -258,8 +258,8 @@ try {
   assert.deepEqual(buildProviderEnv({ name: "b", type: "proxy", engine: "litellm", apiKey: "sk", model: "m" }), {});
 
   // ---------------- buildAgentProviderEnv gating (Stage 7.6) ----------------
-  // claude always needs the proxy now. With no proxyStatus option, it
-  // throws PROVIDER_UNSUPPORTED.
+  // With no Claude routes, provider/currentProvider legacy hints are ignored
+  // and the launch inherits the caller's Anthropic environment.
   cfg = removeProvider(cfg, "minimax");
   cfg = addProvider(cfg, {
     name: "minimax",
@@ -270,22 +270,17 @@ try {
     apiKey: "sk-mm",
     model: "MiniMax-M3",
   });
-  await assert.rejects(
-    () => buildAgentProviderEnv("claude", cfg, { provider: "minimax" }),
-    (err) => err.code === "PROVIDER_UNSUPPORTED",
+  assert.equal(
+    (await buildAgentProviderEnv("claude", cfg, { provider: "minimax" })).source,
+    "inherited",
   );
-  await assert.rejects(
-    () => buildAgentProviderEnv("claude", cfg, { provider: "deepseek" }),
-    (err) => err.code === "PROVIDER_UNSUPPORTED",
+  assert.equal(
+    (await buildAgentProviderEnv("claude", cfg, { provider: "deepseek" })).source,
+    "inherited",
   );
   const curDeepseek = setCurrentProvider(cfg, "claude", "deepseek");
-  await assert.rejects(() => buildAgentProviderEnv("claude", curDeepseek), (err) => err.code === "PROVIDER_UNSUPPORTED");
-  // Stage 8.0: Codex is route-mode only. routes.codex.main unset →
-  // PROVIDER_UNSUPPORTED (no legacy currentProvider.codex fallback).
-  await assert.rejects(
-    () => buildAgentProviderEnv("codex", cfg),
-    (err) => err.code === "PROVIDER_UNSUPPORTED" && /routes\.codex\.main/.test(err.message),
-  );
+  assert.equal((await buildAgentProviderEnv("claude", curDeepseek)).source, "inherited");
+  assert.equal((await buildAgentProviderEnv("codex", cfg)).source, "inherited");
 
   // ---------------- doctorProvider ----------------
   assert.deepEqual(
@@ -416,9 +411,9 @@ try {
   assert.equal(result.providers.deepseek.smallFastModel, "fast");
   assert.equal(warnings.length, 0);
 
-  // ---------------- setClaudeRouteFromProvider: Stage 7.8 contract ----------------
-  // 1. The function writes ONLY routes.claude.main. The provider's
-  //    smallFastModel is ignored (legacy).
+  // ---------------- setClaudeRouteFromProvider grouped contract ----------------
+  // 1. Provider Use writes one coherent main + small profile. The legacy
+  //    smallFastModel field is ignored; both aliases seed from an enabled model.
   {
     const cfg78 = {
       providers: {
@@ -427,9 +422,9 @@ try {
     };
     const { next } = setClaudeRouteFromProvider(cfg78, "p1");
     assert.equal(getRoutes(next).main.provider, "p1");
-    assert.equal(getRoutes(next).small, null, "small must NOT be seeded by provider use");
+    assert.deepEqual(getRoutes(next).small, getRoutes(next).main);
   }
-  // 2. An externally-set small route is preserved (not overwritten).
+  // 2. An old inconsistent small route is replaced, not preserved.
   {
     const cfg78b = {
       providers: {
@@ -438,7 +433,8 @@ try {
       routes: { claude: { small: { provider: "x", model: "y" } } },
     };
     const { next: next2 } = setClaudeRouteFromProvider(cfg78b, "p1");
-    assert.equal(getRoutes(next2).small.provider, "x", "external small preserved");
+    assert.equal(getRoutes(next2).main.provider, "p1");
+    assert.equal(getRoutes(next2).small.provider, "p1");
   }
   // 3. Return shape no longer carries smallPreserved.
   {

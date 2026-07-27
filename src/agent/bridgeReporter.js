@@ -34,14 +34,33 @@ function safeLocalControlProviders(value) {
     const name = safeText(item.name, 64);
     if (!name || seen.has(name)) continue;
     seen.add(name);
-    providers.push({
+    const provider = {
       name,
       type: safeText(item.type, 32) || "proxy",
       litellmProvider: safeText(item.litellmProvider, 64),
-      model: safeText(item.model, 256),
+      model: safeText(item.model, 512),
       target: safeText(item.target, 32),
       deviceId: safeText(item.deviceId, 128),
-    });
+    };
+    const modelIds = new Set();
+    const models = [];
+    for (const raw of Array.isArray(item.models) ? item.models.slice(0, 256) : []) {
+      const object = raw && typeof raw === "object" ? raw : null;
+      const id = safeText(object ? object.id : raw, 512);
+      if (!id || modelIds.has(id)) continue;
+      modelIds.add(id);
+      const enabled = object ? object.enabled !== false : true;
+      models.push({
+        id,
+        enabled,
+        remoteEnabled: enabled && object?.remoteEnabled === true,
+        ...(object?.pricing && typeof object.pricing === "object"
+          ? { pricing: object.pricing }
+          : {}),
+      });
+    }
+    if (models.length > 0) provider.models = models;
+    providers.push(provider);
   }
   return providers;
 }
@@ -250,7 +269,7 @@ function projectRuntimeEvent({ eventType, event, summary, riskLevel }) {
   if (
     nestedType === "agent.interaction.requested"
     && event?.payload
-    && ["permission", "confirm", "questions", "form", "url"].includes(event?.kind)
+    && ["confirm", "questions", "form", "url"].includes(event?.kind)
   ) {
     const interactionId = approvalInteractionId(event);
     if (!interactionId) return null;
@@ -297,7 +316,10 @@ function projectRuntimeEvent({ eventType, event, summary, riskLevel }) {
   if (nestedType === "agent.permission.resolve.error") {
     return {
       eventType: "approval_failed",
-      status: "failed",
+      // This is an operation-level delivery failure. The long-lived Agent
+      // process remains online until a session.failed/session.exited event
+      // says otherwise.
+      status: "running",
       summary: "Approval could not be applied on device",
       detail: "",
       currentStep: "Approval delivery failed",
@@ -315,7 +337,7 @@ function projectRuntimeEvent({ eventType, event, summary, riskLevel }) {
     const suffix = nestedType.split(".").at(-1);
     return {
       eventType: `interaction_${suffix}`,
-      status: suffix === "failed" ? "failed" : "running",
+      status: "running",
       summary: `Interaction ${suffix}`,
       detail: compactText(event?.reason, 512),
       currentStep: suffix === "failed" ? "Interaction failed" : "Running",
@@ -374,11 +396,11 @@ function safeRemoteShareCatalog(value) {
   if (!Array.isArray(value)) return [];
   const seen = new Set();
   const catalog = [];
-  for (const item of value.slice(0, 32)) {
-    const provider = safeText(item?.provider, 64);
+  for (const item of value.slice(0, 256)) {
+    const provider = safeText(item?.provider, 640);
     if (!provider || seen.has(provider)) continue;
     seen.add(provider);
-    catalog.push({ provider, model: safeText(item?.model, 128) });
+    catalog.push({ provider, model: safeText(item?.model, 512) });
   }
   return catalog;
 }

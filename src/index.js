@@ -38,9 +38,11 @@ import {
   getAllRoutes,
   getRoutes,
   hashRoutes,
+  replaceAgentRoutes,
   setRoute,
 } from "./config/routes.js";
 import { LITELLM_VERSION } from "./proxy/litellm.js";
+import { enabledProviderModelEntries } from "./config/providerModels.js";
 import { ProxyManager } from "./proxy/manager.js";
 import { readLocalProxySnapshot, NOOP_REMOTE_CODING_SNAPSHOT, snapshotRemoteCodingStatus, staticProxyStatusFn } from "./proxy/snapshot.js";
 import { RemoteCodingProxyManager } from "./proxy/remoteCodingProxyManager.js";
@@ -129,6 +131,8 @@ originrouter provider update <name> [same flags as add]
 Model routes (Stage 7.5 / 7.6):
   originrouter route list
   originrouter route show [claude|codex]
+  originrouter route set claude --provider <name> --main-model <m> --small-model <m>
+  originrouter route clear claude
   originrouter route set <agent>.<slot> --provider <name> [--model <m>]
                                  claude slots: main, small; codex slot: main
   originrouter route clear <agent>.<slot>
@@ -744,21 +748,14 @@ function handleProvider(args) {
     if (!target) throw new Error(`unknown provider '${name}'`);
 
     if (agent === "claude") {
-      // Stage 7.8: writes ONLY routes.claude.main. fast is owned by the
-      // routes layer and is preserved across provider use calls. Output:
-      // main row always; fast row only when small is set; canonical hint
-      // pointing at `originrouter route set claude.small --provider <name>`.
+      // Claude is one grouped routing profile: main and small always share
+      // the selected Provider. Model selection can still differ later.
       const { next } = setClaudeRouteFromProvider(config, name);
       writeConfig(next);
       const updated = getRoutes(next);
-      console.log("Claude main route updated:");
+      console.log("Claude routes updated:");
       console.log(`  model ${MAIN_ALIAS.padEnd(28)} -> ${updated.main.provider} / ${updated.main.model}`);
-      if (updated.small) {
-        console.log(`  fast  ${SMALL_ALIAS.padEnd(28)} -> ${updated.small.provider} / ${updated.small.model}`);
-      } else {
-        console.log("  fast  (unset; the fast alias will fall back to main)");
-      }
-      console.log(`To set fast route: \`originrouter route set claude.small --provider ${name}\``);
+      console.log(`  fast  ${SMALL_ALIAS.padEnd(28)} -> ${updated.small.provider} / ${updated.small.model}`);
       return;
     }
 
@@ -766,7 +763,9 @@ function handleProvider(args) {
     // writes routes.codex.main = { provider: name, model: provider.model }.
     // Codex 8.0 has no small/fast slot. Codex never falls back to Claude.
     if (agent === "codex") {
-      const next = setRoute(config, "codex", "main", { provider: name, model: target.model });
+      const model = enabledProviderModelEntries(target)[0]?.id;
+      if (!model) throw new Error(`provider '${name}' has no enabled model`);
+      const next = setRoute(config, "codex", "main", { provider: name, model });
       writeConfig(next);
       const updated = getAgentRoutes(next, "codex");
       console.log("Codex main route updated:");
@@ -935,6 +934,25 @@ async function handleRoute(args) {
     if (!opts["--provider"]) {
       throw new Error("Usage: originrouter route set <agent>.<slot> --provider <name> [--model <model>]");
     }
+    if (target === "claude") {
+      const mainModel = opts["--main-model"] || opts["--model"];
+      const smallModel = opts["--small-model"] || mainModel;
+      if (!mainModel || !smallModel) {
+        throw new Error(
+          "Usage: originrouter route set claude --provider <name> " +
+          "--main-model <model> [--small-model <model>]",
+        );
+      }
+      const provider = opts["--provider"];
+      const next = replaceAgentRoutes(config, "claude", {
+        main: { provider, model: mainModel },
+        small: { provider, model: smallModel },
+      });
+      writeConfig(next);
+      console.log("Claude routes set.");
+      printRouteShow(next, "claude");
+      return;
+    }
     const { agent, slot } = parseRouteTarget(target);
     const entry = { provider: opts["--provider"] };
     if (opts["--model"]) entry.model = opts["--model"];
@@ -947,6 +965,12 @@ async function handleRoute(args) {
   if (action === "clear") {
     const target = rest[0];
     if (!target) throw new Error("Usage: originrouter route clear <agent>.<slot>");
+    if (target === "claude") {
+      const next = replaceAgentRoutes(config, "claude", {});
+      writeConfig(next);
+      console.log("Cleared Claude routes. Claude Code will use its environment or Anthropic login.");
+      return;
+    }
     const { agent, slot } = parseRouteTarget(target);
     const next = clearRoute(config, agent, slot);
     writeConfig(next);
@@ -1527,8 +1551,7 @@ async function handleEnvPrint(args) {
       console.log(`  model ${CODEX_MAIN_ALIAS.padEnd(28)} -> ${codexRoutes.main.provider} / ${codexRoutes.main.model}`);
       console.log("  (Codex 8.0 has no small/fast slot; Codex does not fall back to Claude.)");
     } else {
-      console.log("  (no routes — Codex requires routes.codex.main)");
-      console.log(`  Run \`originrouter route set codex.main --provider <name> --model <model>\`.`);
+      console.log("  (unset — existing Codex login and environment are preserved)");
     }
     if (flagName) {
       console.log(`\nNote: --provider ${flagName} is deprecated for codex in Stage 8.0. Routes are the source of truth.`);

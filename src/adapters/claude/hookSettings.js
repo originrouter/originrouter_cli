@@ -5,6 +5,8 @@ import { getStateDir } from "../../persistence/state.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
+export const CLAUDE_INTERACTIVE_HOOK_TIMEOUT_SECONDS = 360;
+
 const DISPLAY_HOOK_EVENTS = [
   "SessionEnd",
   "Stop",
@@ -59,7 +61,11 @@ export function generateClaudeHookSettings({
     hooks.PermissionRequest = [
       {
         matcher: "*",
-        hooks: [{ type: "command", command }],
+        hooks: [{
+          type: "command",
+          command,
+          timeout: CLAUDE_INTERACTIVE_HOOK_TIMEOUT_SECONDS,
+        }],
       },
     ];
   }
@@ -68,7 +74,11 @@ export function generateClaudeHookSettings({
     hooks.Elicitation = [
       {
         matcher: "*",
-        hooks: [{ type: "command", command }],
+        hooks: [{
+          type: "command",
+          command,
+          timeout: CLAUDE_INTERACTIVE_HOOK_TIMEOUT_SECONDS,
+        }],
       },
     ];
   }

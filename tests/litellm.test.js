@@ -64,6 +64,7 @@ assert.ok(NOOP_ANTHROPIC_API_KEY.startsWith("sk-"), "no-op key must be non-empty
       litellmProvider: "deepseek",
       apiKey: "sk-deepseek",
       model: "deepseek-chat",
+      models: ["deepseek-chat", "deepseek-reasoner"],
     },
     {
       name: "glm",
@@ -75,9 +76,11 @@ assert.ok(NOOP_ANTHROPIC_API_KEY.startsWith("sk-"), "no-op key must be non-empty
       model: "glm-5",
     },
   ]);
-  assert.match(yaml, /model_name: deepseek/);
-  assert.match(yaml, /model_name: glm/);
+  assert.match(yaml, /model_name: deepseek\/deepseek-chat/);
+  assert.match(yaml, /model_name: deepseek\/deepseek-reasoner/);
+  assert.match(yaml, /model_name: glm\/glm-5/);
   assert.match(yaml, /model: deepseek\/deepseek-chat/);
+  assert.match(yaml, /model: deepseek\/deepseek-reasoner/);
   assert.match(yaml, /model: openai\/glm-5/);
 }
 {
@@ -374,12 +377,13 @@ const ROUTE_PROVIDERS = {
 }
 
 {
-  // Main + small — both aliases emitted with distinct params.
+  // Main + small use one Provider, while each alias can select a different
+  // model exposed by that Provider.
   const yaml = renderLitellmRoutesConfigYaml(
     {
       claude: {
         main:  { provider: "deepseek", model: "deepseek-chat" },
-        small: { provider: "moonshot", model: "moonshot-v1-8k" },
+        small: { provider: "deepseek", model: "deepseek-chat-fast" },
       },
     },
     ROUTE_PROVIDERS,
@@ -387,7 +391,7 @@ const ROUTE_PROVIDERS = {
   assert.match(yaml, /model_name: originrouter-claude-model/);
   assert.match(yaml, /model: deepseek\/deepseek-chat/);
   assert.match(yaml, /model_name: originrouter-claude-fast-model/);
-  assert.match(yaml, /model: moonshot\/moonshot-v1-8k/);
+  assert.match(yaml, /model: deepseek\/deepseek-chat-fast/);
   // Both keys present, in the order main → fast.
   const mainIdx = yaml.indexOf("originrouter-claude-model\n");
   const smallIdx = yaml.indexOf("originrouter-claude-fast-model");
@@ -395,17 +399,27 @@ const ROUTE_PROVIDERS = {
 }
 
 {
-  // Empty route set throws.
-  assert.throws(
-    () => renderLitellmRoutesConfigYaml({}, ROUTE_PROVIDERS),
-    /no local LiteLLM routes configured/,
-  );
   assert.throws(
     () => renderLitellmRoutesConfigYaml(
-      { claude: { main: null, small: null } },
+      {
+        claude: {
+          main: { provider: "deepseek", model: "deepseek-chat" },
+          small: { provider: "moonshot", model: "moonshot-v1-8k" },
+        },
+      },
       ROUTE_PROVIDERS,
     ),
-    /no local LiteLLM routes configured/,
+    /Claude main and small routes must use the same provider/,
+  );
+}
+
+{
+  // Empty Agent routes still expose enabled Provider models for App chat.
+  const providerOnlyYaml = renderLitellmRoutesConfigYaml({}, ROUTE_PROVIDERS);
+  assert.match(providerOnlyYaml, /model_name: deepseek\/deepseek-chat/);
+  assert.throws(
+    () => renderLitellmRoutesConfigYaml({}, {}),
+    /no enabled local LiteLLM models or Agent routes configured/,
   );
 }
 
@@ -622,13 +636,12 @@ const CODEX_PROVIDERS = {
 }
 
 {
-  assert.throws(
-    () => renderLitellmRoutesConfigYaml(
-      { claude: { main: { provider: "originrouter_cloud", model: "grok-4.5" } } },
-      CODEX_PROVIDERS,
-    ),
-    /no local LiteLLM routes configured/,
+  const yaml = renderLitellmRoutesConfigYaml(
+    { claude: { main: { provider: "originrouter_cloud", model: "grok-4.5" } } },
+    CODEX_PROVIDERS,
   );
+  assert.match(yaml, /model_name: openai_codex\/gpt-5-codex/);
+  assert.doesNotMatch(yaml, /originrouter-claude-model/);
 }
 
 {
@@ -637,7 +650,7 @@ const CODEX_PROVIDERS = {
     {
       claude: {
         main:  { provider: "deepseek", model: "deepseek-chat" },
-        small: { provider: "moonshot", model: "moonshot-v1-8k" },
+        small: { provider: "deepseek", model: "deepseek-chat-fast" },
       },
       codex: { main: { provider: "openai_codex", model: "gpt-5-codex" } },
     },

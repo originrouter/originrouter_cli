@@ -6,7 +6,7 @@ import {
 } from "../agent/bridgeReporter.js";
 import { createAdapter } from "../adapters/createAdapter.js";
 import { buildAgentProviderEnv } from "../config/claudeConfig.js";
-import { clearRoute, setRoute } from "../config/routes.js";
+import { clearRoute, replaceAgentRoutes, setRoute } from "../config/routes.js";
 import { createExecutor } from "../executors/createExecutor.js";
 import { staticProxyStatusFn } from "../proxy/snapshot.js";
 import { appendSessionStart, patchSessionExit } from "../persistence/sessionLog.js";
@@ -17,6 +17,7 @@ import { handleRemoteCodingRequest } from "./remoteCodingServer.js";
 import { protectOriginrouterCodingEnv } from "../runtime/originrouterCodingAuthProxy.js";
 import { setAgentDetailDefault } from "../runtime/agentDetailProfile.js";
 import { buildAuditEvidenceBundle } from "../inquiry/auditEvidenceAdapter.js";
+import { browseAgentWorkspaces } from "./workspaceBrowser.js";
 
 export class SessionManager {
   constructor({
@@ -197,6 +198,19 @@ export class SessionManager {
           e2eePolicy: payload.e2eePolicy === "required" ? "required" : "off",
         },
       });
+      return;
+    }
+    if (payload.type === "local_control.routes.replace") {
+      const agent = String(payload.agent || "");
+      const config = readConfig();
+      const next = replaceAgentRoutes(
+        config,
+        agent,
+        payload.routes && typeof payload.routes === "object" ? payload.routes : {},
+      );
+      writeConfig(next);
+      await this.restartRouteModeProxyIfRunning();
+      await this.onLocalControlChanged?.();
       return;
     }
     if (payload.type === "local_control.route.set") {
@@ -562,6 +576,44 @@ export class SessionManager {
   }
 
   handleEvent(payload) {
+    if (payload.type === "agent.workspace.browse") {
+      const requestId = String(payload.requestId || "").slice(0, 96);
+      if (!requestId || !this.agentCatalog) return false;
+      browseAgentWorkspaces({
+        path: payload.path,
+        query: payload.query,
+        limit: payload.limit,
+        catalog: this.agentCatalog,
+        deviceId: this.deviceId,
+      }).then((page) => this.relayClient.send("agent.workspace.page", {
+        requestId,
+        ...page,
+      })).catch((error) => this.relayClient.send("agent.workspace.page", {
+        requestId,
+        error: error.message || "workspace browse failed",
+        reason: error.code || "workspace_browse_failed",
+      })).catch((error) => {
+        console.error(`[agent-workspace] ${error.message}`);
+      });
+      return true;
+    }
+    if (payload.type === "agent.workspace.trust") {
+      const requestId = String(payload.requestId || "").slice(0, 96);
+      if (!requestId || !this.agentCatalog) return false;
+      Promise.resolve().then(() => this.agentCatalog.trustWorkspace(payload.path, {
+        deviceId: this.deviceId,
+      })).then((workspace) => this.relayClient.send("agent.workspace.trust.result", {
+        requestId,
+        workspace,
+      })).catch((error) => this.relayClient.send("agent.workspace.trust.result", {
+        requestId,
+        error: error.message || "workspace trust failed",
+        reason: error.code || "workspace_trust_failed",
+      })).catch((error) => {
+        console.error(`[agent-workspace] ${error.message}`);
+      });
+      return true;
+    }
     if (payload.type === "agent.launch.request") {
       if (!this.managedAgentSupervisor) return false;
       this.managedAgentSupervisor.start(payload).catch((error) => {

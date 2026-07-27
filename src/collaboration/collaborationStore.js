@@ -235,8 +235,9 @@ export class CollaborationStore {
         run_id TEXT NOT NULL,
         agent_id TEXT NOT NULL DEFAULT '',
         sampled_tokens INTEGER NOT NULL DEFAULT 0,
-        amount_minor INTEGER NOT NULL DEFAULT 0,
-        elapsed_seconds INTEGER NOT NULL DEFAULT 0,
+        amount_micros INTEGER NOT NULL DEFAULT 0,
+        currency TEXT NOT NULL DEFAULT '',
+        cost_source TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
         FOREIGN KEY(run_id) REFERENCES collaboration_runs(run_id) ON DELETE CASCADE
       ) STRICT;
@@ -250,6 +251,9 @@ export class CollaborationStore {
     this.ensureColumn("collaboration_agents", "conversation_id", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_runs", "account_budget_blocked", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("collaboration_runs", "resume_state", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_usage_receipts", "amount_micros", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("collaboration_usage_receipts", "currency", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_usage_receipts", "cost_source", "TEXT NOT NULL DEFAULT ''");
   }
 
   ensureColumn(table, column, declaration) {
@@ -277,9 +281,8 @@ export class CollaborationStore {
     };
     const budget = {
       token_limit: input.budget?.token_limit == null ? 500_000 : Math.max(1, Number(input.budget.token_limit)),
-      amount_limit_minor: input.budget?.amount_limit_minor == null ? null : Math.max(1, Number(input.budget.amount_limit_minor)),
+      amount_limit_micros: input.budget?.amount_limit_micros == null ? null : Math.max(1, Number(input.budget.amount_limit_micros)),
       currency: input.budget?.currency ? safeText(input.budget.currency, 3).toUpperCase() : null,
-      elapsed_seconds_limit: input.budget?.elapsed_seconds_limit == null ? null : Math.max(1, Number(input.budget.elapsed_seconds_limit)),
       max_concurrency: Math.max(1, Math.min(32, Number(input.budget?.max_concurrency ?? 2))),
     };
     assertNoSecretFields(input);
@@ -292,7 +295,7 @@ export class CollaborationStore {
         ) VALUES (?, ?, 'plan_implement_verify', '1', ?, 'created', ?, ?, ?, ?, 0, '', ?, ?, NULL)
       `).run(
         runId, conversationId, objective, JSON.stringify(gates), JSON.stringify(budget),
-        JSON.stringify({ sampled_tokens: 0, amount_minor: 0, elapsed_seconds: 0 }),
+        JSON.stringify({ sampled_tokens: 0, amount_micros: 0, currency: null, unpriced_events: 0 }),
         JSON.stringify({ plan_revisions: 0, rework_rounds: 0 }), createdAt, createdAt,
       );
       const insertAgent = this.db.prepare(`INSERT INTO collaboration_agents(agent_id, run_id, role, runtime, device_id, workspace_id, provider, model, permission_profile, responsibilities_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
@@ -500,17 +503,27 @@ export class CollaborationStore {
     ).get(eventId);
     if (existing) return { run: this.getRun(runId), duplicate: true, warning: null, exhausted: false };
     const sampledTokens = Math.max(0, Math.floor(Number(input.sampled_tokens ?? input.sampledTokens) || 0));
-    const amountMinor = Math.max(0, Math.floor(Number(input.amount_minor ?? input.amountMinor) || 0));
-    const elapsedSeconds = Math.max(0, Math.floor(Number(input.elapsed_seconds ?? input.elapsedSeconds) || 0));
+    const rawAmount = input.amount_micros ?? input.amountMicros;
+    const costSource = safeText(input.cost_source ?? input.costSource, 32);
+    const priced = rawAmount != null
+      && costSource === "configured"
+      && /^[A-Z]{3}$/.test(String(input.currency || "").toUpperCase());
+    const currency = priced ? String(input.currency).toUpperCase() : "";
+    const currencyMatches = !run.budget.currency || run.budget.currency === currency;
+    const amountMicros = priced && currencyMatches
+      ? Math.max(0, Math.floor(Number(rawAmount) || 0))
+      : 0;
     const usage = {
       sampled_tokens: Number(run.usage.sampled_tokens || 0) + sampledTokens,
-      amount_minor: Number(run.usage.amount_minor || 0) + amountMinor,
-      elapsed_seconds: Number(run.usage.elapsed_seconds || 0) + elapsedSeconds,
+      amount_micros: Number(run.usage.amount_micros || 0) + amountMicros,
+      currency: run.budget.currency || currency || run.usage.currency || null,
+      unpriced_events: Number(run.usage.unpriced_events || 0) + (priced && currencyMatches ? 0 : 1),
     };
     const ratios = [
       run.budget.token_limit ? usage.sampled_tokens / Number(run.budget.token_limit) : 0,
-      run.budget.amount_limit_minor ? usage.amount_minor / Number(run.budget.amount_limit_minor) : 0,
-      run.budget.elapsed_seconds_limit ? usage.elapsed_seconds / Number(run.budget.elapsed_seconds_limit) : 0,
+      run.budget.amount_limit_micros
+        ? usage.amount_micros / Number(run.budget.amount_limit_micros)
+        : 0,
     ];
     const maxRatio = Math.max(0, ...ratios.filter(Number.isFinite));
     const exhausted = maxRatio >= 1;
@@ -519,12 +532,12 @@ export class CollaborationStore {
     this.db.transaction(() => {
       this.db.prepare(`
         INSERT INTO collaboration_usage_receipts(
-          event_id, run_id, agent_id, sampled_tokens, amount_minor,
-          elapsed_seconds, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          event_id, run_id, agent_id, sampled_tokens, amount_micros,
+          currency, cost_source, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         eventId, runId, safeText(input.agent_id ?? input.agentId, 195),
-        sampledTokens, amountMinor, elapsedSeconds, updatedAt,
+        sampledTokens, amountMicros, currency, costSource, updatedAt,
       );
       this.db.prepare("UPDATE collaboration_runs SET usage_json = ?, updated_at = ? WHERE run_id = ?")
         .run(JSON.stringify(usage), updatedAt, runId);
@@ -550,21 +563,16 @@ export class CollaborationStore {
     if (!run) throw new Error("collaboration run not found");
     const budget = {
       token_limit: input.token_limit == null ? run.budget.token_limit : Math.max(1, Math.floor(Number(input.token_limit))),
-      amount_limit_minor: input.amount_limit_minor === null
+      amount_limit_micros: input.amount_limit_micros === null
         ? null
-        : input.amount_limit_minor == null
-          ? run.budget.amount_limit_minor
-          : Math.max(1, Math.floor(Number(input.amount_limit_minor))),
+        : input.amount_limit_micros == null
+          ? run.budget.amount_limit_micros
+          : Math.max(1, Math.floor(Number(input.amount_limit_micros))),
       currency: input.currency === null
         ? null
         : input.currency == null
           ? run.budget.currency
           : safeText(input.currency, 3).toUpperCase(),
-      elapsed_seconds_limit: input.elapsed_seconds_limit === null
-        ? null
-        : input.elapsed_seconds_limit == null
-          ? run.budget.elapsed_seconds_limit
-          : Math.max(1, Math.floor(Number(input.elapsed_seconds_limit))),
       max_concurrency: input.max_concurrency == null
         ? run.budget.max_concurrency
         : Math.max(1, Math.min(32, Math.floor(Number(input.max_concurrency)))),
@@ -572,8 +580,9 @@ export class CollaborationStore {
     const updatedAt = iso(this.now());
     const ratios = [
       budget.token_limit ? Number(run.usage.sampled_tokens || 0) / Number(budget.token_limit) : 0,
-      budget.amount_limit_minor ? Number(run.usage.amount_minor || 0) / Number(budget.amount_limit_minor) : 0,
-      budget.elapsed_seconds_limit ? Number(run.usage.elapsed_seconds || 0) / Number(budget.elapsed_seconds_limit) : 0,
+      budget.amount_limit_micros
+        ? Number(run.usage.amount_micros || 0) / Number(budget.amount_limit_micros)
+        : 0,
     ];
     const taskBudgetExhausted = Math.max(0, ...ratios.filter(Number.isFinite)) >= 1;
     let nextState = run.state;
@@ -639,8 +648,9 @@ export class CollaborationStore {
       }
       const ratios = [
         run.budget.token_limit ? Number(run.usage.sampled_tokens || 0) / Number(run.budget.token_limit) : 0,
-        run.budget.amount_limit_minor ? Number(run.usage.amount_minor || 0) / Number(run.budget.amount_limit_minor) : 0,
-        run.budget.elapsed_seconds_limit ? Number(run.usage.elapsed_seconds || 0) / Number(run.budget.elapsed_seconds_limit) : 0,
+        run.budget.amount_limit_micros
+          ? Number(run.usage.amount_micros || 0) / Number(run.budget.amount_limit_micros)
+          : 0,
       ];
       const taskBudgetExhausted = Math.max(0, ...ratios.filter(Number.isFinite)) >= 1;
       if (!taskBudgetExhausted && run.state === "budget_exhausted") {

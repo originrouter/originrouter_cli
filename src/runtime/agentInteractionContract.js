@@ -209,6 +209,9 @@ export function permissionEventToInteraction(event, extras = {}) {
       ? (extras.terminalReply || { strategy: "write_text", submit: "none" })
       : null,
     createdAt: extras.createdAt ?? null,
+    expiresAt: Number.isFinite(extras.expiresAt)
+      ? Math.max(0, Math.floor(extras.expiresAt))
+      : null,
     timeoutMs: extras.timeoutMs ?? null,
   };
 

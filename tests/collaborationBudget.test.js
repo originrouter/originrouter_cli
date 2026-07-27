@@ -16,7 +16,7 @@ const created = coordinator.create({
     lead: { runtime: "codex", device_id: "local", workspace_id: "w", responsibilities: ["research"] },
     worker: { runtime: "claude", device_id: "local", workspace_id: "w", responsibilities: ["implement"] },
   },
-  budget: { token_limit: 1000, amount_limit_minor: 500, elapsed_seconds_limit: 600 },
+  budget: { token_limit: 1000, amount_limit_micros: 5000000, currency: "USD" },
 });
 coordinator.start(created.run_id);
 let usage = store.recordUsage(created.run_id, { eventId: "usage-event-0001", sampledTokens: 799 });
@@ -67,6 +67,39 @@ assert.equal(taskBudgetRaised.tasks[0].state, "active");
 const loweredActiveBudget = store.updateBudget(created.run_id, { token_limit: 500 });
 assert.equal(loweredActiveBudget.state, "budget_exhausted");
 assert.equal(loweredActiveBudget.resume_state, "researching");
+
+const amountRun = coordinator.create({
+  objective: "Configured-price budget",
+  agents: {
+    lead: { runtime: "codex", device_id: "local", workspace_id: "w", responsibilities: ["research"] },
+    worker: { runtime: "claude", device_id: "local", workspace_id: "w", responsibilities: ["implement"] },
+  },
+  budget: { amount_limit_micros: 2_000_000, currency: "USD" },
+});
+coordinator.start(amountRun.run_id);
+let amountUsage = store.recordUsage(amountRun.run_id, {
+  eventId: "amount-priced-0001",
+  amountMicros: 1_600_000,
+  currency: "USD",
+  costSource: "configured",
+});
+assert.equal(amountUsage.warning, "warning");
+amountUsage = store.recordUsage(amountRun.run_id, {
+  eventId: "amount-unsupported-0002",
+  amountMicros: 9_000_000,
+  currency: "USD",
+  costSource: "unsupported",
+});
+assert.equal(amountUsage.exhausted, false);
+assert.equal(amountUsage.run.usage.amount_micros, 1_600_000);
+assert.equal(amountUsage.run.usage.unpriced_events, 1);
+amountUsage = store.recordUsage(amountRun.run_id, {
+  eventId: "amount-priced-0003",
+  amountMicros: 400_000,
+  currency: "USD",
+  costSource: "configured",
+});
+assert.equal(amountUsage.exhausted, true);
 store.close();
 
 const legacyStateDir = mkdtempSync(join(tmpdir(), "or-budget-legacy-"));

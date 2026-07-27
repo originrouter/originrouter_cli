@@ -62,21 +62,27 @@ try {
     assert.match(r.stdout, /no routes configured/);
   }
 
-  // ---- 3. route set claude.main ----
-  await runCli(["route", "set", "claude.main",
-    "--provider", "deepseek", "--model", "deepseek-chat"], { env });
+  // ---- 3. atomic Claude profile set ----
+  await runCli(["route", "set", "claude",
+    "--provider", "deepseek",
+    "--main-model", "deepseek-chat",
+    "--small-model", "deepseek-chat"], { env });
   {
     const cfg = readConfig(home);
     assert.equal(cfg.routes.claude.main.provider, "deepseek");
     assert.equal(cfg.routes.claude.main.model,    "deepseek-chat");
+    assert.equal(cfg.routes.claude.small.provider, "deepseek");
   }
 
-  // ---- 4. route set claude.small ----
-  await runCli(["route", "set", "claude.small",
-    "--provider", "moonshot", "--model", "moonshot-v1-8k"], { env });
+  // ---- 4. cross-Provider Claude small route is rejected ----
   {
-    const cfg = readConfig(home);
-    assert.equal(cfg.routes.claude.small.provider, "moonshot");
+    const r = await runCli(["route", "set", "claude.small",
+      "--provider", "moonshot", "--model", "moonshot-v1-8k"], {
+      env,
+      expectFail: true,
+    });
+    assert.notEqual(r.code, 0);
+    assert.match(r.stderr, /must use the same provider/);
   }
 
   // ---- 5. route show claude ----
@@ -84,7 +90,6 @@ try {
     const r = await runCli(["route", "show", "claude"], { env });
     assert.match(r.stdout, /originrouter-claude/);
     assert.match(r.stdout, /deepseek-chat/);
-    assert.match(r.stdout, /moonshot-v1-8k/);
   }
 
   // ---- 6. route set rejects unknown provider ----
@@ -119,7 +124,7 @@ try {
     assert.equal(cfg.routes.claude.small, undefined);
   }
 
-  // ---- 9. provider use <litellm> writes routes.claude.main (Stage 7.6) ----
+  // ---- 9. provider use <litellm> replaces the grouped Claude profile ----
   // No --force needed; --force is silently accepted for backward compat.
   await runCli(["provider", "use", "moonshot", "--agent", "claude"], { env });
   {
@@ -127,21 +132,20 @@ try {
     // Stage 7.6: currentProvider is no longer written for claude.
     assert.equal(cfg.routes.claude.main.provider, "moonshot");
     assert.equal(cfg.routes.claude.main.model,    "moonshot-v1-8k");
+    assert.equal(cfg.routes.claude.small.provider, "moonshot");
   }
 
-  // ---- 9b. Stage 7.8: provider use does NOT seed routes.claude.small ----
+  // ---- 9b. Provider Use seeds both aliases from one enabled model ----
   {
     const cfg = readConfig(home);
-    assert.equal(cfg.routes.claude.small, undefined,
-      "smallFastModel on the provider no longer seeds routes.claude.small");
+    assert.equal(cfg.routes.claude.small.model, "moonshot-v1-8k");
   }
 
-  // ---- 9c. Stage 7.8: provider use prints the canonical fast-route hint ----
+  // ---- 9c. Provider Use reports both grouped aliases ----
   {
     const r = await runCli(["provider", "use", "deepseek", "--agent", "claude"], { env });
-    assert.match(r.stdout, /To set fast route: `originrouter route set claude\.small --provider deepseek`/);
-    // fast row is only printed when small is set; here small is unset.
-    assert.match(r.stdout, /fast  \(unset; the fast alias will fall back to main\)/);
+    assert.match(r.stdout, /Claude routes updated/);
+    assert.match(r.stdout, /fast\s+originrouter-claude-fast-model -> deepseek \/ deepseek-chat/);
   }
 
   // ---- 10. provider use on a litellm/anthropic provider — also writes routes ----
@@ -178,27 +182,28 @@ try {
   }
 
   // ---- 15. Stage 7.8: provider remove clears routes that point at it ----
-  // Seed both slots at the same provider, then remove it. Both slots
-  // should be cleared and `routes` removed entirely.
-  await runCli(["route", "set", "claude.main",  "--provider", "moonshot",  "--model", "moonshot-v1-8k"], { env });
-  await runCli(["route", "set", "claude.small", "--provider", "moonshot",  "--model", "moonshot-mini"], { env });
-  await runCli(["route", "set", "claude.main",  "--provider", "deepseek",  "--model", "deepseek-chat"], { env });
+  // Removing the selected Provider clears the whole grouped profile.
+  await runCli(["route", "set", "claude",
+    "--provider", "moonshot",
+    "--main-model", "moonshot-v1-8k",
+    "--small-model", "moonshot-v1-8k"], { env });
   {
     const cfg = readConfig(home);
-    assert.equal(cfg.routes.claude.main.provider,  "deepseek");
+    assert.equal(cfg.routes.claude.main.provider,  "moonshot");
     assert.equal(cfg.routes.claude.small.provider, "moonshot");
   }
   {
-    // Remove the small target only.
     const r = await runCli(["provider", "remove", "moonshot"], { env });
-    assert.match(r.stdout, /cleared routes\.claude\.small/);
+    assert.match(r.stdout, /cleared routes\.claude\.main/);
     const cfg = readConfig(home);
-    assert.equal(cfg.routes.claude.main.provider, "deepseek", "main untouched");
-    assert.equal(cfg.routes.claude.small, undefined, "small cleared (was pointing at removed provider)");
+    assert.equal(cfg.routes, undefined);
     assert.equal(cfg.providers.moonshot, undefined);
   }
   {
-    // Now remove the main target. routes object should be removed entirely.
+    await runCli(["route", "set", "claude",
+      "--provider", "deepseek",
+      "--main-model", "deepseek-chat",
+      "--small-model", "deepseek-chat"], { env });
     const r = await runCli(["provider", "remove", "deepseek"], { env });
     assert.match(r.stdout, /cleared routes\.claude\.main/);
     const cfg = readConfig(home);

@@ -1,5 +1,3 @@
-import { hostname, userInfo } from "node:os";
-
 import { revokeOAuthToken } from "../auth/originrouterAuthClient.js";
 import {
   loginWithDeviceFlow,
@@ -13,7 +11,11 @@ import {
   clearCodingAuth,
   readCodingAuth,
 } from "../persistence/codingAuth.js";
-import { ensureDevice, ensureStateDir } from "../persistence/state.js";
+import {
+  defaultDeviceDisplayName,
+  ensureDevice,
+  ensureStateDir,
+} from "../persistence/state.js";
 import { formatCliError, reportCliError } from "../runtime/cliErrors.js";
 
 function parseFlag(args, name) {
@@ -22,16 +24,6 @@ function parseFlag(args, name) {
     if (args[index].startsWith(`--${name}=`)) return args[index].slice(name.length + 3);
   }
   return undefined;
-}
-
-function defaultDeviceName() {
-  try {
-    const user = (userInfo().username || "").trim();
-    const host = (hostname() || "").replace(/\.local$/i, "").trim();
-    return user && host ? `${user}@${host}` : user || host || "OriginRouter CLI";
-  } catch {
-    return "OriginRouter CLI";
-  }
 }
 
 function mask(token) {
@@ -56,7 +48,10 @@ export async function handleLogin(args) {
       suretyBaseUrl,
       h5BaseUrl,
       deviceId: device.deviceId,
-      deviceName: parseFlag(args, "device-name") || defaultDeviceName(),
+      deviceName:
+        parseFlag(args, "device-name") ||
+        device.displayName ||
+        defaultDeviceDisplayName(),
       noBrowser: args.includes("--no-browser"),
     });
     persistOAuthCredential({ stateDir, credential });

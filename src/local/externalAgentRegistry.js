@@ -68,6 +68,7 @@ export class ExternalAgentRegistry {
       commands: existing?.commands || [],
       commandSequence: existing?.commandSequence || 0,
       pendingInteractions: existing?.pendingInteractions || new Set(),
+      pendingInteractionKinds: existing?.pendingInteractionKinds || new Map(),
       mode: safeText(payload?.mode, 32) || existing?.mode || "default",
       modeControl:
         safeText(payload?.modeControl, 16) ||
@@ -169,6 +170,10 @@ export class ExternalAgentRegistry {
     const interactionId = String(event?.interactionId || event?.callId || "");
     if (event?.type === "agent.interaction.requested" && interactionId) {
       session.pendingInteractions.add(interactionId);
+      session.pendingInteractionKinds.set(
+        interactionId,
+        safeText(event?.kind, 32) || "input",
+      );
     }
     if (
       interactionId &&
@@ -181,6 +186,7 @@ export class ExternalAgentRegistry {
       ].includes(event?.type)
     ) {
       session.pendingInteractions.delete(interactionId);
+      session.pendingInteractionKinds.delete(interactionId);
     }
     if (
       event?.type === "agent.interaction.result" &&
@@ -190,6 +196,7 @@ export class ExternalAgentRegistry {
       )
     ) {
       session.pendingInteractions.delete(interactionId);
+      session.pendingInteractionKinds.delete(interactionId);
     }
     if (event?.type === "agent.mode.status") {
       session.mode = safeText(event?.mode, 32) || session.mode;
@@ -354,15 +361,21 @@ export class ExternalAgentRegistry {
   }
 
   project(session) {
+    const status = this.publicStatus(session);
     return {
       session_id: session.sessionId,
       agent_type: session.agent,
       title: session.title,
-      status: session.status,
+      status,
       device_id: session.deviceId,
       device_name: session.deviceName,
-      current_step:
-        session.status === "running" ? session.currentStep : "Stopped",
+      current_step: status === "waiting_approval"
+        ? "Waiting for approval"
+        : status === "waiting_input"
+          ? "Waiting for input"
+          : status === "running"
+            ? session.currentStep
+            : "Stopped",
       last_activity_at: new Date(session.lastSeenAtMs).toISOString(),
       pending_approval_count: session.pendingInteractions.size,
       control_path: "local",
@@ -377,6 +390,18 @@ export class ExternalAgentRegistry {
       detail_profile: session.detailProfile,
       detail_source: session.detailSource,
     };
+  }
+
+  publicStatus(session) {
+    if (session.status !== "running" || session.pendingInteractions.size === 0) {
+      return session.status;
+    }
+    for (const interactionId of session.pendingInteractions) {
+      if (session.pendingInteractionKinds.get(interactionId) === "permission") {
+        return "waiting_approval";
+      }
+    }
+    return "waiting_input";
   }
 
   stepForEvent(event, fallback) {

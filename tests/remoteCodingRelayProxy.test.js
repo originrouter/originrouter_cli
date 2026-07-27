@@ -95,7 +95,7 @@ const RELAY_PORT = 28787 + Math.floor(Math.random() * 1000);
   try { await buildAgentProviderEnv("claude", config, { remoteCodingStatus: probe }); } catch (err) { threw = err; }
   assert.ok(threw);
   assert.equal(threw.code, "PROVIDER_UNSUPPORTED");
-  assert.match(threw.message, /claude\.small.*remote provider/);
+  assert.match(threw.message, /main and small routes must use the same provider/);
 }
 
 {

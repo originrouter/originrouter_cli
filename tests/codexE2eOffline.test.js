@@ -201,11 +201,12 @@ try {
     );
   }
 
-  // ---- 9. env print --agent codex (negative: route unset, proxy still running) ----
+  // ---- 9. env print --agent codex preserves existing auth when unset. ----
   {
-    const r = await runCli(["env", "print", "--agent", "codex"], { env, expectFail: true });
-    assert.notEqual(r.code, 0, `expected non-zero exit, got ${r.code}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
-    assert.match(r.stdout, /Codex requires routes\.codex\.main/);
+    const r = await runCli(["env", "print", "--agent", "codex"], { env });
+    assert.equal(r.code, 0);
+    assert.match(r.stdout, /Source: inherited/);
+    assert.match(r.stdout, /existing Codex login and environment are preserved/);
   }
 
   // ---- 10. CodexAdapter buildLaunch: no user model ----

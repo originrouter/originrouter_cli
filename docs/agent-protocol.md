@@ -1723,7 +1723,7 @@ Stage 8.9 promotes §10.14 from "contract-only" to
   `{ interactionId, decision, value?, data?, reason?, callId? }`
   and forwards `agent.interaction.resolve` to the local session.
   The legacy `POST /sessions/:id/permission` is unchanged.
-- **Mode/status display (read-only).** `localAgentSession.js`
+- **Mode/status and native Claude control.** `localAgentSession.js`
   emits one `agent.mode.status` per session on `session.started`:
   ```json
   {
@@ -1731,18 +1731,22 @@ Stage 8.9 promotes §10.14 from "contract-only" to
     "sessionId": "...",
     "provider": "claude | codex",
     "runtime": "codex-app-server | null",
-    "availableModes": ["default", "acceptEdits", "bypassPermissions", "plan"],
+    "availableModes": ["default", "acceptEdits", "plan", "auto"],
     "mode": "default",
-    "modeControl": "unsupported",
-    "reason": "Live mode switching is not wired in Stage 8.9. Display only."
+    "modeControl": "supported"
   }
   ```
   - `provider` is mapped from the local `agent` command
     (`agent === "codex" ? "codex" : "claude"`).
   - `runtime` is the same value `session.started` already carries.
-  - `modeControl: "unsupported"` — 8.9 is display-only.
+  - Native Claude accepts `agent.mode.set` while it is idle. OriginRouter
+    sends one Shift+Tab at a time and waits for the Hook or rendered footer to
+    confirm the next mode before continuing.
+  - A failed or unconfirmed switch preserves the last confirmed mode and
+    emits `accepted: false` with a reason code.
+  - Other terminal runtimes remain `modeControl: "unsupported"` until they
+    provide their own confirmed controller.
   - Codex availableModes: `["default", "read-only", "safe-yolo", "yolo"]`.
-  - **Remote mode switching is Stage 9.0+; 8.9 does not wire it.**
 
 - **Error reuse.** Unknown-id errors continue to use
   `agent.permission.resolve.error` (the existing type). A

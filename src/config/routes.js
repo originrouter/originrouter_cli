@@ -14,7 +14,7 @@
 //   config.routes = {
 //     claude: {
 //       main:  { provider: "deepseek", model: "deepseek-chat" },
-//       small: { provider: "moonshot", model: "moonshot-v1-8k" }
+//       small: { provider: "deepseek", model: "deepseek-chat-fast" }
 //     },
 //     codex: {
 //       main:  { provider: "openai-codex", model: "gpt-5-codex" }
@@ -26,6 +26,7 @@
 // error. Codex and Claude do not share, do not fallback into each other.
 
 import { createHash } from "node:crypto";
+import { providerModelIds } from "./providerModels.js";
 
 export const ROUTE_AGENTS = Object.freeze(["claude", "codex"]); // Stage 8.0
 
@@ -133,8 +134,9 @@ export function getAllRoutes(config) {
 //
 // Rules:
 //   - entry.provider required, must exist in providers, must be LiteLLM-renderable
-//   - entry.model optional; if omitted, falls back to provider.model
-//   - entry.model when provided must be a non-empty string
+//   - proxy routes require an explicit enabled model from provider.models
+//   - originrouter / remote compatibility records may still fall back to
+//     their own model field
 //
 // Throws with a clear, actionable message on any failure. The renderer in
 // litellm.js also re-checks for type=litellm at render time to catch
@@ -164,10 +166,102 @@ export function validateRouteEntry(entry, providers) {
   if (entry.model != null && (typeof entry.model !== "string" || entry.model.trim() === "")) {
     throw new Error("route entry.model must be a non-empty string when present");
   }
+  const hasModelPolicy = Array.isArray(provider.models)
+    && provider.models.some((model) => model && typeof model === "object");
+  const requestedModel = (entry.model && entry.model.trim())
+    || (!hasModelPolicy && typeof provider.model === "string" ? provider.model.trim() : "");
+  if (provider.type === "proxy") {
+    if (!requestedModel) {
+      throw new Error(`route entry.model is required for provider '${entry.provider}'`);
+    }
+    const enabledModels = providerModelIds(provider, { enabledOnly: true });
+    if (!enabledModels.includes(requestedModel)) {
+      throw new Error(
+        `route model '${requestedModel}' is not enabled on provider '${entry.provider}'`,
+      );
+    }
+  }
   return {
     provider: entry.provider,
-    model: (entry.model && entry.model.trim()) || provider.model,
+    model: requestedModel || provider.model,
   };
+}
+
+// Claude Code exposes two model aliases, but they are one routing profile.
+// Both aliases must resolve through the same Provider. A missing small route
+// is valid and means "use main for small"; a small-only profile or two
+// different Providers is invalid. This protects stored legacy configs and
+// every mutation surface, not just the App UI.
+export function assertAgentRouteConsistency(agent, routeSet) {
+  if (!ROUTE_AGENTS.includes(agent)) {
+    throw new Error(`unknown route agent '${agent}'`);
+  }
+  if (agent !== "claude") return routeSet || {};
+  const routes = routeSet || {};
+  if (!routes.main && routes.small) {
+    const err = new Error(
+      "Claude routes require claude.main when claude.small is configured. " +
+      "Set both routes together or clear claude.small.",
+    );
+    err.code = "PROVIDER_UNSUPPORTED";
+    throw err;
+  }
+  if (
+    routes.main &&
+    routes.small &&
+    routes.main.provider !== routes.small.provider
+  ) {
+    const err = new Error(
+      "Claude main and small routes must use the same provider. " +
+      "Update them together with PUT /routes/claude or clear the Claude routes.",
+    );
+    err.code = "PROVIDER_UNSUPPORTED";
+    throw err;
+  }
+  return routes;
+}
+
+function writeAgentRouteSet(config, agent, routeSet) {
+  const routes = { ...((config && config.routes) || {}) };
+  const agentBlock = {};
+  for (const slot of ROUTE_DEFS[agent].slots) {
+    if (routeSet[slot]) agentBlock[slot] = routeSet[slot];
+  }
+  if (Object.keys(agentBlock).length === 0) delete routes[agent];
+  else routes[agent] = agentBlock;
+  const next = { ...(config || {}) };
+  if (Object.keys(routes).length === 0) delete next.routes;
+  else next.routes = routes;
+  return next;
+}
+
+// Atomically replace every route slot owned by one Agent. The final state is
+// validated before anything is written, so Claude cannot be persisted with
+// main and small pointing at different Providers.
+export function replaceAgentRoutes(config, agent, routeSet) {
+  if (!ROUTE_AGENTS.includes(agent)) {
+    throw new Error(`unknown route agent '${agent}'`);
+  }
+  if (!routeSet || typeof routeSet !== "object" || Array.isArray(routeSet)) {
+    throw new Error("route set must be an object keyed by slot");
+  }
+  const def = ROUTE_DEFS[agent];
+  for (const slot of Object.keys(routeSet)) {
+    if (!def.slots.includes(slot)) {
+      throw new Error(
+        `unknown route slot '${slot}' for agent '${agent}' ` +
+        `(allowed: ${def.slots.join(", ")})`,
+      );
+    }
+  }
+  const providers = (config && config.providers) || {};
+  const normalized = {};
+  for (const slot of def.slots) {
+    const entry = routeSet[slot];
+    if (entry != null) normalized[slot] = validateRouteEntry(entry, providers);
+  }
+  assertAgentRouteConsistency(agent, normalized);
+  return writeAgentRouteSet(config, agent, normalized);
 }
 
 // Pure: returns a new config with the named route slot set.
@@ -183,11 +277,10 @@ export function setRoute(config, agent, slot, entry) {
   }
   const providers = (config && config.providers) || {};
   const normalized = validateRouteEntry(entry, providers);
-  const routes = { ...((config && config.routes) || {}) };
-  const agentBlock = { ...(routes[agent] || {}) };
-  agentBlock[slot] = normalized;
-  routes[agent] = agentBlock;
-  return { ...(config || {}), routes };
+  const nextRoutes = getAgentRoutes(config, agent);
+  nextRoutes[slot] = normalized;
+  assertAgentRouteConsistency(agent, nextRoutes);
+  return writeAgentRouteSet(config, agent, nextRoutes);
 }
 
 // Pure: returns a new config with the named route slot removed.
@@ -200,16 +293,17 @@ export function clearRoute(config, agent, slot) {
     throw new Error(`unknown route slot '${slot}' for agent '${agent}' ` +
                     `(allowed: ${def.slots.join(", ")})`);
   }
-  const routes = { ...((config && config.routes) || {}) };
-  const agentBlock = { ...(routes[agent] || {}) };
-  delete agentBlock[slot];
-  if (Object.keys(agentBlock).length === 0) delete routes[agent];
-  else routes[agent] = agentBlock;
-  // Drop empty `routes: {}` to keep config.json tidy.
-  const next = { ...(config || {}) };
-  if (Object.keys(routes).length === 0) delete next.routes;
-  else next.routes = routes;
-  return next;
+  const nextRoutes = getAgentRoutes(config, agent);
+  if (agent === "claude" && slot === "main") {
+    // Clearing the primary Claude route means "do not override Claude Code".
+    // A small-only route would still inject routing state, so clear the group.
+    nextRoutes.main = null;
+    nextRoutes.small = null;
+  } else {
+    nextRoutes[slot] = null;
+  }
+  assertAgentRouteConsistency(agent, nextRoutes);
+  return writeAgentRouteSet(config, agent, nextRoutes);
 }
 
 // Stage 7.6: effective routes for Claude. Renderer always emits both
@@ -242,6 +336,7 @@ export function effectiveRoutes(routeSet) {
 export function effectiveAgentRoutes(agent, routeSet) {
   const def = ROUTE_DEFS[agent];
   const r = routeSet || {};
+  assertAgentRouteConsistency(agent, r);
   if (!def.fallbackSmallToMain) return r;
   if (!r.main) return r;
   if (r.small) return r;

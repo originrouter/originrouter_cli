@@ -1,9 +1,8 @@
 // Stage 7.6: tests for the single-path buildAgentProviderEnv().
 //
-// All paths are single-path: claude always needs the route-mode proxy running
-// with a matching hash. There is no direct path, no provider-name fallback,
-// no `currentProvider.claude` lookup. resolveProvider() is NOT called for
-// claude.
+// Configured Claude routes use one coherent Provider profile. With no Claude
+// routes, OriginRouter returns an empty env overlay so the user's existing
+// ANTHROPIC_* variables or official Anthropic subscription remain in control.
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -11,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAgentProviderEnv } from "../src/config/claudeConfig.js";
 import { addProvider, setCurrentProvider } from "../src/config/providers.js";
-import { setRoute, clearRoute, CODEX_MAIN_ALIAS, getAllRoutes, hashRoutes, getRoutes, MAIN_ALIAS, SMALL_ALIAS } from "../src/config/routes.js";
+import { setRoute, clearRoute, replaceAgentRoutes, CODEX_MAIN_ALIAS, getAllRoutes, hashRoutes, getRoutes, MAIN_ALIAS, SMALL_ALIAS } from "../src/config/routes.js";
 import { writeCodingAuth } from "../src/persistence/codingAuth.js";
 import { makeOAuthCredential } from "./support/oauthCredential.js";
 
@@ -23,7 +22,17 @@ try {
   let config = {
     providers: {
       // The proxy-routed providers.
-      deepseek: { name: "deepseek", type: "litellm", litellmProvider: "deepseek", apiKey: "sk-ds", model: "deepseek-chat" },
+      deepseek: {
+        name: "deepseek",
+        type: "litellm",
+        litellmProvider: "deepseek",
+        apiKey: "sk-ds",
+        model: "deepseek-chat",
+        models: [
+          { id: "deepseek-chat", enabled: true },
+          { id: "deepseek-chat-fast", enabled: true },
+        ],
+      },
       moonshot: { name: "moonshot", type: "litellm", litellmProvider: "moonshot", apiKey: "sk-ms", model: "moonshot-v1-8k" },
       // An anthropic-compatible provider in the new shape (type=litellm,
       // litellmProvider=anthropic). This is the canonical way to add MiniMax.
@@ -47,14 +56,44 @@ try {
     aliases: [MAIN_ALIAS, SMALL_ALIAS],
   });
 
-  // ---- (1) No routes, no proxy → throws ----
+  // ---- (1) No routes → inherit the launch environment unchanged ----
   {
-    await assert.rejects(
-      () => buildAgentProviderEnv("claude", config, {
-        proxyStatus: () => ({ state: "stopped" }),
+    const out = await buildAgentProviderEnv("claude", config, {
+      proxyStatus: () => ({ state: "stopped" }),
+    });
+    assert.deepEqual(out.env, {});
+    assert.equal(out.provider, null);
+    assert.equal(out.source, "inherited");
+  }
+
+  // ---- (1b) Claude routes are one Provider profile at the CLI core ----
+  {
+    assert.throws(
+      () => setRoute(config, "claude", "small", {
+        provider: "deepseek",
+        model: "deepseek-chat-fast",
       }),
-      (err) => err.code === "PROVIDER_UNSUPPORTED",
+      /require claude\.main/,
     );
+    const mainOnly = setRoute(config, "claude", "main", {
+      provider: "deepseek",
+      model: "deepseek-chat",
+    });
+    assert.throws(
+      () => setRoute(mainOnly, "claude", "small", {
+        provider: "moonshot",
+        model: "moonshot-v1-8k",
+      }),
+      /must use the same provider/,
+    );
+    const grouped = replaceAgentRoutes(config, "claude", {
+      main: { provider: "deepseek", model: "deepseek-chat" },
+      small: { provider: "deepseek", model: "deepseek-chat-fast" },
+    });
+    assert.equal(getRoutes(grouped).main.provider, "deepseek");
+    assert.equal(getRoutes(grouped).small.model, "deepseek-chat-fast");
+    assert.equal(getRoutes(clearRoute(grouped, "claude", "main")).main, null);
+    assert.equal(getRoutes(clearRoute(grouped, "claude", "main")).small, null);
   }
 
   // ---- (2) Routes set, route-mode proxy running with matching hash: four fixed env vars ----
@@ -71,7 +110,7 @@ try {
 
   // ---- (3) Routes set, main + small: both fixed aliases (small explicit) ----
   {
-    config = setRoute(config, "claude", "small", { provider: "moonshot", model: "moonshot-v1-8k" });
+    config = setRoute(config, "claude", "small", { provider: "deepseek", model: "deepseek-chat-fast" });
     const out = await buildAgentProviderEnv("claude", config, {
       proxyStatus: () => routeProbe(config),
     });
@@ -154,13 +193,11 @@ try {
     );
   }
 
-  // ---- (10) codex: route-mode only (Stage 8.0). No routes.codex.main →
-  // PROVIDER_UNSUPPORTED. No legacy currentProvider.codex fallback. ----
+  // ---- (10) codex: no route preserves the user's existing login/env. ----
   {
-    await assert.rejects(
-      () => buildAgentProviderEnv("codex", config),
-      (err) => err.code === "PROVIDER_UNSUPPORTED" && /routes\.codex\.main/.test(err.message),
-    );
+    const inherited = await buildAgentProviderEnv("codex", config);
+    assert.equal(inherited.source, "inherited");
+    assert.deepEqual(inherited.env, {});
   }
 
   // ---- (11) codex: routes.codex.main set + matching hash → proxy env ----
@@ -224,9 +261,8 @@ try {
       ...config,
       providers: { ...(config.providers || {}), official },
     };
-    // Earlier cases (3, 5) left claude.small pointing at moonshot (litellm).
-    // An originrouter main + non-originrouter small is rejected by the
-    // runtime guard. Clear small before the originrouter direct smoke.
+    // Clear the proxy profile before switching the grouped Claude route to
+    // the OriginRouter Provider.
     const configWithoutSmall = clearRoute(configWithOfficial, "claude", "small");
     const configRouted = setRoute(configWithoutSmall, "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });

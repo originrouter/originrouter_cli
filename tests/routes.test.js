@@ -154,10 +154,24 @@ assert.throws(
 // Add small alongside main.
 {
   let cfg = setRoute({ providers: PROVIDERS }, "claude", "main", { provider: "deepseek", model: "deepseek-chat" });
-  cfg = setRoute(cfg, "claude", "small", { provider: "moonshot", model: "moonshot-v1-8k" });
+  cfg = setRoute(cfg, "claude", "small", { provider: "deepseek", model: "deepseek-chat" });
   assert.equal(cfg.routes.claude.main.provider,  "deepseek");
-  assert.equal(cfg.routes.claude.small.provider, "moonshot");
+  assert.equal(cfg.routes.claude.small.provider, "deepseek");
 }
+
+assert.throws(
+  () => {
+    const cfg = setRoute({ providers: PROVIDERS }, "claude", "main", {
+      provider: "deepseek",
+      model: "deepseek-chat",
+    });
+    return setRoute(cfg, "claude", "small", {
+      provider: "moonshot",
+      model: "moonshot-v1-8k",
+    });
+  },
+  /must use the same provider/,
+);
 
 // Replace existing slot.
 {
@@ -188,7 +202,7 @@ assert.throws(
 // Clear small; main survives.
 {
   let cfg = setRoute({ providers: PROVIDERS }, "claude", "main",  { provider: "deepseek", model: "deepseek-chat" });
-  cfg = setRoute(cfg, "claude", "small", { provider: "moonshot", model: "moonshot-v1-8k" });
+  cfg = setRoute(cfg, "claude", "small", { provider: "deepseek", model: "deepseek-chat" });
   cfg = clearRoute(cfg, "claude", "small");
   assert.equal(cfg.routes.claude.main.provider,  "deepseek");
   assert.equal(cfg.routes.claude.small, undefined);
@@ -252,7 +266,7 @@ assert.throws(
     routes: {
       claude: {
         main:  { provider: "deepseek", model: "deepseek-chat" },
-        small: { provider: "moonshot", model: "moonshot-v1-8k" },
+        small: { provider: "deepseek", model: "deepseek-chat-fast" },
       },
     },
   };
@@ -263,7 +277,7 @@ assert.throws(
   // proxy(engine=litellm). The providerRecord carries the projected shape.
   assert.equal(out[MAIN_ALIAS].providerRecord.type, "proxy");
   assert.equal(out[MAIN_ALIAS].providerRecord.engine, "litellm");
-  assert.equal(out[SMALL_ALIAS].provider, "moonshot");
+  assert.equal(out[SMALL_ALIAS].provider, "deepseek");
   assert.equal(out[SMALL_ALIAS].providerRecord.type, "proxy");
   assert.equal(out[SMALL_ALIAS].providerRecord.engine, "litellm");
 }
@@ -375,11 +389,11 @@ assert.throws(
   // Main + small both set → pass through unchanged.
   const routes = {
     main:  { provider: "deepseek", model: "deepseek-chat" },
-    small: { provider: "moonshot", model: "moonshot-v1-8k" },
+    small: { provider: "deepseek", model: "deepseek-chat-fast" },
   };
   const r = effectiveRoutes(routes);
   assert.equal(r.main.provider, "deepseek");
-  assert.equal(r.small.provider, "moonshot");
+  assert.equal(r.small.provider, "deepseek");
   assert.equal(r.small._fallback, undefined);
 }
 
@@ -415,7 +429,7 @@ assert.throws(
   const a = { main: { provider: "deepseek", model: "deepseek-chat" } };
   const b = {
     main:  { provider: "deepseek", model: "deepseek-chat" },
-    small: { provider: "moonshot", model: "moonshot-v1-8k" },
+    small: { provider: "deepseek", model: "deepseek-chat-fast" },
   };
   assert.notEqual(hashRoutes(a), hashRoutes(b));
 }

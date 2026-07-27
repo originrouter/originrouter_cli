@@ -1,5 +1,5 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir, hostname, platform } from "node:os";
+import { homedir, hostname, platform, userInfo } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { VERSION } from "../constants.js";
@@ -44,13 +44,31 @@ export function readDevice() {
   return readJson(join(ensureStateDir(), "device.json"));
 }
 
+export function defaultDeviceDisplayName() {
+  try {
+    const user = String(userInfo().username || "").trim();
+    const host = String(hostname() || "").replace(/\.local$/i, "").trim();
+    return user && host ? `${user}@${host}` : user || host || "OriginRouter CLI";
+  } catch {
+    return "OriginRouter CLI";
+  }
+}
+
 // Device identity is installation/config identity, never a hardware
 // fingerprint. Generate once with a CSPRNG and persist it across logins.
 export function ensureDevice(defaultDeviceId) {
   const path = join(ensureStateDir(), "device.json");
   const existing = readJson(path);
   if (existing?.deviceId && !_isStaleDeviceId(existing.deviceId)) {
-    return existing;
+    if (typeof existing.displayName === "string" && existing.displayName.trim()) {
+      return existing;
+    }
+    const migrated = {
+      ...existing,
+      displayName: defaultDeviceDisplayName(),
+    };
+    writePrivateJson(path, migrated);
+    return migrated;
   }
   if (existing) {
     // Stale device.json — drop it before regenerating.
@@ -61,6 +79,7 @@ export function ensureDevice(defaultDeviceId) {
   const device = {
     deviceId: defaultDeviceId || _newInstallDeviceId(),
     host: hostname(),
+    displayName: defaultDeviceDisplayName(),
     platform: platform(),
     createdAt: new Date().toISOString(),
   };

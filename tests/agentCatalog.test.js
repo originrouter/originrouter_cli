@@ -157,6 +157,54 @@ assert.equal(workerDetail.runs.length, 1);
 assert.notEqual(workerDetail.runs[0].run_id, leadRun.run_id);
 assert.match(workerDetail.runs[0].run_id, /^agent_run_/);
 assert.equal(workerDetail.native_session_id, "claude-native-session");
+
+for (let index = 0; index < 45; index += 1) {
+  catalog.upsertSession({
+    sessionId: `paged-session-${index}`,
+    conversationId: `paged-conversation-${index}`,
+    runId: `paged-run-${index}`,
+    agent: "codex",
+    title: `Paged conversation ${index}`,
+    deviceId: "server-2",
+    cwd: stateDir,
+    status: "completed",
+  });
+}
+const secondHistoryPage = catalog.listConversationPage({
+  collection: "history",
+  search: "Paged conversation",
+  page: 2,
+  pageSize: 20,
+  autoArchiveDays: 0,
+});
+assert.equal(secondHistoryPage.conversations.length, 20);
+assert.deepEqual(secondHistoryPage.pagination, {
+  page: 2,
+  page_size: 20,
+  total: 45,
+  total_pages: 3,
+  has_more: true,
+});
+
+assert.ok(catalog.setConversationArchived("paged-conversation-0", true));
+const archivedPage = catalog.listConversationPage({
+  collection: "archived",
+  search: "Paged conversation",
+  page: 1,
+  pageSize: 20,
+  autoArchiveDays: 0,
+});
+assert.equal(archivedPage.pagination.total, 1);
+assert.equal(archivedPage.conversations[0].conversation_id, "paged-conversation-0");
+assert.ok(catalog.setConversationArchived("paged-conversation-0", false));
+assert.equal(
+  catalog.listConversationPage({
+    collection: "archived",
+    search: "Paged conversation",
+    autoArchiveDays: 30,
+  }).pagination.total,
+  0,
+);
 catalog.close();
 
 const reopened = new AgentCatalog({ stateDir, now });

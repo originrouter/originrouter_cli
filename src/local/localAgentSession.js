@@ -16,6 +16,7 @@ import {
   remoteCodingRouteTarget,
   willRouteRemoteCoding,
 } from "../config/claudeConfig.js";
+import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
 import { DEFAULT_DEVICE_ID, DEFAULT_RELAY_URL } from "../constants.js";
 import { createExecutor } from "../executors/createExecutor.js";
 import {
@@ -61,10 +62,9 @@ import {
 } from "../runtime/agentDetailProfile.js";
 import { LocalAgentBridgeClient } from "./localAgentBridgeClient.js";
 
-// Stage 8.9: agent.mode.status surface. The available mode lists
-// match the planned Stage 9.0+ vocabulary; 8.9 does not wire any
-// of them (modeControl: "unsupported"). Listed for App-side display
-// only.
+// Fallback mode vocabularies for terminal adapters that do not expose their
+// own structured mode controller. Native Claude supplies a Hook-confirmed
+// controller through ClaudeAdapter; other terminal runtimes remain read-only.
 const CLAUDE_AVAILABLE_MODES = Object.freeze([
   "default",
   "acceptEdits",
@@ -85,6 +85,9 @@ export function buildModeStatusEvent({
   provider,
   runtime,
   availableModes,
+  mode = "default",
+  modeControl = "unsupported",
+  reason = "Live mode switching is not available for this runtime.",
 }) {
   return {
     type: "agent.mode.status",
@@ -92,9 +95,9 @@ export function buildModeStatusEvent({
     provider,
     runtime: runtime ?? null,
     availableModes: Array.isArray(availableModes) ? availableModes.slice() : [],
-    mode: "default",
-    modeControl: "unsupported",
-    reason: "Live mode switching is not wired in Stage 8.9. Display only.",
+    mode,
+    modeControl,
+    reason,
   };
 }
 
@@ -151,6 +154,12 @@ export function handleRemoteEvent(payload, ctx) {
     typeof ctx.applyAutonomy === "function"
   ) {
     return ctx.applyAutonomy(payload);
+  }
+  if (
+    payload.type === "agent.mode.set" &&
+    typeof ctx.adapter?.setMode === "function"
+  ) {
+    return ctx.adapter.setMode(payload, ctx.executor);
   }
   if (payload.type === "session.stop") {
     ctx.executor.stop();
@@ -477,7 +486,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     sessionId,
     agentType: agent,
     title: `${agent} session`,
-    deviceName: device.host,
+    deviceName: device.displayName || device.host,
     stateDir: ensureStateDir(),
   });
   const report = (type, extra = {}) => {
@@ -504,6 +513,14 @@ export async function runLocalAgentSession(agent, rawArgs) {
   let catalogSyncTail = Promise.resolve({ ok: true, skipped: true });
   let syncCatalog = () => Promise.resolve({ ok: false, skipped: true });
   const sendTransientEvent = async (event) => {
+    event = applyConfiguredPricing(event, {
+      provider: resolvedProvider,
+      model:
+        options.model ||
+        providerResult.routes?.main?.model ||
+        resolvedProvider?.model,
+      source: providerSource,
+    });
     const transientEvent = {
       ...event,
       eventId: event.eventId || `ate_${randomUUID()}`,
@@ -701,7 +718,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     sessionId,
     agentType: agent,
     title: `${agent} local session`,
-    deviceName: device.host,
+    deviceName: device.displayName || device.host,
     stateDir: ensureStateDir(),
     reportRuntimeEventFn: (payload) =>
       runtimeReporter.report("terminal.activity", { summary: payload.summary }),
@@ -808,6 +825,18 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // adapter's describe() returns `runtime: "codex-app-server"` when
   // the structured app-server path is active, `null` otherwise.
   const runtime = metadata.runtime ?? null;
+  const fallbackModeList =
+    agent === "codex" ? CODEX_AVAILABLE_MODES : CLAUDE_AVAILABLE_MODES;
+  const initialModeStatus =
+    typeof adapter.modeStatusEvent === "function"
+      ? adapter.modeStatusEvent()
+      : buildModeStatusEvent({
+          sessionId,
+          provider: agent === "codex" ? "codex" : "claude",
+          runtime,
+          availableModes: fallbackModeList,
+        });
+  const modeList = initialModeStatus.availableModes;
   syncCatalog = (status) => {
     const snapshot = {
       conversationId,
@@ -933,7 +962,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     agent,
     title: `${agent} session`,
     deviceId: effectiveDeviceId,
-    deviceName: device.host,
+    deviceName: device.displayName || device.host,
     cwd,
     workspaceTrusted: true,
     pid: started.pid,
@@ -943,6 +972,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
     model: resolvedProvider?.model,
     permissionProfile: autonomyProfile,
     startedBy: "local-wrapper",
+    mode: initialModeStatus.mode,
+    modeControl: initialModeStatus.modeControl,
+    availableModes: modeList,
     autonomyProfile,
     autonomyControl: autonomySupported ? "supported" : "unsupported",
     allowedAutonomyScopes: autonomyAllowedScopes,
@@ -984,37 +1016,15 @@ export async function runLocalAgentSession(agent, rawArgs) {
     process.on(signal, handler);
   }
 
-  // Stage 8.9: emit agent.mode.status once per session. The local
-  // `agent` command is mapped to the protocol provider string
-  // explicitly; the runtime tag is the same value session.started
-  // already carries. modeControl: "unsupported" — 8.9 supports
-  // viewing mode/status only. Remote mode switching is Stage 9.0+.
-  const modeList =
-    agent === "codex" ? CODEX_AVAILABLE_MODES : CLAUDE_AVAILABLE_MODES;
+  // Publish the same capability snapshot through direct Relay, the durable
+  // activity reporter, and the local daemon registry.
   send("agent.event", {
-    event: buildModeStatusEvent({
-      sessionId,
-      provider: agent === "codex" ? "codex" : "claude",
-      runtime,
-      availableModes: modeList,
-    }),
+    event: initialModeStatus,
   });
   report("agent.event", {
-    event: buildModeStatusEvent({
-      sessionId,
-      provider: agent === "codex" ? "codex" : "claude",
-      runtime,
-      availableModes: modeList,
-    }),
+    event: initialModeStatus,
   });
-  void localAgentBridge?.sendEvent(
-    buildModeStatusEvent({
-      sessionId,
-      provider: agent === "codex" ? "codex" : "claude",
-      runtime,
-      availableModes: modeList,
-    }),
-  );
+  void localAgentBridge?.sendEvent(initialModeStatus);
   void sendTransientEvent(autonomyStatus());
   void sendTransientEvent(detailStatus());
 
@@ -1090,7 +1100,12 @@ export async function runLocalAgentSession(agent, rawArgs) {
         requestId: payload.requestId,
         interactions: interactions.snapshot(),
         events: recentEvents,
-        mode: "default",
+        mode:
+          typeof adapter.modeStatusEvent === "function"
+            ? adapter.modeStatusEvent().mode
+            : initialModeStatus.mode,
+        modeControl: initialModeStatus.modeControl,
+        availableModes: modeList,
         autonomyProfile,
         autonomy: autonomyStatus(),
       });

@@ -22,10 +22,10 @@ const DEFAULTS = {
   retryDelaysMs: [50, 150],
   // Per-attempt timeout is event-conditional and resolved inside
   // postHookBody (SessionStart: perAttemptTimeoutMs; PermissionRequest:
-  // permissionRequestTimeoutMs to safely cover the hook server's 55s
-  // hold-open).
+  // permissionRequestTimeoutMs to safely cover the hook server's five-minute
+  // hold-open while staying below the six-minute Claude hook deadline).
   perAttemptTimeoutMs: 5_000,
-  permissionRequestTimeoutMs: 58_000,
+  permissionRequestTimeoutMs: 330_000,
   retryableHttpStatuses: new Set([429, 500, 502, 503, 504]),
   retryableCodes: new Set([
     "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN",
@@ -126,7 +126,7 @@ async function postHookBody(body, port, options = {}) {
 
   const eventName = parseEventName(body);
   const path = pickPath(eventName);
-  // PermissionRequest is held open by the server for up to 55s;
+  // PermissionRequest is held open by the server for up to five minutes;
   // the forwarder's per-attempt timeout must safely exceed that,
   // otherwise a normal remote approval would be aborted.
   const perAttemptTimeoutMs = eventName === "PermissionRequest" || eventName === "Elicitation"

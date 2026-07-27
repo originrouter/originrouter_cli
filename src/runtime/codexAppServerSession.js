@@ -2,10 +2,13 @@ import process from "node:process";
 import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import {
+  CODEX_APPROVAL_TIMEOUT_MS,
   CodexAppServerClient,
+  REMOTE_INTERACTION_DECISION_TIMEOUT_MS,
   isCodexAppServerAvailable,
 } from "../adapters/codex/appServerClient.js";
 import { mapCodexAppServerEvent } from "../adapters/codex/eventMapper.js";
+import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
 import {
   findCodexTranscript,
   readCodexConversationHistory,
@@ -75,6 +78,9 @@ const CODEX_MODES = Object.freeze([
   { id: "default", label: "Default" },
   { id: "plan", label: "Plan" },
 ]);
+
+const codexApprovalExpiresAt = () =>
+  Math.ceil((Date.now() + REMOTE_INTERACTION_DECISION_TIMEOUT_MS) / 1000);
 
 export function createSerialAgentEventQueue(handler) {
   let tail = Promise.resolve();
@@ -333,6 +339,11 @@ export async function runCodexAppServerSession(rawArgs) {
     options.model ||
     providerResult.env.OPENAI_MODEL ||
     providerResult.provider?.model;
+  const pricingModel =
+    options.model ||
+    providerResult.routes?.main?.model ||
+    providerResult.provider?.model ||
+    model;
   const sessionTitle = String(options.title || "Codex session")
     .trim()
     .slice(0, 191);
@@ -342,7 +353,7 @@ export async function runCodexAppServerSession(rawArgs) {
     sessionId,
     agentType: "codex",
     title: sessionTitle,
-    deviceName: device.host,
+    deviceName: device.displayName || device.host,
     stateDir,
   });
   let threadId = null;
@@ -554,7 +565,7 @@ export async function runCodexAppServerSession(rawArgs) {
             ),
             expiresAt: params.autoResolutionMs
               ? Math.ceil((Date.now() + params.autoResolutionMs) / 1000)
-              : null,
+              : codexApprovalExpiresAt(),
           }),
         );
       } catch {
@@ -585,6 +596,7 @@ export async function runCodexAppServerSession(rawArgs) {
                 server_name: params.serverName || "",
               },
           containsSecret: containsSecretSchema(params.requestedSchema),
+          expiresAt: codexApprovalExpiresAt(),
         }),
       );
       await markInteractionApplied(resolved);
@@ -656,6 +668,7 @@ export async function runCodexAppServerSession(rawArgs) {
             ...commandPresentation,
           },
           containsSecret: toolInputContainsSecret(params),
+          expiresAt: codexApprovalExpiresAt(),
         }),
       );
       await markInteractionApplied(resolved);
@@ -698,6 +711,7 @@ export async function runCodexAppServerSession(rawArgs) {
             remember_allowed: true,
           },
           containsSecret: toolInputContainsSecret(params.permissions),
+          expiresAt: codexApprovalExpiresAt(),
         }),
       );
       await markInteractionApplied(resolved);
@@ -733,7 +747,11 @@ export async function runCodexAppServerSession(rawArgs) {
     if (rawEvent.type === "task_complete" || rawEvent.type === "turn_aborted")
       currentTurnId = null;
     for (const event of mapCodexAppServerEvent(rawEvent)) {
-      void agentEventQueue.enqueue(event);
+      void agentEventQueue.enqueue(applyConfiguredPricing(event, {
+        provider: providerResult.provider,
+        model: pricingModel,
+        source: providerResult.source,
+      }));
     }
   });
 
@@ -1000,7 +1018,7 @@ export async function runCodexAppServerSession(rawArgs) {
       agent: "codex",
       title: sessionTitle,
       deviceId: effectiveDeviceId,
-      deviceName: device.host,
+      deviceName: device.displayName || device.host,
       cwd,
       workspaceTrusted: true,
       pid: client.child?.pid || process.pid,

@@ -260,13 +260,24 @@ export function mapCodexAppServerEvent(message) {
         + Number(last.cachedInputTokens ?? last.cached_input_tokens ?? 0)
         + Number(last.reasoningOutputTokens ?? last.reasoning_output_tokens ?? 0)),
     );
+    const active = Object.keys(last).length > 0 ? last : total;
+    const inputTokens = Math.max(0, Number(active.inputTokens ?? active.input_tokens ?? 0) || 0);
+    const outputTokens = Math.max(0, Number(active.outputTokens ?? active.output_tokens ?? 0) || 0);
+    const cachedInputTokens = Math.max(0, Number(active.cachedInputTokens ?? active.cached_input_tokens ?? 0) || 0);
+    const reasoningTokens = Math.max(0, Number(active.reasoningOutputTokens ?? active.reasoning_output_tokens ?? 0) || 0);
     return [{
       type: "agent.usage",
       provider: "codex",
       sampledTokens: Math.max(0, Number.isFinite(lastTokens) && lastTokens > 0 ? lastTokens : totalTokens),
-      amountMinor: 0,
-      elapsedSeconds: 0,
-      estimated: false,
+      tokenUsage: {
+        inputTokens,
+        outputTokens,
+        reasoningTokens,
+        cacheReadInputTokens: cachedInputTokens,
+      },
+      amountMicros: null,
+      currency: null,
+      costSource: "unsupported",
     }];
   }
 
@@ -338,7 +349,7 @@ export function mapCodexAppServerEvent(message) {
     }];
   }
 
-  // Stage 8.1: approval timeout. Per-app-server-request timeout (30s)
+  // Approval timeout. The five-minute remote decision window
   // resolves the underlying Codex request with decline and surfaces this
   // event so the relay can drop the pending permission card with
   // reason: "timeout".

@@ -124,12 +124,26 @@ try {
   assert.match(showLegacy.stdout, /smallFastModel: deepseek-mini/);
   assert.match(showLegacy.stdout, /legacy; routes\.claude\.small is source of truth/);
 
-  // And provider use on this legacy-flagged record does NOT seed small.
+  // Provider Use creates one coherent main + small profile. The legacy fast
+  // field is still ignored; both routes seed from the enabled model.
   const useLegacy = run(["provider", "use", "legacy-fast"]);
   assert.equal(useLegacy.code, 0, `use failed: ${useLegacy.stderr}`);
-  assert.match(useLegacy.stdout, /To set fast route: `originrouter route set claude\.small --provider legacy-fast`/);
-  // The small row should be "unset" (not seeded from smallFastModel).
-  assert.match(useLegacy.stdout, /fast  \(unset; the fast alias will fall back to main\)/);
+  assert.match(useLegacy.stdout, /Claude routes updated:/);
+  assert.match(useLegacy.stdout, /model originrouter-claude-model\s+-> legacy-fast \/ deepseek-chat/);
+  assert.match(useLegacy.stdout, /fast\s+originrouter-claude-fast-model -> legacy-fast \/ deepseek-chat/);
+
+  const clearClaude = run(["route", "clear", "claude"]);
+  assert.equal(clearClaude.code, 0, clearClaude.stderr);
+  assert.match(clearClaude.stdout, /Claude Code will use its environment or Anthropic login/);
+
+  const setClaude = run([
+    "route", "set", "claude",
+    "--provider", "legacy-fast",
+    "--main-model", "deepseek-chat",
+    "--small-model", "deepseek-chat",
+  ]);
+  assert.equal(setClaude.code, 0, setClaude.stderr);
+  assert.match(setClaude.stdout, /Claude routes set/);
 } finally {
   rmSync(home, { recursive: true, force: true });
 }

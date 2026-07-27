@@ -12,8 +12,9 @@ const claude = mapClaudeSdkMessage({
 });
 assert.equal(claude[0].type, "agent.usage");
 assert.equal(claude[0].sampledTokens, 175);
-assert.equal(claude[0].amountMinor, 12);
-assert.equal(claude[0].elapsedSeconds, 2);
+assert.equal(claude[0].amountMicros, null);
+assert.equal(claude[0].costSource, "unsupported");
+assert.equal(claude[0].tokenUsage.cacheReadInputTokens, 25);
 
 const codex = mapCodexAppServerEvent({
   type: "token_count",
@@ -22,4 +23,10 @@ const codex = mapCodexAppServerEvent({
 });
 assert.equal(codex[0].type, "agent.usage");
 assert.equal(codex[0].sampledTokens, 100);
+assert.deepEqual(codex[0].tokenUsage, {
+  inputTokens: 80,
+  outputTokens: 20,
+  reasoningTokens: 0,
+  cacheReadInputTokens: 0,
+});
 console.log("Agent usage mapping tests passed");

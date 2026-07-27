@@ -116,11 +116,11 @@ cases.push({
   run: async () => {
     clearCodingKeyFile(home);
     seedOAuthCredential(home);
-    const cfg = { providers: { official: officialClaude, "fast-orig": fastOrig } };
+    const cfg = { providers: { official: officialClaude } };
     const routed = setRoute(cfg, "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
     const routed2 = setRoute(routed, "claude", "small",
-      { provider: "fast-orig", model: "claude-haiku-4-5" });
+      { provider: "official", model: "claude-haiku-4-5" });
     const out = await buildAgentProviderEnv("claude", routed2, {
       proxyStatus: () => ({ state: "stopped" }),
     });
@@ -145,21 +145,17 @@ cases.push({
 });
 
 cases.push({
-  name: "claude originrouter direct: mixed provider (main=originrouter small=proxy) throws",
+  name: "claude route mutation rejects mixed Providers before launch",
   run: async () => {
     clearCodingKeyFile(home);
     seedOAuthCredential(home);
     const cfg = { providers: { official: officialClaude, "moonshot-proxy": moonshotProxy } };
     const routed = setRoute(cfg, "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
-    const routed2 = setRoute(routed, "claude", "small",
-      { provider: "moonshot-proxy", model: "moonshot-v1-8k" });
-    await assert.rejects(
-      () => buildAgentProviderEnv("claude", routed2, {
-        proxyStatus: () => ({ state: "stopped" }),
-      }),
-      (err) => err.code === "PROVIDER_UNSUPPORTED"
-        && /claude\.small.*originrouter/.test(err.message),
+    assert.throws(
+      () => setRoute(routed, "claude", "small",
+        { provider: "moonshot-proxy", model: "moonshot-v1-8k" }),
+      /must use the same provider/,
     );
   },
 });

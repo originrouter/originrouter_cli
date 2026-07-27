@@ -26,6 +26,8 @@ import {
 function makeFakeHookServer() {
   let registered = null;
   let registeredElicitation = null;
+  let registeredSessionStart = null;
+  let registeredHookEvent = null;
   const fake = {
     port: 0,
     stop: () => {},
@@ -42,9 +44,19 @@ function makeFakeHookServer() {
       if (!registeredElicitation) throw new Error("elicitation callback not registered");
       registeredElicitation(interactionId, event);
     },
+    invokeSessionStart(sessionId, event = {}) {
+      if (!registeredSessionStart) throw new Error("session callback not registered");
+      registeredSessionStart(sessionId, event);
+    },
+    invokeHookEvent(event) {
+      if (!registeredHookEvent) throw new Error("hook callback not registered");
+      registeredHookEvent(event);
+    },
     async factory(opts) {
       registered = opts.onPermissionRequest;
       registeredElicitation = opts.onElicitationRequest;
+      registeredSessionStart = opts.onSessionStart;
+      registeredHookEvent = opts.onHookEvent;
       return fake;
     },
   };
@@ -421,7 +433,156 @@ const CODEX_CALL_ID = "codex-approval-1781663500000-zyxwvu";
   assert.deepEqual(writes, ["Submit this once", "\r"]);
 }
 
-// ---- 9. buildModeStatusEvent emits the documented shape ----
+// ---- 9. Native Claude mode switching waits for a Hook ACK ----
+
+{
+  const hook = makeFakeHookServer();
+  const adapter = new ClaudeAdapter({
+    args: [],
+    cwd: "/tmp/proj",
+    hookServerFactory: hook.factory,
+    modeChangeTimeoutMs: 100,
+    modeOutputSettleMs: 10,
+  });
+  await adapter.beforeStart({ sessionId: "s-native-mode", send: () => {} });
+  hook.invokeSessionStart("native-session", {
+    transcript_path: "/tmp/native.jsonl",
+    cwd: "/tmp/proj",
+    permission_mode: "default",
+  });
+  const writes = [];
+  const modeFooters = [
+    "accept edits on (shift+tab to cycle) · for agents",
+    "accept edits on (shift+tab to cycle) · plan mode on (shift+tab to cycle) · for agents",
+  ];
+  const switching = handleRemoteEvent(
+    {
+      type: "agent.mode.set",
+      sessionId: "s-native-mode",
+      mode: "plan",
+      requestId: "mode-request-1",
+    },
+    {
+      sessionId: "s-native-mode",
+      adapter,
+      executor: {
+        write: (data) => {
+          writes.push(data);
+          const footer = modeFooters[writes.length - 1];
+          setTimeout(() => adapter.handleOutput(footer), 0);
+        },
+      },
+    },
+  );
+  assert.equal(await switching, true);
+  assert.deepEqual(writes, ["\x1b[Z", "\x1b[Z"]);
+  assert.equal(adapter.currentMode, "plan");
+  assert.equal(adapter.modeControl, "supported");
+  assert.deepEqual(
+    adapter.availableModes().map((item) => item.id),
+    ["default", "acceptEdits", "plan", "auto"],
+  );
+  const result = adapter
+    .scanStructuredEvents()
+    .filter((event) => event.type === "agent.mode.status")
+    .at(-1);
+  assert.equal(result.mode, "plan");
+  assert.equal(result.accepted, true);
+  assert.equal(result.requestId, "mode-request-1");
+  adapter.cleanup();
+}
+
+// Default mode has no badge in Claude's footer. A complete footer redraw
+// without another mode badge confirms that the cycle returned to default.
+{
+  const hook = makeFakeHookServer();
+  const adapter = new ClaudeAdapter({
+    args: ["--permission-mode", "auto"],
+    cwd: "/tmp/proj",
+    hookServerFactory: hook.factory,
+    modeChangeTimeoutMs: 100,
+    modeOutputSettleMs: 10,
+  });
+  await adapter.beforeStart({ sessionId: "s-native-mode-default", send: () => {} });
+  hook.invokeSessionStart("native-session-default", {
+    transcript_path: "/tmp/native-default.jsonl",
+    cwd: "/tmp/proj",
+    permission_mode: "auto",
+  });
+  const writes = [];
+  const switching = handleRemoteEvent(
+    {
+      type: "agent.mode.set",
+      sessionId: "s-native-mode-default",
+      mode: "default",
+      requestId: "mode-request-default",
+    },
+    {
+      sessionId: "s-native-mode-default",
+      adapter,
+      executor: {
+        write: (data) => {
+          writes.push(data);
+          setTimeout(
+            () => adapter.handleOutput(
+              "auto mode on (shift+tab to cycle) · for agents · for shortcuts",
+            ),
+            0,
+          );
+        },
+      },
+    },
+  );
+  assert.equal(await switching, true);
+  assert.deepEqual(writes, ["\x1b[Z"]);
+  assert.equal(adapter.currentMode, "default");
+  adapter.cleanup();
+}
+
+// Mode changes are rejected while Claude is processing a turn. No terminal
+// key is written and the current mode is preserved.
+{
+  const hook = makeFakeHookServer();
+  const adapter = new ClaudeAdapter({
+    args: [],
+    cwd: "/tmp/proj",
+    hookServerFactory: hook.factory,
+  });
+  await adapter.beforeStart({ sessionId: "s-native-mode-busy", send: () => {} });
+  hook.invokeSessionStart("native-session-busy", {
+    transcript_path: "/tmp/native-busy.jsonl",
+    cwd: "/tmp/proj",
+    permission_mode: "default",
+  });
+  hook.invokeHookEvent({ hook_event_name: "UserPromptSubmit" });
+  const writes = [];
+  const applied = await handleRemoteEvent(
+    {
+      type: "agent.mode.set",
+      sessionId: "s-native-mode-busy",
+      mode: "plan",
+      commandId: "local-mode-command",
+    },
+    {
+      sessionId: "s-native-mode-busy",
+      adapter,
+      executor: { write: (data) => writes.push(data) },
+    },
+  );
+  assert.equal(applied, false);
+  assert.deepEqual(writes, []);
+  const result = adapter
+    .scanStructuredEvents()
+    .filter((event) => event.type === "agent.mode.status")
+    .at(-1);
+  assert.equal(result.mode, "default");
+  assert.equal(result.accepted, false);
+  assert.equal(result.reason, "mode_change_busy");
+  assert.equal(result.requestId, "local-mode-command");
+  adapter.cleanup();
+}
+
+// ---- 10. buildModeStatusEvent keeps unsupported runtimes read-only ----
 
 {
   const ev = buildModeStatusEvent({
@@ -436,9 +597,8 @@ const CODEX_CALL_ID = "codex-approval-1781663500000-zyxwvu";
   assert.equal(ev.runtime, "claude-pty");
   assert.deepEqual(ev.availableModes, ["default", "acceptEdits"]);
   assert.equal(ev.mode, "default");
-  assert.equal(ev.modeControl, "unsupported",
-    "8.9 is display-only; switching is Stage 9.0+");
-  assert.match(ev.reason, /not wired in Stage 8\.9/);
+  assert.equal(ev.modeControl, "unsupported");
+  assert.match(ev.reason, /not available for this runtime/);
 
   // Codex branch returns null runtime by default if not provided.
   const codex = buildModeStatusEvent({

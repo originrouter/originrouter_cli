@@ -232,6 +232,7 @@ test("reportLocalControlRuntime posts display-safe daemon status", async () => {
           name: "originrouter-cloud",
           type: "originrouter",
           model: "gpt-5.4",
+          models: ["gpt-5.4", "gpt-5-mini"],
           apiKey: "must-not-leak",
           baseUrl: "https://private.example.test",
         },
@@ -277,6 +278,10 @@ test("reportLocalControlRuntime posts display-safe daemon status", async () => {
         type: "originrouter",
         litellmProvider: "",
         model: "gpt-5.4",
+        models: [
+          { id: "gpt-5.4", enabled: true, remoteEnabled: false },
+          { id: "gpt-5-mini", enabled: true, remoteEnabled: false },
+        ],
         target: "",
         deviceId: "",
       },
@@ -491,6 +496,25 @@ test("buildRuntimeEventEnvelope projects approvals without forwarding raw input"
   assert.equal(JSON.stringify(payload).includes("must-not-cross-the-network"), false);
 });
 
+test("unified permission interactions remain approval requests", () => {
+  const payload = buildRuntimeEventEnvelope({
+    sessionId: "session-1",
+    agentType: "codex",
+    title: "Review auth",
+    eventType: "agent.event",
+    event: {
+      type: "agent.interaction.requested",
+      interactionId: "permission-3",
+      kind: "permission",
+      tool: "Bash",
+      payload: { redacted: true },
+    },
+  });
+
+  assert.equal(payload.event_type, "approval_requested");
+  assert.equal(payload.status, "waiting_approval");
+});
+
 test("buildRuntimeEventEnvelope maps wrapper lifecycle events to server vocabulary", () => {
   const started = buildRuntimeEventEnvelope({
     sessionId: "session-1",
@@ -562,6 +586,35 @@ test("buildRuntimeEventEnvelope projects managed interactions and mode state", (
   assert.equal(mode.mode, "plan");
   assert.equal(mode.mode_control, "supported");
   assert.equal(mode.available_modes.length, 2);
+});
+
+test("interaction delivery failures do not close the long-lived session", () => {
+  const approvalFailure = buildRuntimeEventEnvelope({
+    sessionId: "session-managed",
+    agentType: "claude",
+    title: "Managed Claude",
+    eventType: "agent.event",
+    event: {
+      type: "agent.permission.resolve.error",
+      interactionId: "permission-1",
+    },
+  });
+  const inputFailure = buildRuntimeEventEnvelope({
+    sessionId: "session-managed",
+    agentType: "claude",
+    title: "Managed Claude",
+    eventType: "agent.event",
+    event: {
+      type: "agent.interaction.failed",
+      interactionId: "input-1",
+      reason: "delivery_timeout",
+    },
+  });
+
+  assert.equal(approvalFailure.event_type, "approval_failed");
+  assert.equal(approvalFailure.status, "running");
+  assert.equal(inputFailure.event_type, "interaction_failed");
+  assert.equal(inputFailure.status, "running");
 });
 
 test("buildRuntimeEventEnvelope normalizes SDK aliases and drops raw events", () => {

@@ -11,11 +11,12 @@ import { createServer } from "node:http";
 // The hook server holds a `pendingPermissions` map keyed by `callId`. When
 // a PermissionRequest arrives, we generate a callId, hand the structured
 // event to the adapter, and suspend the HTTP response until the remote
-// client sends a decision. A 55-second hard timeout (just inside Claude
-// Code's 60-second matcher default) resolves the pending request with an
-// explicit deny + message; Claude Code's local dialog then reappears.
+// client sends a decision. The generated hook config explicitly grants six
+// minutes, so this five-minute decision window leaves one minute for hook
+// transport and process cleanup.
 
-const PERMISSION_TIMEOUT_MS = 55_000;
+export const CLAUDE_INTERACTION_DECISION_TIMEOUT_MS = 300_000;
+export const CLAUDE_PERMISSION_TIMEOUT_MS = 315_000;
 
 export function decisionToElicitationHookJson(action, { content } = {}) {
   const normalized = action === "accept" || action === "decline" || action === "cancel"
@@ -215,7 +216,7 @@ export function startClaudeHookServer({
                 try { onPermissionTimeout(callId, event); } catch {}
               }
             }
-          }, PERMISSION_TIMEOUT_MS);
+          }, CLAUDE_PERMISSION_TIMEOUT_MS);
 
           entry.timer = timer;
           pendingPermissions.set(callId, entry);
@@ -269,7 +270,7 @@ export function startClaudeHookServer({
             if (typeof onElicitationTimeout === "function") {
               try { onElicitationTimeout(interactionId, event); } catch {}
             }
-          }, PERMISSION_TIMEOUT_MS);
+          }, CLAUDE_PERMISSION_TIMEOUT_MS);
           pendingElicitations.set(interactionId, entry);
           if (typeof onElicitationRequest === "function") {
             try {

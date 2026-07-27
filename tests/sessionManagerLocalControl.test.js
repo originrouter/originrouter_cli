@@ -15,6 +15,13 @@ const PROVIDERS = {
     apiKey: "sk-ds",
     model: "deepseek-chat",
   },
+  moonshot: {
+    name: "moonshot",
+    type: "litellm",
+    litellmProvider: "moonshot",
+    apiKey: "sk-ms",
+    model: "moonshot-v1-8k",
+  },
 };
 
 test("SessionManager applies local-control route updates from relay events", async () => {
@@ -59,6 +66,30 @@ test("SessionManager applies local-control route updates from relay events", asy
     assert.deepEqual(restarts, [{ mode: "route", port: 40123 }]);
 
     await manager.handleLocalControlEvent({
+      type: "local_control.routes.replace",
+      agent: "claude",
+      routes: {
+        main: { provider: "deepseek", model: "deepseek-chat" },
+        small: { provider: "deepseek", model: "deepseek-chat" },
+      },
+    });
+    config = readConfig();
+    assert.equal(config.routes.claude.main.provider, "deepseek");
+    assert.equal(config.routes.claude.small.provider, "deepseek");
+
+    await assert.rejects(
+      () => manager.handleLocalControlEvent({
+        type: "local_control.routes.replace",
+        agent: "claude",
+        routes: {
+          main: { provider: "deepseek", model: "deepseek-chat" },
+          small: { provider: "moonshot", model: "moonshot-v1-8k" },
+        },
+      }),
+      /must use the same provider/,
+    );
+
+    await manager.handleLocalControlEvent({
       type: "local_control.route.clear",
       agent: "claude",
       slot: "main",
@@ -66,8 +97,8 @@ test("SessionManager applies local-control route updates from relay events", asy
 
     config = readConfig();
     assert.equal(config.routes?.claude?.main, undefined);
-    assert.equal(restarts.length, 2);
-    assert.equal(snapshotReports, 2);
+    assert.equal(restarts.length, 3);
+    assert.equal(snapshotReports, 3);
   } finally {
     if (prevHome === undefined) delete process.env.ORIGINROUTER_HOME;
     else process.env.ORIGINROUTER_HOME = prevHome;

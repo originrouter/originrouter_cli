@@ -14,7 +14,7 @@
 //      a structured stderr diagnostic with error="hook_forwarder_retry_exhausted".
 //   6. HTTP 404 is fatal (no retry) and logs error="hook_forwarder_fatal".
 //   7. Per-attempt socket timeout fires ETIMEDOUT (does not hang).
-//   8. PermissionRequest/Elicitation use 58s timeout; SessionStart uses 5s.
+//   8. PermissionRequest/Elicitation use 330s timeout; SessionStart uses 5s.
 //   9. pickPath + parseEventName dispatch correctly (incl. hookEventName).
 //  10. isRetryable classifies the documented error set correctly.
 
@@ -23,12 +23,36 @@ import { createRequire } from "node:module";
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
+import {
+  CODEX_APPROVAL_TIMEOUT_MS,
+  REMOTE_INTERACTION_DECISION_TIMEOUT_MS,
+} from "../src/adapters/codex/appServerClient.js";
+import {
+  CLAUDE_INTERACTION_DECISION_TIMEOUT_MS,
+  CLAUDE_PERMISSION_TIMEOUT_MS,
+} from "../src/adapters/claude/hookServer.js";
+import { CLAUDE_INTERACTIVE_HOOK_TIMEOUT_SECONDS } from "../src/adapters/claude/hookSettings.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = dirname(here);
 const require = createRequire(resolve(repo, "package.json"));
-const { postHookBody, pickPath, parseEventName, isRetryable } =
+const { postHookBody, pickPath, parseEventName, isRetryable, DEFAULTS } =
   require("./scripts/claude-session-hook-forwarder-impl.cjs");
+
+assert.equal(
+  REMOTE_INTERACTION_DECISION_TIMEOUT_MS,
+  CLAUDE_INTERACTION_DECISION_TIMEOUT_MS,
+);
+assert.ok(CODEX_APPROVAL_TIMEOUT_MS > REMOTE_INTERACTION_DECISION_TIMEOUT_MS);
+assert.ok(CLAUDE_PERMISSION_TIMEOUT_MS > CLAUDE_INTERACTION_DECISION_TIMEOUT_MS);
+assert.ok(
+  DEFAULTS.permissionRequestTimeoutMs > CLAUDE_PERMISSION_TIMEOUT_MS,
+  "the hook forwarder must outlive the local permission decision window",
+);
+assert.ok(
+  CLAUDE_INTERACTIVE_HOOK_TIMEOUT_SECONDS * 1000 > DEFAULTS.permissionRequestTimeoutMs,
+  "Claude's hook deadline must outlive the forwarder socket timeout",
+);
 
 function startServer(handler) {
   return new Promise((resolveStart) => {
@@ -253,11 +277,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 {
   // Use an injected requestFn that records the per-attempt timeout
   // it received. The point is to assert that the impl picks 5s for
-  // SessionStart and 58s for PermissionRequest.
+  // SessionStart and 330s for PermissionRequest.
   const cases = [
     { event: "SessionStart", expected: 5000 },
-    { event: "PermissionRequest", expected: 58000 },
-    { event: "Elicitation", expected: 58000 },
+    { event: "PermissionRequest", expected: 330000 },
+    { event: "Elicitation", expected: 330000 },
   ];
   for (const { event, expected } of cases) {
     const setTimeoutSpy = { timeoutValue: undefined };

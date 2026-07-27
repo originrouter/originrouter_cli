@@ -83,7 +83,7 @@ function seedProviders(home) {
     litellmProvider: "anthropic",
     baseUrl: "https://api.minimax.example/v1",
     apiKey: "sk-minimax-1234567890",
-    model: "minimax-chat",
+    models: [{ id: "minimax-chat", enabled: true, remoteEnabled: true }],
     smallFastModel: "minimax-chat-fast",
   });
   // deepseek is a litellm provider (Stage 7: routed through the proxy).
@@ -93,7 +93,7 @@ function seedProviders(home) {
     litellmProvider: "deepseek",
     baseUrl: "https://api.deepseek.example/v1",
     apiKey: "sk-deepseek-1234567890",
-    model: "deepseek-chat",
+    models: [{ id: "deepseek-chat", enabled: true, remoteEnabled: true }],
   });
   process.env.ORIGINROUTER_HOME = home;
   return import("../src/persistence/state.js").then(({ writeConfig }) => {

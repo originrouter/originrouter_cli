@@ -15,6 +15,7 @@ import { readConfig, writeConfig } from "../src/persistence/state.js";
 import { ensureApiToken } from "../src/persistence/authToken.js";
 import { LocalAuditStore } from "../src/persistence/localAuditStore.js";
 import { AgentCatalog } from "../src/persistence/agentCatalog.js";
+import { ProxyRequestStore } from "../src/persistence/proxyRequestStore.js";
 
 const home = mkdtempSync(join(tmpdir(), "originrouter-localapi-test-"));
 process.env.ORIGINROUTER_HOME = home;
@@ -26,6 +27,7 @@ const AUTH = { Authorization: `Bearer ${TOKEN}` };
 
 let serverHandle;
 let agentCatalog;
+let proxyRequestStore;
 try {
   // ---------- Seed a config + spy sessionManager ----------
 
@@ -36,7 +38,7 @@ try {
     litellmProvider: "anthropic",
     baseUrl: "https://api.minimax.example/v1",
     apiKey: "sk-minimax-1234567890",
-    model: "MiniMax-M3",
+    models: [{ id: "MiniMax-M3", enabled: true, remoteEnabled: true }],
     smallFastModel: "MiniMax-M2.7",
   });
   config = addProvider(config, {
@@ -45,7 +47,7 @@ try {
     litellmProvider: "custom_openai",
     baseUrl: "https://api.deepseek.com/v1",
     apiKey: "sk-ds-1234567890",
-    model: "deepseek-chat",
+    models: [{ id: "deepseek-chat", enabled: true, remoteEnabled: true }],
   });
   writeConfig(config);
 
@@ -143,6 +145,14 @@ try {
     },
     stopRemoteShareProxy: async () => ({ ok: true, state: "stopped" }),
     restartRemoteShareProxy: async (args) => ({ ok: true, ...args, state: "running" }),
+    discoverProviderModels: async (provider) => ({
+      models: [
+        { id: `${provider.litellmProvider}-chat`, label: "Chat" },
+        { id: `${provider.litellmProvider}-reasoner`, label: "Reasoner" },
+      ],
+      source: "https://models.example/v1/models",
+      fetchedAt: "2026-07-25T00:00:00.000Z",
+    }),
     startedAt: new Date(Date.now() - 5000).toISOString(), // 5s uptime
     pid: 99999,
     version: "test-0.1.0",
@@ -152,6 +162,20 @@ try {
   };
   agentCatalog = new AgentCatalog({ stateDir: home });
   liveCtx.agentCatalog = agentCatalog;
+  proxyRequestStore = new ProxyRequestStore({
+    stateDir: home,
+    now: () => new Date("2026-07-26T12:00:00.000Z"),
+  });
+  for (let index = 0; index < 7; index += 1) {
+    proxyRequestStore.record({
+      requestId: `local-api-request-${index}`,
+      routeName: index % 2 === 0 ? "claude.main" : "codex.main",
+      model: index === 3 ? "searchable-model" : `model-${index}`,
+      status: index % 3 === 0 ? "failed" : "success",
+      createdAt: `2026-07-26T10:00:0${index}.000Z`,
+    });
+  }
+  liveCtx.proxyRequestStore = proxyRequestStore;
   serverHandle = await startLocalApi(liveCtx, { port: 0 });
   // The server's liveCtx reads `ctx.localApiPort` lazily; we patch the bound
   // port onto the SAME ctx object we passed in.
@@ -257,7 +281,10 @@ try {
       providerNames: ["minimax", "deepseek"],
       port: 40124,
     });
-    assert.deepEqual(body.catalog.map((item) => item.provider), ["minimax", "deepseek"]);
+    assert.deepEqual(body.catalog.map((item) => item.provider), [
+      "minimax/MiniMax-M3",
+      "deepseek/deepseek-chat",
+    ]);
     assert.equal(body.e2eePolicy, "required");
   }
 
@@ -337,9 +364,8 @@ try {
 
   // ---------- POST /providers/use ----------
   {
-    // Stage 7.8: provider use for claude writes ONLY routes.claude.main.
-    // routes.claude.small is independent state owned by the routes layer;
-    // smallFastModel is [legacy] and no longer seeds small on use.
+    // Provider Use writes one coherent Claude profile. The legacy
+    // smallFastModel value does not pick a different Provider/model.
     const { status, body } = await postJson("/providers/use", { name: "minimax", agent: "claude" });
     assert.equal(status, 200);
     assert.equal(body.ok, true);
@@ -347,22 +373,51 @@ try {
     assert.equal(body.setAgent, "claude");
     assert.equal(body.routes.claude.main.provider, "minimax");
     assert.equal(body.routes.claude.main.model,    "MiniMax-M3");
-    assert.equal(body.routes.claude.small, null, "small must NOT be seeded from smallFastModel");
+    assert.deepEqual(body.routes.claude.small, body.routes.claude.main);
     // The response carries proxy state (no proxy in this fixture).
     assert.equal(body.proxy.state, "not-installed");
   }
   {
-    // Stage 7.8: openai-compatible is a valid litellm provider; use
-    // succeeds. small is preserved across provider use calls (still null
-    // in this fixture — preservation of null).
+    // Switching Provider replaces both Claude aliases together.
     const { status, body } = await postJson("/providers/use", { name: "deepseek", agent: "claude" });
     assert.equal(status, 200);
     assert.equal(body.routes.claude.main.provider, "deepseek");
-    assert.equal(body.routes.claude.small, null, "small remains unset across provider use calls");
+    assert.equal(body.routes.claude.small.provider, "deepseek");
+  }
+
+  // ---------- PUT /routes/claude is atomic and enforces one Provider ----------
+  {
+    const valid = await putJson("/routes/claude", {
+      main: { provider: "deepseek", model: "deepseek-chat" },
+      small: { provider: "deepseek", model: "deepseek-chat" },
+    });
+    assert.equal(valid.status, 200);
+    assert.equal(valid.body.routes.claude.main.provider, "deepseek");
+    assert.equal(valid.body.routes.claude.small.provider, "deepseek");
+
+    const mixed = await putJson("/routes/claude", {
+      main: { provider: "deepseek", model: "deepseek-chat" },
+      small: { provider: "minimax", model: "MiniMax-M3" },
+    });
+    assert.equal(mixed.status, 400);
+    assert.match(mixed.body.error, /must use the same provider/);
+
+    const inherited = await putJson("/routes/claude", {
+      main: null,
+      small: null,
+    });
+    assert.equal(inherited.status, 200);
+    assert.equal(inherited.body.routes.claude.main, null);
+    assert.equal(inherited.body.routes.claude.small, null);
   }
   {
     // Stage 7.8+: Claude "current" markers in the browser must be derived
     // from routes.claude, not the legacy currentProvider.claude field.
+    const restored = await putJson("/routes/claude", {
+      main: { provider: "deepseek", model: "deepseek-chat" },
+      small: { provider: "deepseek", model: "deepseek-chat" },
+    });
+    assert.equal(restored.status, 200);
     writeConfig(setCurrentProvider(readConfig(), "claude", "minimax"));
     const { status, body } = await getJson("/providers");
     assert.equal(status, 200);
@@ -559,7 +614,8 @@ try {
     });
     assert.equal(status, 200);
     assert.equal(body.provider.baseUrl, "https://api.minimax.example/v2");
-    assert.equal(body.provider.model, "MiniMax-M3.1");
+    assert.equal(body.provider.model, null);
+    assert.equal(body.provider.models[0].id, "MiniMax-M3.1");
     const cfg = readConfig();
     assert.equal(cfg.providers.minimax.apiKey, "sk-minimax-1234567890", "absent apiKey must keep current");
     assert.equal(cfg.providers.minimax.baseUrl, "https://api.minimax.example/v2");
@@ -607,7 +663,8 @@ try {
     const cfg = readConfig();
     assert.equal(cfg.providers.minimax.type, "proxy");
     assert.equal(cfg.providers.minimax.engine, "litellm");
-    assert.equal(cfg.providers.minimax.model, "m-anthropic");
+    assert.equal(cfg.providers.minimax.model, undefined);
+    assert.equal(cfg.providers.minimax.models[0].id, "m-anthropic");
   }
   {
     // apiKey wrong type (number) -> 400 (with type=litellm).
@@ -650,7 +707,7 @@ try {
 
   // ---------- DELETE /providers/:name clears routes (Stage 7.8) ----------
   {
-    // Seed two providers and route both main and small at one of them.
+    // Seed two providers and route both Claude aliases at one Provider.
     let cfg = readConfig();
     cfg = addProvider(cfg, {
       name: "routed-main",
@@ -667,24 +724,22 @@ try {
       model: "deepseek-mini",
     });
     cfg = setRoute(cfg, "claude", "main",  { provider: "routed-main", model: "deepseek-chat" });
-    cfg = setRoute(cfg, "claude", "small", { provider: "routed-fast", model: "deepseek-mini" });
+    cfg = setRoute(cfg, "claude", "small", { provider: "routed-main", model: "deepseek-chat" });
     writeConfig(cfg);
 
-    // Remove routed-fast: small should be cleared; main untouched; response
-    // carries routes + proxy snapshot.
+    // Remove an unrelated Provider: the grouped Claude profile is untouched.
     const r1 = await deleteJson("/providers/routed-fast");
     assert.equal(r1.status, 200);
     assert.equal(r1.body.removed, "routed-fast");
     assert.equal(r1.body.routes.claude.main.provider,  "routed-main");
-    assert.equal(r1.body.routes.claude.small, null, "small was pointing at the removed provider");
+    assert.equal(r1.body.routes.claude.small.provider, "routed-main");
     assert.equal(r1.body.proxy && r1.body.proxy.state, "not-installed");
     const cfg1 = readConfig();
     assert.equal(cfg1.routes.claude.main.provider, "routed-main");
-    assert.equal(cfg1.routes.claude.small, undefined);
+    assert.equal(cfg1.routes.claude.small.provider, "routed-main");
     assert.equal(cfg1.providers["routed-fast"], undefined);
 
-    // Now remove routed-main: main should be cleared; routes object should
-    // be removed entirely (both slots gone).
+    // Removing the selected Provider clears the whole Claude profile.
     const r2 = await deleteJson("/providers/routed-main");
     assert.equal(r2.status, 200);
     assert.equal(r2.body.routes.claude.main,  null);
@@ -754,6 +809,37 @@ try {
     // Bad tail -> 400.
     const { status, body } = await getJson("/proxy/logs?tail=0");
     assert.equal(status, 400);
+  }
+
+  // ---------- GET /proxy/requests uses stable cursor pagination ----------
+  {
+    const first = await getJson("/proxy/requests?limit=3");
+    assert.equal(first.status, 200);
+    assert.equal(first.body.requests.length, 3);
+    assert.equal(first.body.has_more, true);
+    assert.ok(first.body.next_cursor);
+    assert.deepEqual(
+      first.body.requests.map((request) => request.request_id),
+      ["local-api-request-6", "local-api-request-5", "local-api-request-4"],
+    );
+    const second = await getJson(
+      `/proxy/requests?limit=3&cursor=${encodeURIComponent(first.body.next_cursor)}`,
+    );
+    assert.equal(second.status, 200);
+    assert.deepEqual(
+      second.body.requests.map((request) => request.request_id),
+      ["local-api-request-3", "local-api-request-2", "local-api-request-1"],
+    );
+    const failed = await getJson("/proxy/requests?status=failed&limit=20");
+    assert.ok(failed.body.requests.every((request) => request.status === "failed"));
+    const searched = await getJson("/proxy/requests?q=searchable-model");
+    assert.deepEqual(
+      searched.body.requests.map((request) => request.request_id),
+      ["local-api-request-3"],
+    );
+    assert.equal((await getJson("/proxy/requests?limit=0")).status, 400);
+    assert.equal((await getJson("/proxy/requests?status=running")).status, 400);
+    assert.equal((await getJson("/proxy/requests?cursor=invalid")).status, 400);
   }
 
   // ---------- GET /proxy/status ----------
@@ -957,6 +1043,18 @@ try {
     // Each entry has the basic shape.
     const first = body.providers[0];
     assert.ok(first.id && first.label && first.prefix && Array.isArray(first.fields));
+  }
+  {
+    const { status, body } = await postJson("/catalog/litellm-models", {
+      existingName: "deepseek",
+      litellmProvider: "deepseek",
+    });
+    assert.equal(status, 200);
+    assert.deepEqual(body.models.map((model) => model.id), [
+      "deepseek-chat",
+      "deepseek-reasoner",
+    ]);
+    assert.equal(body.source, "https://models.example/v1/models");
   }
 
   // ---------- POST /providers with type=litellm + litellmProvider=bedrock ----------
@@ -1265,5 +1363,6 @@ try {
 } finally {
   if (serverHandle) await serverHandle.close();
   if (agentCatalog) agentCatalog.close();
+  if (proxyRequestStore) proxyRequestStore.close();
   rmSync(home, { recursive: true, force: true });
 }

@@ -23,6 +23,7 @@ registry.appendEvent("claude-local-1", { type: "agent.text", text: "reply" });
 registry.appendEvent("claude-local-1", {
   type: "agent.interaction.requested",
   interactionId: "interaction-1",
+  kind: "questions",
 });
 registry.appendEvent("claude-local-1", {
   type: "agent.mode.status",
@@ -49,6 +50,8 @@ assert.equal(events.events.length, 4);
 assert.equal(events.events[0].text, "reply");
 assert.ok(events.cursor > 0);
 assert.equal(registry.list()[0].pending_approval_count, 1);
+assert.equal(registry.list()[0].status, "waiting_input");
+assert.equal(registry.list()[0].current_step, "Waiting for input");
 assert.equal(registry.list()[0].mode, "plan");
 assert.equal(registry.list()[0].autonomy_profile, "guarded");
 assert.equal(registry.list()[0].autonomy_control, "supported");
@@ -60,6 +63,21 @@ registry.appendEvent("claude-local-1", {
   status: "applied",
 });
 assert.equal(registry.list()[0].pending_approval_count, 0);
+assert.equal(registry.list()[0].status, "running");
+
+registry.appendEvent("claude-local-1", {
+  type: "agent.interaction.requested",
+  interactionId: "permission-1",
+  kind: "permission",
+});
+assert.equal(registry.list()[0].status, "waiting_approval");
+assert.equal(registry.list()[0].current_step, "Waiting for approval");
+registry.appendEvent("claude-local-1", {
+  type: "agent.interaction.result",
+  interactionId: "permission-1",
+  status: "applied",
+});
+assert.equal(registry.list()[0].status, "running");
 
 now += 91_000;
 assert.equal(registry.list()[0].status, "stopped");
