@@ -11,11 +11,28 @@
 
 import assert from "node:assert/strict";
 import http from "node:http";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import WebSocket, { WebSocketServer } from "ws";
 import { RemoteCodingRelayProxy } from "../src/runtime/remoteCodingRelayProxy.js";
+import {
+  decryptRemoteCodingRequest,
+  encryptRemoteCodingResponse,
+  generateRemoteCodingIdentity,
+} from "../src/crypto/remoteCodingE2ee.js";
 
 const RELAY_PORT = 38787 + Math.floor(Math.random() * 1000);
 const REMOTE_CODING_TIMEOUT_MS = "600"; // for the timeout sub-case
+const workerIdentities = new Map();
+const bridgeStateDir = mkdtempSync(join(tmpdir(), "originrouter-remote-smoke-e2ee-"));
+
+function workerIdentity(deviceId) {
+  if (!workerIdentities.has(deviceId)) {
+    workerIdentities.set(deviceId, generateRemoteCodingIdentity());
+  }
+  return workerIdentities.get(deviceId);
+}
 
 function startRelay() {
   return new Promise((resolve, reject) => {
@@ -80,8 +97,18 @@ function startRelay() {
 
     const server = http.createServer((req, res) => {
       if (req.method === "GET" && req.url?.endsWith("/e2ee")) {
+        const parts = req.url.split("/");
+        const deviceId = decodeURIComponent(parts[4] || "");
+        const identity = workerIdentity(deviceId);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ code: 0, data: { policy: "off" } }));
+        res.end(JSON.stringify({
+          code: 0,
+          data: {
+            policy: "required",
+            protocol: "e2ee-v1",
+            public_key: identity.publicKey,
+          },
+        }));
         return;
       }
       if (req.method === "GET" && req.url === "/health") {
@@ -184,6 +211,7 @@ function startFakeWorker(deviceId, script) {
 
       // Open WebSocket to the relay as the worker device.
       const activeFetches = new Map(); // requestId -> AbortController
+      const identity = workerIdentity(deviceId);
 
       const workerWs = new WebSocket(`ws://127.0.0.1:${RELAY_PORT}/relay/v1/devices/${encodeURIComponent(deviceId)}/ws`);
       workerWs.on("message", (raw) => {
@@ -192,7 +220,25 @@ function startFakeWorker(deviceId, script) {
               if (evt?.type === "remote.coding.request") {
                 const controller = new AbortController();
                 activeFetches.set(evt.requestId, controller);
-                handleWorkerRequest(evt, localProxyUrl, controller.signal)
+                let decrypted;
+                try {
+                  decrypted = decryptRemoteCodingRequest(evt, identity);
+                } catch {
+                  activeFetches.delete(evt.requestId);
+                  return;
+                }
+                const clearEnvelope = {
+                  ...decrypted.payload,
+                  requestId: evt.requestId,
+                  sourceDeviceId: evt.sourceDeviceId,
+                  targetDeviceId: evt.targetDeviceId,
+                };
+                handleWorkerRequest(
+                  clearEnvelope,
+                  localProxyUrl,
+                  controller.signal,
+                  decrypted.context,
+                )
                   .catch((err) => {
                     publishWorkerEvent({
                       type: "remote.coding.response.error",
@@ -200,7 +246,7 @@ function startFakeWorker(deviceId, script) {
                       deviceId,
                       code: "upstream_error",
                       message: `worker shim error: ${err?.message || String(err)}`,
-                    });
+                    }, decrypted.context);
                   })
                   .finally(() => activeFetches.delete(evt.requestId));
               }
@@ -212,13 +258,20 @@ function startFakeWorker(deviceId, script) {
               }
       });
 
-      function publishWorkerEvent(payload) {
+      function publishWorkerEvent(payload, context = null) {
         if (workerWs.readyState === WebSocket.OPEN) {
-          workerWs.send(JSON.stringify(payload));
+          if (context) {
+            const { type, deviceId: _deviceId, ...body } = payload;
+            workerWs.send(JSON.stringify(
+              encryptRemoteCodingResponse(context, type, body),
+            ));
+          } else {
+            workerWs.send(JSON.stringify(payload));
+          }
         }
       }
 
-      async function handleWorkerRequest(envelope, localProxyUrl, signal) {
+      async function handleWorkerRequest(envelope, localProxyUrl, signal, context) {
         // Strip caller credential/transport headers (mirrors the real worker).
         const STRIP = new Set(["authorization", "x-api-key", "host", "content-length", "connection", "transfer-encoding"]);
         const headers = {};
@@ -240,7 +293,7 @@ function startFakeWorker(deviceId, script) {
             code: "upstream_error",
             status: response.status,
             message: `worker local proxy returned ${response.status}`,
-          });
+          }, context);
           return;
         }
         publishWorkerEvent({
@@ -249,9 +302,9 @@ function startFakeWorker(deviceId, script) {
           deviceId,
           status: response.status,
           headers: Object.fromEntries(response.headers.entries()),
-        });
+        }, context);
         if (!response.body) {
-          publishWorkerEvent({ type: "remote.coding.response.end", requestId: envelope.requestId, deviceId });
+          publishWorkerEvent({ type: "remote.coding.response.end", requestId: envelope.requestId, deviceId }, context);
           return;
         }
         const reader = response.body.getReader();
@@ -264,9 +317,9 @@ function startFakeWorker(deviceId, script) {
               requestId: envelope.requestId,
               deviceId,
               chunk: Buffer.from(value).toString("base64"),
-            });
+            }, context);
           }
-          publishWorkerEvent({ type: "remote.coding.response.end", requestId: envelope.requestId, deviceId });
+          publishWorkerEvent({ type: "remote.coding.response.end", requestId: envelope.requestId, deviceId }, context);
         } catch (err) {
           if (signal?.aborted) {
             // Caller canceled; send an error so the relay clears state.
@@ -276,7 +329,7 @@ function startFakeWorker(deviceId, script) {
               deviceId,
               code: "upstream_error",
               message: "fetch aborted by caller cancel",
-            });
+            }, context);
             return;
           }
           throw err;
@@ -324,6 +377,7 @@ function postToProxy(port, headers, body) {
 async function makeBridge() {
   const bridge = new RemoteCodingRelayProxy({
     relayUrl: `http://127.0.0.1:${RELAY_PORT}`,
+    stateDir: bridgeStateDir,
     deviceId: "caller-smoke",
   });
   await bridge.start();

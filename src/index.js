@@ -69,6 +69,7 @@ import { formatCliError, reportCliError } from "./runtime/cliErrors.js";
 import { runDoctor, printDoctorResults } from "./commands/doctor.js";
 import { handleServiceCommand } from "./commands/service.js";
 import { handleAuthCommand, handleLogin, handleLogout } from "./commands/auth.js";
+import { handleSecurityCommand } from "./commands/security.js";
 import {
   chooseCloudModel,
   chooseRemoteDevice,
@@ -216,6 +217,7 @@ OriginRouter OAuth login:
                      [--no-browser]
   originrouter logout
   originrouter auth status
+  originrouter security status|rotate
 
   Login uses RFC 8628 Device Authorization Grant directly with Surety. It prints
   an 8-character user code + verification URL, opens the browser
@@ -1883,6 +1885,11 @@ export async function main(argv) {
 
   if (command === "auth") {
     await handleAuthCommand(args);
+    return;
+  }
+
+  if (command === "security") {
+    await handleSecurityCommand(args);
     return;
   }
 

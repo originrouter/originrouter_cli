@@ -75,10 +75,6 @@ import { browseAgentWorkspaces } from "../daemon/workspaceBrowser.js";
 // step with the bind-address check in `startLocalApi` above.
 export const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"]);
 
-function isLoopbackAddress(address) {
-  return LOOPBACK_ADDRESSES.has(String(address || "").toLowerCase());
-}
-
 function httpHost(address) {
   return String(address).includes(":") && !String(address).startsWith("[")
     ? `[${address}]`
@@ -150,6 +146,7 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
     collaborationRuntime: ctx.collaborationRuntime || null,
     agentCatalog: ctx.agentCatalog || null,
     managedAgentSupervisor: ctx.managedAgentSupervisor || null,
+    deviceE2eeLocalGateway: ctx.deviceE2eeLocalGateway || null,
     externalAgentRegistry:
       ctx.externalAgentRegistry ||
       new ExternalAgentRegistry({ catalog: ctx.agentCatalog || null }),
@@ -263,28 +260,23 @@ function safeEqual(a, b) {
 }
 
 // Returns { ok: true } on success, or { ok: false, status, error, reason }.
-// Public methods (GET, HEAD, OPTIONS) always pass. The `/proxy/logs` path is
-// an exception: it requires auth even on GET because the log file may contain
-// user PII / API keys.
-const AUTH_REQUIRED_GET_PATHS = new Set([
-  "/proxy/logs",
-  "/proxy/requests",
-]);
+// Only health/static discovery and the proof-based E2EE bootstrap are public.
 
 function requireAuth(req, ctx) {
   if (DEV_INSECURE) return { ok: true };
   const url = req.url || "/";
   const path = url.split("?")[0];
-  const isAuthRequiredGetPath = AUTH_REQUIRED_GET_PATHS.has(path)
-    || path === "/routes"
-    || path.startsWith("/routes/")
-    || path === "/agent/catalog"
-    || path.startsWith("/agent/catalog/")
-    || path.startsWith("/collaboration/");
-  const needsAuth = !(req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS")
-    || isAuthRequiredGetPath;
+  if (["/local/e2ee/session", "/local/e2ee/messages"].includes(path)) {
+    return { ok: true };
+  }
+  const publicRead = (req.method === "GET" || req.method === "HEAD")
+    && [
+      "/local/auth/challenge",
+      "/local/e2ee/challenge",
+      "/catalog/litellm-providers",
+    ].includes(path);
+  const needsAuth = req.method !== "OPTIONS" && !publicRead;
   if (!needsAuth) return { ok: true };
-  if (isLoopbackAddress(req.socket?.remoteAddress)) return { ok: true };
   const header = req.headers.authorization;
   if (!header) {
     return { ok: false, status: 401, error: "unauthorized", reason: "missing" };
@@ -346,6 +338,57 @@ async function dispatch(ctx, req, res) {
         authRequired: true,
         tokenFile: ctx.apiTokenPath,
       });
+    }
+    if (req.method === "GET" && pathname === "/local/e2ee/challenge") {
+      if (!ctx.deviceE2eeLocalGateway) {
+        return sendError(res, 503, "local E2EE gateway unavailable");
+      }
+      try {
+        return sendOk(res, ctx.deviceE2eeLocalGateway.createChallenge({
+          appDeviceId: url.searchParams.get("app_device_id"),
+          appKeyId: url.searchParams.get("app_key_id"),
+        }));
+      } catch (error) {
+        return sendError(res, 400, error.message, {
+          reason: error.code || "local_e2ee_challenge_failed",
+        });
+      }
+    }
+    if (req.method === "POST" && pathname === "/local/e2ee/session") {
+      if (!ctx.deviceE2eeLocalGateway) {
+        return sendError(res, 503, "local E2EE gateway unavailable");
+      }
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      try {
+        return sendOk(res, ctx.deviceE2eeLocalGateway.authorize({
+          challengeId: body.challenge_id,
+          appIdentity: body.app_identity,
+          hmacProof: body.proof,
+        }));
+      } catch (error) {
+        return sendError(res, 403, error.message, {
+          reason: error.code || "local_e2ee_authorization_failed",
+        });
+      }
+    }
+    if (req.method === "POST" && pathname === "/local/e2ee/messages") {
+      if (!ctx.deviceE2eeLocalGateway) {
+        return sendError(res, 503, "local E2EE gateway unavailable");
+      }
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      try {
+        const envelope = await ctx.deviceE2eeLocalGateway.handleEnvelope(
+          body.envelope,
+          { localPort: req.socket.localPort },
+        );
+        return sendOk(res, { envelope });
+      } catch (error) {
+        return sendError(res, 400, error.message, {
+          reason: error.code || "local_e2ee_message_failed",
+        });
+      }
     }
     if (req.method === "GET" && pathname === "/proxy/logs") {
       return handleProxyLogs(ctx, res, url);
@@ -914,7 +957,7 @@ async function handleRemoteShareStatusPayload(ctx) {
     enabled: configured.enabled === true,
     providers: providerNames,
     catalog,
-    e2eePolicy: configured.e2eePolicy === "required" ? "required" : "off",
+    e2eePolicy: "required",
     e2eeSupported: true,
   };
 }
@@ -1163,11 +1206,7 @@ function writeRemoteShareConfig({ enabled, providers, port, e2eePolicy }) {
       enabled: Boolean(enabled),
       providers: providers || config.remoteShare?.providers || [],
       port: port || config.remoteShare?.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
-      e2eePolicy: e2eePolicy === "required"
-        ? "required"
-        : config.remoteShare?.e2eePolicy === "required" && e2eePolicy == null
-          ? "required"
-          : "off",
+      e2eePolicy: "required",
     },
   };
   writeConfig(next);
@@ -1232,7 +1271,7 @@ async function handleRemoteShareControl(ctx, res, action, body) {
     enabled: true,
     providers: providerNames,
     port: parsedPort,
-    e2eePolicy: body.e2eePolicy === "required" ? "required" : "off",
+    e2eePolicy: "required",
   });
   return sendOk(res, {
     ...result,

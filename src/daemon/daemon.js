@@ -10,6 +10,7 @@ import {
   VERSION,
 } from "../constants.js";
 import { startLocalApi } from "../local/localApi.js";
+import { DeviceE2eeLocalGateway } from "../local/deviceE2eeLocalGateway.js";
 import { ProxyManager } from "../proxy/manager.js";
 import { apiTokenPath, ensureApiToken } from "../persistence/authToken.js";
 import {
@@ -41,6 +42,19 @@ import { PlanImplementVerifyCoordinator } from "../collaboration/planImplementVe
 import { CollaborationRuntime } from "../collaboration/collaborationRuntime.js";
 import { ExternalAgentRelayRouter } from "./externalAgentRelayRouter.js";
 import { ensureRemoteCodingIdentity } from "../crypto/remoteCodingE2ee.js";
+import {
+  ensureDeviceE2eeIdentity,
+  readDeviceE2eeIdentity,
+  resetDeviceE2eeIdentityForEpoch,
+} from "../crypto/deviceE2eeIdentity.js";
+import {
+  getCliDeviceE2eeDirectory,
+  getCliDeviceE2eeStatus,
+  registerCliDeviceE2eeIdentity,
+} from "../security/deviceE2eeClient.js";
+import { storeDeviceE2eeDirectoryCache } from "../security/deviceE2eeDirectoryCache.js";
+import { DeviceE2eeRelayTransport } from "../security/deviceE2eeRelayTransport.js";
+import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 
 function httpHost(address) {
   return String(address).includes(":") && !String(address).startsWith("[")
@@ -175,6 +189,42 @@ export async function startDaemon(args) {
     deviceId: effectiveDeviceId,
     authToken: null,
   });
+  let deviceE2eeEpoch = readDeviceE2eeIdentity(stateDir)?.public_identity?.epoch || 1;
+  try {
+    const credential = await ensureFreshAccessToken({ stateDir });
+    const accessToken = credential?.accessTokens?.control?.token;
+    if (accessToken) {
+      const status = await getCliDeviceE2eeStatus({
+        controlBaseUrl: relayUrl,
+        accessToken,
+      });
+      deviceE2eeEpoch = Number(status?.policy?.epoch || deviceE2eeEpoch);
+    }
+  } catch {}
+  const storedDeviceE2eeIdentity = readDeviceE2eeIdentity(stateDir);
+  const deviceE2eeIdentity = storedDeviceE2eeIdentity
+    && storedDeviceE2eeIdentity.public_identity.device_id === effectiveDeviceId
+    && storedDeviceE2eeIdentity.public_identity.epoch !== deviceE2eeEpoch
+    ? resetDeviceE2eeIdentityForEpoch(stateDir, {
+        deviceId: effectiveDeviceId,
+        epoch: deviceE2eeEpoch,
+      })
+    : ensureDeviceE2eeIdentity(stateDir, {
+        deviceId: effectiveDeviceId,
+        epoch: deviceE2eeEpoch,
+      });
+  const deviceE2eeRelay = new DeviceE2eeRelayTransport({
+    relayClient,
+    localIdentity: deviceE2eeIdentity,
+    stateDir,
+    controlBaseUrl: relayUrl,
+    credentialProvider: () => ensureFreshAccessToken({ stateDir }),
+  });
+  const deviceE2eeLocalGateway = new DeviceE2eeLocalGateway({
+    stateDir,
+    localIdentity: deviceE2eeIdentity,
+    apiTokenPath: apiTokenFile,
+  });
   const auditStore = new LocalAuditStore({ stateDir });
   const collaborationStore = new CollaborationStore({ stateDir });
   const collaborationCoordinator = new PlanImplementVerifyCoordinator({
@@ -222,7 +272,7 @@ export async function startDaemon(args) {
   });
   const externalAgentRelayRouter = new ExternalAgentRelayRouter({
     registry: externalAgentRegistry,
-    relayClient,
+    relayClient: deviceE2eeRelay,
   });
   const managedAgentSupervisor = new ManagedAgentSupervisor({
     catalog: agentCatalog,
@@ -251,7 +301,7 @@ export async function startDaemon(args) {
   });
   const remoteCodingIdentity = ensureRemoteCodingIdentity(stateDir);
   const sessionManager = new SessionManager({
-    relayClient,
+    relayClient: deviceE2eeRelay,
     deviceId: effectiveDeviceId,
     defaultExecutor: executor,
     proxyManager,
@@ -284,6 +334,7 @@ export async function startDaemon(args) {
     agentCatalog,
     managedAgentSupervisor,
     externalAgentRegistry,
+    deviceE2eeLocalGateway,
     configProvider: () => readConfig(),
     startedAt,
     pid: process.pid,
@@ -371,12 +422,14 @@ export async function startDaemon(args) {
   let shuttingDown = false;
   let heartbeatTimer = null;
   let agentActivitySyncTimer = null;
+  let deviceE2eeRefreshTimer = null;
   const shutdown = async (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[daemon] received ${signal}, shutting down…`);
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (agentActivitySyncTimer) clearInterval(agentActivitySyncTimer);
+    if (deviceE2eeRefreshTimer) clearInterval(deviceE2eeRefreshTimer);
     try {
       await sessionManager.shutdown(signal);
     } catch (e) {
@@ -463,8 +516,7 @@ export async function startDaemon(args) {
         ),
         remoteShareBaseUrl: buildProxyBaseUrl(remoteShareStatus),
         remoteShareCatalog,
-        remoteShareE2eePolicy:
-          config.remoteShare?.e2eePolicy === "required" ? "required" : "off",
+        remoteShareE2eePolicy: "required",
         remoteShareE2eePublicKey: remoteCodingIdentity.publicKey,
         agentDetailProfile: agentDetailDefaultFromConfig(config),
         providers: localControlProviderSnapshot(config),
@@ -472,6 +524,31 @@ export async function startDaemon(args) {
       },
       { stateDir },
     ).catch(() => ({ ok: false, error: "request_failed" }));
+  };
+  let registeredDeviceE2eeKeyId = null;
+  const syncDeviceE2eeIdentity = async () => {
+    const keyId = deviceE2eeIdentity.public_identity.key_id;
+    const credential = await ensureFreshAccessToken({ stateDir });
+    const accessToken = credential?.accessTokens?.control?.token;
+    if (!accessToken) return;
+    if (registeredDeviceE2eeKeyId !== keyId) {
+      const registered = await registerCliDeviceE2eeIdentity({
+        controlBaseUrl: relayUrl,
+        accessToken,
+        identity: deviceE2eeIdentity.public_identity,
+      });
+      registeredDeviceE2eeKeyId = registered.key_id;
+      if (registered.trust_status === "pending") {
+        console.warn("[daemon] device E2EE identity is waiting for approval in the App");
+      }
+    }
+    const directory = await getCliDeviceE2eeDirectory({
+      controlBaseUrl: relayUrl,
+      accessToken,
+    });
+    storeDeviceE2eeDirectoryCache(stateDir, directory, {
+      namespace: credential.sessionId,
+    });
   };
   sessionManager.onLocalControlChanged = async () => {
     if (!relayConnected) return;
@@ -487,6 +564,13 @@ export async function startDaemon(args) {
     void syncAgentActivityHistory();
   }, 5 * 60_000);
   agentActivitySyncTimer.unref?.();
+  deviceE2eeRefreshTimer = setInterval(() => {
+    if (!relayConnected) return;
+    deviceE2eeRelay.refreshDirectory().catch((error) => {
+      console.error(`[device-e2ee] directory refresh: ${error.code || error.message}`);
+    });
+  }, 15 * 60_000);
+  deviceE2eeRefreshTimer.unref?.();
 
   writeDaemonState({
     pid: process.pid,
@@ -605,18 +689,40 @@ export async function startDaemon(args) {
 
       await relayClient.connectEvents(
         (payload) => {
-          void collaborationRuntime
-            .handleRelayEvent(payload)
-            .then((handled) => {
-              if (handled) return true;
-              return externalAgentRelayRouter.handle(payload);
-            })
-            .then((handled) => {
-              if (!handled) sessionManager.handleEvent(payload);
-            })
-            .catch((error) => {
-              console.error(`[collaboration-relay] ${error.message}`);
-            });
+          void (async () => {
+            let routed = payload;
+            if (payload?.protocol === "e2ee-v2") {
+              routed = await deviceE2eeRelay.handleInbound(payload);
+              if (!routed) return;
+            } else if (deviceE2eeRelay.rejectsPlaintext(payload)) {
+              console.error(`[device-e2ee] rejected plaintext ${payload?.type || "message"}`);
+              return;
+            }
+            if ([
+              "device.key.changed",
+              "device.revoked",
+              "device.approved",
+              "device.policy.changed",
+              "account.epoch.changed",
+            ].includes(routed.type)) {
+              await deviceE2eeRelay.refreshDirectory({ clearSessions: true });
+              deviceE2eeLocalGateway.clearTrustSessions();
+              return;
+            }
+            if (routed.type === "agent.control.subscribe") {
+              routed = {
+                ...routed,
+                type: "agent.interactions.snapshot.request",
+              };
+            }
+            const collaborationHandled = await collaborationRuntime
+              .handleRelayEvent(routed);
+            if (collaborationHandled) return;
+            const externalHandled = await externalAgentRelayRouter.handle(routed);
+            if (!externalHandled) sessionManager.handleEvent(routed);
+          })().catch((error) => {
+            console.error(`[device-relay] ${error.code || error.message}`);
+          });
         },
         {
           onOpen: () => {
@@ -631,6 +737,9 @@ export async function startDaemon(args) {
               status: "connected",
             });
             reportLocalControlHeartbeat().catch(() => {});
+            syncDeviceE2eeIdentity().catch((error) => {
+              console.error(`[daemon] device E2EE registration: ${error.code || error.message}`);
+            });
             void syncAgentActivityHistory();
             void collaborationRuntime
               .refreshAccountBudgetStatus()
@@ -640,6 +749,7 @@ export async function startDaemon(args) {
           },
           onClose: () => {
             relayConnected = false;
+            deviceE2eeRelay.clearSessions();
           },
           onAlive: () => {
             if (!relayConnected) return;

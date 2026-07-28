@@ -98,12 +98,22 @@ export async function browseAgentWorkspaces({
   }));
   const currentWorkspace = catalog?.getWorkspace(location.currentPath, { deviceId });
   const parent = dirname(location.currentPath);
+  const pageEntries = entries.slice(0, normalizedLimit);
+  // Bridge control messages are capped at 128 KiB. Very deep paths can make
+  // an otherwise small directory page exceed that limit, so trim whole rows
+  // rather than truncating paths into unusable values.
+  while (
+    pageEntries.length > 1
+    && Buffer.byteLength(JSON.stringify(pageEntries), "utf8") > 96 * 1024
+  ) {
+    pageEntries.pop();
+  }
   return {
     current_path: location.currentPath,
     parent_path: parent === location.currentPath ? "" : parent,
     query: location.prefix,
     current_workspace: publicWorkspace(currentWorkspace),
-    entries: entries.slice(0, normalizedLimit),
-    truncated: entries.length > normalizedLimit,
+    entries: pageEntries,
+    truncated: entries.length > pageEntries.length,
   };
 }

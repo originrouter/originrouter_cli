@@ -21,6 +21,18 @@ function oauthResponse(status, payload) {
   };
 }
 
+const enrollmentIdentity = {
+  protocol: "originrouter-device-e2ee-v2",
+  device_id: "device-cli-stable",
+  source: "originrouter_cli",
+  key_id: "sha256:test-key",
+};
+
+const signEnrollmentChallenge = (challenge) => {
+  assert.equal(challenge, "or_ch_test");
+  return "binding-signature";
+};
+
 test("login URL contains only the one-time user code", () => {
   assert.equal(
     loginUrlFor("https://app.originrouter.com/"),
@@ -44,7 +56,15 @@ test("Device Flow rotates RT sequentially and builds four audience tokens", asyn
         user_code: "ABCD-EFGH",
         expires_in: 600,
         interval: 1,
+        enrollment_challenge: "or_ch_test",
       });
+    }
+    if (String(url).endsWith("/api/oauth/device/bind")) {
+      assert.equal(body.get("device_code"), "or_dc_test");
+      assert.equal(body.get("enrollment_challenge"), "or_ch_test");
+      assert.equal(body.get("e2ee_binding_signature"), "binding-signature");
+      assert.deepEqual(JSON.parse(body.get("e2ee_identity")), enrollmentIdentity);
+      return oauthResponse(200, { bound: true });
     }
     if (body.get("grant_type") === "urn:ietf:params:oauth:grant-type:device_code") {
       devicePolls += 1;
@@ -82,6 +102,8 @@ test("Device Flow rotates RT sequentially and builds four audience tokens", asyn
     h5BaseUrl: "https://app.originrouter.com",
     deviceId: "device-cli-stable",
     deviceName: "Work Mac",
+    e2eeIdentity: enrollmentIdentity,
+    signEnrollmentChallenge,
     noBrowser: true,
     sleepFn: async () => {},
     printFn: (line) => printed.push(line),
@@ -119,9 +141,14 @@ test("Device Flow maps denial to a stable client error", async () => {
             user_code: "ABCD",
             expires_in: 600,
             interval: 1,
+            enrollment_challenge: "or_ch_test",
           })
-          : oauthResponse(400, { error: "access_denied" });
+          : call === 2
+            ? oauthResponse(200, { bound: true })
+            : oauthResponse(400, { error: "access_denied" });
       },
+      e2eeIdentity: enrollmentIdentity,
+      signEnrollmentChallenge,
     }),
     (error) => error.code === "device_flow_denied" && error.message === "device_flow_denied",
   );

@@ -186,27 +186,25 @@ export class RemoteCodingRelayProxy {
             { code: "e2ee_directory_unavailable" },
           );
         }
-        if (e2ee.policy === "required") {
-          if (!e2ee.public_key || e2ee.protocol !== "e2ee-v1") {
-            throw Object.assign(
-              new Error("target requires end-to-end encryption but has no compatible public key"),
-              { code: "e2ee_target_incompatible" },
-            );
-          }
-          const encrypted = encryptRemoteCodingRequest({
-            sourceDeviceId: this.deviceId,
-            targetDeviceId,
-            requestId,
-            targetPublicKey: verifyAndPinRemotePublicKey(
-              this.stateDir,
-              targetDeviceId,
-              e2ee.public_key,
-            ),
-            payload: plaintextPayload,
-          });
-          envelope = encrypted.envelope;
-          this._client.setCryptoContext(requestId, encrypted.context);
+        if (!e2ee.public_key || e2ee.protocol !== "e2ee-v1") {
+          throw Object.assign(
+            new Error("target has no compatible end-to-end encryption key"),
+            { code: "e2ee_target_incompatible" },
+          );
         }
+        const encrypted = encryptRemoteCodingRequest({
+          sourceDeviceId: this.deviceId,
+          targetDeviceId,
+          requestId,
+          targetPublicKey: verifyAndPinRemotePublicKey(
+            this.stateDir,
+            targetDeviceId,
+            e2ee.public_key,
+          ),
+          payload: plaintextPayload,
+        });
+        envelope = encrypted.envelope;
+        this._client.setCryptoContext(requestId, encrypted.context);
 
         // Publish first; 400/413/202 from the relay. We also have to
         // register the waiter BEFORE publishing so a fast worker

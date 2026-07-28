@@ -1,0 +1,60 @@
+{
+  "producer": "dart",
+  "app": {
+    "public_identity": {
+      "protocol": "originrouter-device-e2ee-v2",
+      "device_id": "vector-dart-app",
+      "source": "originrouter_app",
+      "epoch": 1,
+      "key_version": 1,
+      "signing_algorithm": "Ed25519",
+      "signing_public_key": "GY7HauGeS4eW3SmGUA6GGO_V3HCxpoY9Q_eno7Jj4lE",
+      "agreement_algorithm": "X25519",
+      "agreement_public_key": "Gt2dKcAIeoSGyJ_oPebgeyZqjPeMw-NBfP7pfPUyMUM",
+      "previous_key_id": null,
+      "created_at": "2026-07-27T15:00:00.000Z",
+      "key_id": "sha256:lNLg8V5W_a9h4bJr0Fl90WD43rzvoV3UZZsDAcCicOw",
+      "self_signature": "8wMZIhrkbrULT36-8iixoDuz3lPJNdZlskSCTYkfQHrc4cvK33OPTWHtFovC5JZm5GFAHak3CCM4pXqpPE34Cg"
+    },
+    "signing_private_key": "IGrGwUB8z4YlGh_s7ioFKpGa0cHOGFryljkML7MFQ40",
+    "agreement_private_key": "kHA2nAWCeHRHa6cc1VxgwXQgjwhb6moaXCJ6uLVW604"
+  },
+  "cli": {
+    "public_identity": {
+      "protocol": "originrouter-device-e2ee-v2",
+      "device_id": "vector-dart-cli",
+      "source": "originrouter_cli",
+      "epoch": 1,
+      "key_version": 1,
+      "signing_algorithm": "Ed25519",
+      "signing_public_key": "F5onHK9JJU6AlvQ3WIf7s6lhccWNg1ipyCAK2CxW2JI",
+      "agreement_algorithm": "X25519",
+      "agreement_public_key": "ofCqM8PwaEp8KopUGoie1Unrk6b2J6IuwQhA7AmyZUY",
+      "previous_key_id": null,
+      "created_at": "2026-07-27T15:00:01.000Z",
+      "key_id": "sha256:R69JFGHNL97TEyAay5-yKzoyvVE0VVbagWh0NYqSSYw",
+      "self_signature": "qbg6uItGhS52doaYu__4P8xIkLkOP-M286lPEQabo1jawj_diV-KtMwNYUrE_6noyEJY0ya5JT5vPqApK2JpBw"
+    },
+    "signing_private_key": "IIV601OoHV-Ct4HSBXhHMRmks4aPxrMDL_GMoRYUElE",
+    "agreement_private_key": "YPpC5V5UdAwQfdDoRM1-UHBUjdfmNtDTvKo95o0Eo1E"
+  },
+  "envelope": {
+    "type": "agent.interaction.resolve",
+    "protocol": "e2ee-v2",
+    "source_device_id": "vector-dart-app",
+    "target_device_id": "vector-dart-cli",
+    "sender_key_id": "sha256:lNLg8V5W_a9h4bJr0Fl90WD43rzvoV3UZZsDAcCicOw",
+    "recipient_key_id": "sha256:R69JFGHNL97TEyAay5-yKzoyvVE0VVbagWh0NYqSSYw",
+    "epoch": 1,
+    "session_id": "e2s_dart_to_node_v1",
+    "direction": "request",
+    "sequence": 0,
+    "routing": {
+      "session_id": "agent-session-vector"
+    },
+    "ephemeral_public_key": "gozaa65W8F5LzaASSC6z36it6ikwD2q02UHowTRS5yo",
+    "nonce": "PMSlXcKX2FHQ-ZHK",
+    "ciphertext": "SdDy5vIqnrAR0-hs9NWsNB1PC9venNPy3Owx6XXsMMW5FVWldArh1k74J7tICezmnW_8QXZHeh-Vno8vgr_R9O6GeHmNc9ijqHCWO1cwMy64Iz-b1K2Qrkta3f7XBmwkokGJR8chzavSuA",
+    "signature": "kShi5Rsj0KY-LzMLPiYBRPW7b-LeSHwpt44jmA4eQ7zYV89DrW5iikQtYy9chSNev3IpZJehdwauIP3FabdTCA"
+  }
+}

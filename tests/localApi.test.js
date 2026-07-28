@@ -184,7 +184,8 @@ try {
   const base = `http://127.0.0.1:${serverHandle.port}`;
 
   // Stage 6+: pass `noAuth: true` on a request to skip the Authorization
-  // header. Loopback requests are allowed; LAN requests still require bearer.
+  // header. Loopback and LAN requests now share the same deny-by-default gate;
+  // E2EE bootstrap endpoints perform their own challenge authentication.
   async function getJson(path, { noAuth = false } = {}) {
     const headers = noAuth ? {} : { ...AUTH };
     const r = await fetch(`${base}${path}`, { headers });
@@ -438,8 +439,8 @@ try {
   }
   {
     const { status, body } = await getJson("/routes", { noAuth: true });
-    assert.equal(status, 200);
-    assert.equal(body.ok, true);
+    assert.equal(status, 401);
+    assert.equal(body.ok, false);
   }
   {
     const { status, body } = await getJson("/routes");
@@ -787,18 +788,17 @@ try {
     assert.ok(body.tokenFile.endsWith("local-api.token"), `tokenFile = ${body.tokenFile}`);
   }
 
-  // ---------- Loopback write without token succeeds ----------
+  // ---------- Loopback write without token is rejected ----------
   {
     const { status, body } = await postJson("/providers/use", { name: "minimax", agent: "claude" }, { noAuth: true });
-    assert.equal(status, 200);
-    assert.equal(body.ok, true);
-    assert.equal(body.setProvider, "minimax");
+    assert.equal(status, 401);
+    assert.equal(body.ok, false);
   }
 
-  // ---------- /proxy/logs is available to loopback without token ----------
+  // ---------- /proxy/logs also requires authentication on loopback ----------
   {
     const r = await fetch(`${base}/proxy/logs?tail=10`);
-    assert.equal(r.status, 404);
+    assert.equal(r.status, 401);
   }
   {
     // Without a logPath recorded, authenticated request also returns 404.

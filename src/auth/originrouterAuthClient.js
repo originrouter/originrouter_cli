@@ -91,6 +91,27 @@ export async function pollDeviceToken({
   );
 }
 
+export async function bindDeviceE2eeIdentity({
+  suretyBaseUrl,
+  deviceCode,
+  enrollmentChallenge,
+  identity,
+  bindingSignature,
+  fetchFn = globalThis.fetch,
+}) {
+  return requestForm(
+    `${base(suretyBaseUrl)}/api/oauth/device/bind`,
+    [
+      ["client_id", "originrouter_cli"],
+      ["device_code", deviceCode],
+      ["enrollment_challenge", enrollmentChallenge],
+      ["e2ee_identity", JSON.stringify(identity)],
+      ["e2ee_binding_signature", bindingSignature],
+    ],
+    { fetchFn },
+  );
+}
+
 export async function refreshOAuthToken({
   tokenEndpoint,
   refreshToken,

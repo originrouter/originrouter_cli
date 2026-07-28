@@ -4,6 +4,7 @@ import { writeCodingAuth } from "../persistence/codingAuth.js";
 import { KEY_KIND, KEY_SOURCE } from "../runtime/authContract.js";
 import {
   AuthClientError,
+  bindDeviceE2eeIdentity,
   pollDeviceToken,
   refreshOAuthToken,
   requestDeviceCode,
@@ -113,6 +114,8 @@ export async function loginWithDeviceFlow({
   h5BaseUrl,
   deviceId,
   deviceName,
+  e2eeIdentity,
+  signEnrollmentChallenge,
   timeoutMs = 600_000,
   initialIntervalMs = 5_000,
   noBrowser = false,
@@ -124,6 +127,9 @@ export async function loginWithDeviceFlow({
   if (!suretyBaseUrl) throw new Error("loginWithDeviceFlow: suretyBaseUrl is required");
   if (!h5BaseUrl) throw new Error("loginWithDeviceFlow: h5BaseUrl is required");
   if (!deviceId) throw new Error("loginWithDeviceFlow: deviceId is required");
+  if (!e2eeIdentity || typeof signEnrollmentChallenge !== "function") {
+    throw new Error("loginWithDeviceFlow: E2EE identity binding is required");
+  }
 
   const issued = await requestDeviceCode({
     suretyBaseUrl,
@@ -131,14 +137,26 @@ export async function loginWithDeviceFlow({
     deviceName: deviceName || deviceId,
     fetchFn,
   });
-  if (!issued?.device_code?.startsWith("or_dc_") || !issued.user_code) {
+  if (!issued?.device_code?.startsWith("or_dc_") || !issued.user_code
+      || !issued.enrollment_challenge?.startsWith("or_ch_")) {
     throw new AuthClientError({ code: "device_code_invalid_response" });
   }
+  const bindingSignature = await signEnrollmentChallenge(
+    issued.enrollment_challenge,
+  );
+  await bindDeviceE2eeIdentity({
+    suretyBaseUrl,
+    deviceCode: issued.device_code,
+    enrollmentChallenge: issued.enrollment_challenge,
+    identity: e2eeIdentity,
+    bindingSignature,
+    fetchFn,
+  });
   const verificationUriComplete = verificationUrlFor({
     h5BaseUrl,
     userCode: issued.user_code,
   });
-  printFn("! To complete login, open this URL and click Authorize:");
+  printFn("! To complete login, open this URL:");
   printFn(`!   ${verificationUriComplete}`);
   printFn(`! Your code: ${issued.user_code}`);
   if (!noBrowser) await openBrowserFn(verificationUriComplete);

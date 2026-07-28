@@ -95,6 +95,10 @@ export function classifyError(err) {
 }
 
 function _fromAuthClientError(err) {
+  const coded = typeof err.code === "string"
+    ? _fromCode(err.code, err.message)
+    : null;
+  if (coded) return coded;
   const status = err.status;
   const bodyMsg = (err.body && (err.body.msg || err.body.message)) || "";
   const combined = `${err.message || ""} ${bodyMsg}`.toLowerCase();
@@ -173,6 +177,16 @@ function _fromCode(code, message) {
       return {
         headline: message || "OriginRouter provider isn't ready.",
         next: "Run `originrouter login` if you haven't signed in yet.",
+      };
+    case "active_device_limit_reached":
+      return {
+        headline: "This account already has 50 active devices.",
+        next: "Revoke a device you no longer use in the App, then try again.",
+      };
+    case "daily_key_rotation_limit_reached":
+      return {
+        headline: "This account has already rotated device keys 10 times today.",
+        next: "Try again after the next UTC day begins.",
       };
     case "ENOENT":
       return {

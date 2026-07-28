@@ -90,7 +90,6 @@ export class SessionManager {
         localProxyUrl: await this.resolveLocalProxyUrl(),
         signal: controller.signal,
         deviceId: this.deviceId,
-        e2eePolicy: config.remoteShare?.e2eePolicy === "required" ? "required" : "off",
         e2eeIdentity: this.remoteCodingIdentity,
       });
     } finally {
@@ -161,7 +160,7 @@ export class SessionManager {
           enabled: true,
           providers: payload.providers,
           port: payload.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
-          e2eePolicy: payload.e2eePolicy === "required" ? "required" : "off",
+          e2eePolicy: "required",
         },
       });
       return;
@@ -195,7 +194,7 @@ export class SessionManager {
           enabled: true,
           providers: payload.providers,
           port: payload.port || DEFAULT_REMOTE_SHARE_PROXY_PORT,
-          e2eePolicy: payload.e2eePolicy === "required" ? "required" : "off",
+          e2eePolicy: "required",
         },
       });
       return;

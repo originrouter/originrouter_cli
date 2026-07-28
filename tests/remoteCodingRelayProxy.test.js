@@ -7,12 +7,34 @@
 
 import assert from "node:assert/strict";
 import http from "node:http";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { WebSocketServer } from "ws";
 import { buildAgentProviderEnv, willRouteRemoteCoding } from "../src/config/claudeConfig.js";
 import { RemoteCodingRelayProxy } from "../src/runtime/remoteCodingRelayProxy.js";
 import { staticProxyStatusFn, NOOP_REMOTE_CODING_SNAPSHOT } from "../src/proxy/snapshot.js";
+import {
+  decryptRemoteCodingRequest,
+  encryptRemoteCodingResponse,
+  generateRemoteCodingIdentity,
+} from "../src/crypto/remoteCodingE2ee.js";
 
 const RELAY_PORT = 28787 + Math.floor(Math.random() * 1000);
+const fakeWorkerIdentity = generateRemoteCodingIdentity();
+const e2eeStateDir = mkdtempSync(join(tmpdir(), "originrouter-remote-proxy-e2ee-"));
+
+function scriptedResponses(body, script) {
+  const { context } = decryptRemoteCodingRequest(body, fakeWorkerIdentity);
+  return script.map((event) => {
+    if (event.type === "remote.coding.response.error"
+        && ["target_offline", "timeout"].includes(event.code)) {
+      return { ...event, requestId: body.requestId };
+    }
+    const { type, ...payload } = event;
+    return encryptRemoteCodingResponse(context, type, payload);
+  });
+}
 
 // ---- Group A: env-builder branch ---------------------------------------
 
@@ -134,7 +156,11 @@ const fakeRelay = await new Promise((resolve) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         code: 0,
-        data: { policy: "off", protocol: null, public_key: null },
+        data: {
+          policy: "required",
+          protocol: "e2ee-v1",
+          public_key: fakeWorkerIdentity.publicKey,
+        },
       }));
       return;
     }
@@ -148,8 +174,8 @@ const fakeRelay = await new Promise((resolve) => {
         if (body.type === "remote.coding.request") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ code: 0, data: { accepted: true } }));
-          for (const evt of pendingScript) {
-            for (const c of callerWsClients) c.send(JSON.stringify({ ...evt, requestId: body.requestId }));
+          for (const evt of scriptedResponses(body, pendingScript)) {
+            for (const c of callerWsClients) c.send(JSON.stringify(evt));
           }
           pendingScript = [];
           return;
@@ -177,8 +203,8 @@ const fakeRelay = await new Promise((resolve) => {
         const body = JSON.parse(String(raw));
         postedEnvelopes.push(body);
         if (body.type === "remote.coding.request") {
-          for (const evt of pendingScript) {
-            ws.send(JSON.stringify({ ...evt, requestId: body.requestId }));
+          for (const evt of scriptedResponses(body, pendingScript)) {
+            ws.send(JSON.stringify(evt));
           }
           pendingScript = [];
         }
@@ -229,6 +255,7 @@ function postToProxy(port, data) {
 async function makeProxy() {
   const proxy = new RemoteCodingRelayProxy({
     relayUrl: `http://127.0.0.1:${RELAY_PORT}`,
+    stateDir: e2eeStateDir,
     deviceId: "caller-test",
   });
   await proxy.start();
@@ -357,7 +384,14 @@ const fakeRelay2 = await new Promise((resolve) => {
   const server = http.createServer((req, res) => {
     if (req.method === "GET" && req.url?.endsWith("/e2ee")) {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ code: 0, data: { policy: "off" } }));
+      res.end(JSON.stringify({
+        code: 0,
+        data: {
+          policy: "required",
+          protocol: "e2ee-v1",
+          public_key: fakeWorkerIdentity.publicKey,
+        },
+      }));
       return;
     }
     if (req.method === "POST" && req.url === "/relay/v1/messages") {
@@ -370,8 +404,8 @@ const fakeRelay2 = await new Promise((resolve) => {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ code: 0, data: { accepted: true } }));
           const script = scriptQueue.shift() || [];
-          for (const evt of script) {
-            for (const c of callerWsClients) c.send(JSON.stringify({ ...evt, requestId: body.requestId }));
+          for (const evt of scriptedResponses(body, script)) {
+            for (const c of callerWsClients) c.send(JSON.stringify(evt));
           }
           return;
         }
@@ -398,8 +432,8 @@ const fakeRelay2 = await new Promise((resolve) => {
         const body = JSON.parse(String(raw));
         if (body.type === "remote.coding.request") {
           const script = scriptQueue.shift() || [];
-          for (const evt of script) {
-            ws.send(JSON.stringify({ ...evt, requestId: body.requestId }));
+          for (const evt of scriptedResponses(body, script)) {
+            ws.send(JSON.stringify(evt));
           }
         }
       });
@@ -419,6 +453,7 @@ const fakeRelay2 = await new Promise((resolve) => {
 async function makeProxy2(deviceId) {
   const proxy = new RemoteCodingRelayProxy({
     relayUrl: `http://127.0.0.1:${RELAY2_PORT}`,
+    stateDir: e2eeStateDir,
     deviceId,
   });
   await proxy.start();

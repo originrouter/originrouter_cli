@@ -75,7 +75,6 @@ export async function handleRemoteCodingRequest(envelope, deps) {
     fetchFn = globalThis.fetch,
     signal,
     deviceId = null,
-    e2eePolicy = "off",
     e2eeIdentity = null,
   } = deps;
 
@@ -123,11 +122,11 @@ export async function handleRemoteCodingRequest(envelope, deps) {
       });
       return { ok: false, code: error?.code || "e2ee_decryption_failed" };
     }
-  } else if (e2eePolicy === "required") {
+  } else {
     await relayClient.send("remote.coding.response.error", {
       requestId,
       code: "e2ee_required",
-      message: "target requires end-to-end encryption; plaintext was rejected",
+      message: "remote coding requires end-to-end encryption; plaintext was rejected",
     });
     return { ok: false, code: "e2ee_required" };
   }

@@ -12,14 +12,19 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { handleRemoteCodingRequest } from "../src/daemon/remoteCodingServer.js";
+import {
+  decryptRemoteCodingResponse,
+  encryptRemoteCodingRequest,
+  generateRemoteCodingIdentity,
+} from "../src/crypto/remoteCodingE2ee.js";
 
 // Capture relayClient.
-function makeRelayClient() {
+function makeRelayClient(context) {
   const events = [];
   return {
     events,
     async send(type, payload) {
-      events.push({ type, ...payload });
+      events.push(decryptRemoteCodingResponse(context, { type, ...payload }));
     },
   };
 }
@@ -39,17 +44,30 @@ function stopLocalProxy(server) {
   return new Promise((resolve) => server.close(resolve));
 }
 
-const baseEnvelope = {
-  type: "remote.coding.request",
-  requestId: "req-1",
-  sourceDeviceId: "caller-test",
-  targetDeviceId: "worker-test",
+const workerIdentity = generateRemoteCodingIdentity();
+const basePayload = {
   runtime: "claude",
   method: "POST",
   path: "/v1/messages",
   headers: { "content-type": "application/json", "accept": "text/event-stream" },
   body: Buffer.from('{"hello":"world"}').toString("base64"),
 };
+
+let requestCounter = 0;
+function makeCase(payload = basePayload) {
+  requestCounter += 1;
+  const encrypted = encryptRemoteCodingRequest({
+    sourceDeviceId: "caller-test",
+    targetDeviceId: "worker-test",
+    requestId: `req-${requestCounter}`,
+    targetPublicKey: workerIdentity.publicKey,
+    payload,
+  });
+  return {
+    envelope: encrypted.envelope,
+    relayClient: makeRelayClient(encrypted.context),
+  };
+}
 
 // ----------------------------------------------------------------
 // Group A: Happy path
@@ -64,10 +82,11 @@ const baseEnvelope = {
     res.end();
   });
 
-  const relayClient = makeRelayClient();
-  const result = await handleRemoteCodingRequest(baseEnvelope, {
+  const { envelope, relayClient } = makeCase();
+  const result = await handleRemoteCodingRequest(envelope, {
     relayClient,
     localProxyUrl: url,
+    e2eeIdentity: workerIdentity,
   });
   await stopLocalProxy(server);
 
@@ -106,10 +125,11 @@ const baseEnvelope = {
     res.writeHead(503, { "Content-Type": "text/plain" });
     res.end("upstream is sad");
   });
-  const relayClient = makeRelayClient();
-  const result = await handleRemoteCodingRequest(baseEnvelope, {
+  const { envelope, relayClient } = makeCase();
+  const result = await handleRemoteCodingRequest(envelope, {
     relayClient,
     localProxyUrl: url,
+    e2eeIdentity: workerIdentity,
   });
   await stopLocalProxy(server);
 
@@ -127,11 +147,12 @@ const baseEnvelope = {
 // Group B2: fetch throws (e.g. local proxy process died mid-request) → upstream_error
 // ----------------------------------------------------------------
 {
-  const relayClient = makeRelayClient();
+  const { envelope, relayClient } = makeCase();
   // A fetchFn that always rejects simulates a torn-down local proxy.
-  const result = await handleRemoteCodingRequest(baseEnvelope, {
+  const result = await handleRemoteCodingRequest(envelope, {
     relayClient,
     localProxyUrl: "http://127.0.0.1:1", // port nobody listens on
+    e2eeIdentity: workerIdentity,
   });
 
   assert.equal(result.ok, false);
@@ -151,22 +172,23 @@ const baseEnvelope = {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end('{"ok":true}');
   });
-  const relayClient = makeRelayClient();
-  await handleRemoteCodingRequest(
-    {
-      ...baseEnvelope,
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer sk-secret-SHOULD-NOT-LEAK",
-        "x-api-key": "sk-noop-SHOULD-NOT-LEAK",
-        host: "evil.example",
-        "content-length": "999",
-        connection: "close",
-        "transfer-encoding": "chunked",
-        "user-agent": "originrouter-caller/9.2",
-      },
+  const payload = {
+    ...basePayload,
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer sk-secret-SHOULD-NOT-LEAK",
+      "x-api-key": "sk-noop-SHOULD-NOT-LEAK",
+      host: "evil.example",
+      "content-length": "999",
+      connection: "close",
+      "transfer-encoding": "chunked",
+      "user-agent": "originrouter-caller/9.2",
     },
-    { relayClient, localProxyUrl: url }
+  };
+  const { envelope, relayClient } = makeCase(payload);
+  await handleRemoteCodingRequest(
+    envelope,
+    { relayClient, localProxyUrl: url, e2eeIdentity: workerIdentity }
   );
   await stopLocalProxy(server);
 
@@ -189,10 +211,11 @@ const baseEnvelope = {
 // Group D: localProxyUrl is null
 // ----------------------------------------------------------------
 {
-  const relayClient = makeRelayClient();
-  const result = await handleRemoteCodingRequest(baseEnvelope, {
+  const { envelope, relayClient } = makeCase();
+  const result = await handleRemoteCodingRequest(envelope, {
     relayClient,
     localProxyUrl: null,
+    e2eeIdentity: workerIdentity,
   });
   assert.equal(result.ok, false);
   assert.equal(result.code, "upstream_error");

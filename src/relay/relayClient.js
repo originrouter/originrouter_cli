@@ -34,6 +34,7 @@ export class RelayClient {
     authToken = null,
     heartbeatIntervalMs = 15_000,
     heartbeatTimeoutMs = 45_000,
+    e2eeAckTimeoutMs = 30_000,
     now = () => Date.now(),
   }) {
     this.relayUrl = relayUrl;
@@ -45,8 +46,10 @@ export class RelayClient {
       Number(heartbeatTimeoutMs) || 45_000,
     );
     this.now = now;
+    this.e2eeAckTimeoutMs = Math.max(1_000, Number(e2eeAckTimeoutMs) || 30_000);
     this._aborted = false;
     this._ws = null;
+    this._e2eeAcks = new Map();
   }
 
   /**
@@ -78,6 +81,98 @@ export class RelayClient {
       },
       { authToken: this.authToken },
     );
+  }
+
+  async sendEnvelope(envelope) {
+    if (!envelope || envelope.protocol !== "e2ee-v2") {
+      throw new Error("invalid E2EE relay envelope");
+    }
+    if (this._ws && this._ws.readyState === WebSocket.OPEN) {
+      const key = this._e2eeAckKey(envelope);
+      if (this._e2eeAcks.has(key)) {
+        throw new Error("duplicate pending E2EE relay envelope");
+      }
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          this._e2eeAcks.delete(key);
+          resolve({
+            ok: false,
+            accepted: false,
+            reason: "relay_ack_timeout",
+            via: "ws",
+          });
+        }, this.e2eeAckTimeoutMs);
+        timer.unref?.();
+        this._e2eeAcks.set(key, { resolve, timer });
+        try {
+          this._ws.send(JSON.stringify(envelope), (error) => {
+            if (!error) return;
+            const pending = this._e2eeAcks.get(key);
+            if (!pending) return;
+            this._e2eeAcks.delete(key);
+            clearTimeout(pending.timer);
+            pending.resolve({
+              ok: false,
+              accepted: false,
+              reason: "relay_send_failed",
+              via: "ws",
+            });
+          });
+        } catch {
+          const pending = this._e2eeAcks.get(key);
+          if (pending) {
+            this._e2eeAcks.delete(key);
+            clearTimeout(pending.timer);
+            pending.resolve({
+              ok: false,
+              accepted: false,
+              reason: "relay_send_failed",
+              via: "ws",
+            });
+          }
+        }
+      });
+    }
+    return postJson(
+      `${this.relayUrl}/relay/v1/messages`,
+      {
+        target_device_id: envelope.target_device_id,
+        payload: envelope,
+      },
+      { authToken: this.authToken },
+    );
+  }
+
+  _e2eeAckKey(payload) {
+    return [
+      String(payload?.session_id || ""),
+      String(payload?.direction || ""),
+      Number(payload?.sequence ?? -1),
+    ].join(":");
+  }
+
+  _handleE2eeAck(payload) {
+    if (payload?.type !== "ack" || !payload?.session_id) return false;
+    const key = this._e2eeAckKey(payload);
+    const pending = this._e2eeAcks.get(key);
+    if (!pending) return false;
+    this._e2eeAcks.delete(key);
+    clearTimeout(pending.timer);
+    pending.resolve({
+      ok: payload.accepted === true,
+      accepted: payload.accepted === true,
+      reason: String(payload.reason || ""),
+      via: "ws",
+    });
+    return true;
+  }
+
+  _failPendingE2eeAcks(reason = "relay_disconnected") {
+    for (const pending of this._e2eeAcks.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve({ ok: false, accepted: false, reason, via: "ws" });
+    }
+    this._e2eeAcks.clear();
   }
 
   async connectEvents(onEvent, { onOpen, onClose, onAlive } = {}) {
@@ -123,12 +218,14 @@ export class RelayClient {
         if (this._aborted) return;
         markActivity();
         try {
-          onEvent(JSON.parse(String(data)));
+          const payload = JSON.parse(String(data));
+          if (!this._handleE2eeAck(payload)) onEvent(payload);
         } catch {}
       });
       ws.once("close", () => {
         stopHeartbeat();
         if (this._ws === ws) this._ws = null;
+        this._failPendingE2eeAcks();
         try { onClose?.(); } catch {}
       });
     });
