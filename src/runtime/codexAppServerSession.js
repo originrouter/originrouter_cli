@@ -73,6 +73,14 @@ import {
   resolveAgentDetailProfile,
 } from "./agentDetailProfile.js";
 import { AiApprovalReviewer } from "./aiApprovalReviewer.js";
+import {
+  aiReviewPolicyFromEnvironment,
+  aiReviewPolicyFromPayload,
+} from "./aiReviewPolicy.js";
+import {
+  readApprovalPolicyReference,
+  resolveApprovalPolicySelection,
+} from "./approvalPolicyStore.js";
 
 const CODEX_MODES = Object.freeze([
   { id: "default", label: "Default" },
@@ -119,6 +127,7 @@ function extractOptions(args) {
     else if (arg.startsWith("--resume=")) {
       options.resume = arg.slice("--resume=".length);
     } else if (arg === "--originrouter-autonomy") take("autonomyProfile");
+    else if (arg === "--originrouter-policy") take("approvalPolicyReference");
     else if (arg === "--originrouter-detail") take("detailProfile");
     else if (arg === "--originrouter-auto-approve")
       options.autonomyProfile = "guarded";
@@ -386,6 +395,12 @@ export async function runCodexAppServerSession(rawArgs) {
     options.autonomyProfile ||
       (autonomyAllowedScopes.length ? "custom" : "manual"),
   );
+  let approvalPolicy = autonomyProfile === "custom" && options.approvalPolicyReference
+    ? readApprovalPolicyReference(options.approvalPolicyReference, { stateDir })
+    : null;
+  let aiReviewPolicy = autonomyProfile === "ai_review"
+    ? aiReviewPolicyFromEnvironment()
+    : null;
   let stopped = false;
   const activitySnapshot = {
     summary: "",
@@ -492,14 +507,21 @@ export async function runCodexAppServerSession(rawArgs) {
       availableModes: CODEX_MODES,
       requestId,
     });
-  const reportAutonomy = (requestId = null) =>
+  const reportAutonomy = (
+    requestId = null,
+    { accepted = null, reason = null } = {},
+  ) =>
     sendAgentEvent(
       buildAutonomyStatusEvent({
         provider: "codex",
         runtime: "codex-app-server",
         profile: autonomyProfile,
         allowedScopes: autonomyAllowedScopes,
+        approvalPolicy,
+        aiReviewPolicy,
         requestId,
+        accepted,
+        reason,
       }),
     );
   const reportDetail = () =>
@@ -519,7 +541,10 @@ export async function runCodexAppServerSession(rawArgs) {
       allowedScopes: autonomyAllowedScopes,
       workspaceRoot: cwd,
       aiReviewer: aiApprovalReviewer,
+      aiReviewPolicy,
       runtime: "codex-app-server",
+      approvalPolicy,
+      stateDir,
       requestInteraction: (item) => interactions.request(item),
       onAutoResolved: ({ request: item, resolved }) =>
         sendAgentEvent({
@@ -533,6 +558,7 @@ export async function runCodexAppServerSession(rawArgs) {
           reason: resolved.reason,
           decisionSource: resolved.decisionSource || "autonomy_policy",
           aiReview: resolved.aiReview || null,
+          policyEvaluation: resolved.policyEvaluation || null,
           decision: resolved.action,
         }),
     });
@@ -899,15 +925,34 @@ export async function runCodexAppServerSession(rawArgs) {
     if (payload.type === "agent.autonomy.set") {
       const requested = normalizeAutonomyProfile(payload.profile, "");
       if (!requested) return false;
-      autonomyProfile = requested;
-      autonomyAllowedScopes =
-        requested === "custom"
-          ? normalizeAutonomyScopes(
-              payload.allowedScopes || payload.allowed_scopes,
-            )
+      try {
+        const nextPolicy = requested === "custom"
+          ? resolveApprovalPolicySelection(payload, { stateDir, current: approvalPolicy })
+          : null;
+        const nextAiReviewPolicy = requested === "ai_review"
+          ? aiReviewPolicyFromPayload(payload)
+          : null;
+        autonomyProfile = requested;
+        approvalPolicy = nextPolicy;
+        aiReviewPolicy = nextAiReviewPolicy;
+        autonomyAllowedScopes = requested === "custom" && !approvalPolicy
+          ? normalizeAutonomyScopes(payload.allowedScopes || payload.allowed_scopes)
           : [];
-      await reportAutonomy(payload.requestId || null);
-      return true;
+        await reportAutonomy(payload.requestId || null, { accepted: true });
+        return true;
+      } catch (error) {
+        await sendAgentEvent(buildAutonomyStatusEvent({
+          provider: "codex",
+          runtime: "codex-app-server",
+          profile: autonomyProfile,
+          allowedScopes: autonomyAllowedScopes,
+          approvalPolicy,
+          requestId: payload.requestId || null,
+          accepted: false,
+          reason: error.code || error.message,
+        }));
+        return false;
+      }
     }
     if (payload.type === "terminal.interrupt" && currentTurnId) {
       await client.interruptTurn(threadId, currentTurnId);

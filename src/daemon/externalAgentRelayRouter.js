@@ -15,6 +15,20 @@ const SESSION_COMMAND_TYPES = new Set([
   "session.stop",
 ]);
 
+function withoutUndefined(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => item === undefined ? null : withoutUndefined(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== undefined)
+        .map(([key, item]) => [key, withoutUndefined(item)]),
+    );
+  }
+  return value;
+}
+
 export class ExternalAgentRelayRouter {
   constructor({ registry, relayClient }) {
     this.registry = registry;
@@ -35,7 +49,7 @@ export class ExternalAgentRelayRouter {
         await this.relayClient.send("agent.interactions.snapshot", {
           sessionId,
           requestId: payload.requestId,
-          ...this.registry.controlSnapshot(sessionId),
+          ...withoutUndefined(this.registry.controlSnapshot(sessionId)),
         });
       }
       return sessionIds.length > 0;
@@ -52,7 +66,7 @@ export class ExternalAgentRelayRouter {
       await this.relayClient.send("agent.history.page", {
         sessionId,
         requestId: payload.requestId,
-        ...history,
+        ...withoutUndefined(history),
       });
       return true;
     }
@@ -71,12 +85,16 @@ export class ExternalAgentRelayRouter {
     if (!sessionId || !event || typeof event !== "object") return false;
 
     if (DIRECT_APP_EVENT_TYPES.has(event.type)) {
-      await this.relayClient.send(event.type, { ...event, sessionId });
+      await this.relayClient.send(
+        event.type,
+        withoutUndefined({ ...event, sessionId }),
+      );
       return true;
     }
+    const { sessionId: _eventSessionId, ...eventWithoutSessionId } = event;
     await this.relayClient.send("agent.stream.event", {
       sessionId,
-      event: { ...event, sessionId: undefined },
+      event: withoutUndefined(eventWithoutSessionId),
     });
     return true;
   }

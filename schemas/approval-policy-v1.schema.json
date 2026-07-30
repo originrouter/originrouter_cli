@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://originrouter.com/schemas/approval-policy-v1.schema.json",
+  "title": "OriginRouter Approval Policy",
+  "description": "Portable allow, deny, and ask rules enforced by OriginRouter CLI.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "id", "rules"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$" },
+    "name": { "type": "string", "maxLength": 128 },
+    "description": { "type": "string" },
+    "defaults": { "$ref": "#/$defs/defaults" },
+    "rules": {
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/rule" }
+    },
+    "declarations": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/declaration" }
+    },
+    "metadata": { "type": "object" }
+  },
+  "$defs": {
+    "effect": { "enum": ["allow", "deny", "ask"] },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "unmatched": { "$ref": "#/$defs/effect" },
+        "parse_error": { "$ref": "#/$defs/effect" },
+        "unknown": { "$ref": "#/$defs/effect" }
+      }
+    },
+    "stringList": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "effect"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$" },
+        "effect": { "$ref": "#/$defs/effect" },
+        "priority": { "type": "integer", "minimum": -1000000, "maximum": 1000000 },
+        "actions": { "$ref": "#/$defs/stringList" },
+        "tools": { "$ref": "#/$defs/stringList" },
+        "when": { "$ref": "#/$defs/condition" },
+        "reason": { "type": "string" },
+        "enabled": { "type": "boolean" }
+      },
+      "anyOf": [
+        { "required": ["actions"] },
+        { "required": ["tools"] },
+        { "required": ["when"] }
+      ]
+    },
+    "condition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["all"],
+          "properties": {
+            "all": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/condition" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["any"],
+          "properties": {
+            "any": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/condition" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["none"],
+          "properties": {
+            "none": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/condition" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["not"],
+          "properties": { "not": { "$ref": "#/$defs/condition" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["field", "op"],
+          "properties": {
+            "field": {
+              "enum": [
+                "action", "risk", "confidence", "provider", "runtime",
+                "interaction.kind", "interaction.source", "tool.name",
+                "command.raw", "command.executable", "command.argv", "command.cwd", "command.dynamic", "command.segment",
+                "resource.kind", "resource.path", "resource.uri",
+                "network.protocol", "network.host", "network.port", "network.method",
+                "database.engine", "database.operation", "database.database", "database.schema", "database.tables",
+                "code.language", "code.script", "code.module", "code.sha256", "declaration.id"
+              ]
+            },
+            "op": {
+              "enum": [
+                "exists", "not_exists", "eq", "neq", "glob", "not_glob",
+                "contains", "not_contains", "starts_with", "ends_with",
+                "path_under", "path_equals", "in", "not_in", "intersects",
+                "contains_all", "lt", "lte", "gt", "gte", "between"
+              ]
+            },
+            "value": {},
+            "case_sensitive": { "type": "boolean" }
+          }
+        }
+      ]
+    },
+    "atom": {
+      "type": "object",
+      "required": ["action"],
+      "properties": {
+        "action": {
+          "enum": [
+            "agent.plan.continue", "agent.input.answer", "agent.form.submit", "agent.url.open", "secret.input",
+            "fs.read", "fs.list", "fs.search", "fs.create", "fs.write", "fs.append", "fs.patch", "fs.copy", "fs.move", "fs.delete", "fs.permissions.write", "fs.unknown",
+            "process.exec", "process.signal", "shell.dynamic", "code.python.execute", "code.javascript.execute", "code.shell.execute", "code.opaque",
+            "network.dns.resolve", "network.connect", "network.listen", "network.http.read", "network.http.write", "network.transfer.upload", "network.transfer.download",
+            "vcs.read", "vcs.write", "vcs.destructive", "vcs.remote.read", "vcs.remote.write",
+            "package.read", "package.install", "package.remove", "package.publish",
+            "db.read", "db.insert", "db.update", "db.delete", "db.schema.create", "db.schema.alter", "db.schema.drop", "db.transaction", "db.admin", "db.unknown",
+            "system.service.read", "system.service.manage", "system.identity.manage", "system.schedule.manage", "system.storage.manage",
+            "infra.read", "infra.write", "infra.destroy", "permission.additional", "tool.unknown"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "declaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "match", "emits"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$" },
+        "match": { "$ref": "#/$defs/condition" },
+        "replaces_opaque": { "type": "boolean" },
+        "emits": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/atom" } },
+        "description": { "type": "string" },
+        "enabled": { "type": "boolean" }
+      }
+    }
+  }
+}

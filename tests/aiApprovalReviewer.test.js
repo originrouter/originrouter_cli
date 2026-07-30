@@ -46,6 +46,17 @@ function reviewRequest(overrides = {}) {
   };
 }
 
+const policySnapshot = {
+  protocol_version: "1",
+  template_id: "ait_daily_tests",
+  version: 2,
+  name: "Daily tests",
+  instructions: "Allow test commands.",
+  allowed_scopes: ["workspace_commands"],
+  applicability: {},
+  content_hash: "a".repeat(64),
+};
+
 test("AI approval review uses the AI token and redacts secret-like payload fields", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "originrouter-ai-reviewer-"));
   writeCodingAuth(stateDir, credential());
@@ -64,14 +75,17 @@ test("AI approval review uses the AI token and redacts secret-like payload field
     },
   });
 
-  const result = await reviewer.review(reviewRequest({
-    payload: {
-      command: "npm test",
-      cwd: "/tmp/project",
-      api_key: "must-not-leave-device",
-      nested: { authorization: "Bearer secret" },
-    },
-  }));
+  const result = await reviewer.review({
+    ...reviewRequest({
+      payload: {
+        command: "npm test",
+        cwd: "/tmp/project",
+        api_key: "must-not-leave-device",
+        nested: { authorization: "Bearer secret" },
+      },
+    }),
+    aiReviewPolicy: policySnapshot,
+  });
 
   assert.equal(result.decision, "allow");
   assert.equal(captured.url, "https://chat.example/ai-review");
@@ -79,6 +93,7 @@ test("AI approval review uses the AI token and redacts secret-like payload field
   const body = JSON.parse(captured.options.body);
   assert.equal(body.interaction.payload.api_key, "[redacted]");
   assert.equal(body.interaction.payload.nested.authorization, "[redacted]");
+  assert.deepEqual(body.ai_review_policy, policySnapshot);
   assert.doesNotMatch(captured.options.body, /must-not-leave-device|Bearer secret/);
 });
 

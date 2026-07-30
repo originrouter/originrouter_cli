@@ -58,6 +58,11 @@ import {
   normalizeAutonomyScopes,
 } from "../runtime/agentAutonomyPolicy.js";
 import {
+  deployApprovalPolicyBundle,
+  readApprovalPolicy,
+} from "../runtime/approvalPolicyStore.js";
+import { aiReviewPolicyFromPayload } from "../runtime/aiReviewPolicy.js";
+import {
   AGENT_DETAIL_PROFILES,
   agentDetailDefaultFromConfig,
   setAgentDetailDefault,
@@ -364,7 +369,9 @@ async function dispatch(ctx, req, res) {
         return sendOk(res, ctx.deviceE2eeLocalGateway.authorize({
           challengeId: body.challenge_id,
           appIdentity: body.app_identity,
+          authMethod: body.auth_method,
           hmacProof: body.proof,
+          deviceProof: body.device_proof,
         }));
       } catch (error) {
         return sendError(res, 403, error.message, {
@@ -846,11 +853,38 @@ async function dispatch(ctx, req, res) {
           const allowedScopes = profile === "custom"
             ? normalizeAutonomyScopes(rawScopes)
             : [];
+          let approvalPolicy = null;
+          let aiReviewPolicy = null;
+          if (profile === "custom") {
+            const bundle = body.policyBundle || body.policy_bundle;
+            const policyId = String(body.policyId || body.policy_id || "").trim();
+            approvalPolicy = bundle
+              ? deployApprovalPolicyBundle(bundle, { stateDir: getStateDir() })
+              : policyId
+                ? readApprovalPolicy(policyId, { stateDir: getStateDir() })
+                : null;
+            const expectedRevision = String(
+              body.policyRevision || body.policy_revision || "",
+            ).replace(/^sha256:/, "").trim();
+            if (approvalPolicy && expectedRevision && approvalPolicy.revision !== expectedRevision) {
+              return sendError(res, 409, "approval policy revision is not installed on this device");
+            }
+          }
+          if (profile === "ai_review") {
+            aiReviewPolicy = aiReviewPolicyFromPayload(body);
+          }
           const command = ctx.externalAgentRegistry.enqueueCommand(sessionId, {
             type: "agent.autonomy.set",
             sessionId,
             profile,
-            allowedScopes,
+            allowedScopes: approvalPolicy ? [] : allowedScopes,
+            ...(approvalPolicy
+              ? {
+                  policyId: approvalPolicy.policy.id,
+                  policyRevision: approvalPolicy.revision,
+                }
+              : {}),
+            ...(aiReviewPolicy ? { aiReviewPolicy } : {}),
             requestId: body.requestId,
           });
           return sendOk(res, {
@@ -927,6 +961,7 @@ async function handleLocalStatus(ctx) {
       authState: typeof ctx.relayAuthState === "function" ? ctx.relayAuthState() : undefined,
       authError: typeof ctx.relayAuthError === "function" ? ctx.relayAuthError() : undefined,
     },
+    e2ee: ctx.deviceE2eeLocalGateway?.identityStatus(ctx.deviceId),
     // Independent runtimes: agent routes and explicitly shared remote access.
     proxy: await ctx.getProxyStatus(),
     remoteShare: await handleRemoteShareStatusPayload(ctx),

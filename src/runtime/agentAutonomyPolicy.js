@@ -1,6 +1,7 @@
 import path from "node:path";
 
 import { INTERACTION_KINDS } from "./agentInteractionContract.js";
+import { evaluateApprovalRequest } from "./approvalPolicy.js";
 
 export const AGENT_AUTONOMY_PROFILES = Object.freeze([
   {
@@ -316,6 +317,9 @@ export function buildAutonomyStatusEvent({
   allowedScopes = [],
   requestId = null,
   reason = null,
+  approvalPolicy = null,
+  aiReviewPolicy = null,
+  accepted = null,
 } = {}) {
   const normalizedProfile = normalizeAutonomyProfile(profile);
   return {
@@ -329,8 +333,25 @@ export function buildAutonomyStatusEvent({
       ? effectiveAutonomyScopes(normalizedProfile, allowedScopes)
       : [],
     availableAutonomyScopes: control === "supported" ? AGENT_AUTONOMY_SCOPES : [],
+    approvalPolicy: normalizedProfile === "custom" && approvalPolicy
+      ? {
+          id: approvalPolicy.policy?.id || approvalPolicy.summary?.id || null,
+          name: approvalPolicy.policy?.name || approvalPolicy.summary?.name || null,
+          revision: approvalPolicy.revision || null,
+          source: approvalPolicy.summary?.source || "device",
+        }
+      : null,
+    aiReviewPolicy: normalizedProfile === "ai_review" && aiReviewPolicy
+      ? {
+          templateId: aiReviewPolicy.template_id,
+          name: aiReviewPolicy.name,
+          version: aiReviewPolicy.version,
+          contentHash: aiReviewPolicy.content_hash,
+        }
+      : null,
     requestId,
     reason,
+    ...(typeof accepted === "boolean" ? { accepted } : {}),
   };
 }
 
@@ -414,9 +435,47 @@ export async function resolveWithAutonomy({
   requestInteraction,
   onAutoResolved,
   aiReviewer,
+  aiReviewPolicy = null,
   runtime,
+  approvalPolicy = null,
+  stateDir = "",
 }) {
   const normalizedProfile = normalizeAutonomyProfile(profile);
+  if (normalizedProfile === "custom" && approvalPolicy) {
+    const policyResult = evaluateApprovalRequest(request, approvalPolicy, {
+      workspace: workspaceRoot,
+      stateDir,
+    });
+    if (policyResult.effect === "ask") return requestInteraction(request);
+    const action = policyResult.effect === "allow" ? "allow" : "deny";
+    const resolved = {
+      interactionId: request.interactionId,
+      responseId: `policy:${request.interactionId}`,
+      action,
+      response: {
+        remember_for_session: false,
+        policy_evaluated: true,
+        ...(action === "allow" && request?.payload?.default_approval_option
+          ? { approval_option: request.payload.default_approval_option }
+          : {}),
+      },
+      autoResolved: true,
+      reason: `approval_policy_${policyResult.effect}`,
+      scope: null,
+      decisionSource: "approval_policy",
+      policyEvaluation: {
+        policyId: policyResult.policyId,
+        revision: policyResult.revision,
+        effect: policyResult.effect,
+        actions: policyResult.atoms.map((atom) => atom.action),
+        matchedRuleIds: [...new Set(policyResult.decisions.flatMap((decision) =>
+          decision.matchedRules.map((rule) => rule.id)))],
+        declarations: policyResult.declarations,
+      },
+    };
+    await onAutoResolved?.({ request, resolved });
+    return resolved;
+  }
   if (normalizedProfile === "ai_review") {
     if (
       !aiReviewer
@@ -428,9 +487,21 @@ export async function resolveWithAutonomy({
     const classification = request?.kind === INTERACTION_KINDS.PERMISSION
       ? classifyPermissionScope(request, workspaceRoot)
       : { scope: request?.kind === INTERACTION_KINDS.CONFIRM ? "plan_continue" : null, reason: "unsupported_interaction_kind" };
+    const policyScopes = new Set(
+      aiReviewPolicy?.allowed_scopes || GUARDED_SCOPE_IDS,
+    );
+    const scopeAllowed = Boolean(
+      classification.scope && policyScopes.has(classification.scope),
+    );
     let review;
     try {
-      review = await aiReviewer.review({ request, classification, runtime, workspaceRoot });
+      review = await aiReviewer.review({
+        request,
+        classification,
+        runtime,
+        workspaceRoot,
+        aiReviewPolicy,
+      });
     } catch {
       return requestInteraction(request);
     }
@@ -440,7 +511,7 @@ export async function resolveWithAutonomy({
     const highRisk = AGENT_AUTONOMY_SCOPES.find((item) => item.id === classification.scope)?.risk === "high";
     if (
       review.decision === "escalate"
-      || (review.decision === "allow" && (highRisk || review.risk === "high"))
+      || (review.decision === "allow" && (!scopeAllowed || highRisk || review.risk === "high"))
     ) {
       return requestInteraction(request);
     }
@@ -465,6 +536,10 @@ export async function resolveWithAutonomy({
         risk: review.risk,
         confidence: review.confidence,
         reviewer: review.reviewer,
+        decisionMethod: review.decision_method,
+        templateId: aiReviewPolicy?.template_id || null,
+        templateVersion: aiReviewPolicy?.version ?? null,
+        templateHash: aiReviewPolicy?.content_hash || null,
       },
     };
     await onAutoResolved?.({ request, resolved });

@@ -1,5 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir, hostname, platform, userInfo } from "node:os";
+import { execFileSync } from "node:child_process";
+import { isIP } from "node:net";
+import { homedir, hostname, platform } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { VERSION } from "../constants.js";
@@ -30,7 +32,7 @@ function writePrivateJson(path, value) {
   chmodSync(path, 0o600);
 }
 
-function _isStaleDeviceId(id) {
+export function isStaleDeviceId(id) {
   if (!id) return true;
   if (id === "local-dev" || id.startsWith("local-dev-")) return true;
   return false;
@@ -40,26 +42,168 @@ function _newInstallDeviceId() {
   return `device-${randomBytes(16).toString("hex")}`;
 }
 
-export function readDevice() {
-  return readJson(join(ensureStateDir(), "device.json"));
+function _deviceCandidateValue({ displayName } = {}) {
+  return {
+    deviceId: _newInstallDeviceId(),
+    host: hostname(),
+    displayName: displayName || defaultDeviceDisplayName(),
+    platform: platform(),
+    createdAt: new Date().toISOString(),
+  };
 }
 
-export function defaultDeviceDisplayName() {
-  try {
-    const user = String(userInfo().username || "").trim();
-    const host = String(hostname() || "").replace(/\.local$/i, "").trim();
-    return user && host ? `${user}@${host}` : user || host || "OriginRouter CLI";
-  } catch {
-    return "OriginRouter CLI";
+export function createDeviceCandidate(stateDir = ensureStateDir(), options = {}) {
+  const path = join(stateDir, "device.pending.json");
+  if (existsSync(path)) unlinkSync(path);
+  const candidate = {
+    ..._deviceCandidateValue(options),
+    verificationStatus: "invalid",
+  };
+  writePrivateJson(path, candidate);
+  return candidate;
+}
+
+export function commitDeviceCandidate(device, stateDir = ensureStateDir()) {
+  if (!device?.deviceId || isStaleDeviceId(device.deviceId)) {
+    throw new Error("invalid OriginRouter device candidate");
   }
+  const pendingPath = join(stateDir, "device.pending.json");
+  const pending = readJson(pendingPath);
+  if (pending?.verificationStatus !== "invalid"
+      || pending?.deviceId !== device.deviceId) {
+    throw new Error("pending OriginRouter device does not match");
+  }
+  const verified = { ...device, verificationStatus: "verified" };
+  writePrivateJson(join(stateDir, "device.json"), verified);
+  unlinkSync(pendingPath);
+  return verified;
+}
+
+export function discardDeviceCandidate(stateDir = ensureStateDir()) {
+  const path = join(stateDir, "device.pending.json");
+  if (existsSync(path)) unlinkSync(path);
+}
+
+export function invalidateDevice(stateDir = ensureStateDir()) {
+  for (const name of ["device.json", "device.pending.json"]) {
+    const path = join(stateDir, name);
+    if (existsSync(path)) unlinkSync(path);
+  }
+}
+
+export function readDevice() {
+  const path = join(ensureStateDir(), "device.json");
+  const existing = readJson(path);
+  if (!existing?.deviceId) return existing;
+  const rawDisplayName = String(existing.displayName || "").trim();
+  const legacyHost = normalizedDeviceName(existing.host);
+  const legacyAutomaticName = !rawDisplayName
+    || rawDisplayName === "OriginRouter CLI"
+    || (/^[^@]+@.+$/.test(rawDisplayName)
+      && (!legacyHost || rawDisplayName.endsWith(`@${legacyHost}`)
+        || isIP(rawDisplayName.slice(rawDisplayName.lastIndexOf("@") + 1))));
+  const nextDisplayName = legacyAutomaticName
+    ? defaultDeviceDisplayName()
+    : cliDeviceDisplayName(rawDisplayName);
+  if (nextDisplayName !== existing.displayName) {
+    const migrated = { ...existing, displayName: nextDisplayName };
+    writePrivateJson(path, migrated);
+    return migrated;
+  }
+  return existing;
+}
+
+function normalizedDeviceName(value) {
+  const normalized = String(value || "")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\.local$/i, "");
+  if (!normalized || ["localhost", "localhost.localdomain", "unknown"]
+    .includes(normalized.toLowerCase()) || isIP(normalized)) return "";
+  return normalized;
+}
+
+function commandValue(runCommand, command, args) {
+  try {
+    return normalizedDeviceName(runCommand(command, args));
+  } catch {
+    return "";
+  }
+}
+
+function linuxPrettyHostname(readText) {
+  try {
+    const content = String(readText("/etc/machine-info") || "");
+    const match = content.match(/^PRETTY_HOSTNAME=(.*)$/m);
+    if (!match) return "";
+    const raw = match[1].trim();
+    const unquoted = raw.startsWith('"') && raw.endsWith('"')
+      ? raw.slice(1, -1).replace(/\\([\\"$`])/g, "$1")
+      : raw;
+    return normalizedDeviceName(unquoted);
+  } catch {
+    return "";
+  }
+}
+
+export function cliDeviceDisplayName(value) {
+  const base = normalizedDeviceName(value) || "OriginRouter device";
+  if (/·\s*CLI$/i.test(base)) return base;
+  const maxBaseLength = 191 - " · CLI".length;
+  const truncated = base.length <= maxBaseLength
+    ? base
+    : base.slice(0, maxBaseLength).trimEnd();
+  return `${truncated} · CLI`;
+}
+
+export function defaultDeviceDisplayName({
+  platformName = platform(),
+  hostnameValue = hostname(),
+  env = process.env,
+  readText = (path) => readFileSync(path, "utf8"),
+  runCommand = (command, args) => execFileSync(command, args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 1000,
+  }),
+} = {}) {
+  const host = normalizedDeviceName(hostnameValue);
+  let base = "";
+  if (platformName === "darwin") {
+    base = commandValue(runCommand, "scutil", ["--get", "ComputerName"])
+      || commandValue(runCommand, "scutil", ["--get", "LocalHostName"])
+      || host;
+  } else if (platformName === "win32") {
+    base = normalizedDeviceName(env.COMPUTERNAME) || host;
+  } else if (platformName === "linux") {
+    base = linuxPrettyHostname(readText)
+      || commandValue(runCommand, "hostnamectl", ["--static"])
+      || host;
+  } else {
+    base = host;
+  }
+  return cliDeviceDisplayName(base);
+}
+
+export function updateDeviceDisplayName(
+  displayName,
+  stateDir = ensureStateDir(),
+) {
+  const path = join(stateDir, "device.json");
+  const existing = readJson(path);
+  if (!existing?.deviceId) return null;
+  const updated = { ...existing, displayName: cliDeviceDisplayName(displayName) };
+  writePrivateJson(path, updated);
+  return updated;
 }
 
 // Device identity is installation/config identity, never a hardware
 // fingerprint. Generate once with a CSPRNG and persist it across logins.
 export function ensureDevice(defaultDeviceId) {
   const path = join(ensureStateDir(), "device.json");
-  const existing = readJson(path);
-  if (existing?.deviceId && !_isStaleDeviceId(existing.deviceId)) {
+  const existing = readDevice();
+  if (existing?.deviceId && !isStaleDeviceId(existing.deviceId)) {
     if (typeof existing.displayName === "string" && existing.displayName.trim()) {
       return existing;
     }
@@ -77,11 +221,10 @@ export function ensureDevice(defaultDeviceId) {
   }
 
   const device = {
-    deviceId: defaultDeviceId || _newInstallDeviceId(),
-    host: hostname(),
-    displayName: defaultDeviceDisplayName(),
-    platform: platform(),
-    createdAt: new Date().toISOString(),
+    ..._deviceCandidateValue(),
+    deviceId: defaultDeviceId && !isStaleDeviceId(defaultDeviceId)
+      ? defaultDeviceId
+      : _newInstallDeviceId(),
   };
   writePrivateJson(path, device);
   return device;

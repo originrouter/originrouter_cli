@@ -4,6 +4,7 @@ import { homedir, platform, userInfo } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
+import { readApiToken } from "../persistence/authToken.js";
 import { getStateDir, readDaemonState } from "../persistence/state.js";
 
 const SERVICE_LABEL = "com.originrouter.daemon";
@@ -284,23 +285,36 @@ function localApiUrlFromState(state) {
   return `http://${urlHost}:${state.localApiPort}`;
 }
 
-async function waitForLocalApiReady({ dryRun = false, timeoutMs = 10_000 } = {}) {
+export async function waitForLocalApiReady({
+  dryRun = false,
+  timeoutMs = 10_000,
+  readState = readDaemonState,
+  readToken = () => readApiToken(getStateDir()),
+  fetchFn = globalThis.fetch,
+  sleep = delay,
+} = {}) {
   if (dryRun) return null;
   const deadline = Date.now() + timeoutMs;
   let lastUrl = null;
   while (Date.now() < deadline) {
-    const state = readDaemonState();
+    const state = readState();
     const baseUrl = localApiUrlFromState(state);
     if (baseUrl) {
       lastUrl = baseUrl;
       try {
-        const response = await fetch(`${baseUrl}/local/status`);
+        // The Local API protects /local/status even on loopback. Re-read the
+        // token on every attempt because the daemon may create it while this
+        // readiness loop is already running.
+        const token = readToken();
+        const response = await fetchFn(`${baseUrl}/local/status`, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
         if (response.ok) return baseUrl;
       } catch {
         // Daemon may have written state before the socket is accepting.
       }
     }
-    await delay(250);
+    await sleep(250);
   }
   throw new Error(`OriginRouter service started, but Local API was not ready within ${timeoutMs}ms${lastUrl ? ` (${lastUrl})` : ""}. Check ~/.originrouter/logs/daemon.err.log.`);
 }
@@ -374,6 +388,27 @@ async function startService({ dryRun = false } = {}) {
     return;
   }
   throw new Error(`Unsupported platform for service management: ${currentPlatform}`);
+}
+
+export async function waitForLaunchdUnloaded({
+  timeoutMs = 5_000,
+  isLoaded = () => {
+    const target = `gui/${userInfo().uid}/${SERVICE_LABEL}`;
+    try {
+      run("launchctl", ["print", target]);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  sleep = delay,
+} = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isLoaded()) return;
+    await sleep(100);
+  }
+  throw new Error(`OriginRouter service did not finish stopping within ${timeoutMs}ms.`);
 }
 
 function stopService({ dryRun = false } = {}) {
@@ -482,6 +517,12 @@ export async function handleServiceCommand(args) {
   }
   if (action === "restart") {
     try { stopService({ dryRun }); } catch {}
+    // launchctl bootout returns before the job is always fully removed from
+    // the per-user domain. Starting immediately can make bootstrap fail while
+    // kickstart then reports that the service does not exist.
+    if (platform() === "darwin" && !dryRun) {
+      await waitForLaunchdUnloaded();
+    }
     await startService({ dryRun });
     return;
   }

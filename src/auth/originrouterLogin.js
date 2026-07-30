@@ -61,9 +61,47 @@ function rotatedRefreshToken(response) {
   return response.refresh_token;
 }
 
-async function completeBundle({ suretyBaseUrl, control, deviceId, fetchFn }) {
+function bundledResourceToken(response, resource) {
+  const token = response?.access_tokens?.[resource];
+  return token && typeof token === "object" ? token : null;
+}
+
+async function completeBundle({
+  suretyBaseUrl,
+  control,
+  deviceId,
+  deviceName,
+  fetchFn,
+}) {
   const tokenEndpoint = `${suretyBaseUrl.replace(/\/+$/, "")}/api/oauth/token`;
   const revocationEndpoint = `${suretyBaseUrl.replace(/\/+$/, "")}/api/oauth/revoke`;
+  const bundled = {
+    control: bundledResourceToken(control, "originrouter.control"),
+    ai: bundledResourceToken(control, "originrouter.ai"),
+    coding: bundledResourceToken(control, "originrouter.coding"),
+    relay: bundledResourceToken(control, "originrouter.relay"),
+  };
+  if (Object.values(bundled).every(Boolean)) {
+    return {
+      kind: KEY_KIND.OAUTH,
+      clientId: "originrouter_cli",
+      source: KEY_SOURCE.ORIGINROUTER_CLI,
+      deviceId,
+      deviceName: deviceName || deviceId,
+      sessionId: control.session_id,
+      refreshToken: rotatedRefreshToken(control),
+      refreshExpiresAt:
+        Date.now() + Number(control.refresh_expires_in || 2592000) * 1000,
+      tokenEndpoint,
+      revocationEndpoint,
+      accessTokens: {
+        control: tokenRecord(bundled.control),
+        ai: tokenRecord(bundled.ai),
+        coding: tokenRecord(bundled.coding),
+        relay: tokenRecord(bundled.relay),
+      },
+    };
+  }
   let refreshToken = rotatedRefreshToken(control);
   const ai = await refreshOAuthToken({
     tokenEndpoint,
@@ -91,6 +129,7 @@ async function completeBundle({ suretyBaseUrl, control, deviceId, fetchFn }) {
     clientId: "originrouter_cli",
     source: KEY_SOURCE.ORIGINROUTER_CLI,
     deviceId,
+    deviceName: deviceName || deviceId,
     sessionId: relay.session_id || control.session_id,
     refreshToken,
     refreshExpiresAt: Date.now() + Number(relay.refresh_expires_in || 2592000) * 1000,
@@ -176,6 +215,7 @@ export async function loginWithDeviceFlow({
         suretyBaseUrl,
         control,
         deviceId,
+        deviceName,
         fetchFn,
       });
       printFn("✓ Authorization received.");

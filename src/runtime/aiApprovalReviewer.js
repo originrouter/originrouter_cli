@@ -2,7 +2,7 @@ import { accessTokenFor, OAUTH_RESOURCES } from "./authContract.js";
 import { displaySafeToolInput } from "./displaySafeToolInput.js";
 import { ensureFreshAccessToken } from "./oauthTokenRefresher.js";
 
-const DEFAULT_ENDPOINT = "https://chat.originrouter.com/api/v1/ai-approval/review";
+const DEFAULT_ENDPOINT = "https://chat.easytransnote.com/api/v1/ai-approval/review";
 
 function safeValue(value, depth = 0) {
   if (depth > 8 || value == null) return null;
@@ -28,7 +28,7 @@ export class AiApprovalReviewer {
     this.fetchFn = fetchFn;
   }
 
-  async review({ request, classification, runtime, workspaceRoot }) {
+  async review({ request, classification, runtime, workspaceRoot, aiReviewPolicy }) {
     if (request?.containsSecret) return { decision: "escalate", reason: "secret_input", risk: "high", confidence: 1 };
     const credential = await ensureFreshAccessToken({
       stateDir: this.stateDir,
@@ -61,6 +61,7 @@ export class AiApprovalReviewer {
           allow_single_request_only: true,
           fallback_to_user_on_error: true,
         },
+        ai_review_policy: aiReviewPolicy || null,
       }),
       signal: AbortSignal.timeout(90_000),
     });

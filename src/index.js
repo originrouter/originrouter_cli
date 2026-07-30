@@ -173,7 +173,7 @@ Legacy config commands (deprecated, prefer 'originrouter provider add'):
   originrouter claude-config --base-url <url> --api-key <key> --model <model> --small-fast-model <model> [legacy]
 
 Other:
-  originrouter daemon [--relay https://app.easytransnote.com] [--relay-mode auto|cloud|local|custom] [--device local-dev] [--local-port <p>]
+  originrouter daemon [--relay https://app.easytransnote.com] [--relay-mode auto|cloud|local|custom] [--device <device-id>] [--local-port <p>]
                       [--bind 127.0.0.1|0.0.0.0] [--allow-lan]
   originrouter daemon-port                           Print the running daemon's local API URL (reads daemon.state.json)
   originrouter service install|start|stop|restart|status|uninstall
@@ -184,6 +184,8 @@ Other:
   originrouter codex-terminal [args...]           Start managed Codex app-server session
   originrouter claude-sdk [args...]               Alias for managed Claude session
   originrouter codex-app-server [args...]         Alias for managed Codex session
+  --originrouter-autonomy <profile>                manual|guarded|ai_review|unrestricted|custom
+  --originrouter-policy <id-or-path>               Approval policy ID or JSON file for custom mode
 
 Examples:
   originrouter run -- bash
@@ -215,7 +217,7 @@ OriginRouter OAuth login:
   originrouter login [--surety-url <url>] [--login-url <url>]
                      [--device-name <name>]
                      [--no-browser]
-  originrouter logout
+  originrouter logout [--remove-device]
   originrouter auth status
   originrouter security status|rotate
 
@@ -241,9 +243,9 @@ OriginRouter wrapper options for claude/codex:
   --provider <name>                              Deprecated for claude; use 'originrouter route set'. Reserved for legacy/debug paths.
   --originrouter-relay https://app.easytransnote.com
   --originrouter-relay-mode auto|cloud|local|custom  auto uses authenticated cloud when signed in, otherwise local-only
-  --originrouter-device local-dev
+  --originrouter-device <device-id>
   --originrouter-session session-id
-  --originrouter-autonomy manual|guarded|unrestricted|custom
+  --originrouter-autonomy manual|guarded|ai_review|unrestricted|custom
   --originrouter-detail concise|standard|detailed  Override this session's installed default
   --originrouter-auto-approve                    Alias for --originrouter-autonomy guarded
   --originrouter-auto-allow <scope[,scope...]>   Use a custom unattended allow-list; repeatable

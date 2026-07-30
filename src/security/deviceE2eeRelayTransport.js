@@ -83,12 +83,14 @@ export class DeviceE2eeRelayTransport {
   constructor({
     relayClient,
     localIdentity,
+    localIdentityProvider = null,
     stateDir,
     controlBaseUrl,
     credentialProvider,
   }) {
     this.relayClient = relayClient;
     this.localIdentity = localIdentity;
+    this.localIdentityProvider = localIdentityProvider;
     this.stateDir = stateDir;
     this.controlBaseUrl = controlBaseUrl;
     this.credentialProvider = credentialProvider;
@@ -96,6 +98,26 @@ export class DeviceE2eeRelayTransport {
     this.routes = new Map();
     this.sendTails = new Map();
     this.inboundTail = Promise.resolve();
+  }
+
+  setLocalIdentity(identity) {
+    const publicIdentity = identity?.public_identity;
+    if (!publicIdentity?.device_id || !publicIdentity?.key_id) {
+      throw new Error("invalid local device E2EE identity");
+    }
+    if (publicIdentity.key_id === this.localIdentity?.public_identity?.key_id
+        && publicIdentity.device_id === this.localIdentity?.public_identity?.device_id) {
+      return false;
+    }
+    this.localIdentity = identity;
+    this.clearSessions();
+    return true;
+  }
+
+  _refreshLocalIdentity() {
+    const next = this.localIdentityProvider?.();
+    if (next) this.setLocalIdentity(next);
+    return this.localIdentity;
   }
 
   async _credential() {
@@ -203,6 +225,7 @@ export class DeviceE2eeRelayTransport {
 
   async _handleInboundSerial(envelope) {
     if (envelope?.protocol !== "e2ee-v2") return null;
+    const localIdentity = this._refreshLocalIdentity();
     this._pruneSessions();
     await this._verifyPeerDirectoryHead(envelope?.routing?.directory_head);
     let session = this.sessions.get(envelope.session_id);
@@ -215,7 +238,7 @@ export class DeviceE2eeRelayTransport {
         envelope.sender_key_id,
       );
       const accepted = DeviceE2eeSession.accept({
-        local: this.localIdentity,
+        local: localIdentity,
         peer,
         firstEnvelope: envelope,
       });
@@ -280,6 +303,7 @@ export class DeviceE2eeRelayTransport {
   }
 
   async send(type, payload = {}) {
+    const localIdentity = this._refreshLocalIdentity();
     if (!PROTECTED_DEVICE_MESSAGE_TYPES.has(type)) {
       return this.relayClient.send(type, payload);
     }
@@ -295,7 +319,7 @@ export class DeviceE2eeRelayTransport {
       if (targetDeviceId) {
         const peer = await this.currentPeer(targetDeviceId);
         session = DeviceE2eeSession.initiate({
-          local: this.localIdentity,
+          local: localIdentity,
           peer,
         });
         this.sessions.set(session.sessionId, session);

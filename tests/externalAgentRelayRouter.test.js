@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { canonicalJson } from "../src/crypto/deviceE2eeIdentity.js";
 import { ExternalAgentRelayRouter } from "../src/daemon/externalAgentRelayRouter.js";
 
 function fixture() {
@@ -15,6 +16,7 @@ function fixture() {
   };
   const relayClient = {
     send: async (type, payload) => {
+      canonicalJson(payload);
       sent.push({ type, payload });
       return { accepted: true };
     },
@@ -48,6 +50,72 @@ test("daemon returns an empty history page for a registered manual session", asy
       },
     },
   ]);
+});
+
+test("daemon preserves text and tool history while removing undefined fields", async () => {
+  const sent = [];
+  const registry = {
+    has: (sessionId) => sessionId === "session-1",
+    history: () => ({
+      messages: [
+        {
+          messageId: "assistant-1",
+          role: "assistant",
+          text: "done",
+          optional: undefined,
+        },
+        {
+          messageId: "tool-1",
+          role: "event",
+          event: {
+            type: "agent.tool_call.end",
+            tool: "Read",
+            content: "file contents",
+            omitted: undefined,
+          },
+        },
+      ],
+      nextCursor: null,
+      hasMore: false,
+    }),
+    controlSnapshot: () => ({ interactions: [], events: [] }),
+    enqueueCommand: () => {},
+  };
+  const relayClient = {
+    send: async (type, payload) => {
+      canonicalJson(payload);
+      sent.push({ type, payload });
+      return { accepted: true };
+    },
+  };
+  const router = new ExternalAgentRelayRouter({ registry, relayClient });
+
+  assert.equal(await router.handle({
+    type: "agent.history.request",
+    sessionId: "session-1",
+    requestId: "history-rich",
+  }), true);
+  assert.deepEqual(sent[0], {
+    type: "agent.history.page",
+    payload: {
+      sessionId: "session-1",
+      requestId: "history-rich",
+      messages: [
+        { messageId: "assistant-1", role: "assistant", text: "done" },
+        {
+          messageId: "tool-1",
+          role: "event",
+          event: {
+            type: "agent.tool_call.end",
+            tool: "Read",
+            content: "file contents",
+          },
+        },
+      ],
+      nextCursor: null,
+      hasMore: false,
+    },
+  });
 });
 
 test("daemon routes App messages to the exact registered session", async () => {
@@ -84,4 +152,30 @@ test("daemon forwards full transient text and session acknowledgements", async (
   assert.equal(sent[0].payload.event.text, "done");
   assert.equal(sent[1].type, "agent.message.result");
   assert.equal(sent[1].payload.sessionId, "session-1");
+});
+
+test("daemon removes undefined fields before protected E2EE serialization", async () => {
+  const { router, sent } = fixture();
+  await router.forwardRegistryNotification({
+    type: "event",
+    sessionId: "session-1",
+    payload: {
+      type: "agent.text",
+      eventId: "text-undefined",
+      text: "complete",
+      optional: undefined,
+      metadata: { safe: true, omitted: undefined },
+      blocks: [undefined, { text: "kept", omitted: undefined }],
+    },
+  });
+  assert.deepEqual(sent[0].payload, {
+    sessionId: "session-1",
+    event: {
+      type: "agent.text",
+      eventId: "text-undefined",
+      text: "complete",
+      metadata: { safe: true },
+      blocks: [null, { text: "kept" }],
+    },
+  });
 });

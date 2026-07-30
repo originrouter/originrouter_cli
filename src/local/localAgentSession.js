@@ -46,11 +46,20 @@ import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 import { PendingInteractionRegistry } from "../runtime/pendingInteractionRegistry.js";
 import {
   buildAutonomyStatusEvent,
-  evaluateAutonomyInteraction,
   invalidAutonomyScopes,
   normalizeAutonomyProfile,
   normalizeAutonomyScopes,
+  resolveWithAutonomy,
 } from "../runtime/agentAutonomyPolicy.js";
+import { AiApprovalReviewer } from "../runtime/aiApprovalReviewer.js";
+import {
+  aiReviewPolicyFromEnvironment,
+  aiReviewPolicyFromPayload,
+} from "../runtime/aiReviewPolicy.js";
+import {
+  readApprovalPolicyReference,
+  resolveApprovalPolicySelection,
+} from "../runtime/approvalPolicyStore.js";
 import { protectOriginrouterCodingEnv } from "../runtime/originrouterCodingAuthProxy.js";
 import {
   displaySafeToolInput,
@@ -271,6 +280,11 @@ export function extractOriginRouterOptions(args) {
       index += 1;
       continue;
     }
+    if (arg === "--originrouter-policy") {
+      options.approvalPolicyReference = args[index + 1];
+      index += 1;
+      continue;
+    }
     if (arg === "--originrouter-detail") {
       options.detailProfile = args[index + 1];
       index += 1;
@@ -322,6 +336,7 @@ function writeLocal(data) {
 
 export async function runLocalAgentSession(agent, rawArgs) {
   const stateDir = ensureStateDir();
+  const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
 
   const { options, passthrough } = extractOriginRouterOptions(rawArgs);
   const relayConfig = readLocalApiConfig();
@@ -460,6 +475,12 @@ export async function runLocalAgentSession(agent, rawArgs) {
           (autonomyAllowedScopes.length ? "custom" : "manual"),
       )
     : "manual";
+  let approvalPolicy = autonomySupported && autonomyProfile === "custom" && options.approvalPolicyReference
+    ? readApprovalPolicyReference(options.approvalPolicyReference, { stateDir })
+    : null;
+  let aiReviewPolicy = autonomySupported && autonomyProfile === "ai_review"
+    ? aiReviewPolicyFromEnvironment()
+    : null;
   if (
     !autonomySupported &&
     (options.autonomyProfile || (options.autonomyAllowedScopes || []).length)
@@ -575,17 +596,20 @@ export async function runLocalAgentSession(agent, rawArgs) {
       ]);
     },
   });
-  const autonomyStatus = (requestId = null) =>
+  const autonomyStatus = (requestId = null, { accepted = null, reason = null } = {}) =>
     buildAutonomyStatusEvent({
       provider: agent,
       runtime: agent === "claude" ? "claude-pty" : "codex-pty",
       profile: autonomyProfile,
       allowedScopes: autonomyAllowedScopes,
+      approvalPolicy,
+      aiReviewPolicy,
       control: autonomySupported ? "supported" : "unsupported",
       requestId,
-      reason: autonomySupported
+      accepted,
+      reason: reason || (autonomySupported
         ? null
-        : "Native Codex does not expose its blocking approval channel. Use originrouter codex-terminal.",
+        : "Native Codex does not expose its blocking approval channel. Use originrouter codex-terminal."),
     });
   const detailStatus = () => ({
     type: "agent.detail.status",
@@ -602,55 +626,49 @@ export async function runLocalAgentSession(agent, rawArgs) {
     }
     const requested = normalizeAutonomyProfile(payload?.profile, "");
     if (!requested) return false;
-    autonomyProfile = requested;
-    autonomyAllowedScopes =
-      requested === "custom"
-        ? normalizeAutonomyScopes(
-            payload?.allowedScopes || payload?.allowed_scopes,
-          )
+    try {
+      const nextPolicy = requested === "custom"
+        ? resolveApprovalPolicySelection(payload, { stateDir, current: approvalPolicy })
+        : null;
+      const nextAiReviewPolicy = requested === "ai_review"
+        ? aiReviewPolicyFromPayload(payload)
+        : null;
+      autonomyProfile = requested;
+      approvalPolicy = nextPolicy;
+      aiReviewPolicy = nextAiReviewPolicy;
+      autonomyAllowedScopes = requested === "custom" && !approvalPolicy
+        ? normalizeAutonomyScopes(payload?.allowedScopes || payload?.allowed_scopes)
         : [];
-    await sendTransientEvent(autonomyStatus(payload?.requestId || null));
-    return true;
+      await sendTransientEvent(autonomyStatus(payload?.requestId || null, { accepted: true }));
+      return true;
+    } catch (error) {
+      await sendTransientEvent(autonomyStatus(payload?.requestId || null, {
+        accepted: false,
+        reason: error.code || error.message,
+      }));
+      return false;
+    }
   };
   const registeredInteractions = new Set();
   const registerInteraction = (event) => {
     const request = normalizePtyInteraction(event, sessionId);
     if (registeredInteractions.has(request.interactionId)) return;
-    const automatic = autonomySupported
-      ? evaluateAutonomyInteraction(request, {
+    registeredInteractions.add(request.interactionId);
+    const resolve = autonomySupported
+      ? resolveWithAutonomy({
+          request,
           profile: autonomyProfile,
           allowedScopes: autonomyAllowedScopes,
+          approvalPolicy,
           workspaceRoot: cwd,
+          stateDir,
+          aiReviewer: aiApprovalReviewer,
+          aiReviewPolicy,
+          runtime: "claude-pty",
+          requestInteraction: (item) => interactions.request(item),
         })
-      : { autoResolve: false };
-    if (automatic.autoResolve) {
-      const applied = adapter.resolvePermission({
-        callId: request.interactionId,
-        interactionId: request.interactionId,
-        decision: "approved",
-        reason: automatic.reason,
-        action: automatic.action,
-        response: automatic.response,
-      });
-      void sendTransientEvent({
-        type: "agent.interaction.auto_resolved",
-        provider: agent,
-        interactionId: request.interactionId,
-        kind: request.kind,
-        title: request.title,
-        autonomyProfile,
-        autonomyScope: automatic.scope,
-        reason:
-          applied === false
-            ? "native_interaction_not_pending"
-            : automatic.reason,
-        status: applied === false ? "failed" : "applied",
-      });
-      return;
-    }
-    registeredInteractions.add(request.interactionId);
-    void interactions
-      .request(request)
+      : interactions.request(request);
+    void resolve
       .then(async (resolved) => {
         const applied = adapter.resolvePermission({
           callId: resolved.interactionId,
@@ -659,15 +677,34 @@ export async function runLocalAgentSession(agent, rawArgs) {
           reason: resolved.action,
           action: resolved.action,
           response: resolved.response,
+          decisionSource: resolved.decisionSource,
         });
-        await interactions.markResult(
-          resolved.interactionId,
-          applied === false ? "failed" : "applied",
-          {
-            responseId: resolved.responseId,
-            reason: applied === false ? "native_interaction_not_pending" : "",
-          },
-        );
+        if (resolved.autoResolved) {
+          await sendTransientEvent({
+            type: "agent.interaction.auto_resolved",
+            provider: agent,
+            interactionId: request.interactionId,
+            kind: request.kind,
+            title: request.title,
+            autonomyProfile,
+            autonomyScope: resolved.scope,
+            reason: applied === false ? "native_interaction_not_pending" : resolved.reason,
+            status: applied === false ? "failed" : "applied",
+            decision: resolved.action,
+            decisionSource: resolved.decisionSource || "autonomy_policy",
+            aiReview: resolved.aiReview || null,
+            policyEvaluation: resolved.policyEvaluation || null,
+          });
+        } else {
+          await interactions.markResult(
+            resolved.interactionId,
+            applied === false ? "failed" : "applied",
+            {
+              responseId: resolved.responseId,
+              reason: applied === false ? "native_interaction_not_pending" : "",
+            },
+          );
+        }
         registeredInteractions.delete(resolved.interactionId);
       })
       .catch(() => {
@@ -978,6 +1015,13 @@ export async function runLocalAgentSession(agent, rawArgs) {
     autonomyProfile,
     autonomyControl: autonomySupported ? "supported" : "unsupported",
     allowedAutonomyScopes: autonomyAllowedScopes,
+    approvalPolicy: approvalPolicy
+      ? {
+          id: approvalPolicy.policy.id,
+          name: approvalPolicy.policy.name || approvalPolicy.policy.id,
+          revision: approvalPolicy.revision,
+        }
+      : null,
     detailProfile: detail.profile,
     detailSource: detail.source,
     transcriptPath:

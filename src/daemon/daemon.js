@@ -202,20 +202,27 @@ export async function startDaemon(args) {
     }
   } catch {}
   const storedDeviceE2eeIdentity = readDeviceE2eeIdentity(stateDir);
-  const deviceE2eeIdentity = storedDeviceE2eeIdentity
-    && storedDeviceE2eeIdentity.public_identity.device_id === effectiveDeviceId
-    && storedDeviceE2eeIdentity.public_identity.epoch !== deviceE2eeEpoch
-    ? resetDeviceE2eeIdentityForEpoch(stateDir, {
-        deviceId: effectiveDeviceId,
-        epoch: deviceE2eeEpoch,
-      })
-    : ensureDeviceE2eeIdentity(stateDir, {
-        deviceId: effectiveDeviceId,
-        epoch: deviceE2eeEpoch,
-      });
+  let deviceE2eeIdentity;
+  if (!storedDeviceE2eeIdentity) {
+    deviceE2eeIdentity = ensureDeviceE2eeIdentity(stateDir, {
+      deviceId: effectiveDeviceId,
+      epoch: deviceE2eeEpoch,
+    });
+  } else if (
+    storedDeviceE2eeIdentity.public_identity.device_id !== effectiveDeviceId
+    || storedDeviceE2eeIdentity.public_identity.epoch !== deviceE2eeEpoch
+  ) {
+    deviceE2eeIdentity = resetDeviceE2eeIdentityForEpoch(stateDir, {
+      deviceId: effectiveDeviceId,
+      epoch: deviceE2eeEpoch,
+    });
+  } else {
+    deviceE2eeIdentity = storedDeviceE2eeIdentity;
+  }
   const deviceE2eeRelay = new DeviceE2eeRelayTransport({
     relayClient,
     localIdentity: deviceE2eeIdentity,
+    localIdentityProvider: () => readDeviceE2eeIdentity(stateDir),
     stateDir,
     controlBaseUrl: relayUrl,
     credentialProvider: () => ensureFreshAccessToken({ stateDir }),
@@ -223,6 +230,7 @@ export async function startDaemon(args) {
   const deviceE2eeLocalGateway = new DeviceE2eeLocalGateway({
     stateDir,
     localIdentity: deviceE2eeIdentity,
+    localIdentityProvider: () => readDeviceE2eeIdentity(stateDir),
     apiTokenPath: apiTokenFile,
   });
   const auditStore = new LocalAuditStore({ stateDir });
@@ -526,16 +534,62 @@ export async function startDaemon(args) {
     ).catch(() => ({ ok: false, error: "request_failed" }));
   };
   let registeredDeviceE2eeKeyId = null;
-  const syncDeviceE2eeIdentity = async () => {
-    const keyId = deviceE2eeIdentity.public_identity.key_id;
+  const activateDeviceE2eeIdentity = (identity, reason = "state changed") => {
+    const previous = deviceE2eeIdentity?.public_identity;
+    deviceE2eeIdentity = identity;
+    const relayChanged = deviceE2eeRelay.setLocalIdentity(identity);
+    const localChanged = deviceE2eeLocalGateway.setLocalIdentity(identity);
+    if (relayChanged || localChanged) {
+      registeredDeviceE2eeKeyId = null;
+      console.log(
+        `[device-e2ee] activated ${identity.public_identity.device_id} `
+        + `${identity.public_identity.key_id} (${reason}; previous `
+        + `${previous?.device_id || "none"} ${previous?.key_id || "none"})`,
+      );
+    }
+    return identity;
+  };
+  const currentDeviceE2eeIdentity = ({ deviceId, epoch } = {}) => {
+    const stored = readDeviceE2eeIdentity(stateDir);
+    if (!stored) {
+      return activateDeviceE2eeIdentity(ensureDeviceE2eeIdentity(stateDir, {
+        deviceId: deviceId || effectiveDeviceId,
+        epoch: epoch || 1,
+      }), "identity initialized");
+    }
+    if (deviceId && stored.public_identity.device_id !== deviceId) {
+      return activateDeviceE2eeIdentity(resetDeviceE2eeIdentityForEpoch(stateDir, {
+        deviceId,
+        epoch: epoch || stored.public_identity.epoch,
+      }), "authenticated device changed");
+    }
+    if (epoch && stored.public_identity.epoch !== epoch) {
+      return activateDeviceE2eeIdentity(resetDeviceE2eeIdentityForEpoch(stateDir, {
+        deviceId: deviceId || stored.public_identity.device_id,
+        epoch,
+      }), "account epoch changed");
+    }
+    return activateDeviceE2eeIdentity(stored, "identity file changed");
+  };
+  const syncDeviceE2eeIdentity = async ({ deviceId = effectiveDeviceId } = {}) => {
     const credential = await ensureFreshAccessToken({ stateDir });
     const accessToken = credential?.accessTokens?.control?.token;
     if (!accessToken) return;
+    const authenticatedDeviceId = credential.deviceId || deviceId;
+    const status = await getCliDeviceE2eeStatus({
+      controlBaseUrl: relayUrl,
+      accessToken,
+    });
+    const identity = currentDeviceE2eeIdentity({
+      deviceId: authenticatedDeviceId,
+      epoch: Number(status?.policy?.epoch || deviceE2eeIdentity.public_identity.epoch),
+    });
+    const keyId = identity.public_identity.key_id;
     if (registeredDeviceE2eeKeyId !== keyId) {
       const registered = await registerCliDeviceE2eeIdentity({
         controlBaseUrl: relayUrl,
         accessToken,
-        identity: deviceE2eeIdentity.public_identity,
+        identity: identity.public_identity,
       });
       registeredDeviceE2eeKeyId = registered.key_id;
       if (registered.trust_status === "pending") {
@@ -566,7 +620,7 @@ export async function startDaemon(args) {
   agentActivitySyncTimer.unref?.();
   deviceE2eeRefreshTimer = setInterval(() => {
     if (!relayConnected) return;
-    deviceE2eeRelay.refreshDirectory().catch((error) => {
+    syncDeviceE2eeIdentity().catch((error) => {
       console.error(`[device-e2ee] directory refresh: ${error.code || error.message}`);
     });
   }, 15 * 60_000);
@@ -682,6 +736,7 @@ export async function startDaemon(args) {
       relayClient.deviceId = relayOptions.deviceId;
       relayClient.setAuthToken(relayOptions.authToken);
       effectiveDeviceId = relayOptions.deviceId;
+      currentDeviceE2eeIdentity({ deviceId: effectiveDeviceId });
       localApiCtx.deviceId = effectiveDeviceId;
       sessionManager.deviceId = effectiveDeviceId;
       managedAgentSupervisor.deviceId = effectiveDeviceId;
@@ -705,7 +760,11 @@ export async function startDaemon(args) {
               "device.policy.changed",
               "account.epoch.changed",
             ].includes(routed.type)) {
-              await deviceE2eeRelay.refreshDirectory({ clearSessions: true });
+              if (routed.type === "account.epoch.changed") {
+                await syncDeviceE2eeIdentity();
+              } else {
+                await deviceE2eeRelay.refreshDirectory({ clearSessions: true });
+              }
               deviceE2eeLocalGateway.clearTrustSessions();
               return;
             }
@@ -796,6 +855,7 @@ export async function startDaemon(args) {
         relayClient.deviceId = relayOptions.deviceId;
         relayClient.setAuthToken(relayOptions.authToken);
         effectiveDeviceId = relayOptions.deviceId;
+        currentDeviceE2eeIdentity({ deviceId: effectiveDeviceId });
         localApiCtx.deviceId = effectiveDeviceId;
         sessionManager.deviceId = effectiveDeviceId;
         relayAuthState = relayOptions.authState || "on";

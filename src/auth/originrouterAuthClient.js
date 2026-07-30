@@ -2,11 +2,12 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 
 export class AuthClientError extends Error {
-  constructor({ status = 0, code = "oauth_request_failed", message = code }) {
+  constructor({ status = 0, code = "oauth_request_failed", message = code, body = null }) {
     super(message);
     this.name = "AuthClientError";
     this.status = status;
     this.code = code;
+    this.body = body;
   }
 }
 
@@ -33,10 +34,17 @@ async function requestForm(url, entries, { timeoutMs = DEFAULT_TIMEOUT_MS, fetch
     try { payload = await response.json(); } catch {}
     if (!response.ok) {
       const code = payload?.error || "oauth_request_failed";
+      const safeBody = payload && typeof payload === "object" ? {
+        error: code,
+        ...(typeof payload.error_description === "string"
+          ? { error_description: payload.error_description }
+          : {}),
+      } : null;
       throw new AuthClientError({
         status: response.status,
         code,
-        message: code,
+        message: payload?.error_description || code,
+        body: safeBody,
       });
     }
     if (!payload || typeof payload !== "object") {

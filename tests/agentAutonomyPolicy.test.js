@@ -151,6 +151,30 @@ test("AI review allows routine work but never grants high-risk authority", async
   assert.equal(userRequests, 1);
 });
 
+test("AI review template scopes can narrow an allow decision", async () => {
+  let reviewedPolicy;
+  const result = await resolveWithAutonomy({
+    request: permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    profile: "ai_review",
+    workspaceRoot: "/tmp/project",
+    aiReviewPolicy: {
+      template_id: "ait_read_only",
+      version: 3,
+      content_hash: "b".repeat(64),
+      allowed_scopes: ["read_tools"],
+    },
+    aiReviewer: {
+      review: async ({ aiReviewPolicy }) => {
+        reviewedPolicy = aiReviewPolicy;
+        return { decision: "allow", risk: "low", confidence: 0.99 };
+      },
+    },
+    requestInteraction: async () => ({ action: "deny", user: true }),
+  });
+  assert.equal(reviewedPolicy.template_id, "ait_read_only");
+  assert.equal(result.user, true);
+});
+
 test("AI review can deny and falls back to the user when unavailable", async () => {
   const denied = await resolveWithAutonomy({
     request: permission({ tool: "command", command: "curl -X POST https://example.com", cwd: "/tmp/project" }),

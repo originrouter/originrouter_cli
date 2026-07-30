@@ -85,7 +85,7 @@ async function rotate() {
   console.log(`Key ID:      ${registered.key_id}`);
   console.log(`Key version: ${registered.key_version}`);
   console.log(`Trust:       ${registered.trust_status}`);
-  console.log("Restart the OriginRouter daemon to activate the new private key.");
+  console.log("A running OriginRouter daemon will activate the new key automatically.");
 }
 
 export async function handleSecurityCommand(args) {

@@ -112,6 +112,7 @@ test("Device Flow rotates RT sequentially and builds four audience tokens", asyn
 
   assert.equal(isOAuthCredentialShape(credential), true);
   assert.equal(credential.deviceId, "device-cli-stable");
+  assert.equal(credential.deviceName, "Work Mac");
   assert.equal(credential.sessionId, "or_ses_login");
   assert.equal(credential.refreshToken, "or_rt_4");
   assert.equal(credential.accessTokens.control.token, "or_at_control_login");
@@ -121,6 +122,76 @@ test("Device Flow rotates RT sequentially and builds four audience tokens", asyn
   assert.equal(devicePolls, 2);
   assert.match(printed.join("\n"), /ABCD-EFGH/);
   assert.equal(calls[0].body.get("device_id"), "device-cli-stable");
+});
+
+test("Device Flow accepts an atomic multi-resource token bundle", async () => {
+  const calls = [];
+  const fetchFn = async (url, init) => {
+    const body = new URLSearchParams(init.body);
+    calls.push({ url: String(url), body });
+    if (String(url).endsWith("/api/oauth/device/code")) {
+      return oauthResponse(200, {
+        device_code: "or_dc_bundle",
+        user_code: "BNDL-0001",
+        expires_in: 600,
+        interval: 1,
+        enrollment_challenge: "or_ch_test",
+      });
+    }
+    if (String(url).endsWith("/api/oauth/device/bind")) {
+      return oauthResponse(200, { bound: true });
+    }
+    return oauthResponse(200, {
+      access_token: "or_at_control_bundle",
+      refresh_token: "or_rt_bundle",
+      session_id: "or_ses_bundle",
+      expires_in: 600,
+      refresh_expires_in: 2_592_000,
+      scope: "control.read control.write ai.models ai.invoke coding.invoke relay.connect",
+      access_tokens: {
+        "originrouter.control": {
+          access_token: "or_at_control_bundle",
+          expires_in: 600,
+          scope: "control.read control.write",
+        },
+        "originrouter.ai": {
+          access_token: "or_at_ai_bundle",
+          expires_in: 600,
+          scope: "ai.models ai.invoke",
+        },
+        "originrouter.coding": {
+          access_token: "or_at_coding_bundle",
+          expires_in: 600,
+          scope: "coding.invoke",
+        },
+        "originrouter.relay": {
+          access_token: "or_at_relay_bundle",
+          expires_in: 600,
+          scope: "relay.connect",
+        },
+      },
+    });
+  };
+
+  const credential = await loginWithDeviceFlow({
+    suretyBaseUrl: "https://surety.example.test",
+    h5BaseUrl: "https://app.originrouter.com",
+    deviceId: "device-cli-stable",
+    deviceName: "Work Mac",
+    e2eeIdentity: enrollmentIdentity,
+    signEnrollmentChallenge,
+    noBrowser: true,
+    sleepFn: async () => {},
+    printFn: () => {},
+    fetchFn,
+  });
+
+  assert.equal(calls.length, 3);
+  assert.equal(credential.refreshToken, "or_rt_bundle");
+  assert.equal(credential.accessTokens.control.token, "or_at_control_bundle");
+  assert.equal(credential.accessTokens.ai.token, "or_at_ai_bundle");
+  assert.equal(credential.accessTokens.coding.token, "or_at_coding_bundle");
+  assert.equal(credential.accessTokens.relay.token, "or_at_relay_bundle");
 });
 
 test("Device Flow maps denial to a stable client error", async () => {

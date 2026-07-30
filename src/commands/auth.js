@@ -9,15 +9,19 @@ import {
   DEFAULT_SURETY_BASE_URL,
 } from "../config/providerRoutes.js";
 import {
-  ensureDeviceE2eeIdentity,
+  commitDeviceE2eeIdentity,
+  createDeviceE2eeIdentityCandidate,
+  discardDeviceE2eeIdentityCandidate,
+  invalidateDeviceE2eeIdentity,
   readDeviceE2eeIdentity,
-  resetDeviceE2eeIdentityForEpoch,
+  signCurrentDeviceRemoval,
   signDeviceE2eeEnrollment,
 } from "../crypto/deviceE2eeIdentity.js";
 import {
   getCliDeviceE2eeDirectory,
-  getCliDeviceE2eeStatus,
   registerCliDeviceE2eeIdentity,
+  removeCurrentCliDevice,
+  signOutCurrentCliDevice,
 } from "../security/deviceE2eeClient.js";
 import { storeDeviceE2eeDirectoryCache } from "../security/deviceE2eeDirectoryCache.js";
 import {
@@ -25,11 +29,19 @@ import {
   readCodingAuth,
 } from "../persistence/codingAuth.js";
 import {
+  commitDeviceCandidate,
+  createDeviceCandidate,
+  discardDeviceCandidate,
+  invalidateDevice,
+  cliDeviceDisplayName,
   defaultDeviceDisplayName,
-  ensureDevice,
   ensureStateDir,
+  isStaleDeviceId,
+  readDevice,
+  updateDeviceDisplayName,
 } from "../persistence/state.js";
 import { formatCliError, reportCliError } from "../runtime/cliErrors.js";
+import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 
 function parseFlag(args, name) {
   for (let index = 0; index < args.length; index++) {
@@ -49,55 +61,123 @@ function expiry(value) {
   return typeof value === "number" ? new Date(value).toISOString() : "(unknown)";
 }
 
-export async function handleLogin(args) {
+const INVALID_STORED_LOGIN_CODES = new Set([
+  "invalid_grant",
+  "invalid_token",
+  "expired_token",
+  "access_denied",
+  "token_revoked",
+  "session_revoked",
+  "OAUTH_REFRESH_EXPIRED",
+  "OAUTH_RESOURCE_TOKEN_MISSING",
+]);
+
+export function storedLoginIsInvalid(error) {
+  if (INVALID_STORED_LOGIN_CODES.has(error?.code)) return true;
+  // Surety uses HTTP 400/401/403 for terminal OAuth credential failures.
+  // Connectivity, rate-limit and server failures must preserve the local
+  // credential because they do not prove that the session is invalid.
+  return [400, 401, 403].includes(Number(error?.status));
+}
+
+export async function inspectStoredLogin({
+  stateDir,
+  fetchFn = globalThis.fetch,
+} = {}) {
+  const stored = readCodingAuth(stateDir);
+  if (!stored) {
+    // Also removes a malformed credential file that readCodingAuth rejected.
+    clearCodingAuth(stateDir);
+    return { state: "missing", credential: null };
+  }
+  try {
+    const credential = await ensureFreshAccessToken({
+      stateDir,
+      forceRefresh: true,
+      fetchFn,
+    });
+    return { state: "active", credential };
+  } catch (error) {
+    if (!storedLoginIsInvalid(error)) throw error;
+    clearCodingAuth(stateDir);
+    return { state: "invalid", credential: null, error };
+  }
+}
+
+export async function handleLogin(args, { fetchFn = globalThis.fetch } = {}) {
   const stateDir = ensureStateDir();
   const suretyBaseUrl = parseFlag(args, "surety-url") ||
     process.env.SURETY_BASE_URL || DEFAULT_SURETY_BASE_URL;
   const h5BaseUrl = parseFlag(args, "login-url") ||
     process.env.ORIGINROUTER_LOGIN_URL || DEFAULT_ORIGINROUTER_H5_BASE_URL;
-  const device = ensureDevice();
-  const storedBeforeLogin = readDeviceE2eeIdentity(stateDir);
-  const enrollmentIdentity = ensureDeviceE2eeIdentity(stateDir, {
-    deviceId: device.deviceId,
-    epoch: storedBeforeLogin?.public_identity?.epoch || 1,
+  const requestedDeviceName = parseFlag(args, "device-name");
+  let storedLogin;
+  try {
+    storedLogin = await inspectStoredLogin({ stateDir, fetchFn });
+  } catch (error) {
+    formatCliError(error);
+    return;
+  }
+  if (storedLogin.state === "active") {
+    const credential = storedLogin.credential;
+    console.log("Already signed in to OriginRouter.");
+    console.log(`Device:  ${credential.deviceName || credential.deviceId}`);
+    console.log("Run `originrouter auth status` to view the session.");
+    console.log("To sign in again, run `originrouter logout` first.");
+    return;
+  }
+  if (storedLogin.state === "invalid") {
+    console.log("The previous sign-in is no longer valid. Starting a new sign-in.");
+  }
+
+  const storedDevice = readDevice();
+  // `local-dev` was a pre-device-identity placeholder. Keep the old formal
+  // record untouched until the replacement login succeeds, but never send it
+  // to Surety as a new authorization identity.
+  const installedDevice = storedDevice && !isStaleDeviceId(storedDevice.deviceId)
+    ? storedDevice
+    : null;
+  const device = installedDevice ?? createDeviceCandidate(stateDir, {
+    displayName: requestedDeviceName
+      ? cliDeviceDisplayName(requestedDeviceName)
+      : undefined,
   });
+  const storedBeforeLogin = readDeviceE2eeIdentity(stateDir);
+  const matchingStoredIdentity = storedBeforeLogin
+    && storedBeforeLogin.public_identity.device_id === device.deviceId
+    ? storedBeforeLogin
+    : null;
+  const enrollmentIdentity = matchingStoredIdentity ??
+    createDeviceE2eeIdentityCandidate(stateDir, {
+      deviceId: device.deviceId,
+      epoch: 1,
+    });
+  const candidateNeedsCommit = matchingStoredIdentity == null;
+  const deviceNeedsCommit = installedDevice == null;
   try {
     const credential = await loginWithDeviceFlow({
       suretyBaseUrl,
       h5BaseUrl,
       deviceId: device.deviceId,
       deviceName:
-        parseFlag(args, "device-name") ||
+        (requestedDeviceName && cliDeviceDisplayName(requestedDeviceName)) ||
         device.displayName ||
         defaultDeviceDisplayName(),
       e2eeIdentity: enrollmentIdentity.public_identity,
       signEnrollmentChallenge: (challenge) =>
         signDeviceE2eeEnrollment(enrollmentIdentity, challenge),
       noBrowser: args.includes("--no-browser"),
+      fetchFn,
     });
+    if (deviceNeedsCommit) commitDeviceCandidate(device, stateDir);
+    if (requestedDeviceName) {
+      updateDeviceDisplayName(requestedDeviceName, stateDir);
+    }
+    if (candidateNeedsCommit) {
+      commitDeviceE2eeIdentity(stateDir, enrollmentIdentity);
+    }
     persistOAuthCredential({ stateDir, credential });
-    let epoch = 1;
-    try {
-      const status = await getCliDeviceE2eeStatus({
-        controlBaseUrl:
-          process.env.ORIGINROUTER_CONTROL_BASE_URL ||
-          DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
-        accessToken: credential.accessTokens.control.token,
-      });
-      epoch = Number(status?.policy?.epoch || 1);
-    } catch {}
-    const storedE2ee = readDeviceE2eeIdentity(stateDir);
-    const e2ee = storedE2ee
-      && storedE2ee.public_identity.device_id === credential.deviceId
-      && storedE2ee.public_identity.epoch !== epoch
-      ? resetDeviceE2eeIdentityForEpoch(stateDir, {
-          deviceId: credential.deviceId,
-          epoch,
-        })
-      : ensureDeviceE2eeIdentity(stateDir, {
-          deviceId: credential.deviceId,
-          epoch,
-        });
+    const e2ee = readDeviceE2eeIdentity(stateDir);
     let registered = null;
     let registrationError = null;
     try {
@@ -132,27 +212,78 @@ export async function handleLogin(args) {
       console.log("Compare this fingerprint with the pending-device entry in the App before approving it.");
     }
   } catch (error) {
+    if (error?.code === "device_flow_denied") {
+      invalidateDeviceE2eeIdentity(stateDir);
+      invalidateDevice(stateDir);
+    } else {
+      discardDeviceE2eeIdentityCandidate(stateDir);
+      discardDeviceCandidate(stateDir);
+    }
     formatCliError(error);
   }
 }
 
-export async function handleLogout() {
+export async function handleLogout(args = []) {
   const stateDir = ensureStateDir();
   const stored = readCodingAuth(stateDir);
   if (!stored) {
     console.log("Not logged in.");
     return;
   }
+  if (args.includes("--remove-device")) {
+    const device = readDevice();
+    const identity = readDeviceE2eeIdentity(stateDir);
+    if (!device || !identity) {
+      reportCliError("This device identity is incomplete.", {
+        next: "Run `originrouter logout` to clear the local session, then sign in again.",
+      });
+      return;
+    }
+    try {
+      const fresh = await ensureFreshAccessToken({ stateDir });
+      await removeCurrentCliDevice({
+        controlBaseUrl:
+          process.env.ORIGINROUTER_CONTROL_BASE_URL ||
+          DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
+        accessToken: fresh.accessTokens.control.token,
+        signedRemoval: signCurrentDeviceRemoval(identity),
+      });
+      clearCodingAuth(stateDir);
+      invalidateDeviceE2eeIdentity(stateDir);
+      invalidateDevice(stateDir);
+      console.log("Signed out and removed this device from the account.");
+      console.log("A later sign-in will register it as a new device.");
+    } catch (error) {
+      formatCliError(error);
+    }
+    return;
+  }
+  let signedOutThroughControl = false;
   try {
-    await revokeOAuthToken({
-      revocationEndpoint: stored.revocationEndpoint,
-      token: stored.refreshToken,
+    const fresh = await ensureFreshAccessToken({ stateDir });
+    await signOutCurrentCliDevice({
+      controlBaseUrl:
+        process.env.ORIGINROUTER_CONTROL_BASE_URL ||
+        DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
+      accessToken: fresh.accessTokens.control.token,
     });
+    signedOutThroughControl = true;
   } catch (error) {
-    console.warn(`logout: remote revocation failed (${error.code || "unavailable"})`);
+    console.warn(`logout: device registry update failed (${error.code || "unavailable"})`);
+  }
+  if (!signedOutThroughControl) {
+    const latestStored = readCodingAuth(stateDir) || stored;
+    try {
+      await revokeOAuthToken({
+        revocationEndpoint: latestStored.revocationEndpoint,
+        token: latestStored.refreshToken,
+      });
+    } catch (error) {
+      console.warn(`logout: remote revocation failed (${error.code || "unavailable"})`);
+    }
   }
   clearCodingAuth(stateDir);
-  console.log("Logged out.");
+  console.log("Logged out. This device remains trusted for a later sign-in.");
 }
 
 function handleAuthStatus() {

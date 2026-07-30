@@ -15,6 +15,19 @@ function safeText(value, maxLength) {
   return String(value || "").slice(0, maxLength);
 }
 
+function approvalPolicySummary(value) {
+  if (!value || typeof value !== "object") return null;
+  const id = safeText(value.id, 64);
+  const revision = safeText(value.revision, 128);
+  if (!id || !revision) return null;
+  return {
+    id,
+    name: safeText(value.name, 128) || id,
+    revision,
+    source: safeText(value.source, 32) || "device",
+  };
+}
+
 export class ExternalAgentRegistry {
   constructor({ now = () => Date.now(), catalog = null } = {}) {
     this.now = now;
@@ -96,6 +109,10 @@ export class ExternalAgentRegistry {
       availableAutonomyScopes: Array.isArray(payload?.availableAutonomyScopes)
         ? payload.availableAutonomyScopes.slice(0, 32)
         : existing?.availableAutonomyScopes || [],
+      approvalPolicy:
+        approvalPolicySummary(payload?.approvalPolicy) ||
+        existing?.approvalPolicy ||
+        null,
       detailProfile:
         safeText(payload?.detailProfile, 16) ||
         existing?.detailProfile ||
@@ -226,6 +243,7 @@ export class ExternalAgentRegistry {
       )
         ? event.availableAutonomyScopes.slice(0, 32)
         : session.availableAutonomyScopes;
+      session.approvalPolicy = approvalPolicySummary(event?.approvalPolicy);
     }
     if (event?.type === "agent.detail.status") {
       session.detailProfile =
@@ -387,6 +405,7 @@ export class ExternalAgentRegistry {
       available_autonomy_profiles: session.availableAutonomyProfiles,
       allowed_autonomy_scopes: session.allowedAutonomyScopes,
       available_autonomy_scopes: session.availableAutonomyScopes,
+      approval_policy: session.approvalPolicy,
       detail_profile: session.detailProfile,
       detail_source: session.detailSource,
     };

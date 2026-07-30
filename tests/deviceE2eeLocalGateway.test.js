@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ensureDeviceE2eeIdentity } from "../src/crypto/deviceE2eeIdentity.js";
+import {
+  ensureDeviceE2eeIdentity,
+  prepareDeviceE2eeRotation,
+  signDeviceE2eeLocalChallenge,
+} from "../src/crypto/deviceE2eeIdentity.js";
 import { DeviceE2eeSession } from "../src/crypto/deviceE2eeEnvelope.js";
 import { writeApiToken } from "../src/persistence/authToken.js";
 import { writeCodingAuth } from "../src/persistence/codingAuth.js";
@@ -64,6 +68,10 @@ const bootstrap = gateway.createChallenge({
   appDeviceId: app.public_identity.device_id,
   appKeyId: app.public_identity.key_id,
 });
+assert.deepEqual(bootstrap.auth_methods, [
+  "device_signature_v1",
+  "local_access_key_v1",
+]);
 gateway.authorize({
   challengeId: bootstrap.challenge.challenge_id,
   appIdentity: app.public_identity,
@@ -87,6 +95,114 @@ assert.equal(internalRequest.options.headers.Authorization, `Bearer ${token}`);
 const opened = session.open(responseEnvelope);
 assert.equal(opened.type, "local.rpc.response");
 assert.equal(opened.payload.body.sessions[0].session_id, "secret");
+
+const signedBootstrap = gateway.createChallenge({
+  appDeviceId: app.public_identity.device_id,
+  appKeyId: app.public_identity.key_id,
+});
+const signedAuthorization = gateway.authorize({
+  challengeId: signedBootstrap.challenge.challenge_id,
+  appIdentity: app.public_identity,
+  authMethod: "device_signature_v1",
+  deviceProof: signDeviceE2eeLocalChallenge(app, signedBootstrap.challenge),
+});
+assert.equal(signedAuthorization.auth_method, "device_signature_v1");
+assert.equal(signedAuthorization.trust_context, deviceE2eeDirectoryHead(cachedDirectory));
+const signedSession = DeviceE2eeSession.initiate({
+  local: app,
+  peer: cli.public_identity,
+  sessionId: "e2s_local_signed_test",
+});
+writeApiToken(stateDir, "d".repeat(64));
+const signedRequestAfterAccessKeyRotation = signedSession.seal(
+  "local.rpc.request",
+  {
+    requestId: "rpc-signed-after-key-rotation",
+    method: "GET",
+    path: "/local/status",
+    query: {},
+  },
+  { routing: { directory_head: signedAuthorization.trust_context } },
+);
+const signedResponseAfterAccessKeyRotation = await gateway.handleEnvelope(
+  signedRequestAfterAccessKeyRotation,
+  { localPort: 3000 },
+);
+assert.equal(
+  signedSession.open(signedResponseAfterAccessKeyRotation).type,
+  "local.rpc.response",
+);
+writeApiToken(stateDir, token);
+
+// A fully local deployment has no coding-key.json and no account directory.
+// Possession of the explicitly entered access key authenticates the App's
+// self-signed device identity without granting any account/Relay trust.
+const offlineStateDir = join(root, "offline-state");
+const offlineToken = "b".repeat(64);
+writeApiToken(offlineStateDir, offlineToken);
+let offlineInternalRequest = null;
+const offlineGateway = new DeviceE2eeLocalGateway({
+  stateDir: offlineStateDir,
+  localIdentity: cli,
+  fetchFn: async (url, options) => {
+    offlineInternalRequest = { url: String(url), options };
+    return new Response(JSON.stringify({ ok: true, mode: "offline" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  },
+});
+const offlineBootstrap = offlineGateway.createChallenge({
+  appDeviceId: app.public_identity.device_id,
+  appKeyId: app.public_identity.key_id,
+});
+const offlineAuthorization = offlineGateway.authorize({
+  challengeId: offlineBootstrap.challenge.challenge_id,
+  appIdentity: app.public_identity,
+  authMethod: "local_access_key_v1",
+  hmacProof: localE2eeChallengeProof(offlineToken, offlineBootstrap.challenge),
+});
+assert.equal(offlineAuthorization.auth_method, "local_access_key_v1");
+assert.match(offlineAuthorization.trust_context, /^local:[A-Za-z0-9_-]+$/);
+const offlineSession = DeviceE2eeSession.initiate({
+  local: app,
+  peer: cli.public_identity,
+  sessionId: "e2s_local_offline_test",
+});
+const offlineRequest = offlineSession.seal("local.rpc.request", {
+  requestId: "rpc-offline",
+  method: "GET",
+  path: "/local/status",
+  query: {},
+}, { routing: { directory_head: offlineAuthorization.trust_context } });
+const offlineResponse = await offlineGateway.handleEnvelope(offlineRequest, {
+  localPort: 3000,
+});
+assert.equal(
+  offlineInternalRequest.options.headers.Authorization,
+  `Bearer ${offlineToken}`,
+);
+assert.equal(
+  offlineSession.open(offlineResponse).payload.body.mode,
+  "offline",
+);
+
+// Rotating the manually shared local access key must immediately invalidate
+// sessions authenticated with that key. Account device-signature sessions do
+// not depend on this credential and remain unaffected.
+writeApiToken(offlineStateDir, "c".repeat(64));
+const requestAfterAccessKeyRotation = offlineSession.seal("local.rpc.request", {
+  requestId: "rpc-offline-after-key-rotation",
+  method: "GET",
+  path: "/local/status",
+  query: {},
+}, { routing: { directory_head: offlineAuthorization.trust_context } });
+await assert.rejects(
+  () => offlineGateway.handleEnvelope(requestAfterAccessKeyRotation, {
+    localPort: 3000,
+  }),
+  (error) => error?.code === "local_access_key_changed",
+);
 
 let activeRequests = 0;
 let maxActiveRequests = 0;
@@ -126,5 +242,41 @@ session.open(await firstResponse);
 session.open(await secondResponse);
 assert.equal(internalCalls, 2);
 assert.equal(maxActiveRequests, 1);
+
+// A daemon may stay running while login or `security rotate` replaces the
+// identity file. The next handshake must use the new key and invalidate every
+// challenge/session created under the previous private key.
+let liveCliIdentity = cli;
+const hotReloadGateway = new DeviceE2eeLocalGateway({
+  stateDir,
+  localIdentity: cli,
+  localIdentityProvider: () => liveCliIdentity,
+});
+const staleBootstrap = hotReloadGateway.createChallenge({
+  appDeviceId: app.public_identity.device_id,
+  appKeyId: app.public_identity.key_id,
+});
+const rotation = prepareDeviceE2eeRotation(join(root, "cli"), {
+  deviceId: cli.public_identity.device_id,
+});
+liveCliIdentity = rotation.next;
+rotation.commit();
+const freshBootstrap = hotReloadGateway.createChallenge({
+  appDeviceId: app.public_identity.device_id,
+  appKeyId: app.public_identity.key_id,
+});
+assert.equal(
+  freshBootstrap.cli_identity.key_id,
+  rotation.next.public_identity.key_id,
+);
+assert.equal(hotReloadGateway.identityStatus("cli-device").keyVersion, 2);
+assert.throws(
+  () => hotReloadGateway.authorize({
+    challengeId: staleBootstrap.challenge.challenge_id,
+    appIdentity: app.public_identity,
+    hmacProof: localE2eeChallengeProof(token, staleBootstrap.challenge),
+  }),
+  /challenge expired/,
+);
 
 console.log("device E2EE local gateway tests ok");

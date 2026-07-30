@@ -4,19 +4,86 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  commitDeviceE2eeIdentity,
+  createDeviceE2eeIdentityCandidate,
   ensureDeviceE2eeIdentity,
   prepareDeviceE2eeRotation,
   resetDeviceE2eeIdentityForEpoch,
+  signCurrentDeviceRemoval,
+  signDeviceE2eeLocalChallenge,
   verifyDeviceE2eeIdentity,
+  verifyDeviceE2eeLocalChallenge,
 } from "../src/crypto/deviceE2eeIdentity.js";
 
 const stateDir = mkdtempSync(join(tmpdir(), "originrouter-device-e2ee-"));
 try {
+  const candidate = createDeviceE2eeIdentityCandidate(stateDir, {
+    deviceId: "cli-pending",
+  });
+  assert.equal(candidate.verification_status, "invalid");
+  assert.equal(
+    JSON.parse(readFileSync(join(stateDir, "device-e2ee-v2.pending.json"), "utf8"))
+      .verification_status,
+    "invalid",
+  );
+  assert.equal(
+    (() => {
+      try {
+        readFileSync(join(stateDir, "device-e2ee-v2.json"));
+        return true;
+      } catch {
+        return false;
+      }
+    })(),
+    false,
+  );
+  commitDeviceE2eeIdentity(stateDir, candidate);
+  assert.equal(
+    JSON.parse(readFileSync(join(stateDir, "device-e2ee-v2.json"), "utf8"))
+      .verification_status,
+    "verified",
+  );
+  rmSync(join(stateDir, "device-e2ee-v2.json"));
+
   const first = ensureDeviceE2eeIdentity(stateDir, { deviceId: "cli-test" });
   const reused = ensureDeviceE2eeIdentity(stateDir, { deviceId: "cli-test" });
   assert.equal(reused.public_identity.key_id, first.public_identity.key_id);
   assert.equal(first.public_identity.key_version, 1);
   assert.equal(verifyDeviceE2eeIdentity(first.public_identity), true);
+  const localChallenge = {
+    protocol: "e2ee-v2",
+    challenge_id: "e2c_identity_test",
+    nonce: "nonce-test",
+    app_device_id: first.public_identity.device_id,
+    app_key_id: first.public_identity.key_id,
+    cli_device_id: "cli-peer",
+    cli_key_id: "sha256:peer",
+    expires_at: "2026-07-30T00:00:00.000Z",
+  };
+  const localProof = signDeviceE2eeLocalChallenge(first, localChallenge);
+  assert.equal(
+    verifyDeviceE2eeLocalChallenge(
+      first.public_identity,
+      localChallenge,
+      localProof,
+    ),
+    true,
+  );
+  assert.equal(
+    verifyDeviceE2eeLocalChallenge(
+      first.public_identity,
+      { ...localChallenge, nonce: "tampered" },
+      localProof,
+    ),
+    false,
+  );
+  const removal = signCurrentDeviceRemoval(first, {
+    now: new Date("2026-07-28T11:00:00.000Z"),
+  });
+  assert.equal(removal.action, "remove_current_device");
+  assert.equal(removal.device_id, "cli-test");
+  assert.equal(removal.key_id, first.public_identity.key_id);
+  assert.ok(removal.signature);
 
   const prepared = prepareDeviceE2eeRotation(stateDir, {
     deviceId: "cli-test",

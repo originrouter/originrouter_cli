@@ -12,6 +12,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -20,10 +21,16 @@ export const DEVICE_E2EE_PROTOCOL = "originrouter-device-e2ee-v2";
 const IDENTITY_DOMAIN = "originrouter/device-identity/v2\n";
 const ROTATION_DOMAIN = "originrouter/device-key-rotation/v2\n";
 const ENROLLMENT_DOMAIN = "originrouter/device-login/v2\n";
+const REMOVAL_DOMAIN = "originrouter/device-removal/v2\n";
+const LOCAL_AUTH_DOMAIN = "originrouter/local-e2ee-device-auth/v1\n";
 const FILE_MODE = 0o600;
 
 function identityPath(stateDir) {
   return join(stateDir, "device-e2ee-v2.json");
+}
+
+function pendingIdentityPath(stateDir) {
+  return join(stateDir, "device-e2ee-v2.pending.json");
 }
 
 function canonicalValue(value) {
@@ -158,6 +165,56 @@ export function ensureDeviceE2eeIdentity(stateDir, { deviceId, epoch = 1 } = {})
   return created;
 }
 
+// Login candidates are intentionally created in memory. They become the
+// installed identity only after account authorization and any trusted-device
+// confirmation have both completed.
+export function createDeviceE2eeIdentityCandidate(
+  stateDir,
+  { deviceId, epoch = 1 } = {},
+) {
+  const pendingPath = pendingIdentityPath(stateDir);
+  if (existsSync(pendingPath)) {
+    // A candidate is scoped to one login attempt. A later invocation treats
+    // it exactly like no local login key and starts with fresh key material.
+    unlinkSync(pendingPath);
+  }
+  const candidate = {
+    ...generateIdentity({ deviceId, epoch, keyVersion: 1 }),
+    verification_status: "invalid",
+  };
+  writePrivate(pendingPath, candidate);
+  return candidate;
+}
+
+export function commitDeviceE2eeIdentity(stateDir, candidate) {
+  if (!candidate?.public_identity || !verifyDeviceE2eeIdentity(candidate.public_identity)) {
+    throw new Error("invalid device E2EE identity candidate");
+  }
+  const pendingPath = pendingIdentityPath(stateDir);
+  const pending = existsSync(pendingPath)
+    ? JSON.parse(readFileSync(pendingPath, "utf8"))
+    : null;
+  if (pending?.verification_status !== "invalid"
+      || pending?.public_identity?.key_id !== candidate.public_identity.key_id) {
+    throw new Error("pending device E2EE identity does not match");
+  }
+  const verified = { ...candidate, verification_status: "verified" };
+  writePrivate(identityPath(stateDir), verified);
+  unlinkSync(pendingPath);
+  return verified;
+}
+
+export function discardDeviceE2eeIdentityCandidate(stateDir) {
+  const path = pendingIdentityPath(stateDir);
+  if (existsSync(path)) unlinkSync(path);
+}
+
+export function invalidateDeviceE2eeIdentity(stateDir) {
+  for (const path of [identityPath(stateDir), pendingIdentityPath(stateDir)]) {
+    if (existsSync(path)) unlinkSync(path);
+  }
+}
+
 export function prepareDeviceE2eeRotation(stateDir, { deviceId, now = new Date() } = {}) {
   const previous = readDeviceE2eeIdentity(stateDir);
   if (!previous) throw new Error("device E2EE identity is not initialized");
@@ -202,6 +259,72 @@ export function signDeviceE2eeEnrollment(identity, enrollmentChallenge) {
     Buffer.from(`${ENROLLMENT_DOMAIN}${canonicalJson(value)}`),
     createPrivateKey({ key: identity.signing_private_jwk, format: "jwk" }),
   ).toString("base64url");
+}
+
+export function signDeviceE2eeLocalChallenge(identity, challenge) {
+  const publicIdentity = identity?.public_identity;
+  if (!publicIdentity || !verifyDeviceE2eeIdentity(publicIdentity)) {
+    throw new Error("invalid device E2EE identity");
+  }
+  if (!challenge || typeof challenge !== "object"
+      || challenge.app_device_id !== publicIdentity.device_id
+      || challenge.app_key_id !== publicIdentity.key_id) {
+    throw new Error("local E2EE challenge does not match device identity");
+  }
+  return sign(
+    null,
+    Buffer.from(`${LOCAL_AUTH_DOMAIN}${canonicalJson(challenge)}`),
+    createPrivateKey({ key: identity.signing_private_jwk, format: "jwk" }),
+  ).toString("base64url");
+}
+
+export function verifyDeviceE2eeLocalChallenge(identity, challenge, signature) {
+  if (!verifyDeviceE2eeIdentity(identity)
+      || !challenge || typeof challenge !== "object"
+      || challenge.app_device_id !== identity.device_id
+      || challenge.app_key_id !== identity.key_id
+      || typeof signature !== "string" || !signature) {
+    return false;
+  }
+  try {
+    return verify(
+      null,
+      Buffer.from(`${LOCAL_AUTH_DOMAIN}${canonicalJson(challenge)}`),
+      createPublicKey({
+        key: {
+          kty: "OKP",
+          crv: "Ed25519",
+          x: identity.signing_public_key,
+        },
+        format: "jwk",
+      }),
+      Buffer.from(signature, "base64url"),
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function signCurrentDeviceRemoval(identity, { now = new Date() } = {}) {
+  const publicIdentity = identity?.public_identity;
+  if (!publicIdentity || !verifyDeviceE2eeIdentity(publicIdentity)) {
+    throw new Error("invalid device E2EE identity");
+  }
+  const value = {
+    action: "remove_current_device",
+    account_epoch: publicIdentity.epoch,
+    device_id: publicIdentity.device_id,
+    key_id: publicIdentity.key_id,
+    created_at: now.toISOString(),
+  };
+  return {
+    ...value,
+    signature: sign(
+      null,
+      Buffer.from(`${REMOVAL_DOMAIN}${canonicalJson(value)}`),
+      createPrivateKey({ key: identity.signing_private_jwk, format: "jwk" }),
+    ).toString("base64url"),
+  };
 }
 
 export function resetDeviceE2eeIdentityForEpoch(

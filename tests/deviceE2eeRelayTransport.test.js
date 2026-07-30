@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ensureDeviceE2eeIdentity } from "../src/crypto/deviceE2eeIdentity.js";
+import {
+  ensureDeviceE2eeIdentity,
+  prepareDeviceE2eeRotation,
+} from "../src/crypto/deviceE2eeIdentity.js";
 import { DeviceE2eeSession } from "../src/crypto/deviceE2eeEnvelope.js";
 import {
   deviceE2eeDirectoryHead,
@@ -156,5 +159,55 @@ assert.equal(orderedSent.length, 2);
 assert.equal(orderedSent[1].sequence, 1);
 sendGates[1].resolve();
 await secondSend;
+
+// Relay encryption must also stop using a startup-time private-key snapshot.
+// Switching the provider identity clears old routes and the next independent
+// dispatch is sealed by the newly activated key.
+let liveRelayIdentity = cli;
+const hotReloadSent = [];
+const hotReloadTransport = new DeviceE2eeRelayTransport({
+  relayClient: {
+    send: async () => {},
+    sendEnvelope: async (envelope) => {
+      hotReloadSent.push(envelope);
+      return { accepted: true };
+    },
+  },
+  localIdentity: cli,
+  localIdentityProvider: () => liveRelayIdentity,
+  stateDir,
+  controlBaseUrl: "https://example.invalid",
+  credentialProvider: async () => credential,
+});
+hotReloadTransport.sessions.set("stale-session", { lastActivityAt: Date.now() });
+const relayRotation = prepareDeviceE2eeRotation(join(root, "cli"), {
+  deviceId: cli.public_identity.device_id,
+});
+liveRelayIdentity = relayRotation.next;
+relayRotation.commit();
+await hotReloadTransport.send("collaboration.remote.dispatch", {
+  protocolVersion: "1",
+  sourceDeviceId: "cli-device",
+  targetDeviceId: "app-device",
+  assignmentId: "assignment-hot-reload",
+  runId: "run-hot-reload",
+  taskId: "task-hot-reload",
+  role: "worker",
+  prompt: "sealed after key rotation",
+});
+assert.equal(hotReloadTransport.sessions.has("stale-session"), false);
+assert.equal(
+  hotReloadSent[0].sender_key_id,
+  relayRotation.next.public_identity.key_id,
+);
+const acceptedAfterRotation = DeviceE2eeSession.accept({
+  local: app,
+  peer: relayRotation.next.public_identity,
+  firstEnvelope: hotReloadSent[0],
+});
+assert.equal(
+  acceptedAfterRotation.firstPayload.payload.prompt,
+  "sealed after key rotation",
+);
 
 console.log("device E2EE relay transport tests ok");

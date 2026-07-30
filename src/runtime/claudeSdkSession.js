@@ -58,6 +58,14 @@ import {
   resolveAgentDetailProfile,
 } from "./agentDetailProfile.js";
 import { AiApprovalReviewer } from "./aiApprovalReviewer.js";
+import {
+  aiReviewPolicyFromEnvironment,
+  aiReviewPolicyFromPayload,
+} from "./aiReviewPolicy.js";
+import {
+  readApprovalPolicyReference,
+  resolveApprovalPolicySelection,
+} from "./approvalPolicyStore.js";
 
 const CLAUDE_MODES = Object.freeze([
   { id: "default", label: "Default" },
@@ -96,6 +104,7 @@ function extractOriginRouterOptions(args) {
     else if (arg === "--permission-mode") take("permissionMode");
     else if (arg === "--prompt") take("initialMessage");
     else if (arg === "--originrouter-autonomy") take("autonomyProfile");
+    else if (arg === "--originrouter-policy") take("approvalPolicyReference");
     else if (arg === "--originrouter-detail") take("detailProfile");
     else if (arg === "--originrouter-auto-approve")
       options.autonomyProfile = "guarded";
@@ -310,6 +319,12 @@ export async function runClaudeSdkSession(rawArgs) {
     options.autonomyProfile ||
       (autonomyAllowedScopes.length ? "custom" : "manual"),
   );
+  let approvalPolicy = autonomyProfile === "custom" && options.approvalPolicyReference
+    ? readApprovalPolicyReference(options.approvalPolicyReference, { stateDir })
+    : null;
+  let aiReviewPolicy = autonomyProfile === "ai_review"
+    ? aiReviewPolicyFromEnvironment()
+    : null;
   let pendingModePayload = null;
   const activitySnapshot = {
     summary: "",
@@ -403,7 +418,7 @@ export async function runClaudeSdkSession(rawArgs) {
       availableModes: CLAUDE_MODES,
       requestId,
     });
-  const reportAutonomy = (requestId = null) =>
+  const reportAutonomy = (requestId = null, { accepted = null, reason = null } = {}) =>
     sendAgentEvent(
       buildAutonomyStatusEvent({
         provider: "claude",
@@ -411,6 +426,10 @@ export async function runClaudeSdkSession(rawArgs) {
         profile: autonomyProfile,
         allowedScopes: autonomyAllowedScopes,
         requestId,
+        approvalPolicy,
+        aiReviewPolicy,
+        accepted,
+        reason,
       }),
     );
   const reportDetail = () =>
@@ -425,15 +444,28 @@ export async function runClaudeSdkSession(rawArgs) {
   const applyAutonomy = async (payload) => {
     const requested = normalizeAutonomyProfile(payload?.profile, "");
     if (!requested) return false;
-    autonomyProfile = requested;
-    autonomyAllowedScopes =
-      requested === "custom"
-        ? normalizeAutonomyScopes(
-            payload?.allowedScopes || payload?.allowed_scopes,
-          )
+    try {
+      const nextPolicy = requested === "custom"
+        ? resolveApprovalPolicySelection(payload, { stateDir, current: approvalPolicy })
+        : null;
+      const nextAiReviewPolicy = requested === "ai_review"
+        ? aiReviewPolicyFromPayload(payload)
+        : null;
+      autonomyProfile = requested;
+      approvalPolicy = nextPolicy;
+      aiReviewPolicy = nextAiReviewPolicy;
+      autonomyAllowedScopes = requested === "custom" && !approvalPolicy
+        ? normalizeAutonomyScopes(payload?.allowedScopes || payload?.allowed_scopes)
         : [];
-    await reportAutonomy(payload?.requestId || null);
-    return true;
+      await reportAutonomy(payload?.requestId || null, { accepted: true });
+      return true;
+    } catch (error) {
+      await reportAutonomy(payload?.requestId || null, {
+        accepted: false,
+        reason: error.code || error.message,
+      });
+      return false;
+    }
   };
   const applyMode = async (payload) => {
     const mode = String(payload?.mode || "");
@@ -469,7 +501,10 @@ export async function runClaudeSdkSession(rawArgs) {
       allowedScopes: autonomyAllowedScopes,
       workspaceRoot: cwd,
       aiReviewer: aiApprovalReviewer,
+      aiReviewPolicy,
       runtime: "claude-sdk",
+      approvalPolicy,
+      stateDir,
       requestInteraction: (item) => interactions.request(item, signal),
       onAutoResolved: ({ request: item, resolved }) =>
         sendAgentEvent({
@@ -483,6 +518,7 @@ export async function runClaudeSdkSession(rawArgs) {
           reason: resolved.reason,
           decisionSource: resolved.decisionSource || "autonomy_policy",
           aiReview: resolved.aiReview || null,
+          policyEvaluation: resolved.policyEvaluation || null,
           decision: resolved.action,
         }),
     });
@@ -522,6 +558,7 @@ export async function runClaudeSdkSession(rawArgs) {
           runtime: "claude-sdk",
           profile: autonomyProfile,
           allowedScopes: autonomyAllowedScopes,
+          approvalPolicy,
         }),
       });
       return true;

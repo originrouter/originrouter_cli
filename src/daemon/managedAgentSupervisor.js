@@ -1,5 +1,14 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { ensureStateDir } from "../persistence/state.js";
+import {
+  deployApprovalPolicyBundle,
+  readApprovalPolicy,
+} from "../runtime/approvalPolicyStore.js";
+import {
+  aiReviewPolicyFromPayload,
+  encodeAiReviewPolicyEnvironment,
+} from "../runtime/aiReviewPolicy.js";
 
 const AGENTS = new Set(["claude", "codex"]);
 const PERMISSION_PROFILES = new Set([
@@ -59,6 +68,8 @@ export class ManagedAgentSupervisor {
       payload.permissionProfile || payload.permission_profile || "manual",
       32,
     ).toLowerCase();
+    let approvalPolicy = null;
+    let aiReviewPolicy = null;
     const resumeConversationId = safeText(
       payload.resumeConversationId || payload.resume_conversation_id,
       96,
@@ -78,6 +89,36 @@ export class ManagedAgentSupervisor {
         "INVALID_PERMISSION_PROFILE",
         `Unsupported permission profile: ${permissionProfile}`,
       );
+    }
+    if (permissionProfile === "custom") {
+      try {
+        const bundle = payload.policyBundle || payload.policy_bundle;
+        const policyId = safeText(payload.policyId || payload.policy_id, 64);
+        approvalPolicy = bundle
+          ? deployApprovalPolicyBundle(bundle, { stateDir: ensureStateDir() })
+          : policyId
+            ? readApprovalPolicy(policyId, { stateDir: ensureStateDir() })
+            : null;
+        const expectedRevision = safeText(
+          payload.policyRevision || payload.policy_revision,
+          128,
+        ).replace(/^sha256:/, "");
+        if (approvalPolicy && expectedRevision && approvalPolicy.revision !== expectedRevision) {
+          throw launchError(
+            "APPROVAL_POLICY_REVISION_NOT_FOUND",
+            "The selected approval policy revision is not installed on this device.",
+          );
+        }
+      } catch (error) {
+        if (error?.code === "APPROVAL_POLICY_REVISION_NOT_FOUND") throw error;
+        throw launchError(
+          error?.code || "APPROVAL_POLICY_INVALID",
+          error?.message || "The approval policy could not be deployed.",
+        );
+      }
+    }
+    if (permissionProfile === "ai_review") {
+      aiReviewPolicy = aiReviewPolicyFromPayload(payload);
     }
     if (!workspaceReference) {
       throw launchError("WORKSPACE_REQUIRED", "A trusted workspace is required.");
@@ -173,17 +214,28 @@ export class ManagedAgentSupervisor {
     if (title) args.push("--originrouter-title", title);
     if (nativeSessionId) args.push("--resume", nativeSessionId);
     if (permissionProfile === "custom") {
+      if (approvalPolicy) {
+        args.push("--originrouter-policy", approvalPolicy.policy.id);
+      }
       const scopes = Array.isArray(payload.allowedScopes || payload.allowed_scopes)
         ? (payload.allowedScopes || payload.allowed_scopes)
             .map((item) => safeText(item, 64))
             .filter(Boolean)
         : [];
-      if (scopes.length) args.push("--originrouter-auto-allow", scopes.join(","));
+      if (!approvalPolicy && scopes.length) args.push("--originrouter-auto-allow", scopes.join(","));
     }
 
     const child = this.spawnFn(this.nodePath, args, {
       cwd: workspace.canonical_path,
-      env: process.env,
+      env: {
+        ...process.env,
+        ...(aiReviewPolicy
+          ? {
+              ORIGINROUTER_AI_REVIEW_POLICY_B64:
+                encodeAiReviewPolicyEnvironment(aiReviewPolicy),
+            }
+          : {}),
+      },
       detached: false,
       stdio: "ignore",
     });

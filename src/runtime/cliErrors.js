@@ -154,6 +154,32 @@ function _fromAuthClientError(err) {
 
 function _fromCode(code, message) {
   switch (code) {
+    case "device_flow_denied":
+      return {
+        headline: "Sign-in was not approved.",
+        detail: "This device's saved security credential was cleared.",
+        next: "Run `originrouter login` again to create a new device credential.",
+      };
+    case "device_revoked":
+    case "device_identity_revoked":
+    case "device_key_recovery_required":
+    case "account_encryption_recovery_required":
+    case "account_epoch_mismatch":
+    case "key_id_mismatch":
+    case "invalid_self_signature":
+      return {
+        headline: "This device needs a new security identity.",
+        detail: message,
+        next: "Run `originrouter login` again. The pending replacement key will be reused and is not active until authorization finishes.",
+      };
+    case "unsupported_e2ee_protocol":
+    case "unsupported_signing_algorithm":
+    case "unsupported_agreement_algorithm":
+      return {
+        headline: "This OriginRouter CLI version is too old for device sign-in.",
+        detail: message,
+        next: "Update OriginRouter CLI, then run `originrouter login` again.",
+      };
     case "RELAY_LOGIN_REQUIRED":
       return {
         headline: "You're not signed in to OriginRouter.",

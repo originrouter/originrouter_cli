@@ -45,3 +45,19 @@ export async function getCliDeviceE2eeStatus(options) {
 export async function getCliDeviceE2eeDirectory(options) {
   return request("/cli/v1/device-e2ee/directory", options);
 }
+
+export async function removeCurrentCliDevice(options) {
+  const data = await request("/cli/v1/device-e2ee/self/remove", {
+    ...options,
+    method: "POST",
+    body: options.signedRemoval,
+  });
+  return data.identity;
+}
+
+export async function signOutCurrentCliDevice(options) {
+  return request("/cli/v1/devices/self/sign-out", {
+    ...options,
+    method: "POST",
+  });
+}
