@@ -59,8 +59,15 @@ import {
 } from "../runtime/agentAutonomyPolicy.js";
 import {
   deployApprovalPolicyBundle,
+  listApprovalPolicyRevisions,
   readApprovalPolicy,
+  rollbackApprovalPolicy,
 } from "../runtime/approvalPolicyStore.js";
+import {
+  approvalPolicyCapabilities,
+  evaluateApprovalRequest,
+  validateApprovalPolicy,
+} from "../runtime/approvalPolicy.js";
 import { aiReviewPolicyFromPayload } from "../runtime/aiReviewPolicy.js";
 import {
   AGENT_DETAIL_PROFILES,
@@ -406,6 +413,82 @@ async function dispatch(ctx, req, res) {
     if (req.method === "GET" && pathname === "/providers") {
       return sendOk(res, { providers: handleProvidersList(ctx) });
     }
+    if (req.method === "GET" && pathname === "/approval-policies/capabilities") {
+      return sendOk(res, { capabilities: approvalPolicyCapabilities() });
+    }
+    if (req.method === "POST" && pathname === "/approval-policies/validate") {
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      const policy = body.policy || body.content || body;
+      const validation = validateApprovalPolicy(policy);
+      return sendOk(res, validation);
+    }
+    if (req.method === "POST" && pathname === "/approval-policies/simulate") {
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      try {
+        const policy = body.policy || body.content;
+        const request = body.request;
+        if (!policy || !request) return sendError(res, 400, "policy and request are required");
+        const result = evaluateApprovalRequest(request, policy, {
+          workspace: body.workspace || process.cwd(),
+          stateDir: getStateDir(),
+        });
+        return sendOk(res, {
+          effect: result.effect,
+          policy_id: result.policyId,
+          revision: result.revision,
+          declarations: result.declarations,
+          decisions: result.decisions.map((decision) => ({
+            action: decision.atom.action,
+            risk: decision.atom.risk,
+            confidence: decision.atom.confidence,
+            effect: decision.effect,
+            matched_rules: decision.matchedRules,
+            fallback: decision.fallback,
+            resource_kind: decision.atom.resource?.kind || null,
+          })),
+        });
+      } catch (error) {
+        return sendError(res, 400, error.message, {
+          reason: error.code || "approval_policy_simulation_failed",
+        });
+      }
+    }
+    const policyRevisionsMatch = pathname.match(/^\/approval-policies\/([a-z0-9._-]+)\/revisions$/);
+    if (policyRevisionsMatch && req.method === "GET") {
+      try {
+        return sendOk(res, {
+          revisions: listApprovalPolicyRevisions(policyRevisionsMatch[1], {
+            stateDir: getStateDir(),
+          }),
+        });
+      } catch (error) {
+        return sendError(res, 400, error.message, {
+          reason: error.code || "approval_policy_revision_list_failed",
+        });
+      }
+    }
+    const policyRollbackMatch = pathname.match(/^\/approval-policies\/([a-z0-9._-]+)\/rollback$/);
+    if (policyRollbackMatch && req.method === "POST") {
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      try {
+        const restored = rollbackApprovalPolicy(
+          policyRollbackMatch[1],
+          body.revision,
+          {
+            stateDir: getStateDir(),
+            expectedRevision: body.expected_revision || body.expectedRevision || null,
+          },
+        );
+        return sendOk(res, { policy: restored.summary });
+      } catch (error) {
+        return sendError(res, error.code === "APPROVAL_POLICY_REVISION_CONFLICT" ? 409 : 400, error.message, {
+          reason: error.code || "approval_policy_rollback_failed",
+        });
+      }
+    }
     // Stage 7: catalog endpoint is intentionally public (no auth required).
     // Static data, no secrets, browser cold-start dependency. Documented in
     // agent-protocol.md §9.
@@ -514,7 +597,7 @@ async function dispatch(ctx, req, res) {
       return sendError(res, 405, `method ${req.method} not allowed`);
     }
     const collaborationMatch = pathname.match(
-      /^\/collaboration\/local\/runs\/([^/]+)(?:\/(start|begin-planning|begin-implementation|cancel|messages|budget))?$/,
+      /^\/collaboration\/local\/runs\/([^/]+)(?:\/(start|confirm|begin-planning|begin-implementation|cancel|messages|budget))?$/,
     );
     if (collaborationMatch) {
       const runId = decodeURIComponent(collaborationMatch[1]);
@@ -533,6 +616,10 @@ async function dispatch(ctx, req, res) {
           ? { run: ctx.collaborationRuntime
               ? await ctx.collaborationRuntime.start(runId)
               : ctx.collaborationCoordinator.start(runId) }
+          : action === "confirm"
+            ? { run: ctx.collaborationRuntime
+                ? await ctx.collaborationRuntime.confirm(runId)
+                : ctx.collaborationCoordinator.confirm(runId) }
           : action === "begin-planning"
             ? { run: ctx.collaborationCoordinator.beginPlanning(runId) }
             : action === "begin-implementation"

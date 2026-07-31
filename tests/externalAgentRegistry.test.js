@@ -44,6 +44,11 @@ registry.appendEvent("claude-local-1", {
     { id: "workspace_edits", label: "Workspace file edits", risk: "normal" },
     { id: "destructive_commands", label: "Destructive commands", risk: "high" },
   ],
+  approvalPolicyCapabilities: {
+    versions: [1, 2],
+    latest_version: 2,
+    registry_hash: "a".repeat(64),
+  },
 });
 const events = registry.eventsAfter(0);
 assert.equal(events.events.length, 4);
@@ -57,6 +62,7 @@ assert.equal(registry.list()[0].autonomy_profile, "guarded");
 assert.equal(registry.list()[0].autonomy_control, "supported");
 assert.deepEqual(registry.list()[0].allowed_autonomy_scopes, ["workspace_edits"]);
 assert.equal(registry.list()[0].available_autonomy_scopes.length, 2);
+assert.deepEqual(registry.list()[0].approval_policy_capabilities.versions, [1, 2]);
 registry.appendEvent("claude-local-1", {
   type: "agent.interaction.result",
   interactionId: "interaction-1",

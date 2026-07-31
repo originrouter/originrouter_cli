@@ -21,7 +21,7 @@ const permission = (payload, extra = {}) => ({
 
 test("guarded autonomy allows routine workspace work", () => {
   const command = evaluateAutonomyInteraction(
-    permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    permission({ tool: "command", command: "git status", cwd: "/tmp/project" }),
     { profile: "guarded", workspaceRoot: "/tmp/project" },
   );
   assert.equal(command.autoResolve, true);
@@ -57,6 +57,24 @@ test("guarded autonomy stops for destructive, elevated, and out-of-workspace wor
     { profile: "guarded", workspaceRoot: "/tmp/project" },
   );
   assert.equal(extraNetwork.autoResolve, false);
+});
+
+test("guarded autonomy escalates indirect execution, outside reads, task, and network reads", () => {
+  for (const payload of [
+    { tool: "Bash", command: "env rm -rf /tmp/x", cwd: "/tmp/project" },
+    { tool: "Bash", command: "npm exec evil-package", cwd: "/tmp/project" },
+    { tool: "Bash", command: "npx evil-package", cwd: "/tmp/project" },
+    { tool: "Bash", command: "./dangerous-script", cwd: "/tmp/project" },
+    { tool: "Read", tool_input: { file_path: "/etc/passwd" } },
+    { tool: "Task", prompt: "modify files" },
+    { tool: "WebFetch", url: "http://127.0.0.1:7437/private" },
+  ]) {
+    const result = evaluateAutonomyInteraction(permission(payload), {
+      profile: "guarded",
+      workspaceRoot: "/tmp/project",
+    });
+    assert.equal(result.autoResolve, false, JSON.stringify(payload));
+  }
 });
 
 test("unrestricted autonomy still requires real answers and secrets", () => {
@@ -108,7 +126,7 @@ test("resolveWithAutonomy bypasses the pending registry only when allowed", asyn
   let requested = 0;
   let autoResolved = 0;
   const result = await resolveWithAutonomy({
-    request: permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    request: permission({ tool: "command", command: "git status", cwd: "/tmp/project" }),
     profile: "guarded",
     workspaceRoot: "/tmp/project",
     requestInteraction: async () => {
@@ -123,13 +141,58 @@ test("resolveWithAutonomy bypasses the pending registry only when allowed", asyn
   assert.equal(autoResolved, 1);
 });
 
+test("workspace policies restrict guarded decisions and shadow policies never auto-resolve", async () => {
+  let requested = 0;
+  const workspacePolicy = {
+    policy: {
+      version: 2,
+      id: "workspace-restrictions",
+      defaults: { unmatched: "ask", parse_error: "ask", unknown: "ask" },
+      rules: [{ id: "deny-git-read", effect: "deny", actions: ["vcs.read"] }],
+    },
+    revision: "workspace-revision",
+    restrictionOnly: true,
+    summary: { source: "workspace_restriction" },
+  };
+  const denied = await resolveWithAutonomy({
+    request: permission({ tool: "command", command: "git status", cwd: "/tmp/project" }),
+    profile: "guarded",
+    workspaceRoot: "/tmp/project",
+    workspaceApprovalPolicy: workspacePolicy,
+    requestInteraction: async () => {
+      requested += 1;
+      return { action: "allow", user: true };
+    },
+  });
+  assert.equal(denied.action, "deny");
+  assert.equal(requested, 0);
+
+  let observed = 0;
+  const shadow = await resolveWithAutonomy({
+    request: permission({ tool: "Read", tool_input: { file_path: "README.md" } }),
+    profile: "custom",
+    workspaceRoot: "/tmp/project",
+    approvalPolicy: {
+      version: 2,
+      id: "shadow-policy",
+      metadata: { enforcement: "shadow" },
+      rules: [{ id: "allow-read", effect: "allow", actions: ["fs.read"] }],
+    },
+    requestInteraction: async () => ({ action: "deny", user: true }),
+    onPolicyObserved: async () => { observed += 1; },
+  });
+  assert.equal(shadow.action, "deny");
+  assert.equal(shadow.policyShadow, true);
+  assert.equal(observed, 1);
+});
+
 test("AI review allows routine work but never grants high-risk authority", async () => {
   let userRequests = 0;
   const allowReviewer = {
     review: async () => ({ decision: "allow", risk: "low", confidence: 0.98, reason: "bounded test command" }),
   };
   const routine = await resolveWithAutonomy({
-    request: permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    request: permission({ tool: "command", command: "git status", cwd: "/tmp/project" }),
     profile: "ai_review",
     workspaceRoot: "/tmp/project",
     runtime: "codex-app-server",
@@ -154,7 +217,7 @@ test("AI review allows routine work but never grants high-risk authority", async
 test("AI review template scopes can narrow an allow decision", async () => {
   let reviewedPolicy;
   const result = await resolveWithAutonomy({
-    request: permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    request: permission({ tool: "command", command: "git status", cwd: "/tmp/project" }),
     profile: "ai_review",
     workspaceRoot: "/tmp/project",
     aiReviewPolicy: {
@@ -187,7 +250,7 @@ test("AI review can deny and falls back to the user when unavailable", async () 
   assert.equal(denied.autoResolved, true);
 
   const fallback = await resolveWithAutonomy({
-    request: permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    request: permission({ tool: "command", command: "git status", cwd: "/tmp/project" }),
     profile: "ai_review",
     workspaceRoot: "/tmp/project",
     aiReviewer: { review: async () => { throw new Error("offline"); } },
@@ -211,7 +274,7 @@ test("AI review escalates uncertain, invalid, secret, and reviewer-high-risk req
 
   const escalated = await resolveWithAutonomy({
     ...base,
-    request: permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    request: permission({ tool: "command", command: "git status", cwd: "/tmp/project" }),
     aiReviewer: {
       review: async () => {
         reviewerCalls += 1;
@@ -223,19 +286,19 @@ test("AI review escalates uncertain, invalid, secret, and reviewer-high-risk req
 
   const invalid = await resolveWithAutonomy({
     ...base,
-    request: permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    request: permission({ tool: "command", command: "git status", cwd: "/tmp/project" }),
     aiReviewer: { review: async () => ({ decision: "maybe", risk: "low" }) },
   });
   assert.equal(invalid.user, true);
 
   const reviewerHighRisk = await resolveWithAutonomy({
     ...base,
-    request: permission({ tool: "command", command: "npm test", cwd: "/tmp/project" }),
+    request: permission({ tool: "command", command: "git status", cwd: "/tmp/project" }),
     aiReviewer: { review: async () => ({ decision: "allow", risk: "high", confidence: 0.7 }) },
   });
   assert.equal(reviewerHighRisk.user, true);
 
-  const secretRequest = permission({ tool: "command", command: "npm test", cwd: "/tmp/project" });
+  const secretRequest = permission({ tool: "command", command: "git status", cwd: "/tmp/project" });
   secretRequest.containsSecret = true;
   const secret = await resolveWithAutonomy({
     ...base,
@@ -262,7 +325,7 @@ test("custom autonomy allows only explicitly selected scopes", () => {
     },
   );
   const command = evaluateAutonomyInteraction(
-    permission({ tool: "Bash", command: "npm test", cwd: "/tmp/project" }),
+    permission({ tool: "Bash", command: "git status", cwd: "/tmp/project" }),
     {
       profile: "custom",
       allowedScopes: ["workspace_edits"],

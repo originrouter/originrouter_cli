@@ -1,7 +1,12 @@
 import path from "node:path";
 
 import { INTERACTION_KINDS } from "./agentInteractionContract.js";
-import { evaluateApprovalRequest } from "./approvalPolicy.js";
+import {
+  approvalPolicyCapabilities,
+  atomizeApprovalRequest,
+  evaluateApprovalRequest,
+  protectedApprovalPolicy,
+} from "./approvalPolicy.js";
 
 export const AGENT_AUTONOMY_PROFILES = Object.freeze([
   {
@@ -209,43 +214,55 @@ export function classifyPermissionScope(request, workspaceRoot) {
   if (request?.containsSecret) {
     return { scope: null, reason: "secret_input" };
   }
-  const tool = normalizedTool(request);
-  if (tool === "permissions") {
+  const normalized = atomizeApprovalRequest(request, { workspace: workspaceRoot });
+  const actions = new Set(normalized.atoms.map((atom) => atom.action));
+  const root = normalized.context.workspace;
+  const outside = normalized.atoms.some((atom) => {
+    const candidates = [atom.resource?.path, atom.command?.cwd, atom.code?.script]
+      .filter(Boolean);
+    return candidates.some((candidate) => {
+      const relative = path.relative(root, candidate);
+      return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+    });
+  });
+  if (actions.has("secret.input")) return { scope: null, reason: "secret_input" };
+  if (actions.has("permission.additional")) {
     return { scope: "additional_permissions", reason: "additional_sandbox_permissions" };
   }
-  if (SAFE_READ_TOOLS.has(tool)) {
-    return { scope: "read_tools", reason: "routine_read_tool" };
+  if (["tool.unknown", "fs.unknown", "db.unknown", "process.opaque", "shell.dynamic", "code.opaque"]
+    .some((action) => actions.has(action))) {
+    return { scope: "unknown_tools", reason: "insufficient_classification" };
   }
-  if (WORKSPACE_WRITE_TOOLS.has(tool)) {
-    const candidates = collectPathCandidates(request?.payload);
-    if (candidates.every((candidate) => isInsideWorkspace(candidate, workspaceRoot))) {
-      return { scope: "workspace_edits", reason: "workspace_file_change" };
-    }
-    return { scope: "outside_workspace", reason: "path_outside_workspace" };
+  if (outside) return { scope: "outside_workspace", reason: "path_outside_workspace" };
+  if ([
+    "fs.delete", "fs.permissions.write", "vcs.destructive", "db.delete",
+    "db.schema.drop", "infra.destroy",
+  ].some((action) => actions.has(action))) {
+    return { scope: "destructive_commands", reason: "destructive_operation" };
   }
-  if (COMMAND_TOOLS.has(tool)) {
-    const command = String(request?.payload?.command || "").trim();
-    const cwd = request?.payload?.cwd;
-    if (
-      hasMeaningfulValue(request?.payload?.additional_permissions)
-      || hasMeaningfulValue(request?.payload?.network_approval_context)
-    ) {
-      return { scope: "additional_permissions", reason: "additional_command_permissions" };
-    }
-    if (!isInsideWorkspace(cwd, workspaceRoot)) {
-      return { scope: "outside_workspace", reason: "cwd_outside_workspace" };
-    }
-    if (!command) return { scope: "unknown_tools", reason: "command_not_displayable" };
-    if (DESTRUCTIVE_COMMAND.some((pattern) => pattern.test(command))) {
-      return { scope: "destructive_commands", reason: "destructive_command" };
-    }
-    if (ELEVATED_COMMAND.some((pattern) => pattern.test(command))) {
-      return { scope: "elevated_commands", reason: "elevated_command" };
-    }
-    if (NETWORK_MUTATION_COMMAND.some((pattern) => pattern.test(command))) {
-      return { scope: "network_mutations", reason: "network_mutation" };
-    }
+  if ([
+    "system.service.manage", "system.identity.manage", "system.schedule.manage",
+    "system.storage.manage", "infra.write", "infra.destroy",
+  ].some((action) => actions.has(action))) {
+    return { scope: "elevated_commands", reason: "elevated_operation" };
+  }
+  if ([
+    "network.connect", "network.listen", "network.http.read", "network.http.write",
+    "network.transfer.upload", "network.transfer.download", "vcs.remote.write",
+    "package.publish",
+  ].some((action) => actions.has(action))) {
+    return { scope: "network_mutations", reason: "network_operation" };
+  }
+  if (["fs.create", "fs.write", "fs.append", "fs.patch", "fs.copy", "fs.move"]
+    .some((action) => actions.has(action))) {
+    return { scope: "workspace_edits", reason: "workspace_file_change" };
+  }
+  if (["process.exec", "package.read", "vcs.read", "vcs.write", "infra.read"]
+    .some((action) => actions.has(action))) {
     return { scope: "workspace_commands", reason: "routine_workspace_command" };
+  }
+  if (["fs.read", "fs.list", "fs.search"].some((action) => actions.has(action))) {
+    return { scope: "read_tools", reason: "routine_read_tool" };
   }
   return { scope: "unknown_tools", reason: "unknown_tool" };
 }
@@ -333,6 +350,9 @@ export function buildAutonomyStatusEvent({
       ? effectiveAutonomyScopes(normalizedProfile, allowedScopes)
       : [],
     availableAutonomyScopes: control === "supported" ? AGENT_AUTONOMY_SCOPES : [],
+    approvalPolicyCapabilities: control === "supported"
+      ? approvalPolicyCapabilities()
+      : null,
     approvalPolicy: normalizedProfile === "custom" && approvalPolicy
       ? {
           id: approvalPolicy.policy?.id || approvalPolicy.summary?.id || null,
@@ -427,6 +447,79 @@ export function evaluateAutonomyInteraction(request, {
   };
 }
 
+function evaluatePolicyLayers(request, {
+  primary,
+  workspacePolicy = null,
+  workspaceRoot,
+  stateDir,
+} = {}) {
+  const layers = [];
+  if (primary) {
+    layers.push({
+      source: primary.summary?.source || "device",
+      restrictionOnly: false,
+      result: evaluateApprovalRequest(request, primary, {
+        workspace: workspaceRoot,
+        stateDir,
+      }),
+    });
+  }
+  if (workspacePolicy) {
+    layers.push({
+      source: workspacePolicy.summary?.source || "workspace",
+      restrictionOnly: workspacePolicy.restrictionOnly === true,
+      result: evaluateApprovalRequest(request, workspacePolicy, {
+        workspace: workspaceRoot,
+        stateDir,
+      }),
+    });
+  }
+  const effects = layers.map((layer) => (
+    layer.restrictionOnly && layer.result.effect === "allow"
+      ? "neutral"
+      : layer.result.effect
+  ));
+  const effect = effects.includes("deny")
+    ? "deny"
+    : effects.includes("ask")
+      ? "ask"
+      : effects.includes("allow")
+        ? "allow"
+        : "ask";
+  return { effect, layers };
+}
+
+function policyEvaluationSummary(evaluation) {
+  return {
+    effect: evaluation.effect,
+    layers: evaluation.layers.map((layer) => ({
+      source: layer.source,
+      restrictionOnly: layer.restrictionOnly,
+      policyId: layer.result.policyId,
+      revision: layer.result.revision,
+      effect: layer.result.effect,
+      actions: layer.result.atoms.map((atom) => atom.action),
+      matchedRuleIds: [...new Set(layer.result.decisions.flatMap((decision) => (
+        decision.matchedRules.map((rule) => rule.id)
+      )))],
+      fallbacks: layer.result.decisions
+        .map((decision) => decision.fallback)
+        .filter(Boolean),
+      decisions: layer.result.decisions.map((decision) => ({
+        action: decision.atom.action,
+        effect: decision.effect,
+        risk: decision.atom.risk,
+        confidence: decision.atom.confidence,
+        fallback: decision.fallback,
+        resourceKind: decision.atom.resource?.kind || null,
+        resourceRole: decision.atom.resource?.role || null,
+        matchedRuleIds: decision.matchedRules.map((rule) => rule.id),
+      })),
+      declarations: layer.result.declarations,
+    })),
+  };
+}
+
 export async function resolveWithAutonomy({
   request,
   profile,
@@ -434,20 +527,44 @@ export async function resolveWithAutonomy({
   workspaceRoot,
   requestInteraction,
   onAutoResolved,
+  onPolicyObserved,
   aiReviewer,
   aiReviewPolicy = null,
   runtime,
   approvalPolicy = null,
+  workspaceApprovalPolicy = null,
   stateDir = "",
 }) {
   const normalizedProfile = normalizeAutonomyProfile(profile);
-  if (normalizedProfile === "custom" && approvalPolicy) {
-    const policyResult = evaluateApprovalRequest(request, approvalPolicy, {
-      workspace: workspaceRoot,
+  if ([INTERACTION_KINDS.QUESTIONS, INTERACTION_KINDS.FORM].includes(request?.kind)) {
+    return requestInteraction(request);
+  }
+  const primaryPolicy = normalizedProfile === "guarded"
+    ? protectedApprovalPolicy()
+    : normalizedProfile === "custom" && approvalPolicy
+      ? approvalPolicy
+      : null;
+  if (primaryPolicy) {
+    const policyResult = evaluatePolicyLayers(request, {
+      primary: primaryPolicy,
+      workspacePolicy: workspaceApprovalPolicy,
+      workspaceRoot,
       stateDir,
     });
+    const policyDocument = primaryPolicy.policy || primaryPolicy;
+    if (policyDocument.metadata?.enforcement === "shadow") {
+      const summary = policyEvaluationSummary(policyResult);
+      await onPolicyObserved?.({ request, evaluation: summary });
+      const manual = await requestInteraction(request);
+      return {
+        ...manual,
+        policyEvaluation: summary,
+        policyShadow: true,
+      };
+    }
     if (policyResult.effect === "ask") return requestInteraction(request);
     const action = policyResult.effect === "allow" ? "allow" : "deny";
+    const summary = policyEvaluationSummary(policyResult);
     const resolved = {
       interactionId: request.interactionId,
       responseId: `policy:${request.interactionId}`,
@@ -463,20 +580,40 @@ export async function resolveWithAutonomy({
       reason: `approval_policy_${policyResult.effect}`,
       scope: null,
       decisionSource: "approval_policy",
-      policyEvaluation: {
-        policyId: policyResult.policyId,
-        revision: policyResult.revision,
-        effect: policyResult.effect,
-        actions: policyResult.atoms.map((atom) => atom.action),
-        matchedRuleIds: [...new Set(policyResult.decisions.flatMap((decision) =>
-          decision.matchedRules.map((rule) => rule.id)))],
-        declarations: policyResult.declarations,
-      },
+      policyEvaluation: summary,
     };
     await onAutoResolved?.({ request, resolved });
     return resolved;
   }
   if (normalizedProfile === "ai_review") {
+    if (workspaceApprovalPolicy) {
+      const workspaceResult = evaluatePolicyLayers(request, {
+        primary: null,
+        workspacePolicy: workspaceApprovalPolicy,
+        workspaceRoot,
+        stateDir,
+      });
+      const effectiveWorkspace = workspaceResult.layers[0]?.result.effect;
+      if (effectiveWorkspace === "deny") {
+        const resolved = {
+          interactionId: request.interactionId,
+          responseId: `policy:${request.interactionId}`,
+          action: "deny",
+          response: { remember_for_session: false, policy_evaluated: true },
+          autoResolved: true,
+          reason: "workspace_policy_deny",
+          scope: null,
+          decisionSource: "approval_policy",
+          policyEvaluation: policyEvaluationSummary({
+            effect: "deny",
+            layers: workspaceResult.layers,
+          }),
+        };
+        await onAutoResolved?.({ request, resolved });
+        return resolved;
+      }
+      if (effectiveWorkspace === "ask") return requestInteraction(request);
+    }
     if (
       !aiReviewer
       || request?.containsSecret

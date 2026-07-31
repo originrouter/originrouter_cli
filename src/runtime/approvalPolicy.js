@@ -1,105 +1,31 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
 import { INTERACTION_KINDS } from "./agentInteractionContract.js";
+import { APPROVAL_POLICY_REGISTRY } from "./generatedApprovalPolicyRegistry.js";
 
-export const APPROVAL_POLICY_VERSION = 1;
+export const APPROVAL_POLICY_VERSION = APPROVAL_POLICY_REGISTRY.latest_version;
+export const APPROVAL_POLICY_SUPPORTED_VERSIONS = Object.freeze([
+  ...APPROVAL_POLICY_REGISTRY.versions,
+]);
 
 export const APPROVAL_POLICY_EFFECTS = Object.freeze([
-  "allow",
-  "deny",
-  "ask",
+  ...APPROVAL_POLICY_REGISTRY.effects,
 ]);
 
 export const APPROVAL_POLICY_ACTIONS = Object.freeze([
-  "agent.plan.continue",
-  "agent.input.answer",
-  "agent.form.submit",
-  "agent.url.open",
-  "secret.input",
-  "fs.read",
-  "fs.list",
-  "fs.search",
-  "fs.create",
-  "fs.write",
-  "fs.append",
-  "fs.patch",
-  "fs.copy",
-  "fs.move",
-  "fs.delete",
-  "fs.permissions.write",
-  "fs.unknown",
-  "process.exec",
-  "process.signal",
-  "shell.dynamic",
-  "code.python.execute",
-  "code.javascript.execute",
-  "code.shell.execute",
-  "code.opaque",
-  "network.dns.resolve",
-  "network.connect",
-  "network.listen",
-  "network.http.read",
-  "network.http.write",
-  "network.transfer.upload",
-  "network.transfer.download",
-  "vcs.read",
-  "vcs.write",
-  "vcs.destructive",
-  "vcs.remote.read",
-  "vcs.remote.write",
-  "package.read",
-  "package.install",
-  "package.remove",
-  "package.publish",
-  "db.read",
-  "db.insert",
-  "db.update",
-  "db.delete",
-  "db.schema.create",
-  "db.schema.alter",
-  "db.schema.drop",
-  "db.transaction",
-  "db.admin",
-  "db.unknown",
-  "system.service.read",
-  "system.service.manage",
-  "system.identity.manage",
-  "system.schedule.manage",
-  "system.storage.manage",
-  "infra.read",
-  "infra.write",
-  "infra.destroy",
-  "permission.additional",
-  "tool.unknown",
+  ...APPROVAL_POLICY_REGISTRY.actions,
 ]);
 
 const EFFECT_SET = new Set(APPROVAL_POLICY_EFFECTS);
 const ACTION_SET = new Set(APPROVAL_POLICY_ACTIONS);
-const CONDITION_OPERATORS = new Set([
-  "exists",
-  "not_exists",
-  "eq",
-  "neq",
-  "glob",
-  "not_glob",
-  "contains",
-  "not_contains",
-  "starts_with",
-  "ends_with",
-  "path_under",
-  "path_equals",
-  "in",
-  "not_in",
-  "intersects",
-  "contains_all",
-  "lt",
-  "lte",
-  "gt",
-  "gte",
-  "between",
+const CONDITION_OPERATORS = new Set(APPROVAL_POLICY_REGISTRY.operators);
+const SCALAR_CONDITION_OPERATORS = new Set([
+  "eq", "neq", "glob", "not_glob", "contains", "not_contains",
+  "starts_with", "ends_with", "path_under", "path_equals",
+  "lt", "lte", "gt", "gte", "between",
 ]);
 const POLICY_KEYS = new Set([
   "$schema",
@@ -135,53 +61,29 @@ const DECLARATION_KEYS = new Set([
   "description",
   "enabled",
 ]);
-const CONDITION_FIELDS = new Set([
-  "action",
-  "risk",
-  "confidence",
-  "provider",
-  "runtime",
-  "interaction.kind",
-  "interaction.source",
-  "tool.name",
-  "command.raw",
-  "command.executable",
-  "command.argv",
-  "command.cwd",
-  "command.dynamic",
-  "command.segment",
-  "resource.kind",
-  "resource.path",
-  "resource.uri",
-  "network.protocol",
-  "network.host",
-  "network.port",
-  "network.method",
-  "database.engine",
-  "database.operation",
-  "database.database",
-  "database.schema",
-  "database.tables",
-  "code.language",
-  "code.script",
-  "code.module",
-  "code.sha256",
-  "declaration.id",
-]);
+const CONDITION_FIELDS = new Set(APPROVAL_POLICY_REGISTRY.condition_fields);
 const MAX_POLICY_BYTES = 1_048_576;
-const MAX_RULES = 256;
-const MAX_DECLARATIONS = 128;
-const MAX_CONDITION_DEPTH = 16;
-const MAX_CONDITION_NODES = 1024;
+const MAX_RULES = APPROVAL_POLICY_REGISTRY.limits.max_rules;
+const MAX_DECLARATIONS = APPROVAL_POLICY_REGISTRY.limits.max_declarations;
+const MAX_CONDITION_DEPTH = APPROVAL_POLICY_REGISTRY.limits.max_condition_depth;
+const MAX_CONDITION_NODES = APPROVAL_POLICY_REGISTRY.limits.max_condition_nodes;
 
 const READ_COMMANDS = new Set(["cat", "head", "tail", "less", "more", "stat", "file", "wc"]);
-const SEARCH_COMMANDS = new Set(["grep", "rg", "find", "fd", "locate"]);
+const SEARCH_COMMANDS = new Set(["grep", "rg", "find", "fd"]);
 const LIST_COMMANDS = new Set(["ls", "tree", "dir"]);
 const SHELL_EXECUTABLES = new Set(["bash", "sh", "zsh", "fish", "dash", "ksh"]);
 const PYTHON_EXECUTABLE = /^(?:python|python\d+(?:\.\d+)?|py)$/i;
 const JAVASCRIPT_EXECUTABLE = /^(?:node|nodejs|deno|bun)$/i;
+const OPAQUE_SCRIPT_EXECUTABLE = /^(?:ruby|perl|php|lua|r|rscript|pwsh|powershell|cmd|cmd\.exe)$/i;
 const SQL_CLIENTS = new Set(["psql", "mysql", "mariadb", "sqlite3", "sqlcmd"]);
-const PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "poetry", "cargo", "gem", "composer"]);
+const PACKAGE_MANAGERS = new Set(["npm", "npx", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "poetry", "cargo", "gem", "composer"]);
+const SAFE_PROCESS_COMMANDS = new Set([
+  "basename", "date", "dirname", "echo", "expr", "false", "id", "printf",
+  "pwd", "test", "true", "type", "uname", "which", "whoami",
+]);
+const COMMAND_WRAPPERS = new Set([
+  "builtin", "command", "env", "exec", "nice", "nohup", "sudo", "doas", "time",
+]);
 
 function objectValue(value) {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -219,13 +121,88 @@ function validateSubstitutions(value, at, errors) {
   }
   if (Array.isArray(value)) {
     value.forEach((item, index) => validateSubstitutions(item, `${at}[${index}]`, errors));
+    return;
   }
+  if (objectValue(value)) {
+    for (const [key, item] of Object.entries(value)) {
+      validateSubstitutions(item, `${at}.${key}`, errors);
+    }
+  }
+}
+
+function conditionContains(condition, predicate) {
+  const value = objectValue(condition);
+  if (!value) return false;
+  if (predicate(value)) return true;
+  if (value.not) return conditionContains(value.not, predicate);
+  for (const key of ["all", "any", "none"]) {
+    if (Array.isArray(value[key]) && value[key].some((item) => conditionContains(item, predicate))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function expandedRuleActions(rule) {
+  if (!Array.isArray(rule?.actions) || rule.actions.length === 0) {
+    return new Set(APPROVAL_POLICY_ACTIONS);
+  }
+  return new Set(APPROVAL_POLICY_ACTIONS.filter((action) => (
+    rule.actions.some((pattern) => matchesApprovalGlob(action, pattern))
+  )));
+}
+
+function ruleStaticScope(rule) {
+  return canonicalApprovalPolicyJson({
+    tools: Array.isArray(rule?.tools) ? [...rule.tools].sort() : null,
+    when: rule?.when || null,
+  });
+}
+
+function setContainsAll(left, right) {
+  for (const item of right) {
+    if (!left.has(item)) return false;
+  }
+  return true;
+}
+
+function approvalPolicyImpact(policy, rules, declarations) {
+  const activeRules = rules.filter((rule) => objectValue(rule) && rule.enabled !== false);
+  const affected = { allow: new Set(), deny: new Set(), ask: new Set() };
+  let broadRuleCount = 0;
+  for (const rule of activeRules) {
+    if (!EFFECT_SET.has(rule.effect)) continue;
+    const actions = expandedRuleActions(rule);
+    for (const action of actions) affected[rule.effect].add(action);
+    if ((!rule.actions || rule.actions.includes("*")) && !rule.tools && !rule.when) {
+      broadRuleCount += 1;
+    }
+  }
+  return {
+    enabled_rule_count: activeRules.length,
+    disabled_rule_count: rules.length - activeRules.length,
+    declaration_count: declarations.length,
+    broad_rule_count: broadRuleCount,
+    action_coverage: {
+      allow: affected.allow.size,
+      deny: affected.deny.size,
+      ask: affected.ask.size,
+      total: APPROVAL_POLICY_ACTIONS.length,
+    },
+    defaults: {
+      unmatched: policy.defaults?.unmatched || "ask",
+      parse_error: policy.defaults?.parse_error || "ask",
+      unknown: policy.defaults?.unknown || "ask",
+    },
+    enforcement: policy.metadata?.enforcement === "shadow" ? "shadow" : "enforce",
+  };
 }
 
 function validateCondition(condition, at, state) {
   const { errors } = state;
-  state.nodes += 1;
-  if (state.nodes > MAX_CONDITION_NODES) {
+  const counter = state.counter || { nodes: 0 };
+  counter.nodes += 1;
+  if (counter.nodes > MAX_CONDITION_NODES) {
     errors.push(issue(at, `condition tree exceeds ${MAX_CONDITION_NODES} nodes`));
     return;
   }
@@ -256,12 +233,13 @@ function validateCondition(condition, at, state) {
     for (let index = 0; index < children.length; index += 1) {
       validateCondition(children[index], `${at}.${key}[${index}]`, {
         ...state,
+        counter,
         depth: state.depth + 1,
       });
     }
     return;
   }
-  const allowedLeaf = new Set(["field", "op", "value", "case_sensitive"]);
+  const allowedLeaf = new Set(["field", "op", "value", "case_sensitive", "quantifier"]);
   validateKnownKeys(value, allowedLeaf, at, errors);
   if (!CONDITION_FIELDS.has(value.field)) {
     errors.push(issue(`${at}.field`, "unknown condition field"));
@@ -275,8 +253,27 @@ function validateCondition(condition, at, state) {
   if (value.case_sensitive != null && typeof value.case_sensitive !== "boolean") {
     errors.push(issue(`${at}.case_sensitive`, "case_sensitive must be boolean"));
   }
+  if (value.quantifier != null && !["any", "all", "none"].includes(value.quantifier)) {
+    errors.push(issue(`${at}.quantifier`, "quantifier must be any, all, or none"));
+  }
   if (value.op === "between" && (!Array.isArray(value.value) || value.value.length !== 2)) {
     errors.push(issue(`${at}.value`, "between requires [minimum, maximum]"));
+  }
+  if (Number(state.version || 1) >= 2) {
+    if (["glob", "not_glob", "contains", "not_contains", "starts_with", "ends_with", "path_under", "path_equals"]
+      .includes(value.op) && typeof value.value !== "string") {
+      errors.push(issue(`${at}.value`, `${value.op} requires a string value`));
+    }
+    if (["in", "not_in", "intersects", "contains_all"].includes(value.op) && !Array.isArray(value.value)) {
+      errors.push(issue(`${at}.value`, `${value.op} requires an array value`));
+    }
+    if (["lt", "lte", "gt", "gte"].includes(value.op) && typeof value.value !== "number") {
+      errors.push(issue(`${at}.value`, `${value.op} requires a numeric value`));
+    }
+    if (value.op === "between" && Array.isArray(value.value)
+      && value.value.some((item) => typeof item !== "number")) {
+      errors.push(issue(`${at}.value`, "between bounds must be numeric"));
+    }
   }
   validateSubstitutions(value.value, `${at}.value`, errors);
 }
@@ -296,14 +293,21 @@ export function validateApprovalPolicy(raw) {
     errors.push(issue("$", `policy exceeds ${MAX_POLICY_BYTES} bytes`));
   }
   validateKnownKeys(policy, POLICY_KEYS, "$", errors);
-  if (policy.version !== APPROVAL_POLICY_VERSION) {
-    errors.push(issue("$.version", `version must be ${APPROVAL_POLICY_VERSION}`));
+  if (!APPROVAL_POLICY_SUPPORTED_VERSIONS.includes(policy.version)) {
+    errors.push(issue("$.version", `version must be one of ${APPROVAL_POLICY_SUPPORTED_VERSIONS.join(", ")}`));
   }
   if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(String(policy.id || ""))) {
     errors.push(issue("$.id", "id must match [a-z0-9][a-z0-9._-]{0,63}"));
   }
   if (policy.name != null && (typeof policy.name !== "string" || policy.name.length > 128)) {
     errors.push(issue("$.name", "name must be a string no longer than 128 characters"));
+  }
+  if (policy.metadata != null && !objectValue(policy.metadata)) {
+    errors.push(issue("$.metadata", "metadata must be an object"));
+  }
+  if (policy.metadata?.enforcement != null
+    && !["enforce", "shadow"].includes(policy.metadata.enforcement)) {
+    errors.push(issue("$.metadata.enforcement", "enforcement must be enforce or shadow"));
   }
   const defaults = objectValue(policy.defaults) || {};
   if (policy.defaults != null && !objectValue(policy.defaults)) {
@@ -313,6 +317,9 @@ export function validateApprovalPolicy(raw) {
   for (const key of DEFAULT_KEYS) {
     if (defaults[key] != null && !EFFECT_SET.has(defaults[key])) {
       errors.push(issue(`$.defaults.${key}`, "effect must be allow, deny, or ask"));
+    }
+    if (["parse_error", "unknown"].includes(key) && defaults[key] === "allow") {
+      errors.push(issue(`$.defaults.${key}`, `${key} cannot automatically allow an unresolved operation`));
     }
   }
   const rules = Array.isArray(policy.rules) ? policy.rules : [];
@@ -343,6 +350,19 @@ export function validateApprovalPolicy(raw) {
         errors.push(issue(`${at}.${key}`, `${key} must be a non-empty string array`));
       }
     }
+    if (rule.effect === "allow" && rule.actions?.includes("*") && !rule.when) {
+      warnings.push(issue(at, "unconditional wildcard allow grants every fully classified atom"));
+    }
+    if (rule.effect === "allow" && rule.actions?.includes("process.exec") && !rule.when) {
+      warnings.push(issue(at, "unconditional process.exec allow should be narrowed by executable and working directory"));
+    }
+    if (Array.isArray(rule.actions)) {
+      for (const pattern of rule.actions) {
+        if (!APPROVAL_POLICY_ACTIONS.some((action) => matchesApprovalGlob(action, pattern))) {
+          warnings.push(issue(`${at}.actions`, `action pattern ${pattern} matches no registered atom`));
+        }
+      }
+    }
     if (rule.enabled != null && typeof rule.enabled !== "boolean") {
       errors.push(issue(`${at}.enabled`, "enabled must be boolean"));
     }
@@ -350,9 +370,54 @@ export function validateApprovalPolicy(raw) {
       warnings.push(issue(at, "rule matches every atom"));
     }
     if (rule.when != null) {
-      validateCondition(rule.when, `${at}.when`, { errors, nodes: 0, depth: 0 });
+      validateCondition(rule.when, `${at}.when`, {
+        errors,
+        counter: { nodes: 0 },
+        depth: 0,
+        version: policy.version,
+      });
     }
   });
+  const activeRules = rules
+    .map((rule, index) => ({ rule: objectValue(rule), index }))
+    .filter((entry) => entry.rule && entry.rule.enabled !== false);
+  for (let rightIndex = 0; rightIndex < activeRules.length; rightIndex += 1) {
+    const current = activeRules[rightIndex];
+    if (!EFFECT_SET.has(current.rule.effect)) continue;
+    const currentActions = expandedRuleActions(current.rule);
+    const currentScope = ruleStaticScope(current.rule);
+    for (let leftIndex = 0; leftIndex < rightIndex; leftIndex += 1) {
+      const previous = activeRules[leftIndex];
+      if (!EFFECT_SET.has(previous.rule.effect)
+        || ruleStaticScope(previous.rule) !== currentScope) continue;
+      const previousActions = expandedRuleActions(previous.rule);
+      if (!setContainsAll(previousActions, currentActions)) continue;
+      const previousPath = `$.rules[${previous.index}]`;
+      const currentPath = `$.rules[${current.index}]`;
+      if (previous.rule.effect === current.rule.effect) {
+        warnings.push(issue(
+          currentPath,
+          `rule is redundant because ${previousPath} already covers the same scope and actions`,
+        ));
+        break;
+      }
+      const rank = { allow: 1, ask: 2, deny: 3 };
+      if (rank[previous.rule.effect] >= rank[current.rule.effect]) {
+        warnings.push(issue(
+          currentPath,
+          `rule cannot change the decision because ${previousPath} applies ${previous.rule.effect} to the same or a broader action set`,
+        ));
+        break;
+      }
+      if (setContainsAll(currentActions, previousActions)) {
+        warnings.push(issue(
+          currentPath,
+          `rule conflicts with ${previousPath}; overlapping atoms resolve to ${current.rule.effect === "deny" ? "deny" : "ask"}`,
+        ));
+        break;
+      }
+    }
+  }
   const declarations = policy.declarations == null
     ? []
     : Array.isArray(policy.declarations)
@@ -380,9 +445,32 @@ export function validateApprovalPolicy(raw) {
       } else {
         declarationIds.add(declaration.id);
       }
-      validateCondition(declaration.match, `${at}.match`, { errors, nodes: 0, depth: 0 });
+      validateCondition(declaration.match, `${at}.match`, {
+        errors,
+        counter: { nodes: 0 },
+        depth: 0,
+        version: policy.version,
+      });
       if (declaration.replaces_opaque != null && typeof declaration.replaces_opaque !== "boolean") {
         errors.push(issue(`${at}.replaces_opaque`, "replaces_opaque must be boolean"));
+      }
+      if (policy.version >= 2 && declaration.replaces_opaque === true) {
+        const hasScriptPath = conditionContains(declaration.match, (condition) => (
+          condition.field === "code.script"
+          && condition.op === "path_equals"
+          && typeof condition.value === "string"
+        ));
+        const hasDigest = conditionContains(declaration.match, (condition) => (
+          condition.field === "code.sha256"
+          && condition.op === "eq"
+          && /^[a-f0-9]{64}$/i.test(String(condition.value || ""))
+        ));
+        if (!hasScriptPath || !hasDigest) {
+          errors.push(issue(
+            `${at}.match`,
+            "v2 declarations that replace opaque code require an exact script scope and SHA-256 digest",
+          ));
+        }
       }
       if (!Array.isArray(declaration.emits) || declaration.emits.length === 0) {
         errors.push(issue(`${at}.emits`, "emits must be a non-empty atom array"));
@@ -395,9 +483,36 @@ export function validateApprovalPolicy(raw) {
           validateSubstitutions(rawAtom, `${at}.emits[${atomIndex}]`, errors);
         });
       }
+      const hasStableScope = conditionContains(declaration.match, (condition) => (
+        [
+          "tool.name",
+          "command.executable",
+          "code.script",
+          "code.module",
+          "code.sha256",
+          "declaration.id",
+        ].includes(condition.field)
+      ));
+      if (!hasStableScope) {
+        warnings.push(issue(
+          `${at}.match`,
+          "declaration is broadly scoped; constrain it by tool, executable, module, or exact script identity",
+        ));
+      }
+      if (Array.isArray(declaration.emits) && declaration.emits.length > 8) {
+        warnings.push(issue(
+          `${at}.emits`,
+          "declaration emits many atoms; split it into smaller declarations so review impact stays auditable",
+        ));
+      }
     });
   }
-  return { valid: errors.length === 0, errors, warnings };
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings,
+    impact: approvalPolicyImpact(policy, rules, declarations || []),
+  };
 }
 
 function canonicalApprovalPolicyValue(value) {
@@ -423,6 +538,28 @@ export function approvalPolicyRevision(policy) {
   return createHash("sha256")
     .update(canonicalApprovalPolicyJson(policy))
     .digest("hex");
+}
+
+export function approvalPolicyCapabilities() {
+  const registry = {
+    versions: APPROVAL_POLICY_SUPPORTED_VERSIONS,
+    latest_version: APPROVAL_POLICY_VERSION,
+    actions: APPROVAL_POLICY_ACTIONS,
+    operators: [...CONDITION_OPERATORS].sort(),
+    condition_fields: [...CONDITION_FIELDS].sort(),
+    max_rules: MAX_RULES,
+    max_declarations: MAX_DECLARATIONS,
+    max_condition_depth: MAX_CONDITION_DEPTH,
+    max_condition_nodes: MAX_CONDITION_NODES,
+    path_canonicalization: APPROVAL_POLICY_REGISTRY.path_canonicalization,
+    unknown_operations: APPROVAL_POLICY_REGISTRY.unknown_operations,
+  };
+  return {
+    ...registry,
+    registry_hash: createHash("sha256")
+      .update(canonicalApprovalPolicyJson(registry))
+      .digest("hex"),
+  };
 }
 
 export function compileApprovalPolicy(raw) {
@@ -513,7 +650,7 @@ export function matchesApprovalGlob(actual, pattern, { caseSensitive = true } = 
   return globRegExp(pattern, caseSensitive).test(String(actual ?? ""));
 }
 
-function normalizedPath(value, base) {
+function lexicalPath(value, base) {
   const text = String(value || "").trim();
   if (!text) return "";
   if (text === "~") return homedir();
@@ -521,9 +658,90 @@ function normalizedPath(value, base) {
   return path.resolve(base || process.cwd(), text);
 }
 
+function resolvedPolicyPath(value, base) {
+  const requested = lexicalPath(value, base);
+  if (!requested) return { path: "", requested, trusted: false };
+
+  let cursor = requested;
+  const missing = [];
+  while (true) {
+    try {
+      lstatSync(cursor);
+      try {
+        const canonical = realpathSync.native(cursor);
+        let hardLinked = false;
+        let device = null;
+        if (!missing.length) {
+          try {
+            const metadata = statSync(canonical);
+            hardLinked = metadata.isFile() && metadata.nlink > 1;
+            device = metadata.dev;
+          } catch {}
+        } else {
+          try { device = statSync(canonical).dev; } catch {}
+        }
+        return {
+          path: missing.length ? path.join(canonical, ...missing) : canonical,
+          requested,
+          trusted: true,
+          hardLinked,
+          device,
+        };
+      } catch {
+        return { path: requested, requested, trusted: false };
+      }
+    } catch (error) {
+      if (!error || !["ENOENT", "ENOTDIR"].includes(error.code)) {
+        return { path: requested, requested, trusted: false };
+      }
+      const parent = path.dirname(cursor);
+      if (parent === cursor) return { path: requested, requested, trusted: false };
+      missing.unshift(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+function pathIsUnder(candidate, root) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (
+    relative !== ".."
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative)
+  );
+}
+
+function policyPathResolution(resolved, context) {
+  if (!resolved.trusted) return "unresolved";
+  if (resolved.hardLinked) return "hardlink";
+  const workspaceBoundary = resolvedPolicyPath(context.workspace, context.workspace);
+  if (resolved.device != null
+    && workspaceBoundary.device != null
+    && resolved.device !== workspaceBoundary.device) {
+    return "mount-boundary";
+  }
+  return "canonical";
+}
+
 function compareLeaf(actual, condition, context) {
   const expected = expandValue(condition.value, context);
   const caseSensitive = condition.case_sensitive !== false;
+  const missing = actual === undefined || actual === null;
+  if (missing) {
+    if (condition.op === "exists") return false;
+    if (condition.op === "not_exists") return true;
+    return false;
+  }
+  if (Array.isArray(actual) && SCALAR_CONDITION_OPERATORS.has(condition.op)) {
+    const quantifier = condition.quantifier
+      || (context.rule_effect === "allow" ? "all" : "any");
+    const nested = { ...condition };
+    delete nested.quantifier;
+    const matches = actual.map((item) => compareLeaf(item, nested, context));
+    if (quantifier === "all") return matches.length > 0 && matches.every(Boolean);
+    if (quantifier === "none") return matches.every((item) => !item);
+    return matches.some(Boolean);
+  }
   switch (condition.op) {
     case "exists": return actual !== undefined && actual !== null;
     case "not_exists": return actual === undefined || actual === null;
@@ -540,17 +758,39 @@ function compareLeaf(actual, condition, context) {
     case "starts_with": return textCompare(actual, expected, caseSensitive, (a, b) => a.startsWith(b));
     case "ends_with": return textCompare(actual, expected, caseSensitive, (a, b) => a.endsWith(b));
     case "path_under": {
-      const root = normalizedPath(expected, context.workspace);
+      if (context.path_match_mode === "requested") {
+        const root = lexicalPath(expected, context.workspace_requested || context.workspace);
+        if (!root) return false;
+        const values = Array.isArray(actual) ? actual : [actual];
+        return values.some((item) => {
+          const candidate = lexicalPath(item, context.workspace_requested || context.workspace);
+          return Boolean(candidate) && pathIsUnder(candidate, root);
+        });
+      }
+      const root = resolvedPolicyPath(expected, context.workspace);
+      if (!root.trusted) return false;
       const values = Array.isArray(actual) ? actual : [actual];
       return values.some((item) => {
-        const candidate = normalizedPath(item, context.workspace);
-        return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+        const candidate = resolvedPolicyPath(item, context.workspace);
+        return candidate.trusted && pathIsUnder(candidate.path, root.path);
       });
     }
     case "path_equals": {
-      const expectedPath = normalizedPath(expected, context.workspace);
+      if (context.path_match_mode === "requested") {
+        const expectedPath = lexicalPath(expected, context.workspace_requested || context.workspace);
+        if (!expectedPath) return false;
+        const values = Array.isArray(actual) ? actual : [actual];
+        return values.some((item) => (
+          lexicalPath(item, context.workspace_requested || context.workspace) === expectedPath
+        ));
+      }
+      const expectedPath = resolvedPolicyPath(expected, context.workspace);
+      if (!expectedPath.trusted) return false;
       const values = Array.isArray(actual) ? actual : [actual];
-      return values.some((item) => normalizedPath(item, context.workspace) === expectedPath);
+      return values.some((item) => {
+        const candidate = resolvedPolicyPath(item, context.workspace);
+        return candidate.trusted && candidate.path === expectedPath.path;
+      });
     }
     case "in": return Array.isArray(expected) && expected.some((item) => compareLeaf(actual, { ...condition, op: "eq", value: item }, context));
     case "not_in": return !compareLeaf(actual, { ...condition, op: "in" }, context);
@@ -586,6 +826,7 @@ function riskForAction(action) {
     "secret.input",
     "fs.delete",
     "fs.permissions.write",
+    "process.opaque",
     "shell.dynamic",
     "code.opaque",
     "network.listen",
@@ -628,10 +869,11 @@ function baseAtom(request, action, extra = {}) {
   };
 }
 
-function collectPathValues(value, key = "", result = []) {
-  if (result.length >= 128 || value == null) return result;
+function collectPathValues(value, key = "", result = [], state = { nodes: 0 }, depth = 0) {
+  state.nodes += 1;
+  if (result.length >= 128 || value == null || state.nodes > 4096 || depth > 32) return result;
   if (Array.isArray(value)) {
-    value.forEach((item) => collectPathValues(item, key, result));
+    value.forEach((item) => collectPathValues(item, key, result, state, depth + 1));
     return result;
   }
   if (typeof value !== "object") {
@@ -641,15 +883,30 @@ function collectPathValues(value, key = "", result = []) {
     }
     return result;
   }
-  for (const [childKey, child] of Object.entries(value)) collectPathValues(child, childKey, result);
+  for (const [childKey, child] of Object.entries(value)) {
+    collectPathValues(child, childKey, result, state, depth + 1);
+  }
   return result;
 }
 
-function pathAtom(request, action, candidate, context, extra = {}) {
-  const resolved = normalizedPath(candidate, context.workspace);
+function pathAtom(request, action, candidate, context, extra = {}, base = context.workspace) {
+  const resolved = resolvedPolicyPath(candidate, base);
+  const resolution = policyPathResolution(resolved, context);
+  const {
+    confidence: requestedConfidence,
+    resource: extraResource,
+    ...rest
+  } = extra;
   return baseAtom(request, action, {
-    resource: { kind: "path", path: resolved || safeText(candidate, 4096) },
-    ...extra,
+    ...rest,
+    confidence: resolved.trusted ? requestedConfidence : "low",
+    resource: {
+      kind: "path",
+      path: resolved.path || safeText(candidate, 4096),
+      requested_path: resolved.requested,
+      path_resolution: resolution,
+      ...(extraResource || {}),
+    },
   });
 }
 
@@ -687,14 +944,17 @@ function shellSegments(command) {
     if (quote) {
       if (char === quote) quote = "";
       else token += char;
-      if (char === "`" || (char === "$" && command[index + 1] === "(")) dynamic = true;
+      if (quote !== "'" && (char === "`" || char === "$")) dynamic = true;
       continue;
     }
     if (char === "'" || char === '"') {
       quote = char;
       continue;
     }
-    if (char === "`" || (char === "$" && command[index + 1] === "(")) dynamic = true;
+    if (char === "`" || char === "$" || ["*", "?", "[", "{"].includes(char)) {
+      dynamic = true;
+    }
+    if (char === "~" && token.length === 0) dynamic = true;
     if (/\s/.test(char)) {
       flushToken();
       if (char === "\n") flushSegment("newline");
@@ -727,17 +987,48 @@ function optionValues(tokens) {
   return tokens.filter((item) => item && !item.startsWith("-"));
 }
 
+function wrappedCommandTokens(executable, args) {
+  let index = 0;
+  const consumesValue = new Set(
+    executable === "sudo" || executable === "doas"
+      ? ["-u", "-g", "-h", "-p", "-C", "-T", "--user", "--group", "--host", "--prompt", "--chdir"]
+      : executable === "env"
+        ? ["-u", "-C", "-S", "--unset", "--chdir", "--split-string"]
+        : executable === "nice"
+          ? ["-n", "--adjustment"]
+          : [],
+  );
+  while (index < args.length) {
+    const token = args[index];
+    if (executable === "env" && /^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+      index += 1;
+      continue;
+    }
+    if (token === "--") {
+      index += 1;
+      break;
+    }
+    if (!token.startsWith("-")) break;
+    const key = token.includes("=") ? token.slice(0, token.indexOf("=")) : token;
+    index += consumesValue.has(key) && !token.includes("=") ? 2 : 1;
+  }
+  return args.slice(index);
+}
+
 function executableName(value) {
   return path.basename(String(value || "")).toLowerCase();
 }
 
-function commandAtom(request, raw, tokens, cwd, segment, dynamic = false) {
+function commandAtom(request, raw, tokens, cwd, segment, dynamic = false, cwdResolution = "canonical", requestedCwd = cwd) {
   return baseAtom(request, "process.exec", {
+    confidence: cwdResolution === "canonical" ? "high" : "low",
     command: {
       raw: safeText(raw, 8192),
       executable: executableName(tokens[0]),
       argv: tokens.slice(1, 128).map((item) => safeText(item, 2048)),
       cwd,
+      requested_cwd: requestedCwd,
+      cwd_resolution: cwdResolution,
       dynamic,
       segment,
     },
@@ -747,6 +1038,7 @@ function commandAtom(request, raw, tokens, cwd, segment, dynamic = false) {
 function scriptHash(scriptPath) {
   try {
     if (!scriptPath || !existsSync(scriptPath)) return "";
+    if (statSync(scriptPath).size > 16 * 1024 * 1024) return "";
     return createHash("sha256").update(readFileSync(scriptPath)).digest("hex");
   } catch {
     return "";
@@ -805,9 +1097,10 @@ function sqlStatements(sql) {
 }
 
 function sqlOperation(statement) {
-  const normalized = statement.replace(/^\s*WITH\b[\s\S]*?\)\s*/i, "").trim();
-  const keyword = normalized.match(/^([a-z]+)/i)?.[1]?.toUpperCase() || "";
-  return {
+  const normalized = statement.trim();
+  const keywords = [...normalized.matchAll(/\b([a-z]+)\b/gi)]
+    .map((match) => match[1].toUpperCase());
+  const operations = {
     SELECT: ["db.read", "select"],
     SHOW: ["db.read", "show"],
     DESCRIBE: ["db.read", "describe"],
@@ -826,7 +1119,29 @@ function sqlOperation(statement) {
     START: ["db.transaction", "begin"],
     COMMIT: ["db.transaction", "commit"],
     ROLLBACK: ["db.transaction", "rollback"],
-  }[keyword] || ["db.unknown", keyword.toLowerCase() || "unknown"];
+    MERGE: ["db.update", "merge"],
+    COPY: ["db.unknown", "copy"],
+    CALL: ["db.unknown", "call"],
+    EXEC: ["db.unknown", "exec"],
+    EXECUTE: ["db.unknown", "execute"],
+    VACUUM: ["db.admin", "vacuum"],
+    ATTACH: ["db.admin", "attach"],
+    DETACH: ["db.admin", "detach"],
+    PRAGMA: ["db.unknown", "pragma"],
+  };
+  const priority = [
+    "DROP", "TRUNCATE", "DELETE", "ALTER", "GRANT", "REVOKE", "VACUUM",
+    "ATTACH", "DETACH", "UPDATE", "MERGE", "INSERT", "CREATE", "COPY",
+    "CALL", "EXEC", "EXECUTE", "PRAGMA", "ROLLBACK", "COMMIT", "BEGIN",
+    "START", "SELECT", "SHOW", "DESCRIBE", "DESC", "EXPLAIN",
+  ];
+  const keyword = priority.find((candidate) => keywords.includes(candidate))
+    || keywords[0]
+    || "";
+  if (keyword === "SELECT" && /\bINTO\s+(?:OUTFILE|DUMPFILE|TEMP|TEMPORARY|TABLE)\b/i.test(normalized)) {
+    return ["db.unknown", "select_into"];
+  }
+  return operations[keyword] || ["db.unknown", keyword.toLowerCase() || "unknown"];
 }
 
 function extractSqlTables(statement) {
@@ -839,7 +1154,14 @@ function extractSqlTables(statement) {
 }
 
 function sqlAtoms(request, sql, engine = "unknown", database = "") {
-  const statements = sqlStatements(String(sql || ""));
+  const rawSql = String(sql || "");
+  if (Buffer.byteLength(rawSql, "utf8") > 256 * 1024) {
+    return [baseAtom(request, "db.unknown", {
+      confidence: "low",
+      database: { engine, operation: "oversized", database, tables: [] },
+    })];
+  }
+  const statements = sqlStatements(rawSql);
   if (!statements.length) {
     return [baseAtom(request, "db.unknown", {
       confidence: "low",
@@ -868,60 +1190,139 @@ function valueAfter(tokens, names) {
   return "";
 }
 
-function semanticCommandAtoms(request, command, segment, context) {
+function semanticCommandAtoms(request, command, segment, context, depth = 0) {
   const tokens = segment.tokens;
   if (!tokens.length) return [];
   const executable = executableName(tokens[0]);
-  const cwd = normalizedPath(request?.payload?.cwd || context.workspace, context.workspace);
-  const atoms = [commandAtom(request, command, tokens, cwd, segment.separator, segment.dynamic)];
+  const cwdPath = resolvedPolicyPath(request?.payload?.cwd || context.workspace, context.workspace);
+  const cwd = cwdPath.path;
+  const cwdResolution = policyPathResolution(cwdPath, context);
+  const atoms = [commandAtom(
+    request,
+    command,
+    tokens,
+    cwd,
+    segment.separator,
+    segment.dynamic,
+    cwdResolution,
+    cwdPath.requested,
+  )];
   const args = tokens.slice(1);
   const positional = optionValues(args);
+  let classified = SAFE_PROCESS_COMMANDS.has(executable);
+
+  if (COMMAND_WRAPPERS.has(executable)) {
+    classified = true;
+    if (["sudo", "doas"].includes(executable)) {
+      atoms.push(baseAtom(request, "system.identity.manage", { command: atoms[0].command }));
+    }
+    const nested = wrappedCommandTokens(executable, args);
+    if (nested.length && depth < 8) {
+      atoms.push(...semanticCommandAtoms(request, command, {
+        tokens: nested,
+        separator: segment.separator,
+        dynamic: segment.dynamic,
+        redirections: segment.redirections,
+      }, context, depth + 1));
+    } else if (!nested.length) {
+      atoms.push(baseAtom(request, "tool.unknown", {
+        confidence: "low",
+        command: atoms[0].command,
+      }));
+    }
+  }
+  if (executable === "xargs") {
+    classified = true;
+    atoms.push(baseAtom(request, "shell.dynamic", { confidence: "low", command: atoms[0].command }));
+  }
   if (segment.dynamic || ["eval", "source", "."].includes(executable)) {
-    atoms.push(baseAtom(request, "shell.dynamic", {
-      confidence: "low",
-      command: atoms[0].command,
-    }));
+    classified = true;
+    atoms.push(baseAtom(request, "shell.dynamic", { confidence: "low", command: atoms[0].command }));
   }
   if (SHELL_EXECUTABLES.has(executable)) {
+    classified = true;
     atoms.push(baseAtom(request, "code.shell.execute", { command: atoms[0].command }));
     if (args.includes("-c") || args.includes("--command")) {
       atoms.push(baseAtom(request, "shell.dynamic", { confidence: "low", command: atoms[0].command }));
+      const commandIndex = args.findIndex((item) => item === "-c" || item === "--command");
+      const nestedCommand = commandIndex >= 0 ? args[commandIndex + 1] : "";
+      if (nestedCommand && depth < 8) {
+        atoms.push(...shellSegments(nestedCommand).flatMap((nested) => (
+          semanticCommandAtoms(request, nestedCommand, nested, context, depth + 1)
+        )));
+      }
     }
   }
-  if (READ_COMMANDS.has(executable)) positional.forEach((item) => atoms.push(pathAtom(request, "fs.read", item, context)));
-  if (SEARCH_COMMANDS.has(executable)) atoms.push(baseAtom(request, "fs.search", { command: atoms[0].command }));
-  if (LIST_COMMANDS.has(executable)) atoms.push(pathAtom(request, "fs.list", positional.at(-1) || cwd, context));
-  if (executable === "rm" || executable === "rmdir") positional.forEach((item) => atoms.push(pathAtom(request, "fs.delete", item, context)));
-  if (["mkdir", "touch", "mktemp"].includes(executable)) positional.forEach((item) => atoms.push(pathAtom(request, "fs.create", item, context)));
+  if (READ_COMMANDS.has(executable)) {
+    classified = true;
+    positional.forEach((item) => atoms.push(pathAtom(request, "fs.read", item, context, {}, cwd)));
+  }
+  if (SEARCH_COMMANDS.has(executable)) {
+    classified = true;
+    const searchPaths = executable === "find"
+      ? positional.slice(0, 1)
+      : positional.slice(1);
+    (searchPaths.length ? searchPaths : [cwd]).forEach((item) => atoms.push(
+      pathAtom(request, "fs.search", item, context, { command: atoms[0].command }, cwd),
+    ));
+    if (args.some((item) => ["-delete", "-exec", "-execdir"].includes(item))) {
+      atoms.push(baseAtom(request, "shell.dynamic", { confidence: "low", command: atoms[0].command }));
+    }
+  }
+  if (LIST_COMMANDS.has(executable)) {
+    classified = true;
+    atoms.push(pathAtom(request, "fs.list", positional.at(-1) || cwd, context, {}, cwd));
+  }
+  if (["rm", "rmdir"].includes(executable)) {
+    classified = true;
+    positional.forEach((item) => atoms.push(pathAtom(request, "fs.delete", item, context, {}, cwd)));
+  }
+  if (["mkdir", "touch", "mktemp"].includes(executable)) {
+    classified = true;
+    positional.forEach((item) => atoms.push(pathAtom(request, "fs.create", item, context, {}, cwd)));
+  }
   if (executable === "cp" && positional.length >= 2) {
-    atoms.push(pathAtom(request, "fs.read", positional[0], context));
-    atoms.push(pathAtom(request, "fs.copy", positional.at(-1), context));
+    classified = true;
+    positional.slice(0, -1).forEach((item) => atoms.push(pathAtom(request, "fs.read", item, context, {
+      resource: { role: "source" },
+    }, cwd)));
+    atoms.push(pathAtom(request, "fs.copy", positional.at(-1), context, {
+      resource: { role: "destination" },
+    }, cwd));
   }
   if (executable === "mv" && positional.length >= 2) {
+    classified = true;
+    positional.slice(0, -1).forEach((item) => atoms.push(pathAtom(request, "fs.move", item, context, {
+      resource: { role: "source" },
+    }, cwd)));
     atoms.push(pathAtom(request, "fs.move", positional.at(-1), context, {
-      source: normalizedPath(positional[0], context.workspace),
-    }));
+      resource: { role: "destination" },
+    }, cwd));
   }
   if (["chmod", "chown", "chgrp"].includes(executable)) {
-    positional.slice(1).forEach((item) => atoms.push(pathAtom(request, "fs.permissions.write", item, context)));
+    classified = true;
+    positional.slice(1).forEach((item) => atoms.push(pathAtom(request, "fs.permissions.write", item, context, {}, cwd)));
   }
   if (executable === "sed") {
+    classified = true;
     const target = positional.at(-1);
-    if (target) atoms.push(pathAtom(request, args.some((item) => item === "-i" || item.startsWith("-i")) ? "fs.write" : "fs.read", target, context));
+    if (target) atoms.push(pathAtom(request, args.some((item) => item === "-i" || item.startsWith("-i")) ? "fs.write" : "fs.read", target, context, {}, cwd));
   }
   if (segment.redirections.length) {
     const target = tokens.at(-1);
-    if (target) atoms.push(pathAtom(request, segment.redirections.some((item) => item.includes(">")) ? "fs.write" : "fs.read", target, context));
+    if (target) atoms.push(pathAtom(request, segment.redirections.some((item) => item.includes(">")) ? "fs.write" : "fs.read", target, context, {}, cwd));
   }
   if (executable === "git") {
+    classified = true;
     const verb = args.find((item) => !item.startsWith("-")) || "";
     if (["status", "log", "diff", "show", "branch", "rev-parse", "ls-files"].includes(verb)) atoms.push(baseAtom(request, "vcs.read", { command: atoms[0].command }));
     else if (["fetch", "pull", "clone"].includes(verb)) atoms.push(baseAtom(request, "vcs.remote.read", { command: atoms[0].command }));
-    else if (["push"].includes(verb)) atoms.push(baseAtom(request, "vcs.remote.write", { command: atoms[0].command }));
+    else if (verb === "push") atoms.push(baseAtom(request, "vcs.remote.write", { command: atoms[0].command }));
     else if (["reset", "clean"].includes(verb) || (verb === "checkout" && args.includes("--")) || verb === "restore") atoms.push(baseAtom(request, "vcs.destructive", { command: atoms[0].command }));
     else atoms.push(baseAtom(request, "vcs.write", { command: atoms[0].command }));
   }
   if (["curl", "wget"].includes(executable)) {
+    classified = true;
     const url = args.find((item) => /^https?:\/\//i.test(item)) || "";
     let method = valueAfter(args, ["-X", "--request"]).toUpperCase();
     if (!method) method = args.some((item) => ["-d", "--data", "--data-raw", "--data-binary", "--form"].includes(item)) ? "POST" : "GET";
@@ -929,6 +1330,7 @@ function semanticCommandAtoms(request, command, segment, context) {
     let parsed;
     try { parsed = url ? new URL(url) : null; } catch { parsed = null; }
     atoms.push(baseAtom(request, write ? "network.http.write" : "network.http.read", {
+      confidence: parsed ? "high" : "low",
       network: {
         protocol: parsed?.protocol?.replace(":", "") || "http",
         host: parsed?.hostname || "",
@@ -938,12 +1340,17 @@ function semanticCommandAtoms(request, command, segment, context) {
       resource: { kind: "uri", uri: url },
     }));
     const output = valueAfter(args, ["-o", "--output", "-O"]);
-    if (output) atoms.push(pathAtom(request, "fs.write", output, context));
+    if (output) atoms.push(pathAtom(request, "fs.write", output, context, {}, cwd));
+    if (args.some((item) => ["-T", "--upload-file"].includes(item))) {
+      atoms.push(baseAtom(request, "network.transfer.upload", { network: { protocol: "http", host: parsed?.hostname || "", port: Number(parsed?.port || 0) } }));
+    }
   }
   if (["ssh", "scp", "rsync"].includes(executable)) {
+    classified = true;
     const remote = args.find((item) => item.includes("@") || /^[a-z0-9.-]+:/i.test(item)) || "";
     const host = remote.replace(/^[^@]+@/, "").split(":")[0];
     atoms.push(baseAtom(request, "network.connect", {
+      confidence: host ? "high" : "low",
       network: { protocol: executable, host, port: executable === "ssh" ? 22 : 0 },
     }));
     if (["scp", "rsync"].includes(executable)) {
@@ -953,21 +1360,35 @@ function semanticCommandAtoms(request, command, segment, context) {
     }
   }
   if (PACKAGE_MANAGERS.has(executable)) {
+    classified = true;
     const verb = args.find((item) => !item.startsWith("-")) || "";
-    const action = ["install", "add", "i", "sync", "update", "upgrade"].includes(verb)
-      ? "package.install"
-      : ["remove", "uninstall", "rm"].includes(verb)
-        ? "package.remove"
-        : ["publish", "release"].includes(verb)
-          ? "package.publish"
-          : "package.read";
+    const executionVerb = ["exec", "run", "run-script", "start", "test", "dlx", "x", "create"].includes(verb)
+      || executable === "npx";
+    const action = executionVerb
+      ? (executable === "npx" || ["exec", "dlx", "x", "create"].includes(verb) ? "package.install" : "package.read")
+      : ["install", "add", "i", "sync", "update", "upgrade"].includes(verb)
+        ? "package.install"
+        : ["remove", "uninstall", "rm"].includes(verb)
+          ? "package.remove"
+          : ["publish", "release"].includes(verb)
+            ? "package.publish"
+            : "package.read";
     atoms.push(baseAtom(request, action, { command: atoms[0].command }));
+    if (executionVerb || ["build", "publish", "release"].includes(verb)) {
+      atoms.push(baseAtom(request, "code.opaque", {
+        confidence: "low",
+        code: { language: "package-script", module: executable, script: "", sha256: "" },
+        command: atoms[0].command,
+      }));
+    }
   }
   if (["systemctl", "service", "launchctl"].includes(executable)) {
+    classified = true;
     const verb = args.find((item) => !item.startsWith("-")) || "";
     atoms.push(baseAtom(request, ["status", "show", "list", "is-active"].includes(verb) ? "system.service.read" : "system.service.manage", { command: atoms[0].command }));
   }
   if (["docker", "podman", "kubectl", "helm", "terraform"].includes(executable)) {
+    classified = true;
     const verb = args.find((item) => !item.startsWith("-")) || "";
     const action = ["get", "list", "show", "inspect", "logs", "ps", "plan", "status"].includes(verb)
       ? "infra.read"
@@ -977,37 +1398,81 @@ function semanticCommandAtoms(request, command, segment, context) {
     atoms.push(baseAtom(request, action, { command: atoms[0].command }));
   }
   if (PYTHON_EXECUTABLE.test(executable)) {
+    classified = true;
     const moduleIndex = args.indexOf("-m");
     const codeIndex = args.indexOf("-c");
-    const script = !args[0]?.startsWith("-") ? normalizedPath(args[0], cwd) : "";
+    const scriptPath = !args[0]?.startsWith("-") ? resolvedPolicyPath(args[0], cwd) : null;
+    const script = scriptPath?.path || "";
     const code = {
       language: "python",
       script,
       module: moduleIndex >= 0 ? safeText(args[moduleIndex + 1], 512) : "",
       sha256: scriptHash(script),
       inline: codeIndex >= 0,
+      requested_script: scriptPath?.requested || "",
+      script_resolution: scriptPath
+        ? policyPathResolution(scriptPath, context)
+        : "canonical",
     };
     atoms.push(baseAtom(request, "code.python.execute", { code, command: atoms[0].command }));
     atoms.push(baseAtom(request, "code.opaque", { confidence: "low", code, command: atoms[0].command }));
   }
   if (JAVASCRIPT_EXECUTABLE.test(executable)) {
+    classified = true;
     const codeIndex = args.indexOf("-e");
-    const script = !args[0]?.startsWith("-") ? normalizedPath(args[0], cwd) : "";
+    const scriptPath = !args[0]?.startsWith("-") ? resolvedPolicyPath(args[0], cwd) : null;
+    const script = scriptPath?.path || "";
     const code = {
       language: "javascript",
       script,
       module: "",
       sha256: scriptHash(script),
       inline: codeIndex >= 0,
+      requested_script: scriptPath?.requested || "",
+      script_resolution: scriptPath
+        ? policyPathResolution(scriptPath, context)
+        : "canonical",
     };
     atoms.push(baseAtom(request, "code.javascript.execute", { code, command: atoms[0].command }));
     atoms.push(baseAtom(request, "code.opaque", { confidence: "low", code, command: atoms[0].command }));
   }
+  if (OPAQUE_SCRIPT_EXECUTABLE.test(executable)) {
+    classified = true;
+    const inline = args.some((item) => ["-e", "-c", "/c", "-command"].includes(item.toLowerCase()));
+    const scriptCandidate = !inline && !args[0]?.startsWith("-") && !args[0]?.startsWith("/")
+      ? args[0]
+      : "";
+    const scriptPath = scriptCandidate ? resolvedPolicyPath(scriptCandidate, cwd) : null;
+    const code = {
+      language: executable.replace(/\.exe$/i, ""),
+      script: scriptPath?.path || "",
+      module: "",
+      sha256: scriptHash(scriptPath?.path || ""),
+      inline,
+      requested_script: scriptPath?.requested || "",
+      script_resolution: scriptPath
+        ? policyPathResolution(scriptPath, context)
+        : "canonical",
+    };
+    atoms.push(baseAtom(request, "code.opaque", {
+      confidence: "low",
+      code,
+      command: atoms[0].command,
+    }));
+  }
   if (SQL_CLIENTS.has(executable)) {
+    classified = true;
     const sql = valueAfter(args, ["-e", "--execute", "-c", "--command"])
       || (executable === "sqlite3" ? args.slice(1).join(" ") : "");
     const database = executable === "sqlite3" ? safeText(args[0], 1024) : valueAfter(args, ["-d", "--dbname", "--database"]);
     atoms.push(...sqlAtoms(request, sql, executable, database));
+  }
+  if (!classified) {
+    atoms.push(baseAtom(request, "process.opaque", {
+      confidence: "low",
+      command: atoms[0].command,
+      resource: { kind: "executable", value: tokens[0] },
+    }));
   }
   return atoms;
 }
@@ -1024,18 +1489,53 @@ function toolAtoms(request, context) {
   const payload = objectValue(request?.payload) || {};
   const input = objectValue(payload.tool_input) || objectValue(payload.input) || payload;
   const tool = safeText(payload.tool || request?.tool || "unknown", 128).replace(/[^a-z0-9_]/gi, "").toLowerCase();
-  if (["bash", "command", "exec", "execcommand", "shell"].includes(tool)) return commandAtoms(request, context);
+  if (["bash", "command", "exec", "execcommand", "shell"].includes(tool)) {
+    const atoms = commandAtoms(request, context);
+    const additional = payload.additional_permissions || payload.network_approval_context;
+    if (additional && (typeof additional !== "object" || Object.keys(additional).length > 0)) {
+      atoms.push(baseAtom(request, "permission.additional", {
+        resource: { kind: "permission", requested: additional },
+      }));
+    }
+    return atoms;
+  }
   if (tool === "permissions") return [baseAtom(request, "permission.additional", { resource: { kind: "permission", requested: payload.requested || payload.additional_permissions || {} } })];
   if (["read", "readfile"].includes(tool)) return collectPathValues(input).map((item) => pathAtom(request, "fs.read", item, context));
-  if (["ls", "list", "glob"].includes(tool)) return collectPathValues(input).map((item) => pathAtom(request, tool === "glob" ? "fs.search" : "fs.list", item, context));
-  if (["grep", "search", "websearch"].includes(tool)) return [baseAtom(request, tool === "websearch" ? "network.http.read" : "fs.search", { resource: { kind: "query" } })];
+  if (["ls", "list", "glob"].includes(tool)) {
+    const paths = collectPathValues(input);
+    return (paths.length ? paths : [context.workspace]).map((item) => (
+      pathAtom(request, tool === "glob" ? "fs.search" : "fs.list", item, context)
+    ));
+  }
+  if (["grep", "search"].includes(tool)) {
+    const paths = collectPathValues(input);
+    return (paths.length ? paths : [context.workspace]).map((item) => (
+      pathAtom(request, "fs.search", item, context)
+    ));
+  }
+  if (tool === "websearch") {
+    return [baseAtom(request, "network.http.read", {
+      resource: { kind: "query" },
+      network: { protocol: "https", host: "", port: 443, method: "GET" },
+    })];
+  }
   if (["write", "multiedit", "notebookedit"].includes(tool)) {
     const paths = collectPathValues(input);
-    return (paths.length ? paths : [context.workspace]).map((item) => pathAtom(request, "fs.write", item, context));
+    return paths.length
+      ? paths.map((item) => pathAtom(request, "fs.write", item, context))
+      : [baseAtom(request, "fs.unknown", {
+          confidence: "low",
+          resource: { kind: "path", operation: "write" },
+        })];
   }
   if (["edit", "applypatch", "file_change", "filechange"].includes(tool)) {
     const paths = collectPathValues(input);
-    return (paths.length ? paths : [context.workspace]).map((item) => pathAtom(request, "fs.patch", item, context));
+    return paths.length
+      ? paths.map((item) => pathAtom(request, "fs.patch", item, context))
+      : [baseAtom(request, "fs.unknown", {
+          confidence: "low",
+          resource: { kind: "path", operation: "patch" },
+        })];
   }
   if (["webfetch"].includes(tool)) {
     const uri = safeText(input.url || payload.url, 4096);
@@ -1059,13 +1559,35 @@ function declarationAtoms(atoms, declarations, context, request) {
     const matched = next.find((atom) => evaluateApprovalCondition(declaration.match, atom, context));
     if (!matched) continue;
     applied.push(declaration.id);
-    if (declaration.replaces_opaque) {
+    const replacementScoped = conditionContains(declaration.match, (condition) => (
+      condition.field === "code.script"
+      && condition.op === "path_equals"
+      && typeof condition.value === "string"
+    )) && conditionContains(declaration.match, (condition) => (
+      condition.field === "code.sha256"
+      && condition.op === "eq"
+      && /^[a-f0-9]{64}$/i.test(String(condition.value || ""))
+    ));
+    if (declaration.replaces_opaque && replacementScoped) {
       next = next.filter((atom) => !(atom.action === "code.opaque" && atom.command?.raw === matched.command?.raw));
     }
     for (const emitted of declaration.emits) {
       const expanded = expandValue(emitted, context);
+      const normalized = { ...expanded };
+      if (expanded.resource?.kind === "path" && expanded.resource.path) {
+        const resolved = resolvedPolicyPath(expanded.resource.path, context.workspace);
+        normalized.resource = {
+          ...expanded.resource,
+          path: resolved.path,
+          requested_path: resolved.requested,
+          path_resolution: policyPathResolution(resolved, context),
+        };
+        if (normalized.resource.path_resolution !== "canonical") {
+          normalized.confidence = "low";
+        }
+      }
       next.push(baseAtom(request, expanded.action, {
-        ...expanded,
+        ...normalized,
         action: expanded.action,
         risk: expanded.risk || riskForAction(expanded.action),
         declaration: { id: declaration.id },
@@ -1080,10 +1602,16 @@ export function atomizeApprovalRequest(request, {
   stateDir = "",
   policy = null,
 } = {}) {
+  const workspacePath = resolvedPolicyPath(workspace, process.cwd());
+  const homePath = resolvedPolicyPath(homedir(), process.cwd());
+  const statePath = stateDir ? resolvedPolicyPath(stateDir, workspacePath.path) : null;
   const context = {
-    workspace: normalizedPath(workspace, process.cwd()),
-    home: homedir(),
-    state_dir: stateDir,
+    workspace: workspacePath.path,
+    workspace_requested: workspacePath.requested,
+    workspace_resolution: workspacePath.trusted ? "canonical" : "unresolved",
+    home: homePath.path,
+    state_dir: statePath?.path || "",
+    policy_version: policy?.version || 1,
   };
   let atoms;
   if (request?.containsSecret) {
@@ -1106,10 +1634,68 @@ export function atomizeApprovalRequest(request, {
   return { atoms: declared.atoms, declarations: declared.declarations, context };
 }
 
+function atomWithRequestedPaths(atom) {
+  let changed = false;
+  let next = atom;
+  if (atom.resource?.requested_path && atom.resource.requested_path !== atom.resource.path) {
+    next = {
+      ...next,
+      resource: { ...atom.resource, path: atom.resource.requested_path },
+    };
+    changed = true;
+  }
+  if (atom.command?.requested_cwd && atom.command.requested_cwd !== atom.command.cwd) {
+    next = {
+      ...next,
+      command: { ...atom.command, cwd: atom.command.requested_cwd },
+    };
+    changed = true;
+  }
+  if (atom.code?.requested_script && atom.code.requested_script !== atom.code.script) {
+    next = {
+      ...next,
+      code: { ...atom.code, script: atom.code.requested_script },
+    };
+    changed = true;
+  }
+  return changed ? next : null;
+}
+
+function atomHasUnresolvedPath(atom) {
+  return (atom.resource?.path_resolution && atom.resource.path_resolution !== "canonical")
+    || (atom.command?.cwd_resolution && atom.command.cwd_resolution !== "canonical")
+    || (atom.code?.script_resolution && atom.code.script_resolution !== "canonical");
+}
+
+function atomRequiresHumanReview(atom) {
+  return atom.confidence === "low"
+    || [
+      "code.opaque",
+      "db.unknown",
+      "fs.unknown",
+      "process.opaque",
+      "shell.dynamic",
+      "tool.unknown",
+    ].includes(atom.action);
+}
+
 function ruleMatches(rule, atom, context) {
   if (rule.actions && !rule.actions.some((pattern) => matchesApprovalGlob(atom.action, pattern))) return false;
   if (rule.tools && !rule.tools.some((pattern) => matchesApprovalGlob(atom.tool?.name || "", pattern, { caseSensitive: false }))) return false;
-  return !rule.when || evaluateApprovalCondition(rule.when, atom, context);
+  if (!rule.when) return true;
+  const canonicalContext = { ...context, rule_effect: rule.effect };
+  const canonicalMatch = evaluateApprovalCondition(rule.when, atom, canonicalContext);
+  const requestedAtom = atomWithRequestedPaths(atom);
+  if (!requestedAtom) return canonicalMatch;
+  const requestedMatch = evaluateApprovalCondition(rule.when, requestedAtom, {
+    ...context,
+    workspace: context.workspace_requested || context.workspace,
+    path_match_mode: "requested",
+    rule_effect: rule.effect,
+  });
+  return rule.effect === "allow"
+    ? canonicalMatch && requestedMatch
+    : canonicalMatch || requestedMatch;
 }
 
 function defaultEffect(policy, atom) {
@@ -1123,13 +1709,18 @@ function atomDecision(policy, atom, context) {
     .filter((rule) => ruleMatches(rule, atom, context))
     .sort((a, b) => b.priority - a.priority || a._index - b._index);
   const effects = new Set(matched.map((rule) => rule.effect));
-  const effect = effects.has("deny")
+  const matchedEffect = effects.has("deny")
     ? "deny"
     : effects.has("ask")
       ? "ask"
       : effects.has("allow")
         ? "allow"
         : defaultEffect(policy, atom);
+  const unsafePath = atomHasUnresolvedPath(atom);
+  const requiresHuman = atomRequiresHumanReview(atom);
+  const effect = matchedEffect === "allow" && (unsafePath || requiresHuman)
+    ? "ask"
+    : matchedEffect;
   return {
     effect,
     atom,
@@ -1139,13 +1730,18 @@ function atomDecision(policy, atom, context) {
       priority: rule.priority,
       reason: rule.reason || null,
     })),
-    fallback: matched.length ? null : effect,
+    fallback: matchedEffect === "allow" && (unsafePath || requiresHuman)
+      ? (unsafePath ? "unresolved_path" : "insufficient_classification")
+      : matched.length
+        ? null
+        : effect,
   };
 }
 
 export function evaluateApprovalPolicy(compiled, atoms, context = {}) {
   const policy = compiled.policy || compiled;
-  const decisions = atoms.map((atom) => atomDecision(policy, atom, context));
+  const evaluationContext = { ...context, policy_version: policy.version || 1 };
+  const decisions = atoms.map((atom) => atomDecision(policy, atom, evaluationContext));
   const effect = decisions.some((item) => item.effect === "deny")
     ? "deny"
     : decisions.every((item) => item.effect === "allow")
@@ -1178,7 +1774,7 @@ export function evaluateApprovalRequest(request, rawPolicy, options = {}) {
 
 export function protectedApprovalPolicy() {
   return {
-    $schema: "https://originrouter.com/schemas/approval-policy-v1.schema.json",
+    $schema: "https://originrouter.com/schemas/approval-policy-v2.schema.json",
     version: 1,
     id: "protected",
     name: "Protected defaults",

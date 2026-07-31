@@ -191,3 +191,72 @@ test("SessionManager starts Remote Share with an explicit Provider allow-list", 
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("SessionManager serves approval policy inspection over the encrypted relay", async () => {
+  const previousHome = process.env.ORIGINROUTER_HOME;
+  const home = mkdtempSync(join(tmpdir(), "originrouter-policy-relay-test-"));
+  process.env.ORIGINROUTER_HOME = home;
+  const sent = [];
+  try {
+    const manager = new SessionManager({
+      relayClient: {
+        async send(type, payload) {
+          sent.push({ type, payload });
+          return { ok: true };
+        },
+      },
+      deviceId: "device-test",
+      defaultExecutor: "fake",
+    });
+    assert.equal(manager.handleEvent({
+      type: "approval.policy.capabilities",
+      requestId: "cap-1",
+    }), true);
+    assert.equal(manager.handleEvent({
+      type: "approval.policy.validate",
+      requestId: "validate-1",
+      policy: {
+        version: 2,
+        id: "relay-policy",
+        defaults: { unmatched: "ask", parse_error: "ask", unknown: "ask" },
+        rules: [{ id: "read", effect: "allow", actions: ["fs.read"] }],
+      },
+    }), true);
+    assert.equal(manager.handleEvent({
+      type: "approval.policy.simulate",
+      requestId: "simulate-1",
+      workspace: home,
+      policy: {
+        version: 2,
+        id: "relay-policy",
+        defaults: { unmatched: "ask", parse_error: "ask", unknown: "ask" },
+        rules: [{
+          id: "read",
+          effect: "allow",
+          actions: ["fs.read"],
+          when: { field: "resource.path", op: "path_under", value: "${workspace}" },
+        }],
+      },
+      request: {
+        kind: "permission",
+        source: "app-server",
+        payload: { tool: "Read", tool_input: { file_path: join(home, "README.md") } },
+      },
+    }), true);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const capabilities = sent.find((item) => item.type === "approval.policy.capabilities.result");
+    assert.equal(capabilities.payload.requestId, "cap-1");
+    assert.ok(capabilities.payload.registry_hash);
+    const validation = sent.find((item) => item.type === "approval.policy.validate.result");
+    assert.equal(validation.payload.valid, true);
+    assert.ok(validation.payload.impact);
+    const simulation = sent.find((item) => item.type === "approval.policy.simulate.result");
+    assert.equal(simulation.payload.effect, "allow");
+    assert.deepEqual(simulation.payload.decisions.map((item) => item.action), ["fs.read"]);
+  } finally {
+    if (previousHome === undefined) delete process.env.ORIGINROUTER_HOME;
+    else process.env.ORIGINROUTER_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});

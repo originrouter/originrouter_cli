@@ -64,6 +64,7 @@ import {
 } from "./aiReviewPolicy.js";
 import {
   readApprovalPolicyReference,
+  readWorkspaceApprovalPolicySafe,
   resolveApprovalPolicySelection,
 } from "./approvalPolicyStore.js";
 
@@ -245,6 +246,7 @@ export async function runClaudeSdkSession(rawArgs) {
   );
   const sessionId = options.session || `claude-${Date.now()}`;
   const cwd = process.cwd();
+  const workspaceApprovalPolicy = readWorkspaceApprovalPolicySafe(cwd);
   let relayPlan = await buildAgentRelayPlan({
     stateDir,
     relayUrl,
@@ -504,8 +506,16 @@ export async function runClaudeSdkSession(rawArgs) {
       aiReviewPolicy,
       runtime: "claude-sdk",
       approvalPolicy,
+      workspaceApprovalPolicy,
       stateDir,
       requestInteraction: (item) => interactions.request(item, signal),
+      onPolicyObserved: ({ request: item, evaluation }) =>
+        sendAgentEvent({
+          type: "agent.approval_policy.shadow",
+          provider: "claude",
+          interactionId: item.interactionId,
+          policyEvaluation: evaluation,
+        }),
       onAutoResolved: ({ request: item, resolved }) =>
         sendAgentEvent({
           type: "agent.interaction.auto_resolved",

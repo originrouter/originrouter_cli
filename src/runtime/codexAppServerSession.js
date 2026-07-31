@@ -79,6 +79,7 @@ import {
 } from "./aiReviewPolicy.js";
 import {
   readApprovalPolicyReference,
+  readWorkspaceApprovalPolicySafe,
   resolveApprovalPolicySelection,
 } from "./approvalPolicyStore.js";
 
@@ -297,6 +298,7 @@ export async function runCodexAppServerSession(rawArgs) {
   );
   const sessionId = options.session || `codex-${Date.now()}`;
   const cwd = process.cwd();
+  const workspaceApprovalPolicy = readWorkspaceApprovalPolicySafe(cwd);
   const startedAt = Date.now();
   let relayPlan = await buildAgentRelayPlan({
     stateDir,
@@ -544,8 +546,16 @@ export async function runCodexAppServerSession(rawArgs) {
       aiReviewPolicy,
       runtime: "codex-app-server",
       approvalPolicy,
+      workspaceApprovalPolicy,
       stateDir,
       requestInteraction: (item) => interactions.request(item),
+      onPolicyObserved: ({ request: item, evaluation }) =>
+        sendAgentEvent({
+          type: "agent.approval_policy.shadow",
+          provider: "codex",
+          interactionId: item.interactionId,
+          policyEvaluation: evaluation,
+        }),
       onAutoResolved: ({ request: item, resolved }) =>
         sendAgentEvent({
           type: "agent.interaction.auto_resolved",

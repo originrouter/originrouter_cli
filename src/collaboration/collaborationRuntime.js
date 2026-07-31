@@ -1,7 +1,22 @@
 import { randomUUID } from "node:crypto";
 
+import {
+  ADAPTIVE_TEMPLATE_ID,
+  buildPlannerPrompt,
+  parsePlannerOutput,
+  taskPrompt,
+} from "./adaptivePlan.js";
+
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "expired"]);
 const COMPLETE_EVENTS = new Set(["agent.task.complete", "agent.task.completed"]);
+const FATAL_DELIVERY_CODES = new Set([
+  "COLLABORATION_ASSIGNMENT_CONFLICT",
+  "COLLABORATION_FENCING_CONFLICT",
+  "COLLABORATION_OUTBOX_CONFLICT",
+  "DEVICE_E2EE_AUTH_UNAVAILABLE",
+  "DEVICE_E2EE_DIRECTORY_FORK",
+  "device_e2ee_required",
+]);
 
 function safeText(value, maxLength = 16_384) {
   return String(value ?? "").trim().slice(0, maxLength);
@@ -18,6 +33,16 @@ function expectedRole(run) {
   return null;
 }
 
+function activeRoles(run) {
+  if (run?.template_id === ADAPTIVE_TEMPLATE_ID) {
+    return Object.entries(run.agents || {})
+      .filter(([, agent]) => agent.current_task_id)
+      .map(([role]) => role);
+  }
+  const role = expectedRole(run);
+  return role ? [role] : [];
+}
+
 function latestContent(run, types, predicate = () => true) {
   const wanted = new Set(types);
   return [...(run.messages || [])].reverse()
@@ -31,6 +56,14 @@ function decision(text, positiveMarkers, negativeMarkers) {
   return false;
 }
 
+function retryableDeliveryError(error) {
+  const code = safeText(error?.code, 96);
+  if (FATAL_DELIVERY_CODES.has(code)) return false;
+  return !/forbidden|invalid.*(payload|assignment|message)/i.test(
+    `${code} ${safeText(error?.message, 256)}`,
+  );
+}
+
 export class CollaborationRuntime {
   constructor({
     store,
@@ -42,6 +75,7 @@ export class CollaborationRuntime {
     deviceId = "local",
     registrationTimeoutMs = 15_000,
     pollIntervalMs = 100,
+    leaseTtlMs = 30 * 60_000,
   }) {
     this.store = store;
     this.coordinator = coordinator;
@@ -52,10 +86,14 @@ export class CollaborationRuntime {
     this.deviceId = deviceId;
     this.registrationTimeoutMs = registrationTimeoutMs;
     this.pollIntervalMs = pollIntervalMs;
+    this.leaseTtlMs = Math.max(60_000, Number(leaseTtlMs) || 0);
     this.buffers = new Map();
     this.completedEvents = new Set();
     this.accountBudgetBlocked = false;
     this.queue = Promise.resolve();
+    this.outboxFlush = Promise.resolve();
+    this.outboxDeliveries = new Map();
+    this.outboxRetryTimer = null;
     this.unsubscribe = registry?.subscribe?.((notification) => this.enqueue(notification)) || (() => {});
   }
 
@@ -77,10 +115,17 @@ export class CollaborationRuntime {
     return this.store.getRun(run.run_id);
   }
 
+  async confirm(runId) {
+    const run = this.coordinator.confirm(runId);
+    void this.syncRun(runId);
+    await this.dispatchForState(runId);
+    return this.store.getRun(run.run_id);
+  }
+
   async cancel(runId) {
     const run = this.coordinator.cancel(runId);
     void this.syncRun(runId);
-    for (const agent of Object.values(run.agents || {})) {
+    for (const [role, agent] of Object.entries(run.agents || {})) {
       if (!agent.originrouter_session_id) continue;
       try {
         this.registry.enqueueCommand(agent.originrouter_session_id, {
@@ -88,8 +133,9 @@ export class CollaborationRuntime {
           sessionId: agent.originrouter_session_id,
         });
       } catch {}
-      this.store.updateAgent(runId, agent === run.agents.lead ? "lead" : agent === run.agents.worker ? "worker" : "verifier", {
+      this.store.updateAgent(runId, role, {
         status: "stopping",
+        currentTaskId: "",
       });
     }
     return this.store.getRun(runId);
@@ -106,9 +152,15 @@ export class CollaborationRuntime {
   }
 
   async recover() {
+    await this.flushOutbox();
     for (const item of this.store.listActiveRuns()) {
       const run = this.store.getRun(item.run_id);
       if (!run || run.state === "created" || TERMINAL_STATES.has(run.state)) continue;
+      if (run.template_id === ADAPTIVE_TEMPLATE_ID) {
+        void this.dispatchForState(run.run_id, { recovery: true })
+          .catch((error) => this.fail(run.run_id, error));
+        continue;
+      }
       const role = expectedRole(run);
       if (!role) continue;
       const sessionId = run.agents[role]?.originrouter_session_id;
@@ -126,12 +178,59 @@ export class CollaborationRuntime {
     const run = this.store.getRun(runId);
     if (!run || TERMINAL_STATES.has(run.state)) return run;
     void this.syncRun(runId);
+    if (run.template_id === ADAPTIVE_TEMPLATE_ID) {
+      return this.dispatchAdaptive(run, { recovery });
+    }
     const role = expectedRole(run);
     if (!role) return run;
     const prompt = this.promptFor(run, role, { recovery });
     if (!prompt) return run;
     await this.dispatch(run, role, prompt);
     return this.store.getRun(runId);
+  }
+
+  async dispatchAdaptive(run, { recovery = false } = {}) {
+    if (recovery) run = this.store.resetAdaptiveActiveTasks(run.run_id);
+    if (run.state === "designing") {
+      const role = run.planner_role;
+      const plannerTask = run.tasks.find((task) => task.task_key === "__planner__");
+      if (!plannerTask || !run.agents[role]) throw new Error("collaboration Planner is unavailable");
+      if (run.agents[role].current_task_id === plannerTask.task_id && !recovery) return run;
+      this.store.updateAdaptiveTask(run.run_id, "__planner__", { state: "active" });
+      await this.dispatch(
+        this.store.getRun(run.run_id),
+        role,
+        buildPlannerPrompt(run, { recovery }),
+        {
+          taskId: plannerTask.task_id,
+          taskKey: "__planner__",
+          phase: "plan_design",
+          retry: recovery,
+        },
+      );
+      return this.store.getRun(run.run_id);
+    }
+    if (run.state !== "executing") return run;
+    const tasks = this.store.runnableAdaptiveTasks(run.run_id);
+    if (tasks.length === 0) {
+      const current = this.store.getRun(run.run_id);
+      const remaining = current.tasks.filter((task) => task.task_key !== "__planner__" && task.state !== "completed");
+      if (remaining.length === 0) {
+        return this.store.transition(run.run_id, "completed");
+      }
+      return current;
+    }
+    await Promise.all(tasks.map(async (task) => {
+      this.store.updateAdaptiveTask(run.run_id, task.task_key, { state: "active" });
+      const current = this.store.getRun(run.run_id);
+      await this.dispatch(current, task.participant_id, taskPrompt(current, task), {
+        taskId: task.task_id,
+        taskKey: task.task_key,
+        phase: task.kind,
+        retry: recovery,
+      });
+    }));
+    return this.store.getRun(run.run_id);
   }
 
   promptFor(run, role, { recovery = false } = {}) {
@@ -175,47 +274,83 @@ export class CollaborationRuntime {
     return "";
   }
 
-  async dispatch(run, role, prompt) {
-    const agent = run.agents[role];
+  async dispatch(run, role, prompt, {
+    taskId = null,
+    taskKey = null,
+    phase = null,
+    retry = false,
+  } = {}) {
+    let agent = run.agents[role];
     if (!agent) throw new Error(`missing collaboration role: ${role}`);
-    const turnKey = `${run.state}:${run.counters.plan_revisions || 0}:${run.counters.rework_rounds || 0}`;
+    const effectiveTaskId = taskId || run.task_ids[0];
+    const effectiveTaskKey = taskKey || run.state;
+    const effectivePhase = phase || run.state;
+    const retrySuffix = retry ? `:retry-${Number(agent.attempt || 0) + 1}` : "";
+    const turnKey = `${effectiveTaskKey}:${run.counters.plan_revisions || 0}:${run.counters.rework_rounds || 0}${retrySuffix}`;
     const messageKey = `dispatch-${role}-${turnKey}`;
+    agent = this.store.issueAgentLease(run.run_id, role, {
+      dispatchKey: messageKey,
+      ttlMs: this.leaseTtlMs,
+    });
     this.store.appendMessage(run.run_id, {
-      task_id: run.task_ids[0],
+      task_id: effectiveTaskId,
       type: "agent.message",
       idempotency_key: messageKey,
       sender: { kind: "coordinator", device_id: this.deviceId },
       recipient: { kind: "agent", agent_id: agent.agent_id, device_id: agent.device_id },
-      payload: { phase: run.state, content: prompt },
+      payload: { phase: effectivePhase, content: prompt },
     });
     this.buffers.set(`${run.run_id}:${role}`, []);
     if (agent.device_id !== this.deviceId && agent.device_id !== "local") {
       if (!this.relayClient) throw new Error("collaboration relay is unavailable");
-      const assignmentId = compactId(`assign-${run.run_id}-${role}`, 96);
-      const result = await this.relayClient.send("collaboration.remote.dispatch", {
+      const assignmentId = compactId(
+        run.template_id === ADAPTIVE_TEMPLATE_ID
+          ? `assign-${run.run_id}-${role}-${effectiveTaskKey}`
+          : `assign-${run.run_id}-${role}`,
+        96,
+      );
+      const deliveryId = compactId(`delivery-${run.run_id}-${role}-${turnKey}`, 96);
+      const payload = {
         protocolVersion: "1",
         sourceDeviceId: this.deviceId,
         targetDeviceId: agent.device_id,
-        deliveryId: compactId(`delivery-${run.run_id}-${role}-${turnKey}`, 96),
+        deliveryId,
         assignmentId,
         runId: run.run_id,
-        taskId: run.task_ids[0],
+        taskId: effectiveTaskId,
         role,
-        phase: run.state,
+        phase: effectivePhase,
+        attempt: agent.attempt,
+        fencingToken: agent.fencing_token,
+        leaseId: agent.lease_id,
+        leaseExpiresAt: agent.lease_expires_at,
         runtime: agent.runtime,
         workspaceId: agent.workspace_id,
         provider: agent.provider,
         model: agent.model,
         permissionProfile: agent.permission_profile || "manual",
         prompt,
-      });
+      };
+      let result;
+      try {
+        result = await this.sendRemoteDurable("collaboration.remote.dispatch", payload, {
+          outboxId: `dispatch:${deliveryId}`,
+        });
+      } catch (error) {
+        if (!retryableDeliveryError(error)) throw error;
+        this.store.updateAgent(run.run_id, role, { status: "waiting_device", currentTaskId: effectiveTaskId });
+        return;
+      }
       const data = result?.data || result || {};
       if (data.accepted === false && !data.queued) {
         const error = new Error(data.reason || "remote collaboration dispatch rejected");
         error.code = String(data.reason || "COLLABORATION_REMOTE_DISPATCH_REJECTED");
         throw error;
       }
-      this.store.updateAgent(run.run_id, role, { status: data.queued ? "waiting_device" : "dispatched" });
+      this.store.updateAgent(run.run_id, role, {
+        status: data.queued ? "waiting_device" : "dispatched",
+        currentTaskId: effectiveTaskId,
+      });
       return;
     }
     let sessionId = agent.originrouter_session_id;
@@ -239,7 +374,7 @@ export class CollaborationRuntime {
           resumeConversationId: conversationId,
           nativeSessionId: agent.native_session_id,
         } : {}),
-        title: `${run.objective.slice(0, 120)} · ${role}`,
+        title: `${run.objective.slice(0, 120)} · ${agent.display_name || role}`,
         startedBy: "collaboration-runtime",
       });
       this.store.updateAgent(run.run_id, role, {
@@ -251,7 +386,7 @@ export class CollaborationRuntime {
       active = true;
     }
     if (!active) throw new Error(`collaboration Agent ${role} did not become ready`);
-    if (run.state === "planning") {
+    if (["planning", "plan_design", "read_only", "discussion"].includes(effectivePhase)) {
       this.registry.enqueueCommand(sessionId, { type: "agent.mode.set", sessionId, mode: "plan" });
     } else {
       this.registry.enqueueCommand(sessionId, { type: "agent.mode.set", sessionId, mode: "default" });
@@ -262,7 +397,7 @@ export class CollaborationRuntime {
       message: prompt,
       messageId: messageKey,
     });
-    this.store.updateAgent(run.run_id, role, { status: "running" });
+    this.store.updateAgent(run.run_id, role, { status: "running", currentTaskId: effectiveTaskId });
   }
 
   async waitForSession(sessionId) {
@@ -298,6 +433,9 @@ export class CollaborationRuntime {
       return;
     }
     if (notification.type !== "event") return;
+    this.store.touchAgentLease(binding.run_id, binding.role, {
+      ttlMs: this.leaseTtlMs,
+    });
     const event = notification.payload || {};
     if (event.type === "agent.usage") {
       const usageId = `usage-${notification.sessionId}-${event.eventId || event.localSequence}`;
@@ -354,7 +492,7 @@ export class CollaborationRuntime {
       for (const runId of runIds) {
         const before = this.store.getRun(runId, { includeMessages: false });
         if (!before) continue;
-        const activeRole = expectedRole(before);
+        const roles = activeRoles(before);
         const result = this.store.setAccountBudgetBlocked(runId, blocked);
         const run = result.run;
         if (!run || !result.changed) continue;
@@ -375,8 +513,9 @@ export class CollaborationRuntime {
           },
         });
         if (blocked) {
-          const agent = activeRole ? before.agents[activeRole] : null;
-          if (agent?.originrouter_session_id) {
+          for (const role of roles) {
+            const agent = before.agents[role];
+            if (!agent?.originrouter_session_id) continue;
             try {
               this.registry.enqueueCommand(agent.originrouter_session_id, {
                 type: "terminal.interrupt",
@@ -397,16 +536,22 @@ export class CollaborationRuntime {
       try {
         await this.receiveRemoteDispatch(payload);
       } catch (error) {
-        await this.relayClient?.send("collaboration.remote.error", {
+        const deliveryId = safeText(payload.deliveryId, 96);
+        await this.sendRemoteDurable("collaboration.remote.error", {
           protocolVersion: "1",
           sourceDeviceId: this.deviceId,
           targetDeviceId: safeText(payload.sourceDeviceId, 191),
+          assignmentId: safeText(payload.assignmentId, 195),
           runId: safeText(payload.runId, 195),
           taskId: safeText(payload.taskId, 195),
           role: safeText(payload.role, 32),
-          deliveryId: safeText(payload.deliveryId, 96),
+          attempt: Math.max(1, Math.floor(Number(payload.attempt) || 0)),
+          fencingToken: Math.max(1, Math.floor(Number(payload.fencingToken) || 0)),
+          deliveryId,
           code: safeText(error?.code || "remote_dispatch_failed", 96),
           message: safeText(error?.message || "Remote collaboration dispatch failed.", 2048),
+        }, {
+          outboxId: `error:${deliveryId}:${compactId(error?.code || "remote_dispatch_failed", 64)}`,
         });
       }
       return true;
@@ -414,14 +559,18 @@ export class CollaborationRuntime {
     if (payload.type === "collaboration.remote.result") {
       if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
       const run = this.store.getRun(payload.runId);
-      if (!run || run.task_ids[0] !== payload.taskId) return true;
+      if (!run || !run.task_ids.includes(payload.taskId)) return true;
       const role = safeText(payload.role, 32);
-      if (expectedRole(run) !== role) return true;
+      if (run.template_id === ADAPTIVE_TEMPLATE_ID) {
+        if (run.agents?.[role]?.current_task_id !== payload.taskId) return true;
+      } else if (expectedRole(run) !== role) return true;
+      if (!this.acceptsFencing(run, role, payload)) return true;
       if (payload.nativeSessionId || payload.conversationId) {
         this.store.updateAgent(run.run_id, role, {
           status: "idle",
           nativeSessionId: payload.nativeSessionId,
           conversationId: payload.conversationId,
+          currentTaskId: payload.taskId,
         });
       }
       await this.handleTurnCompleted(
@@ -436,7 +585,8 @@ export class CollaborationRuntime {
       if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
       const run = this.store.getRun(payload.runId, { includeMessages: false });
       const role = safeText(payload.role, 32);
-      if (!run || !run.agents[role] || run.task_ids[0] !== payload.taskId) return true;
+      if (!run || !run.agents[role] || !run.task_ids.includes(payload.taskId)) return true;
+      if (!this.acceptsFencing(run, role, payload)) return true;
       const usage = this.store.recordUsage(run.run_id, {
         eventId: `usage-${safeText(payload.usageId, 160)}`,
         agentId: run.agents[role].agent_id,
@@ -448,7 +598,8 @@ export class CollaborationRuntime {
       void this.reportUsage(run.run_id, `usage-${safeText(payload.usageId, 160)}`, payload);
       await this.handleBudgetResult(run.run_id, role, null, usage);
       if (usage.exhausted) {
-        await this.relayClient?.send("collaboration.remote.cancel", {
+        const deliveryId = compactId(`budget-cancel-${run.run_id}-${role}-${run.agents[role].fencing_token}`, 96);
+        await this.sendRemoteDurable("collaboration.remote.cancel", {
           protocolVersion: "1",
           sourceDeviceId: this.deviceId,
           targetDeviceId: run.agents[role].device_id,
@@ -456,8 +607,12 @@ export class CollaborationRuntime {
           runId: run.run_id,
           taskId: run.task_ids[0],
           role,
+          attempt: run.agents[role].attempt,
+          fencingToken: run.agents[role].fencing_token,
           reason: "budget_exhausted",
-          deliveryId: compactId(`budget-cancel-${run.run_id}-${role}`, 96),
+          deliveryId,
+        }, {
+          outboxId: `cancel:${deliveryId}`,
         });
       }
       return true;
@@ -466,6 +621,8 @@ export class CollaborationRuntime {
       if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
       const assignment = this.store.getRemoteAssignment(payload.assignmentId);
       if (!assignment || assignment.run_id !== payload.runId) return true;
+      if (payload.fencingToken != null
+          && Number(payload.fencingToken) !== Number(assignment.fencing_token || 0)) return true;
       if (assignment.originrouter_session_id) {
         try {
           this.registry.enqueueCommand(assignment.originrouter_session_id, {
@@ -479,6 +636,9 @@ export class CollaborationRuntime {
     }
     if (payload.type === "collaboration.remote.error") {
       if (safeText(payload.targetDeviceId, 191) === this.deviceId && payload.runId) {
+        const run = this.store.getRun(payload.runId, { includeMessages: false });
+        const role = safeText(payload.role, 32);
+        if (!run || !this.acceptsFencing(run, role, payload)) return true;
         await this.fail(payload.runId, Object.assign(
           new Error(safeText(payload.message, 2048) || "Remote collaboration Agent failed."),
           { code: safeText(payload.code, 96) },
@@ -495,7 +655,7 @@ export class CollaborationRuntime {
     if (safeText(payload.sourceDeviceId, 191) === this.deviceId) throw new Error("invalid collaboration source device");
     const prompt = safeText(payload.prompt, 32_768);
     if (!prompt) throw new Error("remote collaboration prompt is required");
-    let assignment = this.store.upsertRemoteAssignment({
+    const accepted = this.store.upsertRemoteAssignment({
       assignmentId: payload.assignmentId,
       runId: payload.runId,
       taskId: payload.taskId,
@@ -508,7 +668,14 @@ export class CollaborationRuntime {
       provider: payload.provider,
       model: payload.model,
       permissionProfile: payload.permissionProfile,
+      deliveryId: payload.deliveryId,
+      attempt: payload.attempt,
+      fencingToken: payload.fencingToken,
+      leaseId: payload.leaseId,
+      leaseExpiresAt: payload.leaseExpiresAt,
     });
+    if (accepted.stale || accepted.duplicate) return;
+    let assignment = accepted.assignment;
     const bufferKey = `remote:${assignment.assignment_id}`;
     this.buffers.set(bufferKey, []);
     let sessionId = assignment.originrouter_session_id;
@@ -549,7 +716,7 @@ export class CollaborationRuntime {
     this.registry.enqueueCommand(sessionId, {
       type: "agent.mode.set",
       sessionId,
-      mode: payload.phase === "planning" ? "plan" : "default",
+      mode: ["planning", "plan_design", "read_only", "discussion"].includes(payload.phase) ? "plan" : "default",
     });
     this.registry.enqueueCommand(sessionId, {
       type: "agent.message",
@@ -576,9 +743,13 @@ export class CollaborationRuntime {
       return;
     }
     if (notification.type !== "event") return;
+    assignment = this.store.touchRemoteAssignmentLease(assignment.assignment_id, {
+      ttlMs: this.leaseTtlMs,
+    });
     const event = notification.payload || {};
     if (event.type === "agent.usage") {
-      await this.relayClient?.send("collaboration.remote.usage", {
+      const usageId = `${notification.sessionId}-${event.eventId || event.localSequence}`;
+      await this.sendRemoteDurable("collaboration.remote.usage", {
         protocolVersion: "1",
         sourceDeviceId: this.deviceId,
         targetDeviceId: assignment.source_device_id,
@@ -586,11 +757,15 @@ export class CollaborationRuntime {
         runId: assignment.run_id,
         taskId: assignment.task_id,
         role: assignment.role,
-        usageId: `${notification.sessionId}-${event.eventId || event.localSequence}`,
+        attempt: assignment.attempt,
+        fencingToken: assignment.fencing_token,
+        usageId,
         sampledTokens: Math.max(0, Math.floor(Number(event.sampledTokens) || 0)),
         amountMicros: event.amountMicros == null ? null : Math.max(0, Math.floor(Number(event.amountMicros) || 0)),
         currency: safeText(event.currency, 3).toUpperCase(),
         costSource: safeText(event.costSource, 32),
+      }, {
+        outboxId: `usage:${compactId(usageId, 160)}`,
       });
       return;
     }
@@ -607,7 +782,7 @@ export class CollaborationRuntime {
     const output = safeText(event.result || (this.buffers.get(key) || []).join("\n\n"));
     this.buffers.set(key, []);
     const latest = this.store.updateRemoteAssignment(assignment.assignment_id, { status: "idle" });
-    await this.relayClient?.send("collaboration.remote.result", {
+    await this.sendRemoteDurable("collaboration.remote.result", {
       protocolVersion: "1",
       sourceDeviceId: this.deviceId,
       targetDeviceId: latest.source_device_id,
@@ -616,16 +791,124 @@ export class CollaborationRuntime {
       taskId: latest.task_id,
       role: latest.role,
       phase: latest.phase,
+      attempt: latest.attempt,
+      fencingToken: latest.fencing_token,
       completionId,
       output,
       nativeSessionId: latest.native_session_id,
       conversationId: latest.conversation_id,
+    }, {
+      outboxId: `result:${compactId(completionId, 160)}`,
     });
+  }
+
+  acceptsFencing(run, role, payload) {
+    const agent = run?.agents?.[role];
+    if (!agent) return false;
+    const hasAttempt = payload.attempt != null;
+    const hasToken = payload.fencingToken != null;
+    // Protocol v1 peers deployed before fencing support do not send these
+    // fields. Preserve rolling-upgrade compatibility while retaining the
+    // existing run/task/role checks performed by each caller.
+    if (!hasAttempt && !hasToken) return true;
+    if (!hasAttempt || !hasToken) return false;
+    return Number(payload.fencingToken || 0) === Number(agent.fencing_token || 0)
+      && Number(payload.attempt || 0) === Number(agent.attempt || 0);
+  }
+
+  async sendRemoteDurable(type, payload, { outboxId } = {}) {
+    if (!this.relayClient) throw new Error("collaboration relay is unavailable");
+    const item = this.store.enqueueOutbox({
+      outboxId,
+      runId: payload.runId,
+      assignmentId: payload.assignmentId,
+      messageType: type,
+      targetDeviceId: payload.targetDeviceId,
+      payload,
+    });
+    if (item.state === "delivered") return { accepted: true, duplicate: true };
+    return this.deliverOutbox(item);
+  }
+
+  async deliverOutbox(item) {
+    const current = this.outboxDeliveries.get(item.outbox_id);
+    if (current) return current;
+    const operation = this._deliverOutbox(item)
+      .finally(() => this.outboxDeliveries.delete(item.outbox_id));
+    this.outboxDeliveries.set(item.outbox_id, operation);
+    return operation;
+  }
+
+  async _deliverOutbox(item) {
+    this.store.markOutboxAttempt(item.outbox_id);
+    try {
+      const result = await this.relayClient.send(item.message_type, item.payload);
+      const delivery = result?.data || result || {};
+      if (delivery.accepted === false && !delivery.queued) {
+        const error = new Error(delivery.reason || "collaboration relay rejected message");
+        error.code = safeText(delivery.reason, 96) || "COLLABORATION_RELAY_REJECTED";
+        throw error;
+      }
+      this.store.markOutboxDelivered(item.outbox_id);
+      this.applyOutboxDelivery(item, delivery);
+      return result;
+    } catch (error) {
+      const reason = error?.code || error?.message || "delivery_failed";
+      if (retryableDeliveryError(error)) {
+        const latest = this.store.markOutboxFailure(item.outbox_id, reason);
+        this.scheduleOutboxRetry(latest?.attempts || 1);
+      } else {
+        this.store.markOutboxFailed(item.outbox_id, reason);
+      }
+      throw error;
+    }
+  }
+
+  scheduleOutboxRetry(attempts) {
+    if (this.outboxRetryTimer) return;
+    const delayMs = Math.min(60_000, 1_000 * (2 ** Math.min(6, Math.max(0, attempts - 1))));
+    this.outboxRetryTimer = setTimeout(() => {
+      this.outboxRetryTimer = null;
+      void this.flushOutbox();
+    }, delayMs);
+    this.outboxRetryTimer.unref?.();
+  }
+
+  applyOutboxDelivery(item, delivery) {
+    if (item.message_type !== "collaboration.remote.dispatch") return;
+    const run = this.store.getRun(item.run_id, { includeMessages: false });
+    const role = safeText(item.payload?.role, 32);
+    if (!run?.agents?.[role]) return;
+    this.store.updateAgent(run.run_id, role, {
+      status: delivery.queued || delivery.reason === "queued"
+        ? "waiting_device"
+        : "dispatched",
+    });
+  }
+
+  async flushOutbox() {
+    this.outboxFlush = this.outboxFlush.catch(() => {}).then(async () => {
+      const items = this.store.listPendingOutbox({ limit: 500 });
+      let delivered = 0;
+      for (const item of items) {
+        try {
+          await this.deliverOutbox(item);
+          delivered += 1;
+        } catch {}
+      }
+      return { pending: items.length - delivered, delivered };
+    });
+    return this.outboxFlush;
   }
 
   async handleTurnCompleted(runId, role, output, completionKey) {
     let run = this.store.getRun(runId);
-    if (!run || TERMINAL_STATES.has(run.state) || expectedRole(run) !== role) return;
+    if (!run || TERMINAL_STATES.has(run.state)) return;
+    if (run.template_id === ADAPTIVE_TEMPLATE_ID) {
+      await this.handleAdaptiveTurnCompleted(run, role, output, completionKey);
+      return;
+    }
+    if (expectedRole(run) !== role) return;
     const base = {
       task_id: run.task_ids[0],
       sender: { kind: "agent", agent_id: run.agents[role].agent_id, device_id: run.agents[role].device_id },
@@ -695,6 +978,57 @@ export class CollaborationRuntime {
     }
   }
 
+  async handleAdaptiveTurnCompleted(run, role, output, completionKey) {
+    const agent = run.agents?.[role];
+    if (!agent?.current_task_id) return;
+    const task = run.tasks.find((item) => item.task_id === agent.current_task_id);
+    if (!task) return;
+    const base = {
+      task_id: task.task_id,
+      sender: { kind: "agent", agent_id: agent.agent_id, device_id: agent.device_id },
+      recipient: { kind: "coordinator", device_id: this.deviceId },
+      payload: { content: output || "Agent completed without a textual report." },
+    };
+    if (run.state === "designing" && task.task_key === "__planner__" && role === run.planner_role) {
+      let plan;
+      try {
+        plan = parsePlannerOutput(output, { participantIds: Object.keys(run.agents) });
+      } catch (error) {
+        const invalid = new Error(`The Planner returned a plan that could not be validated: ${error.message}`);
+        invalid.code = "COLLABORATION_PLAN_INVALID";
+        throw invalid;
+      }
+      this.store.appendMessage(run.run_id, {
+        ...base,
+        type: "plan.submitted",
+        idempotency_key: `adaptive-plan-${completionKey}`,
+      });
+      this.store.updateAgent(run.run_id, role, { status: "idle", currentTaskId: "" });
+      this.store.setAdaptivePlan(run.run_id, plan);
+      void this.syncRun(run.run_id);
+      return;
+    }
+    if (run.state !== "executing" || task.task_key === "__planner__") return;
+    this.store.appendMessage(run.run_id, {
+      ...base,
+      type: "task.completed",
+      idempotency_key: `adaptive-task-${task.task_key}-${completionKey}`,
+    });
+    this.store.updateAdaptiveTask(run.run_id, task.task_key, {
+      state: "completed",
+      resultSummary: output || "Completed without a written summary.",
+    });
+    this.store.updateAgent(run.run_id, role, { status: "idle", currentTaskId: "" });
+    const current = this.store.getRun(run.run_id);
+    const remaining = current.tasks.filter((item) => item.task_key !== "__planner__" && item.state !== "completed");
+    if (remaining.length === 0) {
+      this.store.transition(run.run_id, "completed");
+      void this.syncRun(run.run_id);
+      return;
+    }
+    await this.dispatchForState(run.run_id);
+  }
+
   async handleBudgetResult(runId, role, sessionId, result) {
     if (!result || result.duplicate || !result.warning) return;
     const run = this.store.getRun(runId, { includeMessages: false });
@@ -730,9 +1064,10 @@ export class CollaborationRuntime {
       sourceDeviceId: this.deviceId,
       runId: run.run_id,
       templateId: run.template_id,
-      objectivePreview: safeText(run.objective, 512),
+      objectivePreview: "",
       state: run.state,
-      taskTitle: safeText(run.tasks[0]?.title, 256),
+      taskTitle: "",
+      contentRedacted: true,
       budget: run.budget,
       usage: run.usage,
       counters: run.counters,
@@ -793,5 +1128,9 @@ export class CollaborationRuntime {
     }
   }
 
-  close() { this.unsubscribe(); }
+  close() {
+    this.unsubscribe();
+    if (this.outboxRetryTimer) clearTimeout(this.outboxRetryTimer);
+    this.outboxRetryTimer = null;
+  }
 }

@@ -16,6 +16,7 @@ import { ensureApiToken } from "../src/persistence/authToken.js";
 import { LocalAuditStore } from "../src/persistence/localAuditStore.js";
 import { AgentCatalog } from "../src/persistence/agentCatalog.js";
 import { ProxyRequestStore } from "../src/persistence/proxyRequestStore.js";
+import { saveApprovalPolicy } from "../src/runtime/approvalPolicyStore.js";
 
 const home = mkdtempSync(join(tmpdir(), "originrouter-localapi-test-"));
 process.env.ORIGINROUTER_HOME = home;
@@ -336,6 +337,54 @@ try {
     for (const p of body.providers) {
       assert.ok(!p.apiKey.includes("1234567890"), `apiKey for ${p.name} should be masked`);
     }
+  }
+
+  // ---------- Approval Policy capabilities, simulation, and rollback ----------
+  {
+    const capabilities = await getJson("/approval-policies/capabilities");
+    assert.equal(capabilities.status, 200);
+    assert.deepEqual(capabilities.body.capabilities.versions, [1, 2]);
+    assert.equal(capabilities.body.capabilities.latest_version, 2);
+    assert.match(capabilities.body.capabilities.registry_hash, /^[a-f0-9]{64}$/);
+
+    const policy = {
+      version: 2,
+      id: "api-policy",
+      defaults: { unmatched: "ask", parse_error: "ask", unknown: "ask" },
+      rules: [{ id: "allow-read", effect: "allow", actions: ["fs.read"] }],
+    };
+    const validation = await postJson("/approval-policies/validate", { policy });
+    assert.equal(validation.status, 200);
+    assert.equal(validation.body.valid, true);
+    const simulation = await postJson("/approval-policies/simulate", {
+      policy,
+      workspace: home,
+      request: {
+        kind: "permission",
+        provider: "claude",
+        runtime: "claude-sdk",
+        source: "hook",
+        payload: { tool: "Read", tool_input: { file_path: "README.md" } },
+        containsSecret: false,
+      },
+    });
+    assert.equal(simulation.status, 200);
+    assert.equal(simulation.body.effect, "allow");
+
+    const first = saveApprovalPolicy(policy, { stateDir: home });
+    const second = saveApprovalPolicy({
+      ...policy,
+      rules: [{ id: "deny-read", effect: "deny", actions: ["fs.read"] }],
+    }, { stateDir: home, expectedRevision: first.revision });
+    const revisions = await getJson("/approval-policies/api-policy/revisions");
+    assert.equal(revisions.status, 200);
+    assert.ok(revisions.body.revisions.some((item) => item.revision === first.revision));
+    const rollback = await postJson("/approval-policies/api-policy/rollback", {
+      revision: first.revision,
+      expected_revision: second.revision,
+    });
+    assert.equal(rollback.status, 200);
+    assert.equal(rollback.body.policy.revision, first.revision);
   }
 
   // ---------- GET /providers/:name ----------

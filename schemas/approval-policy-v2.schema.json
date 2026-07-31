@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://originrouter.com/schemas/approval-policy-v1.schema.json",
-  "title": "OriginRouter Approval Policy",
+  "$id": "https://originrouter.com/schemas/approval-policy-v2.schema.json",
+  "title": "OriginRouter Approval Policy v2",
   "description": "Portable allow, deny, and ask rules enforced by OriginRouter CLI.",
   "type": "object",
   "additionalProperties": false,
   "required": ["version", "id", "rules"],
   "properties": {
     "$schema": { "type": "string" },
-    "version": { "const": 1 },
+    "version": { "const": 2 },
     "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$" },
     "name": { "type": "string", "maxLength": 128 },
     "description": { "type": "string" },
@@ -23,7 +23,13 @@
       "maxItems": 128,
       "items": { "$ref": "#/$defs/declaration" }
     },
-    "metadata": { "type": "object" }
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "enforcement": { "enum": ["enforce", "shadow"] }
+      },
+      "additionalProperties": true
+    }
   },
   "$defs": {
     "effect": { "enum": ["allow", "deny", "ask"] },
@@ -118,7 +124,8 @@
               ]
             },
             "value": {},
-            "case_sensitive": { "type": "boolean" }
+            "case_sensitive": { "type": "boolean" },
+            "quantifier": { "enum": ["any", "all", "none"] }
           }
         }
       ]

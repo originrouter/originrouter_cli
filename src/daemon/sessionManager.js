@@ -18,6 +18,15 @@ import { protectOriginrouterCodingEnv } from "../runtime/originrouterCodingAuthP
 import { setAgentDetailDefault } from "../runtime/agentDetailProfile.js";
 import { buildAuditEvidenceBundle } from "../inquiry/auditEvidenceAdapter.js";
 import { browseAgentWorkspaces } from "./workspaceBrowser.js";
+import {
+  approvalPolicyCapabilities,
+  evaluateApprovalRequest,
+  validateApprovalPolicy,
+} from "../runtime/approvalPolicy.js";
+import {
+  listApprovalPolicyRevisions,
+  rollbackApprovalPolicy,
+} from "../runtime/approvalPolicyStore.js";
 
 export class SessionManager {
   constructor({
@@ -575,6 +584,86 @@ export class SessionManager {
   }
 
   handleEvent(payload) {
+    if (payload.type?.startsWith("approval.policy.")) {
+      const requestId = String(payload.requestId || "").slice(0, 96);
+      if (!requestId) return false;
+      const respond = (type, body) => this.relayClient.send(type, {
+        requestId,
+        ...body,
+      }).catch((error) => {
+        console.error(`[approval-policy] ${error.message}`);
+      });
+      if (payload.type === "approval.policy.capabilities") {
+        respond("approval.policy.capabilities.result", approvalPolicyCapabilities());
+        return true;
+      }
+      if (payload.type === "approval.policy.validate") {
+        Promise.resolve().then(() => validateApprovalPolicy(payload.policy))
+          .then((result) => respond("approval.policy.validate.result", result))
+          .catch((error) => respond("approval.policy.validate.result", {
+            error: error.message || "approval policy validation failed",
+            reason: error.code || "approval_policy_validation_failed",
+          }));
+        return true;
+      }
+      if (payload.type === "approval.policy.simulate") {
+        Promise.resolve().then(() => evaluateApprovalRequest(
+          payload.request,
+          payload.policy,
+          {
+            workspace: payload.workspace || process.cwd(),
+            stateDir: ensureStateDir(),
+          },
+        )).then((result) => respond("approval.policy.simulate.result", {
+          effect: result.effect,
+          policy_id: result.policyId,
+          revision: result.revision,
+          declarations: result.declarations,
+          decisions: result.decisions.map((decision) => ({
+            action: decision.atom.action,
+            risk: decision.atom.risk,
+            confidence: decision.atom.confidence,
+            effect: decision.effect,
+            matched_rules: decision.matchedRules,
+            fallback: decision.fallback,
+            resource_kind: decision.atom.resource?.kind || null,
+          })),
+        })).catch((error) => respond("approval.policy.simulate.result", {
+          error: error.message || "approval policy simulation failed",
+          reason: error.code || "approval_policy_simulation_failed",
+        }));
+        return true;
+      }
+      if (payload.type === "approval.policy.revisions") {
+        Promise.resolve().then(() => listApprovalPolicyRevisions(
+          payload.policyId,
+          { stateDir: ensureStateDir() },
+        )).then((revisions) => respond("approval.policy.revisions.result", {
+          revisions,
+        })).catch((error) => respond("approval.policy.revisions.result", {
+          error: error.message || "approval policy revision list failed",
+          reason: error.code || "approval_policy_revision_list_failed",
+        }));
+        return true;
+      }
+      if (payload.type === "approval.policy.rollback") {
+        Promise.resolve().then(() => rollbackApprovalPolicy(
+          payload.policyId,
+          payload.revision,
+          {
+            stateDir: ensureStateDir(),
+            expectedRevision: payload.expectedRevision || null,
+          },
+        )).then((restored) => respond("approval.policy.rollback.result", {
+          policy: restored.summary,
+        })).catch((error) => respond("approval.policy.rollback.result", {
+          error: error.message || "approval policy rollback failed",
+          reason: error.code || "approval_policy_rollback_failed",
+        }));
+        return true;
+      }
+      return false;
+    }
     if (payload.type === "agent.workspace.browse") {
       const requestId = String(payload.requestId || "").slice(0, 96);
       if (!requestId || !this.agentCatalog) return false;

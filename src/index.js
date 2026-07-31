@@ -70,6 +70,7 @@ import { runDoctor, printDoctorResults } from "./commands/doctor.js";
 import { handleServiceCommand } from "./commands/service.js";
 import { handleAuthCommand, handleLogin, handleLogout } from "./commands/auth.js";
 import { handleSecurityCommand } from "./commands/security.js";
+import { handleCollaborationCommand } from "./commands/collaboration.js";
 import {
   chooseCloudModel,
   chooseRemoteDevice,
@@ -107,6 +108,20 @@ Usage:
   originrouter agent detail [set concise|standard|detailed]
   originrouter agent history [--search <text>] [--agent claude|codex] [--device <id>] [--status <status>] [--json]
   originrouter agent history show <conversation-id> [--json]
+
+Agent collaboration:
+  originrouter collaboration templates [--json]
+  originrouter collaboration list [--json]
+  originrouter collaboration show <run-id> [--json]
+  originrouter collaboration create --objective <text>
+      --participant <id:claude|codex:device:workspace> [--participant ...]
+      [--role <id=natural language responsibility>]
+      [--preference <text>] [--template <id>]
+      [--coordination-prompt <text>] [--concurrency <n>]
+      [--token-limit <n>] [--yes] [--no-wait] [--timeout <seconds>]
+  originrouter collaboration create --spec <collaboration.json> [--yes]
+  originrouter collaboration confirm <run-id>
+  originrouter collaboration cancel <run-id>
 
 Local LiteLLM provider management:
   originrouter provider add <name> [--type proxy] [--base-url <u>] [--model <m>]
@@ -1809,6 +1824,11 @@ export async function main(argv) {
 
   if (command === "agent") {
     handleAgentSettings(args);
+    return;
+  }
+
+  if (command === "collaboration") {
+    await handleCollaborationCommand(args);
     return;
   }
 

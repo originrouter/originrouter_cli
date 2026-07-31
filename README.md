@@ -161,6 +161,70 @@ originrouter claude \
 The App exposes the same per-session allow-list through the Agent conversation
 control panel.
 
+## Agent collaboration
+
+Agent collaboration works from the CLI without the App. New collaborations use
+an adaptive flow: a read-only Planner first turns the objective, participants,
+and collaboration preferences into a validated task graph. Agents do not begin
+execution until the user confirms that plan.
+
+List the built-in starting patterns:
+
+```bash
+originrouter collaboration templates
+```
+
+Create a collaboration:
+
+```bash
+originrouter collaboration create \
+  --objective "Investigate and fix provider reconnection" \
+  --participant architect:codex:local:/path/to/project \
+  --participant builder:claude:local:/path/to/project \
+  --role architect="analyze the architecture and verify the result" \
+  --role builder="implement and test the change" \
+  --preference "research independently when useful"
+```
+
+The participant format is:
+
+```text
+participant-id:claude|codex:device-id:workspace-path
+```
+
+The first participant is the default Planner. `--role` is a natural-language
+preference rather than a hard-coded role. The Planner may assign a different
+task structure when the objective requires it.
+
+In an interactive terminal, `create` waits for the proposed plan and asks
+whether to start it. In scripts, add `--yes` to confirm automatically, or
+manage the run explicitly:
+
+```bash
+originrouter collaboration list
+originrouter collaboration show <run-id>
+originrouter collaboration confirm <run-id>
+originrouter collaboration cancel <run-id>
+```
+
+For reusable definitions or more participants, use a JSON specification:
+
+```bash
+originrouter collaboration create --spec collaboration.json
+```
+
+Budgets are optional. Independent dependency-ready tasks may run in parallel
+on different participants, while one participant receives only one active task
+at a time. Existing `plan_implement_verify` runs remain compatible.
+
+Cross-device task prompts and results use the Device E2EE relay transport. The
+server receives only a redacted run/status and usage projection. SQLite schema
+upgrades are automatic, and interrupted adaptive tasks are reissued with a new
+lease and fencing token after daemon restart.
+
+See [docs/collaboration-adaptive-v2.md](docs/collaboration-adaptive-v2.md) for
+the JSON format, privacy boundary, and recovery behavior.
+
 ## Agent conversation detail
 
 Each OriginRouter CLI installation keeps one default presentation level for

@@ -293,7 +293,11 @@ export async function startDaemon(args) {
     supervisor: managedAgentSupervisor,
     registry: externalAgentRegistry,
     catalog: agentCatalog,
-    relayClient,
+    // Collaboration device messages carry prompts, results, usage details,
+    // and cancellation state. Route them through the same E2EE transport as
+    // Agent control; non-device control projections are passed through by the
+    // wrapper without encryption.
+    relayClient: deviceE2eeRelay,
     deviceId: effectiveDeviceId,
   });
 
@@ -796,9 +800,11 @@ export async function startDaemon(args) {
               status: "connected",
             });
             reportLocalControlHeartbeat().catch(() => {});
-            syncDeviceE2eeIdentity().catch((error) => {
-              console.error(`[daemon] device E2EE registration: ${error.code || error.message}`);
-            });
+            syncDeviceE2eeIdentity()
+              .then(() => collaborationRuntime.flushOutbox())
+              .catch((error) => {
+                console.error(`[daemon] device E2EE registration: ${error.code || error.message}`);
+              });
             void syncAgentActivityHistory();
             void collaborationRuntime
               .refreshAccountBudgetStatus()

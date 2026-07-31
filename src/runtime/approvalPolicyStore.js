@@ -5,6 +5,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -35,6 +36,91 @@ function safePolicyId(value) {
 
 export function approvalPolicyPath(policyId, stateDir = ensureStateDir()) {
   return path.join(approvalPolicyDirectory(stateDir), `${safePolicyId(policyId)}.json`);
+}
+
+function approvalPolicyHistoryDirectory(policyId, stateDir = ensureStateDir()) {
+  return path.join(approvalPolicyDirectory(stateDir), ".history", safePolicyId(policyId));
+}
+
+function persistApprovalPolicyRevision(compiled, stateDir) {
+  const directory = approvalPolicyHistoryDirectory(compiled.policy.id, stateDir);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  chmodSync(directory, 0o700);
+  const filePath = path.join(directory, `${compiled.revision}.json`);
+  if (!existsSync(filePath)) {
+    writeFileSync(filePath, `${JSON.stringify(compiled.policy, null, 2)}\n`, {
+      mode: 0o600,
+      flag: "wx",
+    });
+    chmodSync(filePath, 0o600);
+  }
+  const entries = readdirSync(directory)
+    .filter((name) => /^[a-f0-9]{64}\.json$/.test(name))
+    .map((name) => ({
+      name,
+      modifiedAt: statSync(path.join(directory, name)).mtimeMs,
+    }))
+    .sort((left, right) => right.modifiedAt - left.modifiedAt);
+  for (const entry of entries.slice(20)) unlinkSync(path.join(directory, entry.name));
+}
+
+export function listApprovalPolicyRevisions(policyId, {
+  stateDir = ensureStateDir(),
+} = {}) {
+  const id = safePolicyId(policyId);
+  const directory = approvalPolicyHistoryDirectory(id, stateDir);
+  if (!existsSync(directory)) return [];
+  let currentRevision = null;
+  const currentPath = approvalPolicyPath(id, stateDir);
+  if (existsSync(currentPath)) {
+    try {
+      currentRevision = approvalPolicyRevision(readJson(currentPath));
+    } catch {}
+  }
+  return readdirSync(directory)
+    .filter((name) => /^[a-f0-9]{64}\.json$/.test(name))
+    .map((name) => {
+      const filePath = path.join(directory, name);
+      const compiled = compileApprovalPolicy(readJson(filePath));
+      return {
+        ...summary(compiled, "history", filePath),
+        modifiedAt: new Date(statSync(filePath).mtimeMs).toISOString(),
+        current: compiled.revision === currentRevision,
+      };
+    })
+    .sort((left, right) => (
+      Number(right.current) - Number(left.current)
+      || right.modifiedAt.localeCompare(left.modifiedAt)
+    ));
+}
+
+export function rollbackApprovalPolicy(policyId, revision, {
+  stateDir = ensureStateDir(),
+  expectedRevision = null,
+} = {}) {
+  const id = safePolicyId(policyId);
+  const normalizedRevision = String(revision || "").replace(/^sha256:/, "").trim();
+  if (!/^[a-f0-9]{64}$/.test(normalizedRevision)) {
+    const error = new Error("invalid approval policy revision");
+    error.code = "APPROVAL_POLICY_REVISION_INVALID";
+    throw error;
+  }
+  const filePath = path.join(
+    approvalPolicyHistoryDirectory(id, stateDir),
+    `${normalizedRevision}.json`,
+  );
+  if (!existsSync(filePath)) {
+    const error = new Error("approval policy revision does not exist");
+    error.code = "APPROVAL_POLICY_REVISION_NOT_FOUND";
+    throw error;
+  }
+  const policy = readJson(filePath);
+  if (policy.id !== id) {
+    const error = new Error("approval policy history id mismatch");
+    error.code = "APPROVAL_POLICY_ID_MISMATCH";
+    throw error;
+  }
+  return saveApprovalPolicy(policy, { stateDir, expectedRevision });
 }
 
 function readJson(filePath) {
@@ -106,23 +192,23 @@ export function deployApprovalPolicyBundle(bundle, {
   stateDir = ensureStateDir(),
 } = {}) {
   const value = bundle?.content || bundle?.policy || bundle;
-  const saved = saveApprovalPolicy(value, {
-    stateDir,
-    expectedRevision: bundle?.expectedRevision || bundle?.expected_revision || null,
-  });
+  const compiled = compileApprovalPolicy(value);
   const claimedId = String(bundle?.id || bundle?.policyId || bundle?.policy_id || "").trim();
-  if (claimedId && claimedId !== saved.policy.id) {
+  if (claimedId && claimedId !== compiled.policy.id) {
     const error = new Error("deployed approval policy id does not match its content");
     error.code = "APPROVAL_POLICY_ID_MISMATCH";
     throw error;
   }
   const claimedRevision = String(bundle?.revision || bundle?.policyRevision || bundle?.policy_revision || "").replace(/^sha256:/, "").trim();
-  if (claimedRevision && claimedRevision !== saved.revision) {
+  if (claimedRevision && claimedRevision !== compiled.revision) {
     const error = new Error("deployed approval policy revision does not match its content");
     error.code = "APPROVAL_POLICY_REVISION_MISMATCH";
     throw error;
   }
-  return saved;
+  return saveApprovalPolicy(compiled.policy, {
+    stateDir,
+    expectedRevision: bundle?.expectedRevision || bundle?.expected_revision || null,
+  });
 }
 
 export function resolveApprovalPolicySelection(payload = {}, {
@@ -207,6 +293,7 @@ export function saveApprovalPolicy(rawPolicy, {
     chmodSync(temporary, 0o600);
     renameSync(temporary, filePath);
     chmodSync(filePath, 0o600);
+    persistApprovalPolicyRevision(compiled, stateDir);
   } finally {
     if (existsSync(temporary)) unlinkSync(temporary);
   }
@@ -253,6 +340,34 @@ export function readWorkspaceApprovalPolicy(workspace, {
       trusted,
     },
   };
+}
+
+export function readWorkspaceApprovalPolicySafe(workspace, options = {}) {
+  try {
+    return readWorkspaceApprovalPolicy(workspace, options);
+  } catch (error) {
+    const compiled = compileApprovalPolicy({
+      version: 2,
+      id: "invalid-workspace-policy",
+      name: "Invalid workspace policy",
+      defaults: { unmatched: "ask", parse_error: "ask", unknown: "ask" },
+      rules: [{
+        id: "ask-until-workspace-policy-is-fixed",
+        effect: "ask",
+        actions: ["*"],
+        reason: "The workspace approval policy could not be validated.",
+      }],
+    });
+    return {
+      ...compiled,
+      restrictionOnly: false,
+      summary: {
+        ...summary(compiled, "workspace_invalid"),
+        trusted: false,
+        error: error.message,
+      },
+    };
+  }
 }
 
 export function combineApprovalPolicyEffects(results) {

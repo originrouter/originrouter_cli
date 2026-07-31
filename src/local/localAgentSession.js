@@ -58,6 +58,7 @@ import {
 } from "../runtime/aiReviewPolicy.js";
 import {
   readApprovalPolicyReference,
+  readWorkspaceApprovalPolicySafe,
   resolveApprovalPolicySelection,
 } from "../runtime/approvalPolicyStore.js";
 import { protectOriginrouterCodingEnv } from "../runtime/originrouterCodingAuthProxy.js";
@@ -356,6 +357,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
   const conversationId = options.conversationId || sessionId;
   const sessionStartedAt = new Date().toISOString();
   const cwd = process.cwd();
+  const workspaceApprovalPolicy = readWorkspaceApprovalPolicySafe(cwd);
   let relayPlan = await buildAgentRelayPlan({
     stateDir,
     relayUrl,
@@ -660,12 +662,20 @@ export async function runLocalAgentSession(agent, rawArgs) {
           profile: autonomyProfile,
           allowedScopes: autonomyAllowedScopes,
           approvalPolicy,
+          workspaceApprovalPolicy,
           workspaceRoot: cwd,
           stateDir,
           aiReviewer: aiApprovalReviewer,
           aiReviewPolicy,
           runtime: "claude-pty",
           requestInteraction: (item) => interactions.request(item),
+          onPolicyObserved: ({ request: item, evaluation }) =>
+            sendTransientEvent({
+              type: "agent.approval_policy.shadow",
+              provider: agent,
+              interactionId: item.interactionId,
+              policyEvaluation: evaluation,
+            }),
         })
       : interactions.request(request);
     void resolve

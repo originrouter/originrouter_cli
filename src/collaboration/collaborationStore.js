@@ -5,6 +5,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 
 import { ensureStateDir } from "../persistence/state.js";
+import { ADAPTIVE_TEMPLATE_ID, normalizeParticipants } from "./adaptivePlan.js";
 
 const MESSAGE_TYPES = new Set([
   "task.assign", "task.accepted", "task.progress", "task.question",
@@ -16,7 +17,8 @@ const MESSAGE_TYPES = new Set([
   "agent.shutdown_acknowledged",
 ]);
 const RUN_STATES = new Set([
-  "created", "researching", "decomposing", "planning",
+  "created", "designing", "awaiting_plan_confirmation", "executing",
+  "researching", "decomposing", "planning",
   "awaiting_plan_review", "revision_requested", "plan_approved",
   "implementing", "awaiting_verification", "rework_requested", "completed",
   "waiting_approval", "waiting_input", "waiting_device", "budget_exhausted",
@@ -27,6 +29,7 @@ const SAFE_USAGE_KEYS = new Set([
   "token_limit", "token_budget", "sampled_tokens", "sampledTokens",
   "input_tokens", "inputTokens", "output_tokens", "outputTokens",
   "cached_input_tokens", "cachedInputTokens", "total_tokens", "totalTokens",
+  "fencing_token", "fencingToken",
 ]);
 
 function safeText(value, maxLength = 4096) {
@@ -81,6 +84,9 @@ function normalizeRole(role, name) {
     model: safeText(role.model, 191),
     permission_profile: safeText(role.permission_profile ?? role.permissionProfile, 64),
     responsibilities,
+    display_name: safeText(role.display_name ?? role.displayName, 80) || name,
+    role_hint: safeText(role.role_hint ?? role.roleHint, 2000),
+    planner: role.planner === true,
   };
 }
 
@@ -93,6 +99,12 @@ function publicRun(row) {
     run_id: row.run_id,
     conversation_id: row.conversation_id,
     objective: row.objective,
+    preferences: row.preferences || "",
+    coordination_prompt: row.coordination_prompt || "",
+    workflow_template_id: row.workflow_template_id || "plan_implement_verify",
+    planner_role: row.planner_role || "lead",
+    plan_status: row.plan_status || (row.template_id === ADAPTIVE_TEMPLATE_ID ? "draft" : "confirmed"),
+    plan: parseJson(row.plan_json, null),
     state: row.state,
     gates: parseJson(row.gates_json, {}),
     budget: parseJson(row.budget_json, {}),
@@ -127,6 +139,12 @@ export class CollaborationStore {
         template_id TEXT NOT NULL,
         template_version TEXT NOT NULL,
         objective TEXT NOT NULL,
+        preferences TEXT NOT NULL DEFAULT '',
+        coordination_prompt TEXT NOT NULL DEFAULT '',
+        workflow_template_id TEXT NOT NULL DEFAULT 'plan_implement_verify',
+        planner_role TEXT NOT NULL DEFAULT 'lead',
+        plan_status TEXT NOT NULL DEFAULT 'confirmed',
+        plan_json TEXT NOT NULL DEFAULT '',
         state TEXT NOT NULL,
         gates_json TEXT NOT NULL,
         budget_json TEXT NOT NULL,
@@ -149,10 +167,20 @@ export class CollaborationStore {
         model TEXT NOT NULL DEFAULT '',
         permission_profile TEXT NOT NULL DEFAULT '',
         responsibilities_json TEXT NOT NULL,
+        display_name TEXT NOT NULL DEFAULT '',
+        role_hint TEXT NOT NULL DEFAULT '',
+        planner INTEGER NOT NULL DEFAULT 0,
+        current_task_id TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'idle',
         native_session_id TEXT NOT NULL DEFAULT '',
         originrouter_session_id TEXT NOT NULL DEFAULT '',
         conversation_id TEXT NOT NULL DEFAULT '',
+        attempt INTEGER NOT NULL DEFAULT 0,
+        fencing_token INTEGER NOT NULL DEFAULT 0,
+        lease_id TEXT NOT NULL DEFAULT '',
+        lease_dispatch_key TEXT NOT NULL DEFAULT '',
+        lease_expires_at TEXT NOT NULL DEFAULT '',
+        last_heartbeat_at TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(run_id) REFERENCES collaboration_runs(run_id) ON DELETE CASCADE,
@@ -167,6 +195,13 @@ export class CollaborationStore {
         summary TEXT NOT NULL DEFAULT '',
         state TEXT NOT NULL,
         phase TEXT NOT NULL,
+        task_key TEXT NOT NULL DEFAULT '',
+        participant_id TEXT NOT NULL DEFAULT '',
+        depends_on_json TEXT NOT NULL DEFAULT '[]',
+        instructions TEXT NOT NULL DEFAULT '',
+        kind TEXT NOT NULL DEFAULT 'read_only',
+        deliverable TEXT NOT NULL DEFAULT '',
+        result_summary TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(run_id) REFERENCES collaboration_runs(run_id) ON DELETE CASCADE
@@ -227,8 +262,29 @@ export class CollaborationStore {
         native_session_id TEXT NOT NULL DEFAULT '',
         originrouter_session_id TEXT NOT NULL DEFAULT '',
         conversation_id TEXT NOT NULL DEFAULT '',
+        attempt INTEGER NOT NULL DEFAULT 0,
+        fencing_token INTEGER NOT NULL DEFAULT 0,
+        lease_id TEXT NOT NULL DEFAULT '',
+        lease_expires_at TEXT NOT NULL DEFAULT '',
+        last_heartbeat_at TEXT NOT NULL DEFAULT '',
+        last_delivery_id TEXT NOT NULL DEFAULT '',
+        fencing_mode TEXT NOT NULL DEFAULT 'legacy',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS collaboration_outbox (
+        outbox_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL DEFAULT '',
+        assignment_id TEXT NOT NULL DEFAULT '',
+        message_type TEXT NOT NULL,
+        target_device_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        delivered_at TEXT
       ) STRICT;
       CREATE TABLE IF NOT EXISTS collaboration_usage_receipts (
         event_id TEXT PRIMARY KEY,
@@ -246,14 +302,45 @@ export class CollaborationStore {
       CREATE INDEX IF NOT EXISTS idx_collaboration_artifacts_run ON collaboration_artifacts(run_id, created_at ASC);
       CREATE INDEX IF NOT EXISTS idx_collaboration_remote_session ON collaboration_remote_assignments(originrouter_session_id);
       CREATE INDEX IF NOT EXISTS idx_collaboration_usage_run ON collaboration_usage_receipts(run_id, created_at ASC);
+      CREATE INDEX IF NOT EXISTS idx_collaboration_outbox_pending ON collaboration_outbox(state, updated_at ASC);
     `);
     this.ensureColumn("collaboration_agents", "originrouter_session_id", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_agents", "conversation_id", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_runs", "account_budget_blocked", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("collaboration_runs", "resume_state", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_runs", "preferences", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_runs", "coordination_prompt", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_runs", "workflow_template_id", "TEXT NOT NULL DEFAULT 'plan_implement_verify'");
+    this.ensureColumn("collaboration_runs", "planner_role", "TEXT NOT NULL DEFAULT 'lead'");
+    this.ensureColumn("collaboration_runs", "plan_status", "TEXT NOT NULL DEFAULT 'confirmed'");
+    this.ensureColumn("collaboration_runs", "plan_json", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_usage_receipts", "amount_micros", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("collaboration_usage_receipts", "currency", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_usage_receipts", "cost_source", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_agents", "attempt", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("collaboration_agents", "fencing_token", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("collaboration_agents", "lease_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_agents", "lease_dispatch_key", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_agents", "lease_expires_at", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_agents", "last_heartbeat_at", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_agents", "display_name", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_agents", "role_hint", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_agents", "planner", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("collaboration_agents", "current_task_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_tasks", "task_key", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_tasks", "participant_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_tasks", "depends_on_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("collaboration_tasks", "instructions", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_tasks", "kind", "TEXT NOT NULL DEFAULT 'read_only'");
+    this.ensureColumn("collaboration_tasks", "deliverable", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_tasks", "result_summary", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_remote_assignments", "attempt", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("collaboration_remote_assignments", "fencing_token", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("collaboration_remote_assignments", "lease_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_remote_assignments", "lease_expires_at", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_remote_assignments", "last_heartbeat_at", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_remote_assignments", "last_delivery_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_remote_assignments", "fencing_mode", "TEXT NOT NULL DEFAULT 'legacy'");
   }
 
   ensureColumn(table, column, declaration) {
@@ -266,6 +353,7 @@ export class CollaborationStore {
   createRun(input = {}) {
     const objective = safeText(input.objective, 16_000);
     if (!objective) throw new Error("objective is required");
+    if (Array.isArray(input.participants)) return this.createAdaptiveRun(input, objective);
     const lead = normalizeRole(input.agents?.lead, "lead");
     const worker = normalizeRole(input.agents?.worker, "worker");
     const verifier = input.agents?.verifier ? normalizeRole(input.agents.verifier, "verifier") : null;
@@ -308,6 +396,65 @@ export class CollaborationStore {
     return this.getRun(runId);
   }
 
+  createAdaptiveRun(input, objective) {
+    const participants = normalizeParticipants(input.participants);
+    const explicitPlanner = participants.find((item) => item.planner);
+    const planner = explicitPlanner || participants[0];
+    const runId = id("acr");
+    const conversationId = `collaboration:${randomUUID().replaceAll("-", "")}`;
+    const plannerTaskId = id("act");
+    const createdAt = iso(this.now());
+    const budget = {
+      token_limit: input.budget?.token_limit == null ? null : Math.max(1, Number(input.budget.token_limit)),
+      amount_limit_micros: input.budget?.amount_limit_micros == null ? null : Math.max(1, Number(input.budget.amount_limit_micros)),
+      currency: input.budget?.currency ? safeText(input.budget.currency, 3).toUpperCase() : null,
+      max_concurrency: Math.max(1, Math.min(16, Number(input.budget?.max_concurrency ?? Math.min(4, participants.length)))),
+    };
+    assertNoSecretFields(input);
+    this.db.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO collaboration_runs(
+          run_id, conversation_id, template_id, template_version, objective,
+          preferences, coordination_prompt, workflow_template_id, planner_role,
+          plan_status, plan_json, state, gates_json, budget_json, usage_json,
+          counters_json, account_budget_blocked, resume_state, created_at, updated_at, finished_at
+        ) VALUES (?, ?, ?, '2', ?, ?, ?, ?, ?, 'draft', '', 'created', '{}', ?, ?, '{}', 0, '', ?, ?, NULL)
+      `).run(
+        runId, conversationId, ADAPTIVE_TEMPLATE_ID, objective,
+        safeText(input.preferences, 16_000), safeText(input.coordination_prompt ?? input.coordinationPrompt, 16_000),
+        safeText(input.workflow_template_id ?? input.workflowTemplateId, 64) || "adaptive",
+        planner.participant_id, JSON.stringify(budget),
+        JSON.stringify({ sampled_tokens: 0, amount_micros: 0, currency: null, unpriced_events: 0 }),
+        createdAt, createdAt,
+      );
+      const insert = this.db.prepare(`
+        INSERT INTO collaboration_agents(
+          agent_id, run_id, role, runtime, device_id, workspace_id, provider, model,
+          permission_profile, responsibilities_json, display_name, role_hint, planner,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const participant of participants) {
+        insert.run(
+          id("agent"), runId, participant.participant_id, participant.runtime,
+          participant.device_id, participant.workspace_id, participant.provider,
+          participant.model, participant.permission_profile,
+          JSON.stringify(participant.role_hint ? [participant.role_hint] : []),
+          participant.display_name, participant.role_hint,
+          participant.participant_id === planner.participant_id ? 1 : 0,
+          createdAt, createdAt,
+        );
+      }
+      this.db.prepare(`
+        INSERT INTO collaboration_tasks(
+          task_id, run_id, title, summary, state, phase, task_key, participant_id,
+          depends_on_json, instructions, kind, deliverable, created_at, updated_at
+        ) VALUES (?, ?, ?, '', 'pending', 'plan_design', '__planner__', ?, '[]', '', 'read_only', ?, ?, ?)
+      `).run(plannerTaskId, runId, "Design collaboration plan", planner.participant_id, "A structured plan for user review.", createdAt, createdAt);
+    })();
+    return this.getRun(runId);
+  }
+
   getRun(runId, { includeMessages = true } = {}) {
     const key = safeText(runId, 195);
     const run = publicRun(this.db.prepare("SELECT * FROM collaboration_runs WHERE run_id = ?").get(key));
@@ -317,13 +464,29 @@ export class CollaborationStore {
       workspace_id: row.workspace_id || null, provider: row.provider || null,
       model: row.model || null, permission_profile: row.permission_profile || null,
       responsibilities: parseJson(row.responsibilities_json, []), status: row.status,
+      display_name: row.display_name || row.role,
+      role_hint: row.role_hint || "",
+      planner: Boolean(row.planner),
+      current_task_id: row.current_task_id || null,
       native_session_id: row.native_session_id || null,
       originrouter_session_id: row.originrouter_session_id || null,
       conversation_id: row.conversation_id || null,
+      attempt: Number(row.attempt || 0),
+      fencing_token: Number(row.fencing_token || 0),
+      lease_id: row.lease_id || null,
+      lease_expires_at: row.lease_expires_at || null,
+      last_heartbeat_at: row.last_heartbeat_at || null,
     }]));
     run.tasks = this.db.prepare("SELECT * FROM collaboration_tasks WHERE run_id = ? ORDER BY created_at").all(key).map((row) => ({
       task_id: row.task_id, parent_task_id: row.parent_task_id, assignee_agent_id: row.assignee_agent_id,
       title: row.title, summary: row.summary, state: row.state, phase: row.phase,
+      task_key: row.task_key || null,
+      participant_id: row.participant_id || null,
+      depends_on: parseJson(row.depends_on_json, []),
+      instructions: row.instructions || "",
+      kind: row.kind || "read_only",
+      deliverable: row.deliverable || "",
+      result_summary: row.result_summary || "",
       created_at: row.created_at, updated_at: row.updated_at,
     }));
     run.task_ids = run.tasks.map((task) => task.task_id);
@@ -357,6 +520,7 @@ export class CollaborationStore {
         native_session_id = ?,
         originrouter_session_id = ?,
         conversation_id = ?,
+        current_task_id = ?,
         updated_at = ?
       WHERE run_id = ? AND role = ?
     `).run(
@@ -364,6 +528,7 @@ export class CollaborationStore {
       safeText(payload.native_session_id ?? payload.nativeSessionId ?? current.native_session_id, 191),
       safeText(payload.originrouter_session_id ?? payload.originrouterSessionId ?? current.originrouter_session_id, 64),
       safeText(payload.conversation_id ?? payload.conversationId ?? current.conversation_id, 96),
+      safeText(payload.current_task_id ?? payload.currentTaskId ?? current.current_task_id, 195),
       updatedAt,
       runId,
       role,
@@ -371,6 +536,142 @@ export class CollaborationStore {
     this.db.prepare("UPDATE collaboration_runs SET updated_at = ? WHERE run_id = ?")
       .run(updatedAt, runId);
     return this.getRun(runId, { includeMessages: false }).agents[role];
+  }
+
+  setAdaptivePlan(runId, plan) {
+    const run = this.getRun(runId, { includeMessages: false });
+    if (!run || run.template_id !== ADAPTIVE_TEMPLATE_ID) throw new Error("adaptive collaboration run not found");
+    if (run.state !== "designing") throw new Error("collaboration plan is not being designed");
+    const updatedAt = iso(this.now());
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM collaboration_tasks WHERE run_id = ? AND task_key <> '__planner__'").run(runId);
+      const insertTask = this.db.prepare(`
+        INSERT INTO collaboration_tasks(
+          task_id, run_id, assignee_agent_id, title, summary, state, phase,
+          task_key, participant_id, depends_on_json, instructions, kind,
+          deliverable, result_summary, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, '', 'pending', ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+      `);
+      for (const task of plan.tasks) {
+        const agent = run.agents[task.participant_id];
+        insertTask.run(
+          id("act"), runId, agent.agent_id, task.title, task.mode,
+          task.id, task.participant_id, JSON.stringify(task.depends_on),
+          task.instructions, task.mode, task.deliverable, updatedAt, updatedAt,
+        );
+      }
+      this.db.prepare(`
+        UPDATE collaboration_tasks
+        SET state = 'completed', summary = ?, result_summary = ?, updated_at = ?
+        WHERE run_id = ? AND task_key = '__planner__'
+      `).run(plan.summary || "Plan ready for review.", plan.summary || "Plan ready for review.", updatedAt, runId);
+      this.db.prepare(`
+        UPDATE collaboration_runs
+        SET plan_json = ?, plan_status = 'proposed', state = 'awaiting_plan_confirmation', updated_at = ?
+        WHERE run_id = ?
+      `).run(JSON.stringify(plan), updatedAt, runId);
+    })();
+    return this.getRun(runId);
+  }
+
+  confirmAdaptivePlan(runId) {
+    const run = this.getRun(runId, { includeMessages: false });
+    if (!run || run.template_id !== ADAPTIVE_TEMPLATE_ID) throw new Error("adaptive collaboration run not found");
+    if (run.state !== "awaiting_plan_confirmation" || run.plan_status !== "proposed") {
+      throw new Error("collaboration plan is not waiting for confirmation");
+    }
+    const updatedAt = iso(this.now());
+    this.db.prepare(`
+      UPDATE collaboration_runs SET plan_status = 'confirmed', state = 'executing', updated_at = ? WHERE run_id = ?
+    `).run(updatedAt, runId);
+    return this.getRun(runId);
+  }
+
+  updateAdaptiveTask(runId, taskKey, { state, resultSummary = null } = {}) {
+    const updatedAt = iso(this.now());
+    const info = this.db.prepare(`
+      UPDATE collaboration_tasks
+      SET state = COALESCE(?, state),
+          result_summary = COALESCE(?, result_summary),
+          summary = CASE WHEN ? IS NULL THEN summary ELSE ? END,
+          updated_at = ?
+      WHERE run_id = ? AND task_key = ?
+    `).run(state || null, resultSummary, resultSummary, resultSummary, updatedAt, runId, safeText(taskKey, 64));
+    if (info.changes === 0) throw new Error("collaboration task not found");
+    this.db.prepare("UPDATE collaboration_runs SET updated_at = ? WHERE run_id = ?").run(updatedAt, runId);
+    return this.getRun(runId);
+  }
+
+  runnableAdaptiveTasks(runId) {
+    const run = this.getRun(runId, { includeMessages: false });
+    if (!run || run.template_id !== ADAPTIVE_TEMPLATE_ID || run.state !== "executing") return [];
+    const complete = new Set(run.tasks.filter((task) => task.state === "completed").map((task) => task.task_key));
+    const busyParticipants = new Set(run.tasks.filter((task) => task.state === "active").map((task) => task.participant_id));
+    const activeCount = run.tasks.filter((task) => task.state === "active").length;
+    const capacity = Math.max(0, Number(run.budget.max_concurrency || 1) - activeCount);
+    return run.tasks.filter((task) => (
+      task.task_key !== "__planner__"
+      && task.state === "pending"
+      && !busyParticipants.has(task.participant_id)
+      && task.depends_on.every((dependency) => complete.has(dependency))
+    )).slice(0, capacity);
+  }
+
+  resetAdaptiveActiveTasks(runId) {
+    const run = this.getRun(runId, { includeMessages: false });
+    if (!run || run.template_id !== ADAPTIVE_TEMPLATE_ID) return run;
+    const updatedAt = iso(this.now());
+    this.db.transaction(() => {
+      this.db.prepare("UPDATE collaboration_tasks SET state = 'pending', updated_at = ? WHERE run_id = ? AND state = 'active'")
+        .run(updatedAt, runId);
+      this.db.prepare("UPDATE collaboration_agents SET current_task_id = '', originrouter_session_id = '', status = 'idle', updated_at = ? WHERE run_id = ? AND current_task_id <> ''")
+        .run(updatedAt, runId);
+      this.db.prepare("UPDATE collaboration_runs SET updated_at = ? WHERE run_id = ?").run(updatedAt, runId);
+    })();
+    return this.getRun(runId);
+  }
+
+  issueAgentLease(runId, role, { dispatchKey, ttlMs = 30 * 60_000 } = {}) {
+    const key = safeText(dispatchKey, 191);
+    if (!key) throw new Error("collaboration dispatch key is required");
+    const current = this.db.prepare(
+      "SELECT * FROM collaboration_agents WHERE run_id = ? AND role = ?",
+    ).get(safeText(runId, 195), safeText(role, 32));
+    if (!current) throw new Error("collaboration agent not found");
+    if (current.lease_dispatch_key === key && Number(current.fencing_token || 0) > 0) {
+      return this.getRun(runId, { includeMessages: false }).agents[role];
+    }
+    const now = this.now();
+    const updatedAt = iso(now);
+    const leaseExpiresAt = iso(new Date(now.getTime() + Math.max(60_000, Number(ttlMs) || 0)));
+    const attempt = Number(current.attempt || 0) + 1;
+    const fencingToken = Number(current.fencing_token || 0) + 1;
+    const leaseId = id("acl");
+    this.db.transaction(() => {
+      this.db.prepare(`
+        UPDATE collaboration_agents SET
+          attempt = ?, fencing_token = ?, lease_id = ?, lease_dispatch_key = ?,
+          lease_expires_at = ?, last_heartbeat_at = ?, updated_at = ?
+        WHERE run_id = ? AND role = ?
+      `).run(
+        attempt, fencingToken, leaseId, key, leaseExpiresAt, updatedAt,
+        updatedAt, runId, role,
+      );
+      this.db.prepare("UPDATE collaboration_runs SET updated_at = ? WHERE run_id = ?")
+        .run(updatedAt, runId);
+    })();
+    return this.getRun(runId, { includeMessages: false }).agents[role];
+  }
+
+  touchAgentLease(runId, role, { ttlMs = 30 * 60_000 } = {}) {
+    const now = this.now();
+    const heartbeatAt = iso(now);
+    const leaseExpiresAt = iso(new Date(now.getTime() + Math.max(60_000, Number(ttlMs) || 0)));
+    this.db.prepare(`
+      UPDATE collaboration_agents
+      SET last_heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+      WHERE run_id = ? AND role = ?
+    `).run(heartbeatAt, leaseExpiresAt, heartbeatAt, runId, role);
   }
 
   findAgentBySession(sessionId) {
@@ -390,18 +691,63 @@ export class CollaborationStore {
     const sourceDeviceId = safeText(input.source_device_id ?? input.sourceDeviceId, 191);
     const targetDeviceId = safeText(input.target_device_id ?? input.targetDeviceId, 191);
     const workspaceId = safeText(input.workspace_id ?? input.workspaceId, 191);
-    if (!assignmentId || !runId || !taskId || !role || !sourceDeviceId || !targetDeviceId || !workspaceId) {
+    const deliveryId = safeText(input.delivery_id ?? input.deliveryId, 96);
+    const current = this.getRemoteAssignment(assignmentId);
+    const hasFencing = input.attempt != null
+      && (input.fencing_token ?? input.fencingToken) != null;
+    if (current?.last_delivery_id === deliveryId && deliveryId) {
+      return { assignment: current, duplicate: true, stale: false, legacy: !hasFencing };
+    }
+    const attempt = hasFencing
+      ? Math.max(1, Math.floor(Number(input.attempt) || 0))
+      : Number(current?.attempt || 0) + 1;
+    const fencingToken = hasFencing
+      ? Math.max(1, Math.floor(Number(input.fencing_token ?? input.fencingToken) || 0))
+      : Number(current?.fencing_token || 0) + 1;
+    const nowDate = this.now();
+    const leaseId = safeText(input.lease_id ?? input.leaseId, 195)
+      || `legacy:${deliveryId}`;
+    const leaseExpiresAt = safeText(input.lease_expires_at ?? input.leaseExpiresAt, 64)
+      || iso(new Date(nowDate.getTime() + 30 * 60_000));
+    if (!assignmentId || !runId || !taskId || !role || !sourceDeviceId || !targetDeviceId || !workspaceId
+        || !deliveryId || !leaseId || !leaseExpiresAt || attempt < 1 || fencingToken < 1) {
       throw new Error("invalid remote collaboration assignment");
     }
     if (!["claude", "codex"].includes(runtime)) throw new Error("invalid remote collaboration runtime");
-    const now = iso(this.now());
+    const now = iso(nowDate);
+    if (current && (
+      current.run_id !== runId
+      || current.task_id !== taskId
+      || current.role !== role
+      || current.source_device_id !== sourceDeviceId
+      || current.target_device_id !== targetDeviceId
+    )) {
+      const error = new Error("remote collaboration assignment identity conflict");
+      error.code = "COLLABORATION_ASSIGNMENT_CONFLICT";
+      throw error;
+    }
+    const currentFencingMode = current?.fencing_mode || "legacy";
+    if (!hasFencing && current && currentFencingMode === "strict") {
+      return { assignment: current, duplicate: false, stale: true, legacy: true };
+    }
+    if (hasFencing && current && currentFencingMode === "strict"
+        && fencingToken < Number(current.fencing_token || 0)) {
+      return { assignment: current, duplicate: false, stale: true, legacy: false };
+    }
+    if (hasFencing && current && currentFencingMode === "strict"
+        && fencingToken === Number(current.fencing_token || 0)) {
+      const error = new Error("conflicting collaboration dispatch for active fencing token");
+      error.code = "COLLABORATION_FENCING_CONFLICT";
+      throw error;
+    }
     this.db.prepare(`
       INSERT INTO collaboration_remote_assignments(
         assignment_id, run_id, task_id, role, phase, source_device_id,
         target_device_id, runtime, workspace_id, provider, model,
         permission_profile, status, native_session_id, originrouter_session_id,
-        conversation_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', '', '', ?, ?)
+        conversation_id, attempt, fencing_token, lease_id, lease_expires_at,
+        last_heartbeat_at, last_delivery_id, fencing_mode, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(assignment_id) DO UPDATE SET
         phase = excluded.phase,
         runtime = excluded.runtime,
@@ -409,14 +755,29 @@ export class CollaborationStore {
         provider = excluded.provider,
         model = excluded.model,
         permission_profile = excluded.permission_profile,
+        attempt = excluded.attempt,
+        fencing_token = excluded.fencing_token,
+        lease_id = excluded.lease_id,
+        lease_expires_at = excluded.lease_expires_at,
+        last_heartbeat_at = excluded.last_heartbeat_at,
+        last_delivery_id = excluded.last_delivery_id,
+        fencing_mode = excluded.fencing_mode,
+        status = 'pending',
         updated_at = excluded.updated_at
     `).run(
       assignmentId, runId, taskId, role, safeText(input.phase, 64),
       sourceDeviceId, targetDeviceId, runtime, workspaceId,
       safeText(input.provider, 191), safeText(input.model, 191),
-      safeText(input.permission_profile ?? input.permissionProfile, 64), now, now,
+      safeText(input.permission_profile ?? input.permissionProfile, 64),
+      attempt, fencingToken, leaseId, leaseExpiresAt, now, deliveryId,
+      hasFencing ? "strict" : "legacy", now, now,
     );
-    return this.getRemoteAssignment(assignmentId);
+    return {
+      assignment: this.getRemoteAssignment(assignmentId),
+      duplicate: false,
+      stale: false,
+      legacy: !hasFencing,
+    };
   }
 
   updateRemoteAssignment(assignmentId, payload = {}) {
@@ -436,6 +797,116 @@ export class CollaborationStore {
       iso(this.now()), assignmentId,
     );
     return this.getRemoteAssignment(assignmentId);
+  }
+
+  touchRemoteAssignmentLease(assignmentId, { ttlMs = 30 * 60_000 } = {}) {
+    const now = this.now();
+    const heartbeatAt = iso(now);
+    const leaseExpiresAt = iso(new Date(now.getTime() + Math.max(60_000, Number(ttlMs) || 0)));
+    this.db.prepare(`
+      UPDATE collaboration_remote_assignments
+      SET last_heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+      WHERE assignment_id = ?
+    `).run(heartbeatAt, leaseExpiresAt, heartbeatAt, safeText(assignmentId, 195));
+    return this.getRemoteAssignment(assignmentId);
+  }
+
+  enqueueOutbox(input = {}) {
+    const outboxId = safeText(input.outbox_id ?? input.outboxId, 191);
+    const messageType = safeText(input.message_type ?? input.messageType, 96);
+    const targetDeviceId = safeText(input.target_device_id ?? input.targetDeviceId, 191);
+    const payload = input.payload && typeof input.payload === "object" ? input.payload : {};
+    if (!outboxId || !messageType || !targetDeviceId) {
+      throw new Error("invalid collaboration outbox message");
+    }
+    assertNoSecretFields(payload);
+    const now = iso(this.now());
+    const existing = this.getOutbox(outboxId);
+    if (existing) {
+      const same = existing.message_type === messageType
+        && existing.target_device_id === targetDeviceId
+        && (existing.state === "delivered"
+          || JSON.stringify(existing.payload) === JSON.stringify(payload));
+      if (!same) {
+        const error = new Error("collaboration outbox id conflicts with another message");
+        error.code = "COLLABORATION_OUTBOX_CONFLICT";
+        throw error;
+      }
+      return existing;
+    }
+    this.db.prepare(`
+      INSERT OR IGNORE INTO collaboration_outbox(
+        outbox_id, run_id, assignment_id, message_type, target_device_id,
+        payload_json, state, attempts, last_error, created_at, updated_at, delivered_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, '', ?, ?, NULL)
+    `).run(
+      outboxId,
+      safeText(input.run_id ?? input.runId, 195),
+      safeText(input.assignment_id ?? input.assignmentId, 195),
+      messageType,
+      targetDeviceId,
+      JSON.stringify(payload),
+      now,
+      now,
+    );
+    return this.getOutbox(outboxId);
+  }
+
+  getOutbox(outboxId) {
+    const row = this.db.prepare(
+      "SELECT * FROM collaboration_outbox WHERE outbox_id = ?",
+    ).get(safeText(outboxId, 191));
+    return row ? { ...row, payload: parseJson(row.payload_json, {}) } : null;
+  }
+
+  listPendingOutbox({ limit = 100 } = {}) {
+    return this.db.prepare(`
+      SELECT * FROM collaboration_outbox
+      WHERE state = 'pending'
+      ORDER BY created_at ASC LIMIT ?
+    `).all(Math.max(1, Math.min(500, Number(limit) || 100)))
+      .map((row) => ({ ...row, payload: parseJson(row.payload_json, {}) }));
+  }
+
+  markOutboxAttempt(outboxId, error = "") {
+    const now = iso(this.now());
+    this.db.prepare(`
+      UPDATE collaboration_outbox
+      SET attempts = attempts + 1, last_error = ?, updated_at = ?
+      WHERE outbox_id = ? AND state = 'pending'
+    `).run(safeText(error, 2048), now, safeText(outboxId, 191));
+    return this.getOutbox(outboxId);
+  }
+
+  markOutboxFailure(outboxId, error) {
+    const now = iso(this.now());
+    this.db.prepare(`
+      UPDATE collaboration_outbox
+      SET last_error = ?, updated_at = ?
+      WHERE outbox_id = ? AND state = 'pending'
+    `).run(safeText(error, 2048), now, safeText(outboxId, 191));
+    return this.getOutbox(outboxId);
+  }
+
+  markOutboxFailed(outboxId, error) {
+    const now = iso(this.now());
+    this.db.prepare(`
+      UPDATE collaboration_outbox
+      SET state = 'failed', payload_json = '{}', last_error = ?, updated_at = ?
+      WHERE outbox_id = ? AND state = 'pending'
+    `).run(safeText(error, 2048), now, safeText(outboxId, 191));
+    return this.getOutbox(outboxId);
+  }
+
+  markOutboxDelivered(outboxId) {
+    const now = iso(this.now());
+    this.db.prepare(`
+      UPDATE collaboration_outbox
+      SET state = 'delivered', payload_json = '{}', last_error = '',
+          updated_at = ?, delivered_at = ?
+      WHERE outbox_id = ?
+    `).run(now, now, safeText(outboxId, 191));
+    return this.getOutbox(outboxId);
   }
 
   getRemoteAssignment(assignmentId) {
@@ -551,7 +1022,7 @@ export class CollaborationStore {
               resume_state = CASE WHEN resume_state = '' THEN ? ELSE resume_state END
           WHERE run_id = ?
         `).run(resumeState, runId);
-        this.db.prepare("UPDATE collaboration_tasks SET state = 'paused', updated_at = ? WHERE run_id = ?")
+        this.db.prepare("UPDATE collaboration_tasks SET state = 'paused', updated_at = ? WHERE run_id = ? AND state IN ('active', 'pending')")
           .run(updatedAt, runId);
       }
     })();
@@ -608,12 +1079,16 @@ export class CollaborationStore {
         WHERE run_id = ?
       `).run(JSON.stringify(budget), nextState, nextResumeState, updatedAt, runId);
       if (taskBudgetExhausted && !terminal) {
-        this.db.prepare("UPDATE collaboration_tasks SET state = 'paused', updated_at = ? WHERE run_id = ?")
+        this.db.prepare("UPDATE collaboration_tasks SET state = 'paused', updated_at = ? WHERE run_id = ? AND state IN ('active', 'pending')")
           .run(updatedAt, runId);
       }
       if (restoredState) {
-        this.db.prepare("UPDATE collaboration_tasks SET state = 'active', updated_at = ? WHERE run_id = ?")
-          .run(updatedAt, runId);
+        this.db.prepare("UPDATE collaboration_tasks SET state = ?, updated_at = ? WHERE run_id = ? AND state = 'paused'")
+          .run(run.template_id === ADAPTIVE_TEMPLATE_ID ? "pending" : "active", updatedAt, runId);
+        if (run.template_id === ADAPTIVE_TEMPLATE_ID) {
+          this.db.prepare("UPDATE collaboration_agents SET current_task_id = '', status = 'idle', updated_at = ? WHERE run_id = ?")
+            .run(updatedAt, runId);
+        }
       }
     })();
     return this.getRun(runId);
@@ -642,7 +1117,7 @@ export class CollaborationStore {
               updated_at = ?
           WHERE run_id = ?
         `).run(resumeState, updatedAt, runId);
-        this.db.prepare("UPDATE collaboration_tasks SET state = 'paused', updated_at = ? WHERE run_id = ?")
+        this.db.prepare("UPDATE collaboration_tasks SET state = 'paused', updated_at = ? WHERE run_id = ? AND state IN ('active', 'pending')")
           .run(updatedAt, runId);
         return;
       }
@@ -669,8 +1144,12 @@ export class CollaborationStore {
         WHERE run_id = ?
       `).run(restoredState, restoredState, updatedAt, runId);
       if (restoredState) {
-        this.db.prepare("UPDATE collaboration_tasks SET state = 'active', updated_at = ? WHERE run_id = ?")
-          .run(updatedAt, runId);
+        this.db.prepare("UPDATE collaboration_tasks SET state = ?, updated_at = ? WHERE run_id = ? AND state = 'paused'")
+          .run(run.template_id === ADAPTIVE_TEMPLATE_ID ? "pending" : "active", updatedAt, runId);
+        if (run.template_id === ADAPTIVE_TEMPLATE_ID) {
+          this.db.prepare("UPDATE collaboration_agents SET current_task_id = '', status = 'idle', updated_at = ? WHERE run_id = ?")
+            .run(updatedAt, runId);
+        }
       }
     })();
     return {

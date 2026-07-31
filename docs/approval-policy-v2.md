@@ -1,11 +1,6 @@
-# OriginRouter Approval Policy v1
+# OriginRouter Approval Policy v2
 
 Status: implementation specification
-
-Compatibility status: v1 remains readable, but all runtimes apply the current
-fail-closed hardening for opaque operations, missing negative-condition fields,
-array allow matching, canonical paths, and declaration replacement. New App
-templates use Approval Policy v2; see `docs/approval-policy-v2.md`.
 
 OriginRouter Approval Policy is a local, declarative policy-as-code format for
 Claude and Codex permission requests. The policy is evaluated by the CLI on the
@@ -22,6 +17,8 @@ the relay and OriginRouter Server never make the authorization decision.
 - `deny` overrides `ask`, and `ask` overrides `allow`.
 - Parse errors, unknown tools, dynamic shell expansion, and insufficient
   context default to `ask`.
+- Low-confidence and opaque atoms cannot be converted to `allow`, even by a
+  wildcard rule or an `allow` fallback. A policy may still deny them.
 - Requests containing secrets cannot be automatically answered by policy.
 - Path-based allow rules require both the user-requested path and its canonical
   filesystem target to satisfy the condition. A symlink cannot make an outside
@@ -59,8 +56,8 @@ built-in runtime boundary
 
 ```json
 {
-  "$schema": "https://originrouter.com/schemas/approval-policy-v1.schema.json",
-  "version": 1,
+  "$schema": "https://originrouter.com/schemas/approval-policy-v2.schema.json",
+  "version": 2,
   "id": "developer-default",
   "name": "Developer default",
   "defaults": {
@@ -115,6 +112,22 @@ Leaf condition:
 ```json
 { "field": "command.executable", "op": "eq", "value": "npm" }
 ```
+
+Collection-valued fields may select an explicit quantifier:
+
+```json
+{
+  "field": "command.argv",
+  "op": "glob",
+  "value": "--safe-*",
+  "quantifier": "all"
+}
+```
+
+The supported quantifiers are `any`, `all`, and `none`. When omitted, allow
+rules use `all` and restrictive ask/deny rules use `any`. Operators other than
+`exists` and `not_exists` return false when the field is missing; negative
+operators do not treat absent evidence as proof that an operation is safe.
 
 Supported operators:
 
@@ -315,8 +328,8 @@ fs.write            path=report.txt
 ```
 
 Command substitution, backticks, `eval`, `source`, `bash -c`, `sh -c`, and
-unresolved shell expansion add `shell.dynamic`. A policy must explicitly allow
-that atom or the request asks the user.
+unresolved shell expansion add `shell.dynamic`. Opaque shell behavior always
+asks the user; an allow wildcard cannot suppress this boundary.
 
 ## SQL
 
@@ -337,6 +350,9 @@ ALTER                          -> db.schema.alter
 DROP, TRUNCATE                 -> db.schema.drop
 GRANT, REVOKE                  -> db.admin
 BEGIN, COMMIT, ROLLBACK        -> db.transaction
+MERGE                          -> db.update
+COPY, CALL, EXEC, PRAGMA       -> db.unknown
+VACUUM, ATTACH, DETACH         -> db.admin
 ```
 
 ## Python and other scripts
@@ -354,7 +370,7 @@ Policies can declare a known invocation and its expected operations:
     "all": [
       { "field": "code.language", "op": "eq", "value": "python" },
       { "field": "code.script", "op": "path_equals", "value": "${workspace}/scripts/report.py" },
-      { "field": "code.sha256", "op": "eq", "value": "8d969eef6ecad3c29a3a629280e686cff8ca..." }
+      { "field": "code.sha256", "op": "eq", "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" }
     ]
   },
   "replaces_opaque": true,
@@ -369,12 +385,101 @@ Declarations are matched against the actual executable, arguments, resolved
 script path, and current file hash. If an asserted hash no longer matches,
 `code.opaque` remains and the interaction asks the user.
 
+In v2, `replaces_opaque: true` requires both an exact `code.script`
+`path_equals` condition and a 64-character `code.sha256` equality condition.
+The runtime applies this replacement boundary to v1 policies as a fail-closed
+compatibility hardening.
+
+## Enforcement modes
+
+Policies enforce decisions by default. Observation mode evaluates and audits a
+policy without automatically allowing or denying the request:
+
+```json
+{
+  "metadata": { "enforcement": "shadow" }
+}
+```
+
+The CLI emits `agent.approval_policy.shadow` with display-safe per-layer and
+per-atom results, then forwards the request to normal user approval.
+
+## Capabilities, simulation, and rollback
+
+Managed Agent status includes supported policy versions, the latest version,
+the action/operator registry hash, evaluator limits, and the active path
+boundary mode. The App verifies the selected policy version and registry hash
+before deployment.
+
+The authenticated local API provides:
+
+```text
+GET  /approval-policies/capabilities
+POST /approval-policies/validate
+POST /approval-policies/simulate
+GET  /approval-policies/<id>/revisions
+POST /approval-policies/<id>/rollback
+```
+
+The CLI retains the latest 20 immutable local revisions for each installed
+policy. Simulation uses the same authoritative atomizer and evaluator as live
+Agent requests and never executes the simulated request.
+
+The App exposes these operations from the policy editor under **Validate and
+simulate**. The user selects a reachable CLI device, chooses a common operation,
+a pending approval request, or a JSON request, and receives the final effect,
+every normalized atom, matched rule IDs, classification confidence, and fallback
+reason. Device revision history marks the currently installed revision. A
+rollback changes only that device; it does not overwrite the account template.
+
+For remote devices, request and response payloads use the trusted device E2EE
+channel. OriginRouter Server routes ciphertext and never receives the policy,
+synthetic request, matched rules, or revision contents in plaintext.
+
+## Validation diagnostics
+
+Validation returns errors, warnings, and an impact summary. Warnings currently
+cover:
+
+- action patterns that match no registered atomic operation;
+- identical or overlapping rules whose stronger decision makes another rule
+  redundant;
+- allow/ask/deny conflicts over the same static scope;
+- unconditional wildcard or process execution rules;
+- declarations that are not constrained by a stable tool, executable, module,
+  script path, or digest;
+- declarations that emit too many atoms to review as one auditable unit.
+
+The impact summary reports enabled and disabled rule counts, declaration count,
+broad rule count, enforcement mode, and the number of registered actions
+covered by allow, ask, and deny rules. These counts describe possible static
+coverage. They do not claim that every condition will match at runtime.
+
+## Registry source and generation
+
+The canonical registry is:
+
+```text
+schemas/approval-policy-registry.json
+```
+
+It generates the CLI JavaScript registry and the App Dart registry. Published
+v1 and v2 schemas are checked against the same source during CLI tests.
+
+```bash
+npm run generate:approval-policy-registry
+npm run check:approval-policy-registry
+```
+
+The generator updates the sibling `originrouter_app` checkout when present. A
+standalone CLI checkout validates its own generated JavaScript and schemas.
+
 ## Example: whitelist plus blacklist
 
 ```json
 {
-  "$schema": "https://originrouter.com/schemas/approval-policy-v1.schema.json",
-  "version": 1,
+  "$schema": "https://originrouter.com/schemas/approval-policy-v2.schema.json",
+  "version": 2,
   "id": "backend-development",
   "name": "Backend development",
   "defaults": { "unmatched": "ask", "parse_error": "ask", "unknown": "ask" },
