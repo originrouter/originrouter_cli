@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -133,6 +133,23 @@ const persistedDuplicate = await restartedSupervisor.start({
 });
 assert.equal(persistedDuplicate.duplicate, true);
 assert.equal(persistedDuplicate.conversationId, "conversation-1");
+
+const inheritedChild = join(workspace.canonical_path, "inherited-child");
+mkdirSync(inheritedChild);
+const inheritedLaunch = await supervisor.start({
+  launchId: "launch-inherited-child",
+  sessionId: "session-inherited-child",
+  conversationId: "conversation-inherited-child",
+  runId: "run-inherited-child",
+  agentType: "codex",
+  workspaceId: inheritedChild,
+  permissionProfile: "guarded",
+});
+assert.equal(inheritedLaunch.accepted, true);
+assert.equal(inheritedLaunch.workspacePath, inheritedChild);
+assert.notEqual(inheritedLaunch.workspaceId, workspace.workspace_id);
+assert.equal(spawns.at(-1).options.cwd, inheritedChild);
+assert.equal(catalog.getWorkspace(inheritedChild, { deviceId: "device-1" }).trusted, true);
 catalog.close();
 
 console.log("managed Agent supervisor tests ok");

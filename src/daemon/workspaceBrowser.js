@@ -80,7 +80,10 @@ export async function browseAgentWorkspaces({
         if (!info.isDirectory()) continue;
       }
       const canonicalPath = await realpath(candidate);
-      const workspace = catalog?.getWorkspace(canonicalPath, { deviceId });
+      const exactWorkspace = catalog?.getWorkspace(canonicalPath, { deviceId });
+      const workspace = exactWorkspace?.trusted
+        ? exactWorkspace
+        : catalog?.getTrustedWorkspaceForPath?.(canonicalPath, { deviceId });
       entries.push({
         name: child.name,
         path: canonicalPath,
@@ -96,7 +99,10 @@ export async function browseAgentWorkspaces({
     numeric: true,
     sensitivity: "base",
   }));
-  const currentWorkspace = catalog?.getWorkspace(location.currentPath, { deviceId });
+  const exactCurrentWorkspace = catalog?.getWorkspace(location.currentPath, { deviceId });
+  const currentWorkspace = exactCurrentWorkspace?.trusted
+    ? exactCurrentWorkspace
+    : catalog?.getTrustedWorkspaceForPath?.(location.currentPath, { deviceId });
   const parent = dirname(location.currentPath);
   const pageEntries = entries.slice(0, normalizedLimit);
   // Bridge control messages are capped at 128 KiB. Very deep paths can make

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,8 +10,12 @@ const root = mkdtempSync(join(tmpdir(), "originrouter-workspace-browser-"));
 const stateDir = join(root, "state");
 const projects = join(root, "projects");
 const alpha = join(projects, "alpha-app");
+const nested = join(alpha, "nested-app");
+const outside = join(root, "outside-app");
 mkdirSync(stateDir);
-mkdirSync(alpha, { recursive: true });
+mkdirSync(nested, { recursive: true });
+mkdirSync(outside);
+symlinkSync(outside, join(alpha, "outside-link"));
 mkdirSync(join(projects, "beta-app"), { recursive: true });
 mkdirSync(join(projects, ".hidden-app"));
 writeFileSync(join(projects, "notes.txt"), "not a directory");
@@ -51,6 +55,28 @@ try {
   });
   assert.equal(page.entries[0].trusted, true);
   assert.equal(page.entries[0].workspace_id, workspace.workspace_id);
+
+  page = await browseAgentWorkspaces({
+    path: alpha,
+    catalog,
+    deviceId: "device-1",
+  });
+  const nestedEntry = page.entries.find((item) => item.name === "nested-app");
+  assert.equal(nestedEntry.trusted, true);
+  assert.equal(nestedEntry.workspace_id, "", "inherited children must launch by exact path");
+  const outsideLink = page.entries.find((item) => item.name === "outside-link");
+  assert.equal(outsideLink.trusted, false, "symlinks outside the trusted parent must not inherit");
+  assert.equal(
+    catalog.getTrustedWorkspaceForPath(nested, { deviceId: "device-1" })
+      .inherited_from_workspace_id,
+    workspace.workspace_id,
+  );
+  assert.equal(
+    catalog.getTrustedWorkspaceForPath(join(projects, "beta-app"), {
+      deviceId: "device-1",
+    }),
+    null,
+  );
 
   assert.throws(
     () => catalog.trustWorkspace("/", { deviceId: "device-1" }),

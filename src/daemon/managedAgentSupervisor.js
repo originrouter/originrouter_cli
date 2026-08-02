@@ -141,9 +141,23 @@ export class ManagedAgentSupervisor {
       }
       return { ...persisted, duplicate: true };
     }
-    const workspace = this.catalog?.getWorkspace(workspaceReference, {
+    let workspace = this.catalog?.getWorkspace(workspaceReference, {
       deviceId: this.deviceId,
     });
+    if (workspace?.trusted !== true) {
+      const inheritedWorkspace = this.catalog?.getTrustedWorkspaceForPath?.(
+        workspaceReference,
+        { deviceId: this.deviceId },
+      );
+      if (inheritedWorkspace?.trusted === true) {
+        // Materialize the selected child as its own workspace so launches and
+        // history retain the real cwd while access remains inherited.
+        workspace = this.catalog.trustWorkspace(
+          inheritedWorkspace.canonical_path,
+          { deviceId: this.deviceId },
+        );
+      }
+    }
     if (!workspace) {
       throw launchError(
         "WORKSPACE_NOT_FOUND",

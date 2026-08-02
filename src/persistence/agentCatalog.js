@@ -899,6 +899,41 @@ export class AgentCatalog {
     return row ? { ...row, trusted: Boolean(row.trusted) } : null;
   }
 
+  getTrustedWorkspaceForPath(path, { deviceId = "" } = {}) {
+    let canonical;
+    try {
+      canonical = assertTrustableWorkspacePath(path);
+    } catch {
+      return null;
+    }
+    const normalizedDeviceId = safeText(deviceId, 191);
+    const rows = this.db.prepare(`
+      SELECT workspace_id, device_id, display_name, canonical_path,
+             repo_root, trusted, created_at, updated_at
+      FROM agent_workspaces
+      WHERE trusted = 1
+        AND (@deviceId = '' OR device_id = @deviceId)
+    `).all({ deviceId: normalizedDeviceId });
+    const ancestor = rows
+      .filter((row) => isWithinPath(canonical, row.canonical_path))
+      .sort((left, right) => right.canonical_path.length - left.canonical_path.length)[0];
+    if (!ancestor) return null;
+    if (ancestor.canonical_path === canonical) {
+      return { ...ancestor, trusted: true };
+    }
+    return {
+      workspace_id: "",
+      device_id: normalizedDeviceId || ancestor.device_id,
+      display_name: basename(canonical) || canonical,
+      canonical_path: canonical,
+      repo_root: repositoryRoot(canonical),
+      trusted: true,
+      inherited_from_workspace_id: ancestor.workspace_id,
+      created_at: ancestor.created_at,
+      updated_at: ancestor.updated_at,
+    };
+  }
+
   trustWorkspace(path, { deviceId = "" } = {}) {
     const canonical = assertTrustableWorkspacePath(path);
     // Resolve the final path before persisting it. Symlink aliases therefore
