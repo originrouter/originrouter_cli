@@ -4,8 +4,12 @@ import {
   chooseCloudModel,
   chooseRemoteDevice,
   chooseRemoteProvider,
+  loadCliDeviceDirectory,
   loadCloudModels,
   loadRemoteCliDevices,
+  printCliDevices,
+  printRemoteCliDevices,
+  remoteRouteEligibleDevices,
   remoteProviderName,
   selectControlBaseUrl,
 } from "../src/commands/routeSources.js";
@@ -19,6 +23,70 @@ const signedIn = async () => makeOAuthCredential();
     fetchFn: async () => { throw new Error("override must skip probes"); },
   });
   assert.equal(baseUrl, "https://override.example");
+}
+
+{
+  const devices = await loadCliDeviceDirectory({
+    stateDir: "/tmp/route-sources-test",
+    env: { ORIGINROUTER_CONTROL_BASE_URL: "https://control.example" },
+    ensureFreshAccessTokenFn: signedIn,
+    fetchFn: async (url) => ({
+      ok: true,
+      status: 200,
+      json: async () => url.endsWith("/device-e2ee/directory")
+        ? {
+            data: {
+              identities: [
+                { device_id: "device-cli-a", trust_status: "trusted" },
+              ],
+            },
+          }
+        : {
+            data: {
+              devices: [
+                {
+                  device_id: "device-cli-a",
+                  device_name: "Work Mac",
+                  is_self: true,
+                  online: true,
+                  remote_share_running: false,
+                },
+              ],
+            },
+          },
+    }),
+  });
+  assert.equal(devices[0].trustStatus, "trusted");
+  assert.equal(devices[0].isSelf, true);
+  const lines = [];
+  printCliDevices(devices, (line) => lines.push(line));
+  assert.match(lines[0], /this device · online · trusted · Remote Share off/);
+}
+
+{
+  const allDevices = [
+    {
+      deviceId: "device-cli-a",
+      deviceName: "Work Mac",
+      online: true,
+      remoteShareRunning: false,
+      remoteShareCatalog: [],
+    },
+    {
+      deviceId: "device-cli-b",
+      deviceName: "Laptop",
+      online: true,
+      remoteShareRunning: false,
+      remoteShareCatalog: [],
+    },
+  ];
+  assert.deepEqual(remoteRouteEligibleDevices(allDevices), []);
+  const lines = [];
+  printRemoteCliDevices([], (line) => lines.push(line), { allDevices });
+  assert.deepEqual(lines, [
+    "No devices are currently sharing remote model providers.",
+    "2 authorized CLI devices are online, but Remote Share is not enabled.",
+  ]);
 }
 
 {

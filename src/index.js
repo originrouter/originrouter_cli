@@ -42,6 +42,7 @@ import {
   setRoute,
 } from "./config/routes.js";
 import { LITELLM_VERSION } from "./proxy/litellm.js";
+import { DEFAULT_ORIGINROUTER_CONTROL_BASE_URL } from "./config/providerRoutes.js";
 import { enabledProviderModelEntries } from "./config/providerModels.js";
 import { ProxyManager } from "./proxy/manager.js";
 import { readLocalProxySnapshot, NOOP_REMOTE_CODING_SNAPSHOT, snapshotRemoteCodingStatus, staticProxyStatusFn } from "./proxy/snapshot.js";
@@ -81,9 +82,12 @@ import {
   chooseRemoteDevice,
   chooseRemoteProvider,
   loadCloudModels,
+  loadCliDeviceDirectory,
   loadRemoteCliDevices,
+  printCliDevices,
   printCloudModels,
   printRemoteCliDevices,
+  remoteRouteEligibleDevices,
   remoteProviderName,
 } from "./commands/routeSources.js";
 import { runClaudeSdkSession } from "./runtime/claudeSdkSession.js";
@@ -109,6 +113,7 @@ Usage:
   originrouter status
   originrouter doctor [provider <name>]
   originrouter sessions [--json]
+  originrouter devices [--json]
   originrouter env print [--provider <name>] [--agent claude|codex]
   originrouter agent detail [set concise|standard|detailed]
   originrouter agent history [--search <text>] [--agent claude|codex] [--device <id>] [--status <status>] [--json]
@@ -1066,12 +1071,14 @@ async function handleCloudRouteSource(args) {
 async function handleRemoteRouteSource(args) {
   const [action, ...rest] = args;
   const stateDir = ensureStateDir();
-  const devices = (await loadRemoteCliDevices({ stateDir })).filter(
-    (device) => device.online && device.remoteShareRunning,
-  );
+  const allDevices = await loadRemoteCliDevices({
+    stateDir,
+    env: deviceDirectoryEnvironment(),
+  });
+  const devices = remoteRouteEligibleDevices(allDevices);
 
   if (action === "devices") {
-    printRemoteCliDevices(devices);
+    printRemoteCliDevices(devices, console.log, { allDevices });
     return;
   }
   if (action !== "set") {
@@ -1119,6 +1126,36 @@ async function handleRemoteRouteSource(args) {
   });
   writeConfig(next);
   console.log(`Route ${target} now uses remote CLI device: ${device.deviceName || device.deviceId}.`);
+}
+
+async function handleDevices(args) {
+  const unsupported = args.filter((item) => item !== "--json");
+  if (unsupported.length > 0) {
+    throw new Error("Usage: originrouter devices [--json]");
+  }
+  const devices = await loadCliDeviceDirectory({
+    stateDir: ensureStateDir(),
+    env: deviceDirectoryEnvironment(),
+  });
+  if (args.includes("--json")) {
+    console.log(JSON.stringify(devices, null, 2));
+    return;
+  }
+  printCliDevices(devices);
+}
+
+function deviceDirectoryEnvironment() {
+  if (process.env.ORIGINROUTER_CONTROL_BASE_URL || process.env.ORIGINROUTER_API_BASE_URL) {
+    return process.env;
+  }
+  const relayUrl = readDaemonState()?.relayUrl;
+  return {
+    ...process.env,
+    ORIGINROUTER_CONTROL_BASE_URL:
+      typeof relayUrl === "string" && relayUrl.trim()
+        ? relayUrl.trim()
+        : DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
+  };
 }
 
 // ---------- proxy ----------
@@ -1905,6 +1942,11 @@ export async function main(argv) {
 
   if (command === "env") {
     handleEnvPrint(args);
+    return;
+  }
+
+  if (command === "devices") {
+    await handleDevices(args);
     return;
   }
 

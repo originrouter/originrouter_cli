@@ -208,11 +208,98 @@ export async function loadRemoteCliDevices({
     .map((device) => ({
       deviceId: nonEmptyString(device?.device_id),
       deviceName: nonEmptyString(device?.device_name),
+      isSelf: device?.is_self === true,
       online: device?.online === true,
       remoteShareRunning: device?.remote_share_running === true,
       remoteShareCatalog: remoteShareCatalog(device?.remote_share_catalog),
+      remoteShareE2eePolicy: nonEmptyString(device?.remote_share_e2ee_policy) || "off",
+      remoteShareE2eeSupported: device?.remote_share_e2ee_supported === true,
+      trustStatus: "unknown",
     }))
     .filter((device) => device.deviceId);
+}
+
+/// Builds the general account device directory. Trust comes from the existing
+/// E2EE directory endpoint; failure to load that optional projection must not
+/// hide otherwise authorized devices.
+export async function loadCliDeviceDirectory({
+  stateDir,
+  fetchFn = globalThis.fetch,
+  env = process.env,
+  ensureFreshAccessTokenFn = ensureFreshAccessToken,
+  selectControlBaseUrlFn = selectControlBaseUrl,
+} = {}) {
+  const devices = await loadRemoteCliDevices({
+    stateDir,
+    fetchFn,
+    env,
+    ensureFreshAccessTokenFn,
+    selectControlBaseUrlFn,
+  });
+  if (devices.length === 0) return devices;
+  try {
+    const [token, controlBaseUrl] = await Promise.all([
+      signedInToken({
+        stateDir,
+        resource: OAUTH_RESOURCES.CONTROL,
+        ensureFreshAccessTokenFn,
+      }),
+      selectControlBaseUrlFn({ fetchFn, env }),
+    ]);
+    const payload = await requestJson(
+      fetchFn,
+      `${trimBaseUrl(controlBaseUrl)}/cli/v1/device-e2ee/directory`,
+      {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+      },
+    );
+    const identities = unwrapData(payload).identities;
+    const trustByDevice = new Map(
+      (Array.isArray(identities) ? identities : [])
+        .map((identity) => [
+          nonEmptyString(identity?.device_id),
+          nonEmptyString(identity?.trust_status) || "unknown",
+        ])
+        .filter(([deviceId]) => deviceId),
+    );
+    return devices.map((device) => ({
+      ...device,
+      trustStatus: trustByDevice.get(device.deviceId) || "unknown",
+    }));
+  } catch {
+    return devices;
+  }
+}
+
+export function remoteRouteEligibleDevices(devices) {
+  return devices.filter(
+    (device) =>
+      device.online &&
+      device.remoteShareRunning &&
+      device.remoteShareCatalog.length > 0,
+  );
+}
+
+export function printCliDevices(devices, printFn = console.log) {
+  if (devices.length === 0) {
+    printFn("No authorized CLI devices are available for this account.");
+    return;
+  }
+  for (const device of devices) {
+    const name = device.deviceName || device.deviceId;
+    const status = [
+      device.isSelf ? "this device" : null,
+      device.online ? "online" : "offline",
+      device.trustStatus && device.trustStatus !== "unknown"
+        ? device.trustStatus
+        : "trust unknown",
+      device.remoteShareRunning
+        ? `Remote Share on · ${device.remoteShareCatalog.length} shared provider${device.remoteShareCatalog.length === 1 ? "" : "s"}`
+        : "Remote Share off",
+    ].filter(Boolean);
+    printFn(`${name} (${device.deviceId}) · ${status.join(" · ")}`);
+  }
 }
 
 export function printCloudModels(models, printFn = console.log) {
@@ -226,9 +313,31 @@ export function printCloudModels(models, printFn = console.log) {
   }
 }
 
-export function printRemoteCliDevices(devices, printFn = console.log) {
+export function printRemoteCliDevices(
+  devices,
+  printFn = console.log,
+  { allDevices = devices } = {},
+) {
   if (devices.length === 0) {
-    printFn("No authorized CLI devices are available.");
+    if (allDevices.length === 0) {
+      printFn("No authorized CLI devices are available for this account.");
+      return;
+    }
+    const online = allDevices.filter((device) => device.online);
+    if (online.length === 0) {
+      printFn("No devices are currently available for remote model routing.");
+      printFn(`${allDevices.length} authorized CLI device${allDevices.length === 1 ? " is" : "s are"} offline.`);
+      return;
+    }
+    const sharingWithoutModels = online.filter(
+      (device) => device.remoteShareRunning && device.remoteShareCatalog.length === 0,
+    );
+    printFn("No devices are currently sharing remote model providers.");
+    if (sharingWithoutModels.length > 0) {
+      printFn(`${sharingWithoutModels.length} online device${sharingWithoutModels.length === 1 ? " has" : "s have"} Remote Share enabled but no provider models are shared.`);
+    } else {
+      printFn(`${online.length} authorized CLI device${online.length === 1 ? " is" : "s are"} online, but Remote Share is not enabled.`);
+    }
     return;
   }
   for (const device of devices) {

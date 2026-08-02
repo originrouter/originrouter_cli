@@ -211,6 +211,33 @@ OriginRouter keeps three source types distinct:
 A local provider entry never represents OriginRouter Cloud. Cloud and remote
 sources require login and use audience-scoped credentials.
 
+Account devices and remote model routes are deliberately separate:
+
+```bash
+originrouter devices
+originrouter devices --json
+```
+
+`originrouter devices` lists every authorized CLI device and reports whether
+it is online, trusted, the current device, and running Remote Share. It is the
+device-discovery command for Agent control and collaboration diagnostics.
+
+`originrouter route remote devices` lists only devices currently eligible to
+serve remote LLM routes: the device must be online, Remote Share must be
+running, and at least one Provider model must be shared. Remote Agent control
+and cross-device collaboration do not require Remote Share.
+
+Device commands use the running daemon's Relay/control endpoint so the CLI and
+App do not drift between separate brand directories. With no running daemon,
+they use the product default. `ORIGINROUTER_CONTROL_BASE_URL` remains the
+explicit development override.
+
+New or reinstalled devices intentionally start without trusted Agent
+workspaces. In the App, select the target device, enter or browse to a folder,
+and explicitly confirm that folder before launching an Agent or adding it to a
+collaboration. Browsing starts at the target device's home directory, but the
+home directory is never trusted automatically.
+
 ## Agent control and approval modes
 
 Start a session with an explicit autonomy profile:
