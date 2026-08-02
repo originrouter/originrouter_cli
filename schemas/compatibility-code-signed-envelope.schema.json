@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://originrouter.com/schemas/compatibility-code-signed-v1.json",
+  "title": "Signed OriginRouter Compatibility Code Bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "key_id", "algorithm", "payload", "signature"],
+  "properties": {
+    "schema": {"const": "originrouter-compatibility-code-signed-v1"},
+    "key_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "algorithm": {"const": "Ed25519"},
+    "payload": {"$ref": "compatibility-code-bundle.schema.json"},
+    "signature": {"type": "string", "minLength": 1, "maxLength": 512}
+  }
+}

@@ -84,6 +84,46 @@ function safeLocalControlRoutes(value) {
   return routes;
 }
 
+function safeCompatibilityStatus(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const patches = Array.isArray(value.patches) ? value.patches.slice(0, 128).map((patch) => ({
+    id: safeText(patch?.id, 256),
+    name: safeText(patch?.name, 128),
+    description: safeText(patch?.description, 1024),
+    version: safeText(patch?.version, 32),
+    phase: safeText(patch?.phase, 16),
+    required: patch?.required === true,
+    failure_mode: safeText(patch?.failure_mode, 16),
+    match: patch?.match && typeof patch.match === "object" ? patch.match : {},
+    enabled: patch?.enabled !== false,
+  })).filter((patch) => patch.id) : [];
+  const operation = value.last_operation && typeof value.last_operation === "object"
+    ? {
+        id: safeText(value.last_operation.id, 128),
+        action: safeText(value.last_operation.action, 16),
+        state: safeText(value.last_operation.state, 16),
+        started_at: safeText(value.last_operation.started_at, 64),
+        completed_at: safeText(value.last_operation.completed_at, 64),
+        message: safeText(value.last_operation.message, 512),
+      }
+    : null;
+  return {
+    engine_version: safeText(value.engine_version, 32),
+    source: safeText(value.source, 16),
+    bundle_id: safeText(value.bundle_id, 256),
+    revision: Math.max(0, Number.parseInt(String(value.revision || 0), 10) || 0),
+    generated_at: safeText(value.generated_at, 64),
+    automatic_updates: value.automatic_updates === true,
+    last_checked_at: safeText(value.last_checked_at, 64),
+    latest_revision: Math.max(0, Number.parseInt(String(value.latest_revision || 0), 10) || 0),
+    update_available: value.update_available === true,
+    can_rollback: value.can_rollback === true,
+    enabled_patch_count: patches.filter((patch) => patch.enabled).length,
+    patches,
+    last_operation: operation,
+  };
+}
+
 function compactText(value, maxLen = 512) {
   return safeText(value, maxLen).replace(/\s+/g, " ");
 }
@@ -778,6 +818,7 @@ export async function reportLocalControlRuntime(payload, {
     return { ok: false, error: "fetch_unavailable" };
   }
 
+  const compatibility = safeCompatibilityStatus(payload?.compatibility);
   const body = {
     cli_running: payload?.cliRunning !== false,
     cli_version: safeText(payload?.cliVersion, 64),
@@ -793,6 +834,7 @@ export async function reportLocalControlRuntime(payload, {
     agent_detail_profile: safeText(payload?.agentDetailProfile, 16) || "concise",
     providers: safeLocalControlProviders(payload?.providers),
     routes: safeLocalControlRoutes(payload?.routes),
+    ...(compatibility ? { compatibility } : {}),
   };
 
   const controller = new AbortController();

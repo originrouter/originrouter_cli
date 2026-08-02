@@ -55,6 +55,7 @@ import {
 import { storeDeviceE2eeDirectoryCache } from "../security/deviceE2eeDirectoryCache.js";
 import { DeviceE2eeRelayTransport } from "../security/deviceE2eeRelayTransport.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
+import { refreshCompatibilityPack } from "../compatibility/updater.js";
 
 function httpHost(address) {
   return String(address).includes(":") && !String(address).startsWith("[")
@@ -322,6 +323,9 @@ export async function startDaemon(args) {
     auditStore,
     agentCatalog,
     managedAgentSupervisor,
+    stateDir,
+    compatibilityAutomaticUpdates:
+      relayMode !== "local" && process.env.ORIGINROUTER_COMPATIBILITY_UPDATES !== "off",
   });
 
   // Stage 3 + Stage 4 + Stage 6: start the local 127.0.0.1-only HTTP API.
@@ -435,6 +439,7 @@ export async function startDaemon(args) {
   let heartbeatTimer = null;
   let agentActivitySyncTimer = null;
   let deviceE2eeRefreshTimer = null;
+  let compatibilityUpdateTimer = null;
   const shutdown = async (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -442,6 +447,7 @@ export async function startDaemon(args) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (agentActivitySyncTimer) clearInterval(agentActivitySyncTimer);
     if (deviceE2eeRefreshTimer) clearInterval(deviceE2eeRefreshTimer);
+    if (compatibilityUpdateTimer) clearInterval(compatibilityUpdateTimer);
     try {
       await sessionManager.shutdown(signal);
     } catch (e) {
@@ -533,6 +539,7 @@ export async function startDaemon(args) {
         agentDetailProfile: agentDetailDefaultFromConfig(config),
         providers: localControlProviderSnapshot(config),
         routes: localControlRouteSnapshot(config),
+        compatibility: sessionManager.compatibilityStatus(),
       },
       { stateDir },
     ).catch(() => ({ ok: false, error: "request_failed" }));
@@ -629,6 +636,24 @@ export async function startDaemon(args) {
     });
   }, 15 * 60_000);
   deviceE2eeRefreshTimer.unref?.();
+  const updateCompatibilityPatches = async () => {
+    if (relayMode === "local" || process.env.ORIGINROUTER_COMPATIBILITY_UPDATES === "off") return;
+    try {
+      const result = await refreshCompatibilityPack({ stateDir });
+      if (result.installed) {
+        console.log(
+          `[compatibility] activated patch bundle ${result.pack.bundle_id || result.pack.pack_id} revision ${result.pack.revision}`,
+        );
+      }
+    } catch (error) {
+      console.warn(`[compatibility] patch update failed: ${error.message}`);
+    }
+  };
+  void updateCompatibilityPatches();
+  compatibilityUpdateTimer = setInterval(() => {
+    void updateCompatibilityPatches();
+  }, 6 * 60 * 60_000);
+  compatibilityUpdateTimer.unref?.();
 
   writeDaemonState({
     pid: process.pid,

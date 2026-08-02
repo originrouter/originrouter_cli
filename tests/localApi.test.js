@@ -84,6 +84,46 @@ try {
     mode: "share",
   };
   const fakeSessionManager = {
+    compatibility: {
+      engine_version: "2.0.0",
+      source: "builtin",
+      bundle_id: "originrouter-builtin-compatibility",
+      revision: 2,
+      automatic_updates: true,
+      patches: [],
+      can_rollback: false,
+      update_available: false,
+      last_operation: null,
+    },
+    compatibilityStatus() { return this.compatibility; },
+    async runCompatibilityAction(action, operationId) {
+      this.compatibility = {
+        ...this.compatibility,
+        last_checked_at: "2026-07-31T00:00:00.000Z",
+        last_operation: {
+          id: operationId,
+          action,
+          state: "succeeded",
+          message: "Compatibility patches are current.",
+        },
+      };
+      return { ok: true, compatibility: this.compatibility };
+    },
+    async setCompatibilityPatchEnabled(patchId, enabled, operationId) {
+      this.compatibility = {
+        ...this.compatibility,
+        patches: this.compatibility.patches.map((patch) => (
+          patch.id === patchId ? { ...patch, enabled } : patch
+        )),
+        last_operation: {
+          id: operationId,
+          action: enabled ? "patch_enable" : "patch_disable",
+          state: "succeeded",
+          message: "",
+        },
+      };
+      return { ok: true, compatibility: this.compatibility };
+    },
     sessions: new Map([
       [sessionId, {
         id: sessionId,
@@ -268,6 +308,35 @@ try {
     assert.equal(body.proxy.port, null);
     assert.match(body.proxy.note, /LiteLLM/);
     assert.deepEqual(body.remoteShare.catalog, []);
+    assert.equal(body.compatibility.revision, 2);
+    assert.equal(body.compatibility.automatic_updates, true);
+  }
+
+  // ---------- Compatibility status and synchronous local action ----------
+  {
+    const current = await getJson("/compatibility");
+    assert.equal(current.status, 200);
+    assert.equal(current.body.compatibility.bundle_id, "originrouter-builtin-compatibility");
+    const updated = await postJson("/compatibility/check", { operation_id: "compat-local-test" });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.body.compatibility.last_operation.id, "compat-local-test");
+    assert.equal(updated.body.compatibility.last_operation.state, "succeeded");
+    fakeSessionManager.compatibility.patches = [{
+      id: "responses.non-openai.agent-compatibility",
+      enabled: true,
+    }];
+    const toggled = await fetch(
+      `${base}/compatibility/patches/responses.non-openai.agent-compatibility`,
+      {
+        method: "PATCH",
+        headers: { ...AUTH, "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: false, operation_id: "compat-toggle-test" }),
+      },
+    );
+    const toggledBody = await toggled.json();
+    assert.equal(toggled.status, 200);
+    assert.equal(toggledBody.compatibility.patches[0].enabled, false);
+    assert.equal(toggledBody.compatibility.last_operation.id, "compat-toggle-test");
   }
 
   // ---------- POST /remote-share/start ----------
@@ -1009,7 +1078,10 @@ try {
     const r = await fetch(`${base}/providers`, { method: "OPTIONS" });
     assert.equal(r.status, 204);
     assert.equal(r.headers.get("access-control-allow-origin"), "*");
-    assert.equal(r.headers.get("access-control-allow-methods"), "GET, POST, PUT, DELETE, OPTIONS");
+    assert.equal(
+      r.headers.get("access-control-allow-methods"),
+      "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    );
     assert.equal(r.headers.get("access-control-allow-headers"), "Content-Type, Authorization");
   }
 

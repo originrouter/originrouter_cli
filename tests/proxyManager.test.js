@@ -311,11 +311,15 @@ try {
       // spawn called with the expected argv.
       assert.equal(spawnCalls.length, 1);
       const { cmd, args } = spawnCalls[0];
-      assert.ok(cmd.endsWith("/venv/bin/litellm"), `litellm path was ${cmd}`);
-      assert.deepEqual(args, [
+      assert.equal(cmd, process.execPath);
+      assert.match(args[0], /compatibility\/gatewayProcess\.js$/);
+      assert.deepEqual(args.slice(1), [
+        "--litellm", litellmBinaryPath(home),
         "--config", r.configPath,
-        "--host", "127.0.0.1",
+        "--route-map", r.routeMapPath,
+        "--state-dir", home,
         "--port", "40123",
+        "--host", "127.0.0.1",
       ]);
       // Stage 7: rendered YAML uses the deepseek/ prefix (catalog-driven).
       const yaml = readFileSync(r.configPath, "utf8");

@@ -321,7 +321,7 @@ async function dispatch(ctx, req, res) {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
       "Access-Control-Max-Age": "600",
     });
     res.end();
@@ -344,6 +344,37 @@ async function dispatch(ctx, req, res) {
     // Static routes first.
     if (req.method === "GET" && pathname === "/local/status") {
       return sendOk(res, await handleLocalStatus(ctx));
+    }
+    if (req.method === "GET" && pathname === "/compatibility") {
+      return sendOk(res, { compatibility: ctx.sessionManager.compatibilityStatus() });
+    }
+    const compatibilityAction = pathname.match(/^\/compatibility\/(check|update|rollback)$/);
+    if (req.method === "POST" && compatibilityAction) {
+      const body = await readJsonBody(req).catch(() => ({}));
+      const result = await ctx.sessionManager.runCompatibilityAction(
+        compatibilityAction[1],
+        String(body.operation_id || `compat-${Date.now()}`),
+      );
+      if (!result.ok) return sendError(res, 409, result.error, { compatibility: result.compatibility });
+      return sendOk(res, result);
+    }
+    const compatibilityPatch = pathname.match(/^\/compatibility\/patches\/([^/]+)$/);
+    if (req.method === "PATCH" && compatibilityPatch) {
+      const body = await readJsonBody(req);
+      if (typeof body.enabled !== "boolean") {
+        return sendError(res, 400, "enabled must be a boolean");
+      }
+      const result = await ctx.sessionManager.setCompatibilityPatchEnabled(
+        decodeURIComponent(compatibilityPatch[1]),
+        body.enabled,
+        String(body.operation_id || `compat-${Date.now()}`),
+      );
+      if (!result.ok) {
+        return sendError(res, 409, result.error, {
+          compatibility: result.compatibility,
+        });
+      }
+      return sendOk(res, result);
     }
     if (req.method === "GET" && pathname === "/local/auth/challenge") {
       return sendOk(res, {
@@ -1056,6 +1087,7 @@ async function handleLocalStatus(ctx) {
       profile: agentDetailDefaultFromConfig(readConfig()),
       availableProfiles: AGENT_DETAIL_PROFILES,
     },
+    compatibility: ctx.sessionManager?.compatibilityStatus?.(),
   };
 }
 

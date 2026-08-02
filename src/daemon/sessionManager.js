@@ -11,6 +11,12 @@ import { createExecutor } from "../executors/createExecutor.js";
 import { staticProxyStatusFn } from "../proxy/snapshot.js";
 import { appendSessionStart, patchSessionExit } from "../persistence/sessionLog.js";
 import { ensureStateDir, readConfig, writeConfig } from "../persistence/state.js";
+import {
+  rollbackCompatibilityPack,
+  setCompatibilityPatchEnabled,
+} from "../compatibility/patchStore.js";
+import { checkCompatibilityPack, refreshCompatibilityPack } from "../compatibility/updater.js";
+import { compatibilityStatus } from "../compatibility/status.js";
 import { DEFAULT_PROXY_PORT, DEFAULT_REMOTE_SHARE_PROXY_PORT } from "../constants.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 import { handleRemoteCodingRequest } from "./remoteCodingServer.js";
@@ -44,6 +50,8 @@ export class SessionManager {
     agentCatalog = null,
     managedAgentSupervisor = null,
     onLocalControlChanged = null,
+    stateDir = ensureStateDir(),
+    compatibilityAutomaticUpdates = true,
   }) {
     this.relayClient = relayClient;
     this.deviceId = deviceId;
@@ -59,6 +67,9 @@ export class SessionManager {
     this.agentCatalog = agentCatalog;
     this.managedAgentSupervisor = managedAgentSupervisor;
     this.onLocalControlChanged = onLocalControlChanged;
+    this.stateDir = stateDir;
+    this.compatibilityAutomaticUpdates = compatibilityAutomaticUpdates;
+    this.lastCompatibilityOperation = null;
     this.sessions = new Map();
     // Stage 9.2: per-requestId abort controllers for in-flight remote
     // coding fetches. The cancel event aborts the underlying fetch so
@@ -74,6 +85,114 @@ export class SessionManager {
       return `http://${status.host || "127.0.0.1"}:${status.port}`;
     }
     return null;
+  }
+
+  compatibilityStatus() {
+    return compatibilityStatus(this.stateDir, {
+      automaticUpdates: this.compatibilityAutomaticUpdates,
+      lastOperation: this.lastCompatibilityOperation,
+    });
+  }
+
+  async runCompatibilityAction(action, operationId = `compat-${Date.now()}`) {
+    const startedAt = new Date().toISOString();
+    this.lastCompatibilityOperation = {
+      id: operationId,
+      action,
+      state: "running",
+      started_at: startedAt,
+      completed_at: null,
+      message: "",
+    };
+    try {
+      let result;
+      if (action === "check") {
+        result = await checkCompatibilityPack({ stateDir: this.stateDir });
+      } else if (action === "update") {
+        result = await refreshCompatibilityPack({ stateDir: this.stateDir });
+      } else if (action === "rollback") {
+        result = rollbackCompatibilityPack(this.stateDir);
+        if (!result.rolledBack) throw new Error("No previous compatibility bundle is available.");
+      } else {
+        throw new Error(`Unsupported compatibility action '${action}'.`);
+      }
+      this.lastCompatibilityOperation = {
+        id: operationId,
+        action,
+        state: "succeeded",
+        started_at: startedAt,
+        completed_at: new Date().toISOString(),
+        message: action === "check"
+          ? (result.update_available ? `Revision ${result.latest_revision} is available.` : "Compatibility patches are current.")
+          : action === "update"
+            ? (result.installed ? `Revision ${result.pack?.revision} installed.` : "Compatibility patches are current.")
+            : `Rolled back to revision ${result.pack?.revision}.`,
+      };
+      await this.onLocalControlChanged?.();
+      return { ok: true, result, compatibility: this.compatibilityStatus() };
+    } catch (error) {
+      this.lastCompatibilityOperation = {
+        id: operationId,
+        action,
+        state: "failed",
+        started_at: startedAt,
+        completed_at: new Date().toISOString(),
+        message: String(error?.message || error).slice(0, 512),
+      };
+      await this.onLocalControlChanged?.();
+      return { ok: false, error: this.lastCompatibilityOperation.message, compatibility: this.compatibilityStatus() };
+    }
+  }
+
+  async setCompatibilityPatchEnabled(
+    patchId,
+    enabled,
+    operationId = `compat-${Date.now()}`,
+  ) {
+    const normalizedPatchId = String(patchId || "").trim();
+    const current = this.compatibilityStatus();
+    if (!current.patches.some((patch) => patch.id === normalizedPatchId)) {
+      throw new Error(`Unknown compatibility patch '${normalizedPatchId}'.`);
+    }
+    const startedAt = new Date().toISOString();
+    this.lastCompatibilityOperation = {
+      id: operationId,
+      action: enabled ? "patch_enable" : "patch_disable",
+      state: "running",
+      started_at: startedAt,
+      completed_at: null,
+      message: "",
+    };
+    try {
+      setCompatibilityPatchEnabled(this.stateDir, normalizedPatchId, enabled);
+      this.lastCompatibilityOperation = {
+        id: operationId,
+        action: enabled ? "patch_enable" : "patch_disable",
+        state: "succeeded",
+        started_at: startedAt,
+        completed_at: new Date().toISOString(),
+        message: enabled
+          ? `Compatibility patch '${normalizedPatchId}' enabled.`
+          : `Compatibility patch '${normalizedPatchId}' disabled.`,
+      };
+      await this.onLocalControlChanged?.();
+      return { ok: true, compatibility: this.compatibilityStatus() };
+    } catch (error) {
+      this.lastCompatibilityOperation = {
+        id: operationId,
+        action: enabled ? "patch_enable" : "patch_disable",
+        state: "failed",
+        started_at: startedAt,
+        completed_at: new Date().toISOString(),
+        message: String(error?.message || error).slice(0, 512),
+      };
+      await this.onLocalControlChanged?.();
+      return {
+        ok: false,
+        error: this.lastCompatibilityOperation.message,
+        compatibility: this.compatibilityStatus(),
+      };
+    }
   }
 
   async handleRemoteCodingEvent(envelope) {
@@ -144,6 +263,19 @@ export class SessionManager {
   }
 
   async handleLocalControlEvent(payload) {
+    const compatibilityMatch = String(payload.type || "").match(/^local_control\.compatibility\.(check|update|rollback)$/);
+    if (compatibilityMatch) {
+      await this.runCompatibilityAction(compatibilityMatch[1], String(payload.operation_id || `compat-${Date.now()}`));
+      return;
+    }
+    if (payload.type === "local_control.compatibility.patch.set") {
+      await this.setCompatibilityPatchEnabled(
+        payload.patch_id,
+        payload.enabled === true,
+        String(payload.operation_id || `compat-${Date.now()}`),
+      );
+      return;
+    }
     if (payload.type === "local_control.litellm.start") {
       const result = await this.startRouteModeProxy(payload.port);
       if (!result?.ok) throw new Error(result?.error || "agent proxy start failed");

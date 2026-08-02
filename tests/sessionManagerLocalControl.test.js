@@ -148,6 +148,66 @@ test("SessionManager starts route-mode proxy for local-control litellm start", a
   assert.deepEqual(starts, [{ mode: "route", port: 40123 }]);
 });
 
+test("SessionManager reports the final compatibility operation result", async () => {
+  const home = mkdtempSync(join(tmpdir(), "originrouter-compatibility-control-test-"));
+  let snapshotReports = 0;
+  try {
+    const manager = new SessionManager({
+      relayClient: { send: async () => ({ ok: true }) },
+      deviceId: "device-test",
+      defaultExecutor: "fake",
+      stateDir: home,
+      onLocalControlChanged: async () => { snapshotReports += 1; },
+    });
+    await manager.handleLocalControlEvent({
+      type: "local_control.compatibility.rollback",
+      operation_id: "compat-operation-1",
+    });
+    const status = manager.compatibilityStatus();
+    assert.equal(status.last_operation.id, "compat-operation-1");
+    assert.equal(status.last_operation.action, "rollback");
+    assert.equal(status.last_operation.state, "failed");
+    assert.match(status.last_operation.message, /No previous compatibility bundle/);
+    assert.equal(snapshotReports, 1);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager applies one compatibility patch toggle from relay", async () => {
+  const home = mkdtempSync(join(tmpdir(), "originrouter-compatibility-toggle-test-"));
+  let snapshotReports = 0;
+  try {
+    const manager = new SessionManager({
+      relayClient: { send: async () => ({ ok: true }) },
+      deviceId: "device-test",
+      defaultExecutor: "fake",
+      stateDir: home,
+      onLocalControlChanged: async () => { snapshotReports += 1; },
+    });
+
+    await manager.handleLocalControlEvent({
+      type: "local_control.compatibility.patch.set",
+      operation_id: "compat-patch-operation-1",
+      patch_id: "responses.non-openai.agent-compatibility",
+      enabled: false,
+    });
+
+    const status = manager.compatibilityStatus();
+    const patch = status.patches.find(
+      (item) => item.id === "responses.non-openai.agent-compatibility",
+    );
+    assert.equal(patch.enabled, false);
+    assert.equal(status.enabled_patch_count, status.patches.length - 1);
+    assert.equal(status.last_operation.id, "compat-patch-operation-1");
+    assert.equal(status.last_operation.action, "patch_disable");
+    assert.equal(status.last_operation.state, "succeeded");
+    assert.equal(snapshotReports, 1);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("SessionManager starts Remote Share with an explicit Provider allow-list", async () => {
   const previousHome = process.env.ORIGINROUTER_HOME;
   const home = mkdtempSync(join(tmpdir(), "originrouter-remote-share-test-"));

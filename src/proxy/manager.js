@@ -7,9 +7,10 @@
 //   - status: read state + check pid alive + poll /health/liveliness
 //   - restart: stop + start
 //
-// The manager does NOT spawn Node.js HTTP handlers — it just exposes methods
-// that the daemon's local API calls. This keeps the manager testable with
-// a mocked child_process spawn and avoids embedding HTTP-shaped logic.
+// The manager starts one detached OriginRouter Compatibility Gateway process.
+// That child owns the private LiteLLM process and exposes the stable public
+// loopback port. Keeping HTTP transformation logic in the child still leaves
+// this lifecycle manager testable with a mocked child_process spawn.
 //
 // Bind safety is enforced at start time: if a caller tries to start with
 // host != 127.0.0.1 the manager throws before spawn.
@@ -17,11 +18,11 @@
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   LITELLM_PACKAGE,
   isInstalled,
-  litellmArgs,
   litellmBinaryPath,
   pipBinaryPath,
   pythonBinaryPath,
@@ -39,10 +40,17 @@ import {
   hashRoutes,
 } from "../config/routes.js";
 import { readConfig, readProxyState, writeProxyState, clearProxyState } from "../persistence/state.js";
+import { buildCompatibilityRouteMap } from "../compatibility/routeMap.js";
 
-const HEALTH_POLL_TIMEOUT_MS = 15_000;
+// The public port is opened only after the child Gateway has started and
+// health-checked its private LiteLLM process. Allow enough time for both
+// layers on slower first boots.
+const HEALTH_POLL_TIMEOUT_MS = 35_000;
 const HEALTH_POLL_INTERVAL_MS = 250;
 const PROXY_HOST = "127.0.0.1";
+const COMPATIBILITY_GATEWAY_PROCESS = fileURLToPath(
+  new URL("../compatibility/gatewayProcess.js", import.meta.url),
+);
 
 // Stage 6: signals that count as a "crash" for UI reporting. SIGTERM is
 // graceful (we sent it). The others are unexpected deaths.
@@ -86,6 +94,24 @@ export class ProxyManager {
 
   _logPrefix() {
     return this.stateKey === "proxy" ? "litellm" : this.stateKey;
+  }
+
+  _writeCompatibilityRouteMap(configDir, name, input) {
+    const routeMapPath = join(configDir, `compatibility-routes-${name}.json`);
+    writeFileSync(routeMapPath, `${JSON.stringify(buildCompatibilityRouteMap(input))}\n`, { mode: 0o600 });
+    return routeMapPath;
+  }
+
+  _gatewayArgs({ litellm, configPath, routeMapPath, port }) {
+    return [
+      COMPATIBILITY_GATEWAY_PROCESS,
+      "--litellm", litellm,
+      "--config", configPath,
+      "--route-map", routeMapPath,
+      "--state-dir", this.stateDir,
+      "--port", String(port),
+      "--host", PROXY_HOST,
+    ];
   }
 
   // ----------------------------------------------------------------
@@ -256,6 +282,20 @@ export class ProxyManager {
         : provider;
       writeFileSync(configPath, renderLitellmConfigYaml(forRender), { mode: 0o600 });
     }
+    const routeMapProviders = mode === "share"
+      ? Object.fromEntries(providers.map((item) => [item.name, item]))
+      : { [providerName]: provider };
+    const routeMapPath = this._writeCompatibilityRouteMap(
+      configDir,
+      mode === "share" ? "share" : `provider-${providerName}`,
+      {
+        config: { providers: routeMapProviders },
+        mode,
+        providerName,
+        providerNames,
+        litellmVersion: version,
+      },
+    );
 
     // Bind safety: only loopback.
     if (PROXY_HOST !== "127.0.0.1") {
@@ -273,9 +313,9 @@ export class ProxyManager {
     const errFd = openSync(logPath, "a", 0o600);
 
     const litellm = litellmBinaryPath(this.stateDir, version);
-    const args = litellmArgs(configPath, port, PROXY_HOST);
+    const args = this._gatewayArgs({ litellm, configPath, routeMapPath, port });
 
-    const child = this.spawnFn(litellm, args, {
+    const child = this.spawnFn(process.execPath, args, {
       stdio: ["ignore", outFd, errFd],
       detached: true,
     });
@@ -345,6 +385,7 @@ export class ProxyManager {
       providers: mode === "share" ? providerNames : null,
       startedAt: new Date().toISOString(),
       configPath,
+      routeMapPath,
       logPath,
     });
 
@@ -358,6 +399,7 @@ export class ProxyManager {
       providers: mode === "share" ? providerNames : null,
       version,
       configPath,
+      routeMapPath,
       logPath,
     };
   }
@@ -400,6 +442,15 @@ export class ProxyManager {
       mkdirSync(configDir, { recursive: true });
       const configPath = join(configDir, `config-routes-${routesHash}.yaml`);
       writeFileSync(configPath, yaml, { mode: 0o600 });
+      const routeMapPath = this._writeCompatibilityRouteMap(
+        configDir,
+        `routes-${routesHash}`,
+        {
+          config: { providers, routes: allRoutes },
+          mode: "route",
+          litellmVersion: version,
+        },
+      );
 
       if (PROXY_HOST !== "127.0.0.1") {
         return { ok: false, error: `proxy host must be 127.0.0.1 (got ${PROXY_HOST})` };
@@ -412,9 +463,9 @@ export class ProxyManager {
       const errFd = openSync(logPath, "a", 0o600);
 
       const litellm = litellmBinaryPath(this.stateDir, version);
-      const args = litellmArgs(configPath, port, PROXY_HOST);
+      const args = this._gatewayArgs({ litellm, configPath, routeMapPath, port });
 
-      const child = this.spawnFn(litellm, args, {
+      const child = this.spawnFn(process.execPath, args, {
         stdio: ["ignore", outFd, errFd],
         detached: true,
       });
@@ -474,6 +525,7 @@ export class ProxyManager {
         provider: null,
         startedAt: new Date().toISOString(),
         configPath,
+        routeMapPath,
         logPath,
       });
 
@@ -486,6 +538,7 @@ export class ProxyManager {
         routesHash,
         aliases,
         configPath,
+        routeMapPath,
         logPath,
       };
     } finally {
@@ -653,6 +706,7 @@ export class ProxyManager {
       aliases: cur.aliases || null,
       startedAt: cur.startedAt,
       configPath: cur.configPath,
+      routeMapPath: cur.routeMapPath || null,
       logPath: cur.logPath,
       // Stage 6: include lastExit* (cleared on next successful start).
       lastExitReason: cur.lastExitReason || null,
