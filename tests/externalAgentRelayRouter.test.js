@@ -154,6 +154,35 @@ test("daemon forwards full transient text and session acknowledgements", async (
   assert.equal(sent[1].payload.sessionId, "session-1");
 });
 
+test("remote collaboration events retain a target after E2EE reconnects", async () => {
+  const { sent, commands } = fixture();
+  const registry = {
+    has: (sessionId) => sessionId === "session-1",
+    history: () => ({ messages: [], nextCursor: null, hasMore: false }),
+    controlSnapshot: () => ({ interactions: [], events: [], mode: "default" }),
+    enqueueCommand: (sessionId, command) =>
+      commands.push({ sessionId, command }),
+  };
+  const router = new ExternalAgentRelayRouter({
+    registry,
+    relayClient: {
+      send: async (type, payload) => {
+        sent.push({ type, payload });
+        return { accepted: true };
+      },
+    },
+    targetDeviceForSession: (sessionId) =>
+      sessionId === "session-1" ? "coordinator-device" : "",
+  });
+  await router.forwardRegistryNotification({
+    type: "event",
+    sessionId: "session-1",
+    payload: { type: "agent.text", eventId: "remote-text", text: "progress" },
+  });
+  assert.equal(sent[0].payload.targetDeviceId, "coordinator-device");
+  assert.equal(sent[0].payload.event.text, "progress");
+});
+
 test("daemon removes undefined fields before protected E2EE serialization", async () => {
   const { router, sent } = fixture();
   await router.forwardRegistryNotification({

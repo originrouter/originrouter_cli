@@ -49,6 +49,7 @@ export function mapClaudeSdkMessage(message) {
       type: "agent.session_id",
       provider: "claude",
       sessionId: message.session_id,
+      model: safeText(message.model, 128),
     });
     events.push(activity(message, "session_metadata", "Claude session initialized", "", {
       tools: (message.tools || []).slice(0, 128),
@@ -157,10 +158,13 @@ export function mapClaudeSdkMessage(message) {
       });
     }
     events.push({
-      type: "agent.task.completed",
+      type: message.is_error ? "agent.task.failed" : "agent.task.completed",
       provider: "claude",
       subtype: message.subtype,
       result: safeText(message.result || message.errors?.join("\n"), 16_384),
+      error: message.is_error
+        ? safeText(message.result || message.errors?.join("\n") || "Claude request failed", 2048)
+        : undefined,
       isError: Boolean(message.is_error),
       stopReason: safeText(message.stop_reason, 128),
       durationMs: Number(message.duration_ms || 0),

@@ -104,6 +104,21 @@ export function createSerialAgentEventQueue(handler) {
   };
 }
 
+export function buildCodexCollaborationMode(mode, model) {
+  const resolvedModel = String(model || "").trim();
+  if (!resolvedModel) {
+    throw new Error("Codex collaboration mode requires a resolved model.");
+  }
+  return {
+    mode,
+    settings: {
+      model: resolvedModel,
+      reasoning_effort: null,
+      developer_instructions: null,
+    },
+  };
+}
+
 function extractOptions(args) {
   const options = {};
   const prompt = [];
@@ -346,7 +361,7 @@ export async function runCodexAppServerSession(rawArgs) {
   let relayViaDaemon = false;
   ({ providerResult, proxy: originrouterCodingProxy } =
     await protectOriginrouterCodingEnv("codex", providerResult, { stateDir }));
-  const model =
+  let model =
     options.model ||
     providerResult.env.OPENAI_MODEL ||
     providerResult.provider?.model;
@@ -811,14 +826,7 @@ export async function runCodexAppServerSession(rawArgs) {
     const result = await client.startTurn({
       threadId,
       input: textInput(text),
-      collaborationMode: {
-        mode: currentMode,
-        settings: {
-          model,
-          reasoning_effort: null,
-          developer_instructions: null,
-        },
-      },
+      collaborationMode: buildCodexCollaborationMode(currentMode, model),
     });
     currentTurnId = result?.turn?.id || currentTurnId;
     return true;
@@ -919,14 +927,7 @@ export async function runCodexAppServerSession(rawArgs) {
         return false;
       await client.updateThreadSettings({
         threadId,
-        collaborationMode: {
-          mode,
-          settings: {
-            model,
-            reasoning_effort: null,
-            developer_instructions: null,
-          },
-        },
+        collaborationMode: buildCodexCollaborationMode(mode, model),
       });
       currentMode = mode;
       await reportMode(payload.requestId || null);
@@ -1033,6 +1034,13 @@ export async function runCodexAppServerSession(rawArgs) {
     threadId = thread?.thread?.id;
     if (!threadId)
       throw new Error("Codex app-server did not return a thread id.");
+    // Codex may select its configured default model when thread/start omits
+    // one. Collaboration-mode settings require that resolved model to be an
+    // explicit string, so retain the value returned by the App Server before
+    // issuing thread/settings/update or turn/start.
+    model = model || thread?.model || thread?.thread?.model;
+    if (!model)
+      throw new Error("Codex app-server did not return a resolved model.");
     await refreshTranscriptPath();
 
     await send("session.started", {
@@ -1055,15 +1063,35 @@ export async function runCodexAppServerSession(rawArgs) {
         relayViaDaemon = connected;
       },
       onCommand: async (payload) => {
-        const applied = await handleRemoteEvent(payload);
-        if (payload?.type === "agent.message") {
+        try {
+          const applied = await handleRemoteEvent(payload);
+          if (payload?.type === "agent.message") {
+            await localAgentBridge?.sendEvent({
+              type: "agent.message.result",
+              messageId: payload.messageId || payload.commandId,
+              accepted: applied !== false,
+            });
+          }
+          return applied;
+        } catch (error) {
+          const reason = String(error?.code || error?.message || "agent_command_failed")
+            .slice(0, 512);
           await localAgentBridge?.sendEvent({
-            type: "agent.message.result",
-            messageId: payload.messageId || payload.commandId,
-            accepted: applied !== false,
+            type: "agent.task.failed",
+            commandType: String(payload?.type || "unknown").slice(0, 64),
+            messageId: payload?.messageId || payload?.commandId,
+            error: reason,
           });
+          if (payload?.type === "agent.message") {
+            await localAgentBridge?.sendEvent({
+              type: "agent.message.result",
+              messageId: payload.messageId || payload.commandId,
+              accepted: false,
+              reason,
+            });
+          }
+          return false;
         }
-        return applied;
       },
     });
     relayViaDaemon = await localAgentBridge.start({

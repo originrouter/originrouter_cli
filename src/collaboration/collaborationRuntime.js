@@ -9,6 +9,7 @@ import {
 
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "expired"]);
 const COMPLETE_EVENTS = new Set(["agent.task.complete", "agent.task.completed"]);
+const FAILED_EVENTS = new Set(["agent.task.failed", "agent.task.aborted"]);
 const FATAL_DELIVERY_CODES = new Set([
   "COLLABORATION_ASSIGNMENT_CONFLICT",
   "COLLABORATION_FENCING_CONFLICT",
@@ -123,9 +124,47 @@ export class CollaborationRuntime {
   }
 
   async cancel(runId) {
+    const before = this.store.getRun(runId);
     const run = this.coordinator.cancel(runId);
     void this.syncRun(runId);
-    for (const [role, agent] of Object.entries(run.agents || {})) {
+    const remoteCancellations = [];
+    for (const [role, agent] of Object.entries(before?.agents || {})) {
+      const remote = agent.device_id !== this.deviceId && agent.device_id !== "local";
+      if (remote && agent.current_task_id && this.relayClient) {
+        const task = before.tasks?.find((item) => item.task_id === agent.current_task_id);
+        const assignmentId = compactId(
+          before.template_id === ADAPTIVE_TEMPLATE_ID
+            ? `assign-${before.run_id}-${role}-${task?.task_key || agent.current_task_id}`
+            : `assign-${before.run_id}-${role}`,
+          96,
+        );
+        const deliveryId = compactId(
+          `cancel-${before.run_id}-${role}-${agent.fencing_token || 0}`,
+          96,
+        );
+        remoteCancellations.push(
+          this.sendRemoteDurable("collaboration.remote.cancel", {
+            protocolVersion: "1",
+            sourceDeviceId: this.deviceId,
+            targetDeviceId: agent.device_id,
+            assignmentId,
+            runId: before.run_id,
+            taskId: agent.current_task_id,
+            role,
+            attempt: agent.attempt,
+            fencingToken: agent.fencing_token,
+            reason: "cancelled",
+            deliveryId,
+          }, {
+            outboxId: `cancel:${deliveryId}`,
+          }).catch(() => null),
+        );
+        this.store.updateAgent(runId, role, {
+          status: "stopping",
+          currentTaskId: "",
+        });
+        continue;
+      }
       if (!agent.originrouter_session_id) continue;
       try {
         this.registry.enqueueCommand(agent.originrouter_session_id, {
@@ -138,6 +177,7 @@ export class CollaborationRuntime {
         currentTaskId: "",
       });
     }
+    await Promise.all(remoteCancellations);
     return this.store.getRun(runId);
   }
 
@@ -437,6 +477,13 @@ export class CollaborationRuntime {
       ttlMs: this.leaseTtlMs,
     });
     const event = notification.payload || {};
+    if (FAILED_EVENTS.has(event.type)) {
+      const error = new Error(safeText(event.error || event.reason, 2048)
+        || "Collaboration Agent command failed.");
+      error.code = safeText(event.code, 96) || "COLLABORATION_AGENT_COMMAND_FAILED";
+      await this.fail(binding.run_id, error);
+      return;
+    }
     if (event.type === "agent.usage") {
       const usageId = `usage-${notification.sessionId}-${event.eventId || event.localSequence}`;
       const usage = this.store.recordUsage(binding.run_id, {
@@ -619,6 +666,8 @@ export class CollaborationRuntime {
     }
     if (payload.type === "collaboration.remote.cancel") {
       if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      const budgetExhausted = safeText(payload.reason, 96) === "budget_exhausted";
+      if (!budgetExhausted) this.store.recordRemoteCancellation(payload);
       const assignment = this.store.getRemoteAssignment(payload.assignmentId);
       if (!assignment || assignment.run_id !== payload.runId) return true;
       if (payload.fencingToken != null
@@ -626,12 +675,14 @@ export class CollaborationRuntime {
       if (assignment.originrouter_session_id) {
         try {
           this.registry.enqueueCommand(assignment.originrouter_session_id, {
-            type: "terminal.interrupt",
+            type: budgetExhausted ? "terminal.interrupt" : "session.stop",
             sessionId: assignment.originrouter_session_id,
           });
         } catch {}
       }
-      this.store.updateRemoteAssignment(assignment.assignment_id, { status: "budget_exhausted" });
+      this.store.updateRemoteAssignment(assignment.assignment_id, {
+        status: budgetExhausted ? "budget_exhausted" : "cancelled",
+      });
       return true;
     }
     if (payload.type === "collaboration.remote.error") {
@@ -655,6 +706,7 @@ export class CollaborationRuntime {
     if (safeText(payload.sourceDeviceId, 191) === this.deviceId) throw new Error("invalid collaboration source device");
     const prompt = safeText(payload.prompt, 32_768);
     if (!prompt) throw new Error("remote collaboration prompt is required");
+    if (this.store.isRemoteAssignmentCancelled(payload)) return;
     const accepted = this.store.upsertRemoteAssignment({
       assignmentId: payload.assignmentId,
       runId: payload.runId,
@@ -684,6 +736,11 @@ export class CollaborationRuntime {
     ));
     if (!active) {
       sessionId = compactId(`collab-remote-${assignment.role}-${randomUUID()}`);
+      this.relayClient?.bindRoute?.(sessionId, [
+        assignment.assignment_id,
+        assignment.run_id,
+        assignment.source_device_id,
+      ]);
       const conversationId = assignment.conversation_id
         || compactId(`remote-${assignment.run_id}-${assignment.role}`, 96);
       const launch = await this.supervisor.start({
@@ -711,6 +768,18 @@ export class CollaborationRuntime {
       });
       await this.waitForSession(launch.sessionId);
       active = true;
+    }
+    this.relayClient?.bindRoute?.(sessionId, [
+      assignment.assignment_id,
+      assignment.run_id,
+      assignment.source_device_id,
+    ]);
+    if (this.store.isRemoteAssignmentCancelled(assignment)) {
+      try {
+        this.registry.enqueueCommand(sessionId, { type: "session.stop", sessionId });
+      } catch {}
+      this.store.updateRemoteAssignment(assignment.assignment_id, { status: "cancelled" });
+      return;
     }
     if (!active) throw new Error("remote collaboration Agent did not become ready");
     this.registry.enqueueCommand(sessionId, {
@@ -747,6 +816,28 @@ export class CollaborationRuntime {
       ttlMs: this.leaseTtlMs,
     });
     const event = notification.payload || {};
+    if (FAILED_EVENTS.has(event.type)) {
+      const message = safeText(event.error || event.reason, 2048)
+        || "Remote collaboration Agent command failed.";
+      this.store.updateRemoteAssignment(assignment.assignment_id, { status: "failed" });
+      await this.sendRemoteDurable("collaboration.remote.error", {
+        protocolVersion: "1",
+        sourceDeviceId: this.deviceId,
+        targetDeviceId: assignment.source_device_id,
+        assignmentId: assignment.assignment_id,
+        runId: assignment.run_id,
+        taskId: assignment.task_id,
+        role: assignment.role,
+        attempt: assignment.attempt,
+        fencingToken: assignment.fencing_token,
+        deliveryId: compactId(`failed-${assignment.assignment_id}-${randomUUID()}`, 96),
+        code: safeText(event.code, 96) || "COLLABORATION_AGENT_COMMAND_FAILED",
+        message,
+      }, {
+        outboxId: `error:${compactId(`${assignment.assignment_id}-${assignment.fencing_token}-command`, 160)}`,
+      });
+      return;
+    }
     if (event.type === "agent.usage") {
       const usageId = `${notification.sessionId}-${event.eventId || event.localSequence}`;
       await this.sendRemoteDurable("collaboration.remote.usage", {

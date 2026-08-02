@@ -216,6 +216,22 @@ export class DeviceE2eeRelayTransport {
     return cache;
   }
 
+  bindRoute(routeKey, relatedKeys = []) {
+    const key = text(routeKey);
+    if (!key) return false;
+    const candidates = Array.isArray(relatedKeys) ? relatedKeys : [relatedKeys];
+    const sessionId = candidates
+      .map(text)
+      .filter(Boolean)
+      .map((candidate) => this.routes.get(candidate))
+      .find((candidate) => candidate && this.sessions.has(candidate));
+    if (!sessionId) return false;
+    this.routes.delete(key);
+    this.routes.set(key, sessionId);
+    this._pruneRoutes();
+    return true;
+  }
+
   handleInbound(envelope) {
     const operation = this.inboundTail.then(() =>
       this._handleInboundSerial(envelope));

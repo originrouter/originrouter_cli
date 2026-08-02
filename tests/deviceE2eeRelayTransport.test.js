@@ -62,6 +62,36 @@ assert.equal(sent[0].protocol, "e2ee-v2");
 assert.equal(JSON.stringify(sent[0]).includes("secret stream"), false);
 const opened = appSession.open(sent[0]);
 assert.equal(opened.payload.event.text, "secret stream");
+
+const inboundCollaboration = appSession.seal("collaboration.remote.dispatch", {
+  protocolVersion: "1",
+  sourceDeviceId: "app-device",
+  targetDeviceId: "cli-device",
+  assignmentId: "assignment-inbound",
+  runId: "run-inbound",
+  taskId: "task-inbound",
+  role: "worker",
+  prompt: "private inbound objective",
+}, { routing: {
+  directory_head: deviceE2eeDirectoryHead(cachedDirectory),
+} });
+assert.equal(
+  (await transport.handleInbound(inboundCollaboration)).assignmentId,
+  "assignment-inbound",
+);
+assert.equal(
+  transport.bindRoute("managed-session-inbound", ["assignment-inbound"]),
+  true,
+);
+await transport.send("agent.stream.event", {
+  sessionId: "managed-session-inbound",
+  event: { text: "bound collaboration stream" },
+});
+assert.equal(
+  appSession.open(sent.at(-1)).payload.event.text,
+  "bound collaboration stream",
+);
+assert.equal(transport.bindRoute("orphan-session", ["missing-assignment"]), false);
 assert.equal(transport.rejectsPlaintext({
   type: "agent.message",
   message: "must reject",
@@ -77,13 +107,13 @@ await transport.send("collaboration.remote.dispatch", {
   role: "worker",
   prompt: "private collaboration objective",
 });
-assert.equal(sent.length, 2);
-assert.equal(sent[1].protocol, "e2ee-v2");
-assert.equal(JSON.stringify(sent[1]).includes("private collaboration objective"), false);
+assert.equal(sent.length, 3);
+assert.equal(sent[2].protocol, "e2ee-v2");
+assert.equal(JSON.stringify(sent[2]).includes("private collaboration objective"), false);
 const acceptedCollaboration = DeviceE2eeSession.accept({
   local: app,
   peer: cli.public_identity,
-  firstEnvelope: sent[1],
+  firstEnvelope: sent[2],
 });
 assert.equal(
   acceptedCollaboration.firstPayload.payload.prompt,
@@ -103,9 +133,9 @@ await transport.send("collaboration.remote.dispatch", {
   role: "worker",
   prompt: "second private objective",
 });
-assert.notEqual(sent[1].session_id, sent[2].session_id);
-assert.equal(sent[1].sequence, 0);
+assert.notEqual(sent[2].session_id, sent[3].session_id);
 assert.equal(sent[2].sequence, 0);
+assert.equal(sent[3].sequence, 0);
 
 const deferred = () => {
   let resolve;

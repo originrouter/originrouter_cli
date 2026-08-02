@@ -274,6 +274,7 @@ export async function runClaudeSdkSession(rawArgs) {
   let relayViaDaemon = false;
   ({ providerResult, proxy: originrouterCodingProxy } =
     await protectOriginrouterCodingEnv("claude", providerResult, { stateDir }));
+  let model = options.model || providerResult.provider?.model;
   const messageQueue = new AsyncMessageQueue();
   const sessionTitle = String(options.title || "Claude session")
     .trim()
@@ -347,7 +348,7 @@ export async function runClaudeSdkSession(rawArgs) {
         workspaceName: basename(cwd),
         runtime: "claude-sdk",
         provider: providerResult.provider?.name,
-        model: options.model || providerResult.provider?.model,
+        model,
         permissionProfile: autonomyProfile,
         ...activitySnapshot,
       },
@@ -881,7 +882,7 @@ export async function runClaudeSdkSession(rawArgs) {
         onElicitation,
         permissionMode: currentMode,
         allowDangerouslySkipPermissions: true,
-        model: options.model || providerResult.provider?.model,
+        model,
         fallbackModel:
           options.fallbackModel || providerResult.provider?.smallFastModel,
         includeHookEvents: true,
@@ -898,15 +899,35 @@ export async function runClaudeSdkSession(rawArgs) {
         relayViaDaemon = connected;
       },
       onCommand: async (payload) => {
-        const applied = await handleRemoteEvent(payload);
-        if (payload?.type === "agent.message") {
+        try {
+          const applied = await handleRemoteEvent(payload);
+          if (payload?.type === "agent.message") {
+            await localAgentBridge?.sendEvent({
+              type: "agent.message.result",
+              messageId: payload.messageId || payload.commandId,
+              accepted: applied !== false,
+            });
+          }
+          return applied;
+        } catch (error) {
+          const reason = String(error?.code || error?.message || "agent_command_failed")
+            .slice(0, 512);
           await localAgentBridge?.sendEvent({
-            type: "agent.message.result",
-            messageId: payload.messageId || payload.commandId,
-            accepted: applied !== false,
+            type: "agent.task.failed",
+            commandType: String(payload?.type || "unknown").slice(0, 64),
+            messageId: payload?.messageId || payload?.commandId,
+            error: reason,
           });
+          if (payload?.type === "agent.message") {
+            await localAgentBridge?.sendEvent({
+              type: "agent.message.result",
+              messageId: payload.messageId || payload.commandId,
+              accepted: false,
+              reason,
+            });
+          }
+          return false;
         }
-        return applied;
       },
     });
     relayViaDaemon = await localAgentBridge.start({
@@ -924,7 +945,7 @@ export async function runClaudeSdkSession(rawArgs) {
       nativeSessionId: claudeSessionId,
       runtime: "claude-sdk",
       provider: providerResult.provider?.name,
-      model: options.model || providerResult.provider?.model,
+      model,
       permissionProfile: currentMode,
       startedBy: "local-sdk",
       mode: currentMode,
@@ -952,16 +973,18 @@ export async function runClaudeSdkSession(rawArgs) {
       for (const event of mapClaudeSdkMessage(message)) {
         if (event.type === "agent.session_id" && event.sessionId) {
           claudeSessionId = event.sessionId;
+          model = model || event.model;
           transcriptPath = claudeTranscriptPathForSession(cwd, claudeSessionId);
           await localAgentBridge?.update({
             nativeSessionId: claudeSessionId,
             transcriptPath,
+            model,
           });
           await syncCatalog("running");
         }
         await sendAgentEvent(applyConfiguredPricing(event, {
           provider: providerResult.provider,
-          model: options.model || providerResult.routes?.main?.model || providerResult.provider?.model,
+          model: model || providerResult.routes?.main?.model,
           source: providerResult.source,
         }));
       }
@@ -969,6 +992,10 @@ export async function runClaudeSdkSession(rawArgs) {
     if (!stopped) await stopSession(null);
   } catch (error) {
     if (stopped) return;
+    await localAgentBridge?.sendEvent({
+      type: "agent.task.failed",
+      error: String(error?.code || error?.message || "claude_sdk_failed").slice(0, 2048),
+    });
     await send("session.error", { message: error.message });
     await report("session.error", { message: error.message });
     stopped = true;

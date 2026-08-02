@@ -197,6 +197,26 @@ const sdkEvents = mapClaudeSdkMessage({
 assert.equal(sdkEvents.find((event) => event.type === "agent.text")?.text, "Checking files.");
 assert.equal(sdkEvents.find((event) => event.type === "agent.tool_call.start")?.callId, "toolu_sdk_1");
 
+const sdkInitEvents = mapClaudeSdkMessage({
+  type: "system",
+  subtype: "init",
+  session_id: "claude-default-model-session",
+  model: "claude-sonnet-default",
+});
+assert.equal(
+  sdkInitEvents.find((event) => event.type === "agent.session_id")?.model,
+  "claude-sonnet-default",
+);
+
+const sdkFailedResult = mapClaudeSdkMessage({
+  type: "result",
+  subtype: "error_during_execution",
+  is_error: true,
+  result: "Claude request failed before completion",
+});
+assert.equal(sdkFailedResult.at(-1)?.type, "agent.task.failed");
+assert.match(sdkFailedResult.at(-1)?.error, /failed before completion/);
+
 const sdkStateEvents = mapClaudeSdkMessage({
   type: "system",
   subtype: "session_state_changed",

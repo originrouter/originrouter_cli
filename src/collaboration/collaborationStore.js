@@ -272,6 +272,17 @@ export class CollaborationStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS collaboration_remote_cancellations (
+        assignment_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        attempt INTEGER NOT NULL DEFAULT 0,
+        fencing_token INTEGER NOT NULL DEFAULT 0,
+        reason TEXT NOT NULL DEFAULT 'cancelled',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
       CREATE TABLE IF NOT EXISTS collaboration_outbox (
         outbox_id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL DEFAULT '',
@@ -913,6 +924,83 @@ export class CollaborationStore {
     return this.db.prepare(
       "SELECT * FROM collaboration_remote_assignments WHERE assignment_id = ?",
     ).get(safeText(assignmentId, 195)) || null;
+  }
+
+  recordRemoteCancellation(input = {}) {
+    const assignmentId = safeText(input.assignmentId ?? input.assignment_id, 195);
+    const runId = safeText(input.runId ?? input.run_id, 195);
+    const taskId = safeText(input.taskId ?? input.task_id, 195);
+    const role = safeText(input.role, 32);
+    if (!assignmentId || !runId || !taskId || !role) {
+      throw new Error("invalid remote collaboration cancellation");
+    }
+    const attempt = Math.max(0, Math.floor(Number(input.attempt) || 0));
+    const fencingToken = Math.max(0, Math.floor(Number(
+      input.fencingToken ?? input.fencing_token,
+    ) || 0));
+    const reason = safeText(input.reason, 96) || "cancelled";
+    const existing = this.getRemoteCancellation(assignmentId);
+    if (existing && (
+      existing.run_id !== runId
+      || existing.task_id !== taskId
+      || existing.role !== role
+    )) {
+      const error = new Error("remote collaboration cancellation identity conflict");
+      error.code = "COLLABORATION_CANCELLATION_CONFLICT";
+      throw error;
+    }
+    const now = iso(this.now());
+    this.db.prepare(`
+      INSERT INTO collaboration_remote_cancellations(
+        assignment_id, run_id, task_id, role, attempt, fencing_token,
+        reason, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(assignment_id) DO UPDATE SET
+        attempt = CASE
+          WHEN excluded.fencing_token >= collaboration_remote_cancellations.fencing_token
+          THEN excluded.attempt ELSE collaboration_remote_cancellations.attempt END,
+        fencing_token = MAX(
+          collaboration_remote_cancellations.fencing_token,
+          excluded.fencing_token
+        ),
+        reason = CASE
+          WHEN excluded.fencing_token >= collaboration_remote_cancellations.fencing_token
+          THEN excluded.reason ELSE collaboration_remote_cancellations.reason END,
+        updated_at = excluded.updated_at
+    `).run(
+      assignmentId,
+      runId,
+      taskId,
+      role,
+      attempt,
+      fencingToken,
+      reason,
+      now,
+      now,
+    );
+    return this.getRemoteCancellation(assignmentId);
+  }
+
+  getRemoteCancellation(assignmentId) {
+    return this.db.prepare(
+      "SELECT * FROM collaboration_remote_cancellations WHERE assignment_id = ?",
+    ).get(safeText(assignmentId, 195)) || null;
+  }
+
+  isRemoteAssignmentCancelled(input = {}) {
+    const cancellation = this.getRemoteCancellation(
+      input.assignmentId ?? input.assignment_id,
+    );
+    if (!cancellation) return false;
+    if (cancellation.run_id !== safeText(input.runId ?? input.run_id, 195)) return false;
+    if (cancellation.role !== safeText(input.role, 32)) return false;
+    const fencingToken = Math.max(0, Math.floor(Number(
+      input.fencingToken ?? input.fencing_token,
+    ) || 0));
+    const attempt = Math.max(0, Math.floor(Number(input.attempt) || 0));
+    if (cancellation.fencing_token > fencingToken) return true;
+    return cancellation.fencing_token === fencingToken
+      && cancellation.attempt >= attempt;
   }
 
   findRemoteAssignmentBySession(sessionId) {

@@ -223,6 +223,55 @@ const legacyUpgraded = store.upsertRemoteAssignment({
 assert.equal(legacyUpgraded.stale, false);
 assert.equal(legacyUpgraded.assignment.fencing_mode, "strict");
 
+const cancelledBeforeDispatch = {
+  assignmentId: "assignment-cancel-before-dispatch",
+  runId: "run-cancel-before-dispatch",
+  taskId: "task-cancel-before-dispatch",
+  role: "worker",
+  attempt: 1,
+  fencingToken: 4,
+  reason: "cancelled",
+};
+store.recordRemoteCancellation(cancelledBeforeDispatch);
+assert.equal(store.isRemoteAssignmentCancelled(cancelledBeforeDispatch), true);
+assert.equal(store.isRemoteAssignmentCancelled({
+  ...cancelledBeforeDispatch,
+  attempt: 2,
+  fencingToken: 5,
+}), false);
+assert.throws(
+  () => store.recordRemoteCancellation({
+    ...cancelledBeforeDispatch,
+    runId: "conflicting-cancel-run",
+  }),
+  /cancellation identity conflict/,
+);
+
+await runtime.handleRelayEvent({
+  type: "collaboration.remote.cancel",
+  protocolVersion: "1",
+  sourceDeviceId: "device-b",
+  targetDeviceId: "device-a",
+  deliveryId: "cancel-before-dispatch",
+  ...cancelledBeforeDispatch,
+});
+await runtime.handleRelayEvent({
+  type: "collaboration.remote.dispatch",
+  protocolVersion: "1",
+  sourceDeviceId: "device-b",
+  targetDeviceId: "device-a",
+  deliveryId: "late-dispatch-after-cancel",
+  runtime: "codex",
+  workspaceId: "workspace-a",
+  permissionProfile: "manual",
+  prompt: "This late dispatch must not launch an Agent.",
+  ...cancelledBeforeDispatch,
+});
+assert.equal(
+  store.getRemoteAssignment(cancelledBeforeDispatch.assignmentId),
+  null,
+);
+
 const run = runtime.coordinator.create({
   objective: "Validate fencing acceptance.",
   agents: {
@@ -278,4 +327,85 @@ assert.equal(
 
 runtime.close();
 store.close();
+
+const cancelStateDir = mkdtempSync(join(tmpdir(), "originrouter-collaboration-cancel-"));
+const cancelStore = new CollaborationStore({ stateDir: cancelStateDir });
+const cancelDeliveries = [];
+const cancelRuntime = runtimeFor(cancelStore, {
+  async send(type, payload) {
+    cancelDeliveries.push({ type, payload });
+    return { accepted: true, queued: false };
+  },
+});
+const cancelRun = cancelRuntime.coordinator.create({
+  objective: "Cancel a remote collaboration before it returns.",
+  agents: {
+    lead: {
+      runtime: "codex",
+      device_id: "device-b",
+      workspace_id: "workspace-b",
+      responsibilities: ["research"],
+    },
+    worker: {
+      runtime: "claude",
+      device_id: "device-b",
+      workspace_id: "workspace-b",
+      responsibilities: ["implement"],
+    },
+  },
+});
+await cancelRuntime.start(cancelRun.run_id);
+await new Promise((resolve) => setImmediate(resolve));
+assert.ok(cancelDeliveries.some(
+  (item) => item.type === "collaboration.remote.dispatch",
+));
+await cancelRuntime.cancel(cancelRun.run_id);
+const remoteCancel = cancelDeliveries.find(
+  (item) => item.type === "collaboration.remote.cancel",
+);
+assert.ok(remoteCancel, "remote cancellation must be sent before a session id is returned");
+assert.equal(remoteCancel.payload.assignmentId, `assign-${cancelRun.run_id}-lead`);
+assert.equal(cancelStore.getRun(cancelRun.run_id).state, "cancelled");
+cancelRuntime.close();
+cancelStore.close();
+
+const failureStateDir = mkdtempSync(join(tmpdir(), "originrouter-collaboration-failure-"));
+const failureStore = new CollaborationStore({ stateDir: failureStateDir });
+const failureDeliveries = [];
+const failureRuntime = runtimeFor(failureStore, {
+  async send(type, payload) {
+    failureDeliveries.push({ type, payload });
+    return { accepted: true, queued: false };
+  },
+});
+const remoteFailure = failureStore.upsertRemoteAssignment({
+  assignmentId: "assignment-command-failure",
+  runId: "run-command-failure",
+  taskId: "task-command-failure",
+  role: "worker",
+  phase: "plan_design",
+  sourceDeviceId: "device-b",
+  targetDeviceId: "device-a",
+  runtime: "codex",
+  workspaceId: "workspace-a",
+  attempt: 1,
+  fencingToken: 1,
+  deliveryId: "delivery-command-failure",
+}).assignment;
+await failureRuntime.handleRemoteAgentNotification(remoteFailure, {
+  type: "event",
+  sessionId: "session-command-failure",
+  payload: {
+    type: "agent.task.failed",
+    error: "codex app-server rejected turn/start",
+  },
+});
+const remoteError = failureDeliveries.find(
+  (item) => item.type === "collaboration.remote.error",
+);
+assert.ok(remoteError, "managed Agent command failures must reach the coordinator");
+assert.equal(remoteError.payload.code, "COLLABORATION_AGENT_COMMAND_FAILED");
+assert.match(remoteError.payload.message, /turn\/start/);
+failureRuntime.close();
+failureStore.close();
 console.log("collaboration reliability tests passed");

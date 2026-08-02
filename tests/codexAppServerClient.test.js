@@ -15,13 +15,31 @@
 import assert from "node:assert/strict";
 import { CodexAppServerClient } from "../src/adapters/codex/appServerClient.js";
 import { mapCodexApprovalRequest } from "../src/adapters/codex/eventMapper.js";
-import { createSerialAgentEventQueue } from "../src/runtime/codexAppServerSession.js";
+import {
+  buildCodexCollaborationMode,
+  createSerialAgentEventQueue,
+} from "../src/runtime/codexAppServerSession.js";
 import {
   permissionEventToInteraction,
   INTERACTION_SOURCES,
 } from "../src/runtime/agentInteractionContract.js";
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+{
+  assert.deepEqual(buildCodexCollaborationMode("plan", "gpt-5.4"), {
+    mode: "plan",
+    settings: {
+      model: "gpt-5.4",
+      reasoning_effort: null,
+      developer_instructions: null,
+    },
+  });
+  assert.throws(
+    () => buildCodexCollaborationMode("plan", undefined),
+    /requires a resolved model/,
+  );
+}
 
 {
   const delivered = [];

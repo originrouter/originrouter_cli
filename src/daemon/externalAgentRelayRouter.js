@@ -30,9 +30,10 @@ function withoutUndefined(value) {
 }
 
 export class ExternalAgentRelayRouter {
-  constructor({ registry, relayClient }) {
+  constructor({ registry, relayClient, targetDeviceForSession = null }) {
     this.registry = registry;
     this.relayClient = relayClient;
+    this.targetDeviceForSession = targetDeviceForSession;
   }
 
   async handle(payload) {
@@ -83,17 +84,22 @@ export class ExternalAgentRelayRouter {
       notification.sessionId || event?.sessionId || "",
     ).slice(0, 64);
     if (!sessionId || !event || typeof event !== "object") return false;
+    const targetDeviceId = String(
+      this.targetDeviceForSession?.(sessionId) || "",
+    ).slice(0, 191);
+    const route = targetDeviceId ? { targetDeviceId } : {};
 
     if (DIRECT_APP_EVENT_TYPES.has(event.type)) {
       await this.relayClient.send(
         event.type,
-        withoutUndefined({ ...event, sessionId }),
+        withoutUndefined({ ...event, sessionId, ...route }),
       );
       return true;
     }
     const { sessionId: _eventSessionId, ...eventWithoutSessionId } = event;
     await this.relayClient.send("agent.stream.event", {
       sessionId,
+      ...route,
       event: withoutUndefined(eventWithoutSessionId),
     });
     return true;
