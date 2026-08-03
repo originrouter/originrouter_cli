@@ -40,8 +40,17 @@ function canonicalValue(value) {
       Object.keys(value).sort().map((key) => [key, canonicalValue(value[key])]),
     );
   }
-  if (value === null || typeof value === "string" || typeof value === "boolean"
-      || Number.isSafeInteger(value)) return value;
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return value;
+  }
+  // Agent event payloads legitimately contain finite decimal values such as
+  // elapsed seconds and model costs. JSON supports them, and JSON.stringify
+  // gives both sides of the Node-based E2EE protocol the same representation.
+  // Continue rejecting NaN and infinities because JSON would silently turn
+  // those values into null and change the signed payload's meaning.
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Object.is(value, -0) ? 0 : value;
+  }
   throw new TypeError(`unsupported canonical JSON value: ${typeof value}`);
 }
 

@@ -208,3 +208,24 @@ test("daemon removes undefined fields before protected E2EE serialization", asyn
     },
   });
 });
+
+test("daemon forwards finite decimal Agent metrics through E2EE serialization", async () => {
+  const { router, sent } = fixture();
+  await router.forwardRegistryNotification({
+    type: "event",
+    sessionId: "session-1",
+    payload: {
+      type: "agent.usage",
+      eventId: "usage-decimal",
+      costUsd: 0.0125,
+      elapsedSeconds: 1.75,
+    },
+  });
+  assert.equal(sent[0].payload.event.costUsd, 0.0125);
+  assert.equal(sent[0].payload.event.elapsedSeconds, 1.75);
+});
+
+test("canonical E2EE JSON still rejects non-finite numbers", () => {
+  assert.throws(() => canonicalJson({ value: Number.NaN }), /unsupported canonical JSON value/);
+  assert.throws(() => canonicalJson({ value: Number.POSITIVE_INFINITY }), /unsupported canonical JSON value/);
+});

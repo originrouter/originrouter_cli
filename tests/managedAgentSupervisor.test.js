@@ -150,6 +150,21 @@ assert.equal(inheritedLaunch.workspacePath, inheritedChild);
 assert.notEqual(inheritedLaunch.workspaceId, workspace.workspace_id);
 assert.equal(spawns.at(-1).options.cwd, inheritedChild);
 assert.equal(catalog.getWorkspace(inheritedChild, { deviceId: "device-1" }).trusted, true);
+
+await supervisor.start({
+  launchId: "launch-cancelled",
+  sessionId: "session-cancelled",
+  conversationId: "conversation-cancelled",
+  runId: "run-cancelled",
+  agentType: "claude",
+  workspaceId: workspace.workspace_id,
+});
+catalog.finishSession("session-cancelled", { status: "stopped" });
+child.emit("exit", 0, null);
+const cancelledRun = catalog
+  .getConversation("conversation-cancelled")
+  .runs.find((item) => item.originrouter_session_id === "session-cancelled");
+assert.equal(cancelledRun.status, "stopped");
 catalog.close();
 
 console.log("managed Agent supervisor tests ok");

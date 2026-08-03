@@ -250,7 +250,7 @@ Examples:
     --model anthropic.claude-3-5-sonnet-20241022-v2:0
 
 OriginRouter OAuth login:
-  originrouter login [--surety-url <url>] [--login-url <url>]
+  originrouter login [status] [--surety-url <url>] [--login-url <url>]
                      [--device-name <name>]
                      [--no-browser]
                      [--configure-agents|--keep-agent-routes|--no-agent-setup]
@@ -2061,6 +2061,10 @@ export async function main(argv) {
   }
 
   if (command === "login") {
+    if (args[0] === "status") {
+      await handleAuthCommand(["status"]);
+      return;
+    }
     await handleLogin(args);
     return;
   }

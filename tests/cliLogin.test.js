@@ -57,6 +57,24 @@ test("auth status displays the OAuth session without printing raw tokens", async
   }
 });
 
+test("login status is a read-only alias and never starts Agent route setup", async () => {
+  const home = mkdtempSync(join(tmpdir(), "originrouter-cli-login-status-"));
+  try {
+    writeCodingAuth(home, makeOAuthCredential({
+      deviceId: "device-login-status",
+      sessionId: "or_ses_login_status",
+    }));
+    const result = await runCli(home, ["login", "status"]);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /Logged in \(OriginRouter OAuth\)/);
+    assert.match(result.stdout, /device-login-status/);
+    assert.doesNotMatch(result.stdout, /Configure OriginRouter Cloud/);
+    assert.doesNotMatch(result.stdout, /Agent routes unchanged/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("help exposes the current auth surface only", async () => {
   const home = mkdtempSync(join(tmpdir(), "originrouter-cli-help-"));
   try {

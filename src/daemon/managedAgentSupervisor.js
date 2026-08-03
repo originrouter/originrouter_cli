@@ -298,8 +298,23 @@ export class ManagedAgentSupervisor {
       this.launches.delete(launchId);
     });
     child.once("exit", (code, signal) => {
+      const recordedRun = this.catalog
+        ?.getConversation?.(conversationId)
+        ?.runs?.find((item) => item.originrouter_session_id === sessionId);
+      const recordedStatus = safeText(recordedRun?.status, 32);
+      const activeStatuses = new Set([
+        "starting",
+        "running",
+        "waiting_approval",
+        "waiting_input",
+        "waiting_device",
+      ]);
       this.catalog?.finishSession(sessionId, {
-        status: code === 0 && !signal ? "completed" : "failed",
+        status: recordedStatus && !activeStatuses.has(recordedStatus)
+          ? recordedStatus
+          : code === 0 && !signal
+            ? "completed"
+            : "failed",
         exitCode: code,
         exitSignal: signal,
       });

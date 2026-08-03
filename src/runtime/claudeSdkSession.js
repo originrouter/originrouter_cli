@@ -83,6 +83,27 @@ const PLAN_APPROVAL_OPTIONS = Object.freeze([
   { id: "bypassPermissions", label: "Implement without further prompts" },
 ]);
 
+export function resolveClaudeSdkModelSelection(options = {}, providerResult = {}) {
+  const environment = providerResult.env || {};
+  const routes = providerResult.routes || {};
+  const provider = providerResult.provider || {};
+  const model =
+    options.model ||
+    environment.ANTHROPIC_MODEL ||
+    routes.main?.model ||
+    provider.model;
+  // ANTHROPIC_SMALL_FAST_MODEL is an auxiliary low-latency model used by
+  // Claude Code. It is not the Agent SDK's outage fallback model.
+  const fallbackModel = options.fallbackModel;
+  return {
+    model,
+    // Claude Agent SDK rejects identical main and fallback model values.
+    fallbackModel: fallbackModel && fallbackModel !== model
+      ? fallbackModel
+      : undefined,
+  };
+}
+
 function extractOriginRouterOptions(args) {
   const options = {};
   for (let index = 0; index < args.length; index += 1) {
@@ -274,7 +295,8 @@ export async function runClaudeSdkSession(rawArgs) {
   let relayViaDaemon = false;
   ({ providerResult, proxy: originrouterCodingProxy } =
     await protectOriginrouterCodingEnv("claude", providerResult, { stateDir }));
-  let model = options.model || providerResult.provider?.model;
+  const modelSelection = resolveClaudeSdkModelSelection(options, providerResult);
+  let model = modelSelection.model;
   const messageQueue = new AsyncMessageQueue();
   const sessionTitle = String(options.title || "Claude session")
     .trim()
@@ -534,12 +556,18 @@ export async function runClaudeSdkSession(rawArgs) {
         }),
     });
 
-  const stopSession = async (signal = null) => {
+  const stopSession = async (signal = null, { exitProcess = false } = {}) => {
     if (stopped) return;
     stopped = true;
     stopHeartbeat();
     abortController.abort();
     messageQueue.close();
+    if (typeof queryRef?.return === "function") {
+      await Promise.race([
+        queryRef.return().catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 500)),
+      ]);
+    }
     await interactions.cancelAll("session_stopped");
     await localAgentBridge?.close(signal ? "stopped" : "completed");
     localAgentBridge = null;
@@ -549,6 +577,12 @@ export async function runClaudeSdkSession(rawArgs) {
     await report("session.exited", { code: 0, signal });
     await syncCatalog(signal ? "stopped" : "completed");
     await runtimeReporter.flush();
+    if (exitProcess) {
+      // claude-sdk owns background handles that can survive an aborted async
+      // iterator. This command runs one managed session per process, so a
+      // remotely stopped session must also terminate its wrapper process.
+      setImmediate(() => process.exit(0));
+    }
   };
 
   const handleRemoteEvent = async (payload) => {
@@ -644,7 +678,7 @@ export async function runClaudeSdkSession(rawArgs) {
       return true;
     }
     if (payload.type === "session.stop") {
-      await stopSession("SIGTERM");
+      await stopSession("SIGTERM", { exitProcess: true });
       return true;
     }
     return false;
@@ -883,8 +917,7 @@ export async function runClaudeSdkSession(rawArgs) {
         permissionMode: currentMode,
         allowDangerouslySkipPermissions: true,
         model,
-        fallbackModel:
-          options.fallbackModel || providerResult.provider?.smallFastModel,
+        fallbackModel: modelSelection.fallbackModel,
         includeHookEvents: true,
         forwardSubagentText: true,
         ...(typeof options.resume === "string"
