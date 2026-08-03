@@ -706,6 +706,10 @@ async function captureSpawnEnv(env) {
   fakeChild.stdin = { writable: true, write() {} };
   const connectPromise = c.connect({
     env: { OPENAI_API_KEY: "test-key" },
+    configArgs: [
+      ["mcp_servers.originrouter.command", '"/usr/local/bin/node"'],
+      ["mcp_servers.originrouter.args", '["/cli","agent-mcp-server"]'],
+    ],
     modelProvider: {
       id: "originrouter_proxy",
       name: "OriginRouter Route",
@@ -726,6 +730,8 @@ async function captureSpawnEnv(env) {
   ]);
   assert.ok(capturedArgs.includes('model_providers.originrouter_proxy.base_url="http://127.0.0.1:40123/v1"'));
   assert.ok(capturedArgs.includes('model_providers.originrouter_proxy.wire_api="responses"'));
+  assert.ok(capturedArgs.includes('mcp_servers.originrouter.command="/usr/local/bin/node"'));
+  assert.ok(capturedArgs.includes('mcp_servers.originrouter.args=["/cli","agent-mcp-server"]'));
   assert.deepEqual(capturedArgs.slice(-2), ["--listen", "stdio://"]);
   c.disconnect();
 }

@@ -46,6 +46,8 @@ export const PROTECTED_DEVICE_MESSAGE_TYPES = new Set([
   "collaboration.remote.error",
   "collaboration.remote.usage",
   "collaboration.remote.cancel",
+  "collaboration.mcp.request",
+  "collaboration.mcp.response",
 ]);
 
 function text(value) {

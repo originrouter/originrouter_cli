@@ -106,7 +106,7 @@ export class CodexAppServerClient {
     this.serverRequestHandler = handler;
   }
 
-  async connect({ cwd = process.cwd(), env = process.env, modelProvider = null } = {}) {
+  async connect({ cwd = process.cwd(), env = process.env, modelProvider = null, configArgs = [] } = {}) {
     // Stage 8.0A: pass `--listen stdio://` to match happy's reference
     // (codexAppServerClient.ts:394). Pre-0.100 Codex CLIs never reach
     // this line because isCodexAppServerAvailable() returns false.
@@ -135,6 +135,10 @@ export class CodexAppServerClient {
       for (const [key, value] of config) {
         args.push("-c", `${key}=${JSON.stringify(String(value))}`);
       }
+    }
+    for (const [key, value] of Array.isArray(configArgs) ? configArgs : []) {
+      if (!key || value == null) continue;
+      args.push("-c", `${String(key)}=${String(value)}`);
     }
     args.push("--listen", "stdio://");
     this.child = this.spawnFn("codex", args, {

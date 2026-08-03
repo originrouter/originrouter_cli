@@ -50,6 +50,7 @@ import {
 } from "../relay/agentRelayPolicy.js";
 import { RelayClient } from "../relay/relayClient.js";
 import { LocalAgentBridgeClient } from "../local/localAgentBridgeClient.js";
+import { codexAgentGatewayConfigArgs } from "../mcp/agentGatewayConfig.js";
 import {
   buildInteractionRequest,
   INTERACTION_KINDS,
@@ -1012,6 +1013,9 @@ export async function runCodexAppServerSession(rawArgs) {
     await client.connect({
       cwd,
       env: { ...process.env, ...providerResult.env },
+      configArgs: String(options.runId || "").startsWith("acr_")
+        ? codexAgentGatewayConfigArgs(sessionId)
+        : [],
       modelProvider: providerResult.env.OPENAI_BASE_URL
         ? {
             id: "originrouter_proxy",

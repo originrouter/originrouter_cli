@@ -610,6 +610,47 @@ async function dispatch(ctx, req, res) {
     if (req.method === "GET" && pathname === "/agent/local/sessions") {
       return sendOk(res, { sessions: ctx.externalAgentRegistry.list() });
     }
+    if (req.method === "POST" && pathname === "/agent/local/mcp-gateway") {
+      if (!ctx.collaborationRuntime) {
+        return sendError(res, 503, "Agent MCP gateway unavailable", {
+          reason: "collaboration_mcp_unavailable",
+        });
+      }
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      const sessionId = String(body.session_id || "").trim().slice(0, 64);
+      try {
+        const result = await ctx.collaborationRuntime.handleMcpGatewayRequest({
+          sessionId,
+          action: body.action,
+          payload: body.payload || {},
+        });
+        if (body.action === "delegate" && result?.task_id) {
+          ctx.auditStore?.append(sessionId, {
+            category: "collaboration",
+            correlationId: result.task_id,
+            phase: "delegated",
+            actionKind: "agent_mcp_delegate",
+            title: "Agent delegated work through OriginRouter MCP",
+            summary: `Delegated to ${String(result.participant_id || "participant").slice(0, 32)}`,
+            risk: "normal",
+            outcome: result.state || "pending",
+            decisionSource: "agent_mcp_gateway",
+            tool: "originrouter.delegate_task",
+            commandPreview: "",
+            cwd: "",
+            target: String(result.participant_id || "").slice(0, 32),
+            detail: { task_id: result.task_id, state: result.state },
+            createdAt: new Date().toISOString(),
+          });
+        }
+        return sendOk(res, result);
+      } catch (error) {
+        return sendError(res, 409, error.message || "Agent MCP gateway request failed", {
+          reason: error.code || "collaboration_mcp_failed",
+        });
+      }
+    }
     if (pathname === "/collaboration/local/runs") {
       if (req.method === "GET") {
         const runs = ctx.collaborationStore.listRuns({ limit: url.searchParams.get("limit") })

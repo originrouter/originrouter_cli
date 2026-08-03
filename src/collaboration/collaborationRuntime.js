@@ -95,7 +95,221 @@ export class CollaborationRuntime {
     this.outboxFlush = Promise.resolve();
     this.outboxDeliveries = new Map();
     this.outboxRetryTimer = null;
+    this.mcpRequests = new Map();
     this.unsubscribe = registry?.subscribe?.((notification) => this.enqueue(notification)) || (() => {});
+  }
+
+  mcpBinding(sessionId) {
+    const local = this.store.findAgentBySession(sessionId);
+    if (local) {
+      const run = this.store.getRun(local.run_id, { includeMessages: false });
+      const agent = run?.agents?.[local.role];
+      return {
+        coordinator: true,
+        runId: local.run_id,
+        role: local.role,
+        taskId: agent?.current_task_id,
+        sourceDeviceId: this.deviceId,
+      };
+    }
+    const remote = this.store.findRemoteAssignmentBySession(sessionId);
+    if (remote) {
+      return {
+        coordinator: false,
+        runId: remote.run_id,
+        role: remote.role,
+        taskId: remote.task_id,
+        sourceDeviceId: this.deviceId,
+        coordinatorDeviceId: remote.source_device_id,
+      };
+    }
+    return null;
+  }
+
+  async handleMcpGatewayRequest({ sessionId, action, payload = {} } = {}) {
+    const binding = this.mcpBinding(safeText(sessionId, 64));
+    if (!binding?.runId || !binding?.role || !binding?.taskId) {
+      const error = new Error("This Agent session is not attached to an active collaboration task.");
+      error.code = "COLLABORATION_MCP_SESSION_UNAVAILABLE";
+      throw error;
+    }
+    const normalizedAction = safeText(action, 32);
+    if (!["list", "delegate", "status"].includes(normalizedAction)) {
+      const error = new Error("Unsupported Agent MCP gateway action.");
+      error.code = "COLLABORATION_MCP_ACTION_INVALID";
+      throw error;
+    }
+    const requestId = compactId(`mcp-${randomUUID()}`, 64);
+    if (binding.coordinator) {
+      return this.executeMcpGatewayRequest({
+        requestId,
+        runId: binding.runId,
+        sourceRole: binding.role,
+        sourceTaskId: binding.taskId,
+        sourceDeviceId: binding.sourceDeviceId,
+        action: normalizedAction,
+        payload,
+      });
+    }
+    if (!this.relayClient) {
+      const error = new Error("OriginRouter virtual network is unavailable.");
+      error.code = "COLLABORATION_MCP_RELAY_UNAVAILABLE";
+      throw error;
+    }
+    const response = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.mcpRequests.delete(requestId);
+        const error = new Error("Agent MCP gateway request timed out.");
+        error.code = "COLLABORATION_MCP_TIMEOUT";
+        reject(error);
+      }, 15_000);
+      timer.unref?.();
+      this.mcpRequests.set(requestId, { resolve, reject, timer });
+    });
+    try {
+      const sent = await this.relayClient.send("collaboration.mcp.request", {
+        protocolVersion: "1",
+        requestId,
+        sourceDeviceId: this.deviceId,
+        targetDeviceId: binding.coordinatorDeviceId,
+        runId: binding.runId,
+        sourceRole: binding.role,
+        sourceTaskId: binding.taskId,
+        action: normalizedAction,
+        payload,
+      });
+      const delivery = sent?.data || sent || {};
+      if (delivery.accepted === false && !delivery.queued) {
+        const error = new Error(delivery.reason || "Agent MCP gateway request was rejected.");
+        error.code = safeText(delivery.reason, 96) || "COLLABORATION_MCP_REJECTED";
+        throw error;
+      }
+      return await response;
+    } catch (error) {
+      const pending = this.mcpRequests.get(requestId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.mcpRequests.delete(requestId);
+      }
+      throw error;
+    }
+  }
+
+  async executeMcpGatewayRequest({
+    requestId,
+    runId,
+    sourceRole,
+    sourceTaskId,
+    sourceDeviceId,
+    action,
+    payload = {},
+  }) {
+    const run = this.store.getRun(runId);
+    const source = run?.agents?.[sourceRole];
+    const sourceTask = run?.tasks?.find((task) => task.task_id === sourceTaskId);
+    if (!run || run.template_id !== ADAPTIVE_TEMPLATE_ID || run.state !== "executing") {
+      const error = new Error("Agent MCP tools require an executing adaptive collaboration.");
+      error.code = "COLLABORATION_MCP_RUN_UNAVAILABLE";
+      throw error;
+    }
+    if (!source || source.device_id !== sourceDeviceId
+        || source.current_task_id !== sourceTaskId || sourceTask?.state !== "active") {
+      const error = new Error("The requesting Agent no longer owns the active collaboration task.");
+      error.code = "COLLABORATION_MCP_SOURCE_STALE";
+      throw error;
+    }
+    if (action === "list") {
+      return {
+        run_id: run.run_id,
+        source_participant_id: sourceRole,
+        participants: Object.entries(run.agents)
+          .filter(([role]) => role !== sourceRole)
+          .map(([role, agent]) => ({
+            participant_id: role,
+            display_name: agent.display_name || role,
+            runtime: agent.runtime,
+            device_id: agent.device_id,
+            status: agent.status,
+            role_hint: agent.role_hint || "",
+          })),
+      };
+    }
+    if (action === "status") {
+      const taskId = safeText(payload.task_id ?? payload.taskId, 195);
+      const task = run.tasks.find((item) => item.task_id === taskId);
+      if (!task || task.parent_task_id !== sourceTaskId) {
+        const error = new Error("The delegated collaboration task is unavailable to this Agent.");
+        error.code = "COLLABORATION_MCP_TASK_UNAVAILABLE";
+        throw error;
+      }
+      return {
+        task_id: task.task_id,
+        participant_id: task.participant_id,
+        state: task.state,
+        result: task.state === "completed" ? task.result_summary : "",
+        updated_at: task.updated_at,
+      };
+    }
+    const participantId = safeText(payload.participant_id ?? payload.participantId, 32).toLowerCase();
+    const target = run.agents?.[participantId];
+    const instructions = safeText(payload.instructions, 16_000);
+    if (!target || participantId === sourceRole) {
+      const error = new Error("Choose another available collaboration participant.");
+      error.code = "COLLABORATION_MCP_TARGET_INVALID";
+      throw error;
+    }
+    if (!instructions) {
+      const error = new Error("Delegated Agent instructions are required.");
+      error.code = "COLLABORATION_MCP_INSTRUCTIONS_REQUIRED";
+      throw error;
+    }
+    if (target.current_task_id || run.tasks.some((task) => (
+      task.participant_id === participantId && task.state === "active"
+    ))) {
+      const error = new Error("The selected Agent is already working on another collaboration task.");
+      error.code = "COLLABORATION_MCP_TARGET_BUSY";
+      throw error;
+    }
+    const activeCount = run.tasks.filter((task) => task.state === "active").length;
+    if (payload.wait_requested === true && activeCount >= Number(run.budget.max_concurrency || 1)) {
+      const error = new Error("ask_agent requires one free collaboration concurrency slot; increase max concurrency or use delegate_task.");
+      error.code = "COLLABORATION_MCP_CONCURRENCY_REQUIRED";
+      throw error;
+    }
+    const task = this.store.addAdaptiveTask(run.run_id, {
+      taskKey: compactId(`mcp_${requestId}`, 64),
+      parentTaskId: sourceTaskId,
+      participantId,
+      sourceParticipantId: sourceRole,
+      title: `Request from ${sourceRole}`,
+      instructions,
+      mode: safeText(payload.mode, 32) || "discussion",
+      deliverable: safeText(payload.deliverable, 2_000),
+    });
+    this.store.appendMessage(run.run_id, {
+      task_id: sourceTaskId,
+      type: "agent.mcp.delegated",
+      idempotency_key: `agent-mcp-delegate-${requestId}`,
+      sender: { kind: "agent", agent_id: source.agent_id, device_id: source.device_id },
+      recipient: { kind: "agent", agent_id: target.agent_id, device_id: target.device_id },
+      payload: {
+        delegated_task_id: task.task_id,
+        source_participant_id: sourceRole,
+        target_participant_id: participantId,
+        mode: task.kind,
+      },
+    });
+    await this.dispatchForState(run.run_id);
+    const current = this.store.getRun(run.run_id, { includeMessages: false });
+    const created = current.tasks.find((item) => item.task_id === task.task_id);
+    return {
+      task_id: created.task_id,
+      participant_id: created.participant_id,
+      state: created.state,
+      message: created.state === "pending"
+        ? "Task queued. Use get_task_result to check progress."
+        : "Task dispatched. Use get_task_result to read the response.",
+    };
   }
 
   enqueue(notification) {
@@ -578,6 +792,53 @@ export class CollaborationRuntime {
       }
       return true;
     }
+    if (payload.type === "collaboration.mcp.request") {
+      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      const requestId = safeText(payload.requestId, 64);
+      let result = null;
+      let errorPayload = null;
+      try {
+        result = await this.executeMcpGatewayRequest({
+          requestId,
+          runId: safeText(payload.runId, 195),
+          sourceRole: safeText(payload.sourceRole, 32),
+          sourceTaskId: safeText(payload.sourceTaskId, 195),
+          sourceDeviceId: safeText(payload.sourceDeviceId, 191),
+          action: safeText(payload.action, 32),
+          payload: payload.payload || {},
+        });
+      } catch (error) {
+        errorPayload = {
+          code: safeText(error?.code, 96) || "COLLABORATION_MCP_FAILED",
+          message: safeText(error?.message, 2048) || "Agent MCP gateway request failed.",
+        };
+      }
+      await this.relayClient?.send?.("collaboration.mcp.response", {
+        protocolVersion: "1",
+        requestId,
+        sourceDeviceId: this.deviceId,
+        targetDeviceId: safeText(payload.sourceDeviceId, 191),
+        runId: safeText(payload.runId, 195),
+        ...(errorPayload ? { error: errorPayload } : { result }),
+      });
+      return true;
+    }
+    if (payload.type === "collaboration.mcp.response") {
+      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      const requestId = safeText(payload.requestId, 64);
+      const pending = this.mcpRequests.get(requestId);
+      if (!pending) return true;
+      clearTimeout(pending.timer);
+      this.mcpRequests.delete(requestId);
+      if (payload.error) {
+        const error = new Error(safeText(payload.error.message, 2048) || "Agent MCP gateway request failed.");
+        error.code = safeText(payload.error.code, 96) || "COLLABORATION_MCP_FAILED";
+        pending.reject(error);
+      } else {
+        pending.resolve(payload.result || {});
+      }
+      return true;
+    }
     if (!String(payload.type || "").startsWith("collaboration.remote.")) return false;
     if (payload.type === "collaboration.remote.dispatch") {
       try {
@@ -620,12 +881,20 @@ export class CollaborationRuntime {
           currentTaskId: payload.taskId,
         });
       }
-      await this.handleTurnCompleted(
-        run.run_id,
-        role,
-        safeText(payload.output),
-        safeText(payload.completionId, 160) || compactId(`remote-${payload.deliveryId || randomUUID()}`, 160),
-      );
+      try {
+        await this.handleTurnCompleted(
+          run.run_id,
+          role,
+          safeText(payload.output),
+          safeText(payload.completionId, 160) || compactId(`remote-${payload.deliveryId || randomUUID()}`, 160),
+        );
+      } catch (error) {
+        // A remote result can immediately unlock a task assigned to this
+        // device.  Launch failures for that follow-up task must become a
+        // terminal collaboration error instead of escaping to the daemon's
+        // generic relay logger and leaving the task falsely marked active.
+        await this.fail(run.run_id, error);
+      }
       return true;
     }
     if (payload.type === "collaboration.remote.usage") {
@@ -891,6 +1160,15 @@ export class CollaborationRuntime {
     }, {
       outboxId: `result:${compactId(completionId, 160)}`,
     });
+    // A remote assignment is one turn. Preserve its native session id for a
+    // later resumed assignment, but release the managed wrapper once the
+    // durable result has reached the source device.
+    try {
+      this.registry.enqueueCommand(notification.sessionId, {
+        type: "session.stop",
+        sessionId: notification.sessionId,
+      });
+    } catch {}
   }
 
   acceptsFencing(run, role, payload) {
@@ -1041,12 +1319,13 @@ export class CollaborationRuntime {
     if (run.state === "implementing") {
       run = this.coordinator.receive(runId, { ...base, type: "implementation.completed", idempotency_key: `implementation-${completionKey}` }).run;
       if (run.gates.implementation_requires_verification === false) {
-        this.coordinator.receive(runId, {
+        run = this.coordinator.receive(runId, {
           ...base,
           type: "verification.passed",
           idempotency_key: `auto-verification-${completionKey}`,
           sender: { kind: "coordinator", device_id: this.deviceId },
-        });
+        }).run;
+        this.stopLocalRunSessions(run);
         void this.syncRun(runId);
         return;
       }
@@ -1064,6 +1343,7 @@ export class CollaborationRuntime {
         this.coordinator.beginImplementation(runId);
         await this.dispatchForState(runId);
       } else {
+        if (run.state === "completed") this.stopLocalRunSessions(run);
         void this.syncRun(runId);
       }
     }
@@ -1113,11 +1393,24 @@ export class CollaborationRuntime {
     const current = this.store.getRun(run.run_id);
     const remaining = current.tasks.filter((item) => item.task_key !== "__planner__" && item.state !== "completed");
     if (remaining.length === 0) {
-      this.store.transition(run.run_id, "completed");
+      const completed = this.store.transition(run.run_id, "completed");
+      this.stopLocalRunSessions(completed);
       void this.syncRun(run.run_id);
       return;
     }
     await this.dispatchForState(run.run_id);
+  }
+
+  stopLocalRunSessions(run) {
+    for (const agent of Object.values(run?.agents || {})) {
+      if (!agent.originrouter_session_id) continue;
+      try {
+        this.registry.enqueueCommand(agent.originrouter_session_id, {
+          type: "session.stop",
+          sessionId: agent.originrouter_session_id,
+        });
+      } catch {}
+    }
   }
 
   async handleBudgetResult(runId, role, sessionId, result) {
@@ -1223,5 +1516,12 @@ export class CollaborationRuntime {
     this.unsubscribe();
     if (this.outboxRetryTimer) clearTimeout(this.outboxRetryTimer);
     this.outboxRetryTimer = null;
+    for (const pending of this.mcpRequests.values()) {
+      clearTimeout(pending.timer);
+      const error = new Error("Agent MCP gateway stopped.");
+      error.code = "COLLABORATION_MCP_STOPPED";
+      pending.reject(error);
+    }
+    this.mcpRequests.clear();
   }
 }

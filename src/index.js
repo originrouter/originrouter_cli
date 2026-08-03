@@ -93,6 +93,7 @@ import {
 } from "./commands/routeSources.js";
 import { runClaudeSdkSession } from "./runtime/claudeSdkSession.js";
 import { runCodexAppServerSession } from "./runtime/codexAppServerSession.js";
+import { runAgentGatewayMcpServer } from "./mcp/agentGatewayServer.js";
 import {
   detectClaudeAgentSdkAvailability,
   detectCliAvailability,
@@ -2086,6 +2087,11 @@ export async function main(argv) {
 
   if (command === "doctor") {
     await handleDoctor(args);
+    return;
+  }
+
+  if (command === "agent-mcp-server") {
+    await runAgentGatewayMcpServer(args);
     return;
   }
 

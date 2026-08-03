@@ -132,6 +132,9 @@ worker.registry.emit(workerSession, { type: "agent.text", text: "Remote plan", e
 worker.registry.emit(workerSession, { type: "agent.task.completed", eventId: "b-plan-done" });
 await worker.runtime.queue;
 assert.equal(source.store.getRun(run.run_id).state, "awaiting_plan_review");
+assert.ok(worker.registry.commands.some((item) => (
+  item.sessionId === workerSession && item.command.type === "session.stop"
+)), "the remote wrapper is released after its durable result is delivered");
 
 source.registry.emit(leadSession, { type: "agent.text", text: "ORIGINROUTER_DECISION: APPROVE", eventId: "a-review" });
 source.registry.emit(leadSession, { type: "agent.task.complete", eventId: "a-review-done" });
@@ -147,6 +150,9 @@ source.registry.emit(leadSession, { type: "agent.text", text: "ORIGINROUTER_VERI
 source.registry.emit(leadSession, { type: "agent.task.complete", eventId: "a-verify-done" });
 await source.runtime.queue;
 assert.equal(source.store.getRun(run.run_id).state, "completed");
+assert.ok(source.registry.commands.some((item) => (
+  item.sessionId === leadSession && item.command.type === "session.stop"
+)), "local managed sessions are released when the collaboration completes");
 
 source.runtime.close(); worker.runtime.close();
 source.store.close(); worker.store.close();

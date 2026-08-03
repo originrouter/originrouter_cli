@@ -325,6 +325,82 @@ assert.equal(
   false,
 );
 
+// A valid remote result may unlock a local follow-up task. If that local
+// Agent cannot launch, the run must fail visibly instead of remaining in an
+// impossible `executing` / active-task state.
+const followUpRun = runtime.coordinator.create({
+  objective: "Fail a local follow-up launch visibly.",
+  participants: [
+    {
+      participant_id: "remote",
+      runtime: "claude",
+      device_id: "device-b",
+      workspace_id: "workspace-b",
+      planner: true,
+    },
+    {
+      participant_id: "local",
+      runtime: "codex",
+      device_id: "device-a",
+      workspace_id: "missing-local-workspace",
+    },
+  ],
+});
+runtime.coordinator.start(followUpRun.run_id);
+store.setAdaptivePlan(followUpRun.run_id, {
+  title: "Remote then local",
+  summary: "Exercise local launch failure after a remote result.",
+  tasks: [
+    {
+      id: "remote_task",
+      title: "Remote task",
+      instructions: "Return a result.",
+      participant_id: "remote",
+      depends_on: [],
+      mode: "read_only",
+      deliverable: "A result.",
+    },
+    {
+      id: "local_task",
+      title: "Local task",
+      instructions: "Verify the result.",
+      participant_id: "local",
+      depends_on: ["remote_task"],
+      mode: "verify",
+      deliverable: "A verdict.",
+    },
+  ],
+});
+runtime.coordinator.confirm(followUpRun.run_id);
+const executableFollowUp = store.getRun(followUpRun.run_id);
+const remoteTask = executableFollowUp.tasks.find((task) => task.task_key === "remote_task");
+const leasedRemote = store.issueAgentLease(followUpRun.run_id, "remote", {
+  dispatchKey: "remote-follow-up-test",
+});
+store.updateAdaptiveTask(followUpRun.run_id, "remote_task", { state: "active" });
+store.updateAgent(followUpRun.run_id, "remote", {
+  status: "dispatched",
+  currentTaskId: remoteTask.task_id,
+});
+await runtime.handleRelayEvent({
+  type: "collaboration.remote.result",
+  targetDeviceId: "device-a",
+  assignmentId: "assignment-follow-up",
+  runId: followUpRun.run_id,
+  taskId: remoteTask.task_id,
+  role: "remote",
+  attempt: leasedRemote.attempt,
+  fencingToken: leasedRemote.fencing_token,
+  completionId: "completion-follow-up",
+  output: "Remote task completed.",
+});
+const failedFollowUp = store.getRun(followUpRun.run_id);
+assert.equal(failedFollowUp.state, "failed");
+assert.equal(
+  failedFollowUp.messages.find((message) => message.type === "task.failed")?.payload?.content,
+  "not used",
+);
+
 runtime.close();
 store.close();
 

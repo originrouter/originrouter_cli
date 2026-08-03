@@ -14,7 +14,7 @@ const MESSAGE_TYPES = new Set([
   "review.revision_requested", "implementation.completed",
   "verification.passed", "verification.failed", "rework.requested",
   "artifact.created", "agent.message", "agent.shutdown_requested",
-  "agent.shutdown_acknowledged",
+  "agent.shutdown_acknowledged", "agent.mcp.delegated",
 ]);
 const RUN_STATES = new Set([
   "created", "designing", "awaiting_plan_confirmation", "executing",
@@ -611,6 +611,58 @@ export class CollaborationStore {
     if (info.changes === 0) throw new Error("collaboration task not found");
     this.db.prepare("UPDATE collaboration_runs SET updated_at = ? WHERE run_id = ?").run(updatedAt, runId);
     return this.getRun(runId);
+  }
+
+  addAdaptiveTask(runId, input = {}) {
+    const run = this.getRun(runId, { includeMessages: false });
+    if (!run || run.template_id !== ADAPTIVE_TEMPLATE_ID) {
+      throw new Error("adaptive collaboration run not found");
+    }
+    if (run.state !== "executing") {
+      throw new Error("collaboration is not executing");
+    }
+    const taskKey = safeText(input.task_key ?? input.taskKey, 64);
+    const participantId = safeText(input.participant_id ?? input.participantId, 32);
+    const participant = run.agents?.[participantId];
+    if (!taskKey) throw new Error("collaboration task key is required");
+    if (!participant) throw new Error("collaboration task participant is unavailable");
+    const existing = run.tasks.find((task) => task.task_key === taskKey);
+    if (existing) return existing;
+    const parentTaskId = safeText(input.parent_task_id ?? input.parentTaskId, 195) || null;
+    if (parentTaskId && !run.tasks.some((task) => task.task_id === parentTaskId)) {
+      throw new Error("collaboration parent task is unavailable");
+    }
+    const mode = safeText(input.kind ?? input.mode, 32) || "discussion";
+    if (!["read_only", "workspace_write", "verify", "discussion"].includes(mode)) {
+      throw new Error("unsupported collaboration task mode");
+    }
+    const taskId = id("act");
+    const updatedAt = iso(this.now());
+    this.db.prepare(`
+      INSERT INTO collaboration_tasks(
+        task_id, run_id, parent_task_id, assignee_agent_id, title, summary,
+        state, phase, task_key, participant_id, depends_on_json,
+        instructions, kind, deliverable, result_summary, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, '', 'pending', ?, ?, ?, '[]', ?, ?, ?, '', ?, ?)
+    `).run(
+      taskId,
+      runId,
+      parentTaskId,
+      participant.agent_id,
+      safeText(input.title, 256) || `Request from ${safeText(input.sourceParticipantId, 32) || "Agent"}`,
+      mode,
+      taskKey,
+      participantId,
+      safeText(input.instructions, 16_000),
+      mode,
+      safeText(input.deliverable, 2_000) || "A concise response for the requesting Agent.",
+      updatedAt,
+      updatedAt,
+    );
+    this.db.prepare("UPDATE collaboration_runs SET updated_at = ? WHERE run_id = ?")
+      .run(updatedAt, runId);
+    return this.getRun(runId, { includeMessages: false })
+      .tasks.find((task) => task.task_id === taskId);
   }
 
   runnableAdaptiveTasks(runId) {

@@ -1,6 +1,13 @@
 import process from "node:process";
 import { randomUUID } from "node:crypto";
-import { basename } from "node:path";
+import {
+  chmodSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import {
   createRuntimeEventReporter,
   reportAgentConversationMetadata,
@@ -29,6 +36,7 @@ import {
 import { RelayClient } from "../relay/relayClient.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 import { LocalAgentBridgeClient } from "../local/localAgentBridgeClient.js";
+import { agentGatewayMcpConfig } from "../mcp/agentGatewayConfig.js";
 import {
   buildInteractionRequest,
   INTERACTION_KINDS,
@@ -101,6 +109,53 @@ export function resolveClaudeSdkModelSelection(options = {}, providerResult = {}
     fallbackModel: fallbackModel && fallbackModel !== model
       ? fallbackModel
       : undefined,
+  };
+}
+
+const CLAUDE_RUNTIME_ENV_KEYS = Object.freeze([
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+]);
+
+// Claude filesystem settings are merged after the subprocess environment and
+// can otherwise replace an explicit OriginRouter route with a stale user-level
+// ANTHROPIC_BASE_URL. Use the SDK's highest-priority flag-settings layer to
+// pin only the runtime route fields. The local capability token never appears
+// in argv: it lives in a mode-0600 temporary file for the session lifetime.
+export function createClaudeRuntimeSettingsOverride(
+  providerResult = {},
+  { temporaryRoot = tmpdir() } = {},
+) {
+  const source = String(providerResult?.source || "");
+  if (!source || source === "inherited") return null;
+  const sourceEnv = providerResult?.env || {};
+  const env = Object.fromEntries(
+    CLAUDE_RUNTIME_ENV_KEYS
+      .filter((key) => Object.prototype.hasOwnProperty.call(sourceEnv, key))
+      .map((key) => [key, String(sourceEnv[key] ?? "")]),
+  );
+  if (Object.keys(env).length === 0) return null;
+
+  const directory = mkdtempSync(join(temporaryRoot, "originrouter-claude-settings-"));
+  const path = join(directory, "settings.json");
+  try {
+    chmodSync(directory, 0o700);
+    writeFileSync(path, `${JSON.stringify({ env })}\n`, { mode: 0o600 });
+  } catch (error) {
+    rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+  let cleaned = false;
+  return {
+    path,
+    cleanup() {
+      if (cleaned) return;
+      cleaned = true;
+      rmSync(directory, { recursive: true, force: true });
+    },
   };
 }
 
@@ -292,6 +347,7 @@ export async function runClaudeSdkSession(rawArgs) {
   });
   let originrouterCodingProxy = null;
   let localAgentBridge = null;
+  let runtimeSettingsOverride = null;
   let relayViaDaemon = false;
   ({ providerResult, proxy: originrouterCodingProxy } =
     await protectOriginrouterCodingEnv("claude", providerResult, { stateDir }));
@@ -568,6 +624,8 @@ export async function runClaudeSdkSession(rawArgs) {
         new Promise((resolve) => setTimeout(resolve, 500)),
       ]);
     }
+    runtimeSettingsOverride?.cleanup();
+    runtimeSettingsOverride = null;
     await interactions.cancelAll("session_stopped");
     await localAgentBridge?.close(signal ? "stopped" : "completed");
     localAgentBridge = null;
@@ -906,6 +964,10 @@ export async function runClaudeSdkSession(rawArgs) {
   }
 
   try {
+    runtimeSettingsOverride = createClaudeRuntimeSettingsOverride(providerResult);
+    const originrouterMcp = String(options.runId || "").startsWith("acr_")
+      ? agentGatewayMcpConfig(sessionId)
+      : null;
     queryRef = query({
       prompt: messageQueue,
       options: {
@@ -918,6 +980,8 @@ export async function runClaudeSdkSession(rawArgs) {
         allowDangerouslySkipPermissions: true,
         model,
         fallbackModel: modelSelection.fallbackModel,
+        settings: runtimeSettingsOverride?.path,
+        ...(originrouterMcp ? { mcpServers: { originrouter: originrouterMcp } } : {}),
         includeHookEvents: true,
         forwardSubagentText: true,
         ...(typeof options.resume === "string"
@@ -1037,6 +1101,8 @@ export async function runClaudeSdkSession(rawArgs) {
     await interactions.cancelAll("session_error");
     await localAgentBridge?.close("failed");
     localAgentBridge = null;
+    runtimeSettingsOverride?.cleanup();
+    runtimeSettingsOverride = null;
     await originrouterCodingProxy?.stop().catch(() => {});
     originrouterCodingProxy = null;
     await send("session.exited", { code: 1, signal: null });
@@ -1044,6 +1110,8 @@ export async function runClaudeSdkSession(rawArgs) {
     await runtimeReporter.flush();
     throw error;
   } finally {
+    runtimeSettingsOverride?.cleanup();
+    runtimeSettingsOverride = null;
     await originrouterCodingProxy?.stop().catch(() => {});
     for (const [signal, handler] of signalHandlers)
       process.off(signal, handler);
