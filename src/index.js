@@ -70,6 +70,7 @@ import { formatCliError, reportCliError } from "./runtime/cliErrors.js";
 import { runDoctor, printDoctorResults } from "./commands/doctor.js";
 import { handleServiceCommand } from "./commands/service.js";
 import { handleAuthCommand, handleLogin, handleLogout } from "./commands/auth.js";
+import { handleAgentRouteSetup } from "./commands/agentRouteSetup.js";
 import { handleSecurityCommand } from "./commands/security.js";
 import { handleCollaborationCommand } from "./commands/collaboration.js";
 import {
@@ -116,6 +117,7 @@ Usage:
   originrouter devices [--json]
   originrouter env print [--provider <name>] [--agent claude|codex]
   originrouter agent detail [set concise|standard|detailed]
+  originrouter agent setup [--cloud|--native]
   originrouter agent history [--search <text>] [--agent claude|codex] [--device <id>] [--status <status>] [--json]
   originrouter agent history show <conversation-id> [--json]
 
@@ -251,6 +253,7 @@ OriginRouter OAuth login:
   originrouter login [--surety-url <url>] [--login-url <url>]
                      [--device-name <name>]
                      [--no-browser]
+                     [--configure-agents|--keep-agent-routes|--no-agent-setup]
   originrouter logout [--remove-device]
   originrouter auth status
   originrouter security status|rotate
@@ -267,6 +270,9 @@ OriginRouter OAuth login:
   --surety-url     Surety OAuth base URL. Defaults to SURETY_BASE_URL
                    or https://surety.easytransnote.com.
   --login-url      H5 authorization page base URL.
+  --configure-agents  Apply OriginRouter Cloud recommended Claude/Codex models after login.
+  --keep-agent-routes Keep Agent routes unchanged, including private Provider routes.
+  --no-agent-setup    Alias for --keep-agent-routes; useful in scripts and CI.
 
   The CLI stores one rotating Refresh Token and separate short-lived
   Access Tokens for Control, AI, Coding, and Relay. The installation
@@ -486,8 +492,12 @@ function argumentValue(args, name) {
   return index >= 0 ? args[index + 1] : undefined;
 }
 
-function handleAgentSettings(args) {
+async function handleAgentSettings(args) {
   const [section, action, value] = args;
+  if (section === "setup") {
+    await handleAgentRouteSetup(args.slice(1), { stateDir: ensureStateDir() });
+    return;
+  }
   if (section === "history") {
     const catalog = new AgentCatalog({ stateDir: ensureStateDir() });
     try {
@@ -520,7 +530,9 @@ function handleAgentSettings(args) {
   }
   if (section !== "detail") {
     throw new Error(
-      "Usage: originrouter agent detail [set concise|standard|detailed] | originrouter agent history [options]",
+      "Usage: originrouter agent setup [--cloud|--native] | " +
+      "originrouter agent detail [set concise|standard|detailed] | " +
+      "originrouter agent history [options]",
     );
   }
   if (!action || action === "show") {
@@ -1976,7 +1988,7 @@ export async function main(argv) {
   }
 
   if (command === "agent") {
-    handleAgentSettings(args);
+    await handleAgentSettings(args);
     return;
   }
 

@@ -42,6 +42,10 @@ import {
 } from "../persistence/state.js";
 import { formatCliError, reportCliError } from "../runtime/cliErrors.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
+import {
+  maybeConfigureAgentRoutesAfterLogin,
+  resetCloudRoutesOnLogout,
+} from "./agentRouteSetup.js";
 
 function parseFlag(args, name) {
   for (let index = 0; index < args.length; index++) {
@@ -104,7 +108,17 @@ export async function inspectStoredLogin({
   }
 }
 
-export async function handleLogin(args, { fetchFn = globalThis.fetch } = {}) {
+export async function handleLogin(args, {
+  fetchFn = globalThis.fetch,
+  agentRouteSetupFn = maybeConfigureAgentRoutesAfterLogin,
+} = {}) {
+  const configureAgents = args.includes("--configure-agents");
+  const keepRoutes = args.includes("--keep-agent-routes") ||
+    args.includes("--no-agent-setup");
+  if (configureAgents && keepRoutes) {
+    reportCliError("Choose either --configure-agents or --keep-agent-routes, not both.");
+    return;
+  }
   const stateDir = ensureStateDir();
   const suretyBaseUrl = parseFlag(args, "surety-url") ||
     process.env.SURETY_BASE_URL || DEFAULT_SURETY_BASE_URL;
@@ -123,7 +137,12 @@ export async function handleLogin(args, { fetchFn = globalThis.fetch } = {}) {
     console.log("Already signed in to OriginRouter.");
     console.log(`Device:  ${credential.deviceName || credential.deviceId}`);
     console.log("Run `originrouter auth status` to view the session.");
-    console.log("To sign in again, run `originrouter logout` first.");
+    try {
+      await agentRouteSetupFn({ args, stateDir });
+    } catch (error) {
+      console.warn(`Agent route setup was not completed: ${error?.message || error}`);
+      console.warn("The existing OriginRouter login and Agent routes remain active.");
+    }
     return;
   }
   if (storedLogin.state === "invalid") {
@@ -211,6 +230,12 @@ export async function handleLogin(args, { fetchFn = globalThis.fetch } = {}) {
     if (registered?.trust_status === "pending") {
       console.log("Compare this fingerprint with the pending-device entry in the App before approving it.");
     }
+    try {
+      await agentRouteSetupFn({ args, stateDir });
+    } catch (error) {
+      console.warn(`Agent route setup was not completed: ${error?.message || error}`);
+      console.warn("The OriginRouter login succeeded and existing Agent routes were preserved.");
+    }
   } catch (error) {
     if (error?.code === "device_flow_denied") {
       invalidateDeviceE2eeIdentity(stateDir);
@@ -223,10 +248,13 @@ export async function handleLogin(args, { fetchFn = globalThis.fetch } = {}) {
   }
 }
 
-export async function handleLogout(args = []) {
+export async function handleLogout(args = [], {
+  resetCloudRoutesFn = resetCloudRoutesOnLogout,
+} = {}) {
   const stateDir = ensureStateDir();
   const stored = readCodingAuth(stateDir);
   if (!stored) {
+    resetCloudRoutesFn();
     console.log("Not logged in.");
     return;
   }
@@ -249,6 +277,7 @@ export async function handleLogout(args = []) {
         signedRemoval: signCurrentDeviceRemoval(identity),
       });
       clearCodingAuth(stateDir);
+      resetCloudRoutesFn();
       invalidateDeviceE2eeIdentity(stateDir);
       invalidateDevice(stateDir);
       console.log("Signed out and removed this device from the account.");
@@ -283,6 +312,7 @@ export async function handleLogout(args = []) {
     }
   }
   clearCodingAuth(stateDir);
+  resetCloudRoutesFn();
   console.log("Logged out. This device remains trusted for a later sign-in.");
 }
 
