@@ -165,6 +165,28 @@ const cancelledRun = catalog
   .getConversation("conversation-cancelled")
   .runs.find((item) => item.originrouter_session_id === "session-cancelled");
 assert.equal(cancelledRun.status, "stopped");
+
+const budgetBlockedSupervisor = new ManagedAgentSupervisor({
+  catalog,
+  deviceId: "device-1",
+  relayUrl: "https://relay.example.test",
+  agentBudgetStore: {
+    status(scope, agent) {
+      return { blocked: scope === "agent" && agent === "codex" };
+    },
+  },
+});
+await assert.rejects(
+  budgetBlockedSupervisor.start({
+    launchId: "launch-budget-blocked",
+    sessionId: "session-budget-blocked",
+    conversationId: "conversation-budget-blocked",
+    runId: "run-budget-blocked",
+    agentType: "codex",
+    workspaceId: workspace.workspace_id,
+  }),
+  (error) => error.code === "AGENT_BUDGET_EXHAUSTED",
+);
 catalog.close();
 
 console.log("managed Agent supervisor tests ok");

@@ -84,6 +84,49 @@ function safeLocalControlRoutes(value) {
   return routes;
 }
 
+function safeAgentBudgetPolicy(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const positive = (input) => {
+    const number = Number(input);
+    return Number.isFinite(number) && number > 0 ? Math.floor(number) : null;
+  };
+  return {
+    daily_token_limit: positive(value.daily_token_limit),
+    weekly_token_limit: positive(value.weekly_token_limit),
+    daily_amount_limit_micros: positive(value.daily_amount_limit_micros),
+    weekly_amount_limit_micros: positive(value.weekly_amount_limit_micros),
+    currency: /^[A-Z]{3}$/.test(String(value.currency || "").toUpperCase())
+      ? String(value.currency).toUpperCase()
+      : "USD",
+    enforcement: value.enforcement === "warn" ? "warn" : "block",
+  };
+}
+
+function safeAgentBudgets(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const status = (entry) => ({
+    policy: safeAgentBudgetPolicy(entry?.policy),
+    daily: {
+      sampled_tokens: Math.max(0, Number(entry?.daily?.sampled_tokens) || 0),
+      amount_micros: Math.max(0, Number(entry?.daily?.amount_micros) || 0),
+    },
+    weekly: {
+      sampled_tokens: Math.max(0, Number(entry?.weekly?.sampled_tokens) || 0),
+      amount_micros: Math.max(0, Number(entry?.weekly?.amount_micros) || 0),
+    },
+    warning: entry?.warning === true,
+    exhausted: entry?.exhausted === true,
+    blocked: entry?.blocked === true,
+  });
+  return {
+    device: status(value.device),
+    agents: {
+      claude: status(value.agents?.claude),
+      codex: status(value.agents?.codex),
+    },
+  };
+}
+
 function safeCompatibilityStatus(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const patches = Array.isArray(value.patches) ? value.patches.slice(0, 128).map((patch) => ({
@@ -834,6 +877,7 @@ export async function reportLocalControlRuntime(payload, {
     agent_detail_profile: safeText(payload?.agentDetailProfile, 16) || "concise",
     providers: safeLocalControlProviders(payload?.providers),
     routes: safeLocalControlRoutes(payload?.routes),
+    agent_budgets: safeAgentBudgets(payload?.agentBudgets),
     ...(compatibility ? { compatibility } : {}),
   };
 

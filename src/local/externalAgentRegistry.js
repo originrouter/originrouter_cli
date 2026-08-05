@@ -15,6 +15,19 @@ function safeText(value, maxLength) {
   return String(value || "").slice(0, maxLength);
 }
 
+function isInternalTelemetryActivity(event) {
+  if (event?.type !== "agent.activity") return false;
+  return new Set([
+    "commands_changed",
+    "hook",
+    "mcp_status",
+    "memory_recall",
+    "notification",
+    "rate_limit",
+    "settings_applied",
+  ]).has(safeText(event?.activity, 64));
+}
+
 function approvalPolicySummary(value) {
   if (!value || typeof value !== "object") return null;
   const id = safeText(value.id, 64);
@@ -47,6 +60,9 @@ export class ExternalAgentRegistry {
     this.now = now;
     this.catalog = catalog;
     this.sessions = new Map();
+    // Cursors are process-local. Consumers use this id to detect a daemon
+    // restart before applying a cursor from the previous process.
+    this.eventStreamId = `local_stream_${randomUUID()}`;
     this.eventCursor = 0;
     this.listeners = new Set();
   }
@@ -91,6 +107,13 @@ export class ExternalAgentRegistry {
         safeText(payload?.startedAt, 64) || existing?.startedAt || nowIso(),
       lastSeenAtMs: this.now(),
       events: existing?.events || [],
+      eventIds:
+        existing?.eventIds ||
+        new Set(
+          (existing?.events || [])
+            .map((event) => safeText(event?.eventId, 96))
+            .filter(Boolean),
+        ),
       eventSequence: existing?.eventSequence || 0,
       commands: existing?.commands || [],
       commandSequence: existing?.commandSequence || 0,
@@ -190,6 +213,10 @@ export class ExternalAgentRegistry {
 
   appendEvent(sessionId, event) {
     const session = this.require(sessionId);
+    const providedEventId = safeText(event?.eventId, 96);
+    if (providedEventId && session.eventIds.has(providedEventId)) {
+      return session.eventSequence;
+    }
     session.eventSequence += 1;
     this.eventCursor += 1;
     session.lastSeenAtMs = this.now();
@@ -202,6 +229,7 @@ export class ExternalAgentRegistry {
       createdAt: event?.createdAt || Math.floor(this.now() / 1000),
     };
     session.events.push(storedEvent);
+    session.eventIds.add(storedEvent.eventId);
     const interactionId = String(event?.interactionId || event?.callId || "");
     if (event?.type === "agent.interaction.requested" && interactionId) {
       session.pendingInteractions.add(interactionId);
@@ -278,6 +306,9 @@ export class ExternalAgentRegistry {
     } catch {}
     if (session.events.length > MAX_EVENTS) {
       session.events.splice(0, session.events.length - MAX_EVENTS);
+      session.eventIds = new Set(
+        session.events.map((item) => item.eventId).filter(Boolean),
+      );
     }
     this.notify("event", sessionId, storedEvent);
     return session.eventSequence;
@@ -301,7 +332,12 @@ export class ExternalAgentRegistry {
     events.sort(
       (a, b) => Number(a.localCursor || 0) - Number(b.localCursor || 0),
     );
-    return { events, cursor };
+    return {
+      events,
+      cursor,
+      latestCursor: this.eventCursor,
+      streamId: this.eventStreamId,
+    };
   }
 
   enqueueCommand(sessionId, command) {
@@ -470,6 +506,9 @@ export class ExternalAgentRegistry {
       case "agent.ready":
         return "Ready";
       case "agent.activity":
+        if (isInternalTelemetryActivity(event)) {
+          return fallback || "Running locally";
+        }
         return safeText(event?.summary, 191) || "Running locally";
       case "agent.detail.status":
         return fallback || "Running locally";

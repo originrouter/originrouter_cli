@@ -115,6 +115,7 @@ function publicRun(row) {
     created_at: row.created_at,
     updated_at: row.updated_at,
     finished_at: row.finished_at || null,
+    archived_at: row.archived_at || null,
   };
 }
 
@@ -154,7 +155,8 @@ export class CollaborationStore {
         resume_state TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        finished_at TEXT
+        finished_at TEXT,
+        archived_at TEXT
       ) STRICT;
       CREATE TABLE IF NOT EXISTS collaboration_agents (
         agent_id TEXT PRIMARY KEY,
@@ -308,12 +310,29 @@ export class CollaborationStore {
         created_at TEXT NOT NULL,
         FOREIGN KEY(run_id) REFERENCES collaboration_runs(run_id) ON DELETE CASCADE
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS collaboration_execution_events (
+        event_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        task_id TEXT NOT NULL DEFAULT '',
+        participant_id TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL DEFAULT '',
+        type TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        detail TEXT NOT NULL DEFAULT '',
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(run_id) REFERENCES collaboration_runs(run_id) ON DELETE CASCADE
+      ) STRICT;
       CREATE INDEX IF NOT EXISTS idx_collaboration_runs_updated ON collaboration_runs(updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_collaboration_messages_run ON collaboration_messages(run_id, sequence ASC);
       CREATE INDEX IF NOT EXISTS idx_collaboration_artifacts_run ON collaboration_artifacts(run_id, created_at ASC);
       CREATE INDEX IF NOT EXISTS idx_collaboration_remote_session ON collaboration_remote_assignments(originrouter_session_id);
       CREATE INDEX IF NOT EXISTS idx_collaboration_usage_run ON collaboration_usage_receipts(run_id, created_at ASC);
       CREATE INDEX IF NOT EXISTS idx_collaboration_outbox_pending ON collaboration_outbox(state, updated_at ASC);
+      CREATE INDEX IF NOT EXISTS idx_collaboration_execution_run
+        ON collaboration_execution_events(run_id, created_at ASC);
+      CREATE INDEX IF NOT EXISTS idx_collaboration_execution_participant
+        ON collaboration_execution_events(run_id, participant_id, created_at ASC);
     `);
     this.ensureColumn("collaboration_agents", "originrouter_session_id", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_agents", "conversation_id", "TEXT NOT NULL DEFAULT ''");
@@ -325,6 +344,7 @@ export class CollaborationStore {
     this.ensureColumn("collaboration_runs", "planner_role", "TEXT NOT NULL DEFAULT 'lead'");
     this.ensureColumn("collaboration_runs", "plan_status", "TEXT NOT NULL DEFAULT 'confirmed'");
     this.ensureColumn("collaboration_runs", "plan_json", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_runs", "archived_at", "TEXT");
     this.ensureColumn("collaboration_usage_receipts", "amount_micros", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("collaboration_usage_receipts", "currency", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_usage_receipts", "cost_source", "TEXT NOT NULL DEFAULT ''");
@@ -506,9 +526,69 @@ export class CollaborationStore {
     return run;
   }
 
-  listRuns({ limit = 50 } = {}) {
-    return this.db.prepare("SELECT * FROM collaboration_runs ORDER BY updated_at DESC LIMIT ?")
-      .all(Math.max(1, Math.min(200, Number(limit) || 50))).map(publicRun);
+  listRuns({ limit = 50, includeArchived = false } = {}) {
+    const archived = includeArchived ? "" : "WHERE archived_at IS NULL";
+    return this.db.prepare(
+      `SELECT * FROM collaboration_runs ${archived} ORDER BY updated_at DESC LIMIT ?`,
+    ).all(Math.max(1, Math.min(200, Number(limit) || 50))).map(publicRun);
+  }
+
+  listRunPage({
+    category = "all",
+    page = 1,
+    pageSize = 5,
+    includeArchived = false,
+  } = {}) {
+    const terminal = "('completed','failed','cancelled','expired')";
+    const attention = "('awaiting_plan_confirmation','budget_exhausted','failed','revision_requested','rework_requested','waiting_approval','waiting_input','blocked')";
+    const conditions = [];
+    if (!includeArchived) conditions.push("archived_at IS NULL");
+    if (category === "attention") conditions.push(`state IN ${attention}`);
+    if (category === "active") {
+      conditions.push(`state NOT IN ${terminal}`);
+      conditions.push(`state NOT IN ${attention}`);
+    }
+    if (category === "recent") conditions.push(`state IN ${terminal}`);
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const safePageSize = Math.max(1, Math.min(50, Number(pageSize) || 5));
+    const safePage = Math.max(1, Number(page) || 1);
+    const total = Number(
+      this.db.prepare(`SELECT COUNT(*) AS count FROM collaboration_runs ${where}`).get()?.count || 0,
+    );
+    const rows = this.db.prepare(`
+      SELECT * FROM collaboration_runs ${where}
+      ORDER BY updated_at DESC LIMIT ? OFFSET ?
+    `).all(safePageSize, (safePage - 1) * safePageSize).map(publicRun);
+    return {
+      runs: rows.map((run) => this.getRun(run.run_id, { includeMessages: false })),
+      page: safePage,
+      page_size: safePageSize,
+      total,
+      total_pages: Math.max(1, Math.ceil(total / safePageSize)),
+    };
+  }
+
+  archiveRun(runId, archived = true) {
+    const run = this.getRun(runId, { includeMessages: false });
+    if (!run) throw new Error("collaboration run not found");
+    if (!["completed", "failed", "cancelled", "expired"].includes(run.state)) {
+      throw new Error("only finished collaboration runs can be archived");
+    }
+    const archivedAt = archived ? iso(this.now()) : null;
+    this.db.prepare(
+      "UPDATE collaboration_runs SET archived_at = ?, updated_at = ? WHERE run_id = ?",
+    ).run(archivedAt, iso(this.now()), run.run_id);
+    return this.getRun(run.run_id);
+  }
+
+  deleteRun(runId) {
+    const run = this.getRun(runId, { includeMessages: false });
+    if (!run) return false;
+    if (!["completed", "failed", "cancelled", "expired"].includes(run.state)) {
+      throw new Error("only finished collaboration runs can be deleted");
+    }
+    return this.db.prepare("DELETE FROM collaboration_runs WHERE run_id = ?")
+      .run(run.run_id).changes > 0;
   }
 
   listActiveRuns({ limit = 100 } = {}) {
@@ -1344,6 +1424,72 @@ export class CollaborationStore {
   listMessages(runId, { after = 0, limit = 200 } = {}) {
     return this.db.prepare("SELECT * FROM collaboration_messages WHERE run_id = ? AND sequence > ? ORDER BY sequence ASC LIMIT ?")
       .all(safeText(runId, 195), Math.max(0, Number(after) || 0), Math.max(1, Math.min(500, Number(limit) || 200))).map((row) => this.publicMessage(row));
+  }
+
+  recordExecutionEvent(runId, input = {}) {
+    const run = this.getRun(runId, { includeMessages: false });
+    if (!run) throw new Error("collaboration run not found");
+    const eventId = safeText(input.event_id ?? input.eventId, 195) || id("ace");
+    const metadata = input.metadata && typeof input.metadata === "object"
+      ? input.metadata
+      : {};
+    assertNoSecretFields(metadata);
+    const createdAt = iso(input.created_at ?? input.createdAt ?? this.now());
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO collaboration_execution_events(
+        event_id, run_id, task_id, participant_id, session_id, type,
+        summary, detail, metadata_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      eventId,
+      run.run_id,
+      safeText(input.task_id ?? input.taskId, 195),
+      safeText(input.participant_id ?? input.participantId, 32),
+      safeText(input.session_id ?? input.sessionId, 64),
+      safeText(input.type, 96) || "agent.activity",
+      safeText(input.summary, 1024),
+      safeText(input.detail, 8192),
+      JSON.stringify(metadata),
+      createdAt,
+    );
+    return { duplicate: result.changes === 0, event_id: eventId };
+  }
+
+  listExecutionEvents(runId, {
+    participantId = "",
+    after = "",
+    limit = 100,
+  } = {}) {
+    const safeLimit = Math.max(1, Math.min(200, Number(limit) || 100));
+    const conditions = ["run_id = ?"];
+    const values = [safeText(runId, 195)];
+    if (participantId) {
+      conditions.push("participant_id = ?");
+      values.push(safeText(participantId, 32));
+    }
+    if (after) {
+      conditions.push("created_at > ?");
+      values.push(iso(after));
+    }
+    values.push(safeLimit);
+    return this.db.prepare(`
+      SELECT event_id, run_id, task_id, participant_id, session_id, type,
+             summary, detail, metadata_json, created_at
+      FROM collaboration_execution_events
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY created_at ASC, event_id ASC LIMIT ?
+    `).all(...values).map((row) => ({
+      event_id: row.event_id,
+      run_id: row.run_id,
+      task_id: row.task_id || null,
+      participant_id: row.participant_id || null,
+      session_id: row.session_id || null,
+      type: row.type,
+      summary: row.summary,
+      detail: row.detail,
+      metadata: parseJson(row.metadata_json, {}),
+      created_at: row.created_at,
+    }));
   }
 
   transition(runId, nextState, { counter = null, taskState = null, taskPhase = null } = {}) {

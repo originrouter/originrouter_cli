@@ -272,6 +272,7 @@ test("reportLocalControlRuntime posts display-safe daemon status", async () => {
     remote_share_e2ee_policy: "off",
     remote_share_e2ee_public_key: "",
     agent_detail_profile: "concise",
+    agent_budgets: {},
     providers: [
       {
         name: "originrouter-cloud",

@@ -78,6 +78,7 @@ import { ExternalAgentRegistry } from "./externalAgentRegistry.js";
 import { LocalAuditStore } from "../persistence/localAuditStore.js";
 import { ProxyRequestStore } from "../persistence/proxyRequestStore.js";
 import { buildAuditEvidenceBundle } from "../inquiry/auditEvidenceAdapter.js";
+import { AgentBudgetStore } from "../agent/agentBudgetStore.js";
 import { CollaborationStore } from "../collaboration/collaborationStore.js";
 import { PlanImplementVerifyCoordinator } from "../collaboration/planImplementVerifyCoordinator.js";
 import { browseAgentWorkspaces } from "../daemon/workspaceBrowser.js";
@@ -131,6 +132,8 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
   // handle immediately after binding, so the handler sees the bound port on
   // its first request.
   const auditStore = ctx.auditStore || new LocalAuditStore();
+  const ownsAgentBudgetStore = !ctx.agentBudgetStore;
+  const agentBudgetStore = ctx.agentBudgetStore || new AgentBudgetStore();
   const ownsProxyRequestStore = !ctx.proxyRequestStore;
   const proxyRequestStore = ctx.proxyRequestStore || new ProxyRequestStore();
   const collaborationStore = ctx.collaborationStore || new CollaborationStore();
@@ -152,6 +155,7 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
     discoverProviderModels: ctx.discoverProviderModels || discoverProviderModels,
     sessionManager: ctx.sessionManager,
     auditStore,
+    agentBudgetStore,
     proxyRequestStore,
     collaborationStore,
     collaborationCoordinator,
@@ -201,6 +205,7 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
     server,
     close: () => new Promise((resolve) => server.close(() => {
       if (ownsProxyRequestStore) proxyRequestStore.close();
+      if (ownsAgentBudgetStore) agentBudgetStore.close();
       resolve();
     })),
   };
@@ -541,6 +546,21 @@ async function dispatch(ctx, req, res) {
     if (req.method === "GET" && pathname === "/routes") {
       return handleRoutesList(ctx, res);
     }
+    if (pathname === "/agent-budgets") {
+      if (req.method === "GET") {
+        return sendOk(res, { budgets: ctx.agentBudgetStore.snapshot() });
+      }
+      if (req.method === "PUT") {
+        const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+        if (body.__error) return sendError(res, 400, body.__error);
+        try {
+          return sendOk(res, { budgets: ctx.agentBudgetStore.setPolicies(body) });
+        } catch (error) {
+          return sendError(res, 400, error.message || "invalid Agent budget policy");
+        }
+      }
+      return sendError(res, 405, `method ${req.method} not allowed on /agent-budgets`);
+    }
     const routesAgentMatch = pathname.match(/^\/routes\/([a-z]+)$/);
     if (routesAgentMatch) {
       const agent = decodeURIComponent(routesAgentMatch[1]);
@@ -653,6 +673,14 @@ async function dispatch(ctx, req, res) {
     }
     if (pathname === "/collaboration/local/runs") {
       if (req.method === "GET") {
+        if (url.searchParams.has("category") || url.searchParams.has("page")) {
+          return sendOk(res, ctx.collaborationStore.listRunPage({
+            category: url.searchParams.get("category") || "all",
+            page: url.searchParams.get("page"),
+            pageSize: url.searchParams.get("page_size"),
+            includeArchived: url.searchParams.get("archived") === "true",
+          }));
+        }
         const runs = ctx.collaborationStore.listRuns({ limit: url.searchParams.get("limit") })
           .map((run) => ctx.collaborationStore.getRun(run.run_id));
         return sendOk(res, { runs });
@@ -668,6 +696,32 @@ async function dispatch(ctx, req, res) {
       }
       return sendError(res, 405, `method ${req.method} not allowed`);
     }
+    const collaborationEventsMatch = pathname.match(
+      /^\/collaboration\/local\/runs\/([^/]+)\/events$/,
+    );
+    if (collaborationEventsMatch && req.method === "GET") {
+      const runId = decodeURIComponent(collaborationEventsMatch[1]);
+      const run = ctx.collaborationStore.getRun(runId, { includeMessages: false });
+      if (!run) return sendError(res, 404, "collaboration run not found");
+      return sendOk(res, {
+        events: ctx.collaborationStore.listExecutionEvents(runId, {
+          participantId: url.searchParams.get("participant_id") || "",
+          after: url.searchParams.get("after") || "",
+          limit: url.searchParams.get("limit"),
+        }),
+      });
+    }
+    const collaborationArchiveMatch = pathname.match(
+      /^\/collaboration\/local\/runs\/([^/]+)\/archive$/,
+    );
+    if (collaborationArchiveMatch && req.method === "POST") {
+      const runId = decodeURIComponent(collaborationArchiveMatch[1]);
+      try {
+        return sendOk(res, { run: ctx.collaborationStore.archiveRun(runId, true) });
+      } catch (error) {
+        return sendError(res, 409, error.message || "collaboration run could not be archived");
+      }
+    }
     const collaborationMatch = pathname.match(
       /^\/collaboration\/local\/runs\/([^/]+)(?:\/(start|confirm|begin-planning|begin-implementation|cancel|messages|budget))?$/,
     );
@@ -677,6 +731,26 @@ async function dispatch(ctx, req, res) {
       if (req.method === "GET" && !action) {
         const run = ctx.collaborationStore.getRun(runId);
         return run ? sendOk(res, { run }) : sendError(res, 404, "collaboration run not found");
+      }
+      if (req.method === "GET" && action === "messages") {
+        const run = ctx.collaborationStore.getRun(runId, { includeMessages: false });
+        if (!run) return sendError(res, 404, "collaboration run not found");
+        return sendOk(res, {
+          messages: ctx.collaborationStore.listMessages(runId, {
+            after: url.searchParams.get("after"),
+            limit: url.searchParams.get("limit"),
+          }),
+        });
+      }
+      if (req.method === "DELETE" && !action) {
+        try {
+          const deleted = ctx.collaborationStore.deleteRun(runId);
+          return deleted
+            ? sendOk(res, { deleted: true, run_id: runId })
+            : sendError(res, 404, "collaboration run not found");
+        } catch (error) {
+          return sendError(res, 409, error.message || "collaboration run could not be deleted");
+        }
       }
       if (req.method !== "POST" || !action) {
         return sendError(res, 405, `method ${req.method} not allowed`);

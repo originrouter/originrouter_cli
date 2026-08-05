@@ -21,6 +21,16 @@ assert.equal(queued.commands[0].commandId, command.commandId);
 
 registry.appendEvent("claude-local-1", { type: "agent.text", text: "reply" });
 registry.appendEvent("claude-local-1", {
+  type: "agent.text",
+  text: "reported once",
+  eventId: "stable-event-1",
+});
+registry.appendEvent("claude-local-1", {
+  type: "agent.text",
+  text: "duplicate retry",
+  eventId: "stable-event-1",
+});
+registry.appendEvent("claude-local-1", {
   type: "agent.interaction.requested",
   interactionId: "interaction-1",
   kind: "questions",
@@ -51,9 +61,19 @@ registry.appendEvent("claude-local-1", {
   },
 });
 const events = registry.eventsAfter(0);
-assert.equal(events.events.length, 4);
+assert.equal(events.events.length, 5);
 assert.equal(events.events[0].text, "reply");
+assert.equal(
+  events.events.filter((event) => event.eventId === "stable-event-1").length,
+  1,
+);
 assert.ok(events.cursor > 0);
+assert.equal(events.latestCursor, events.cursor);
+assert.match(events.streamId, /^local_stream_/);
+assert.notEqual(
+  new ExternalAgentRegistry().eventsAfter(0).streamId,
+  events.streamId,
+);
 assert.equal(registry.list()[0].pending_approval_count, 1);
 assert.equal(registry.list()[0].status, "waiting_input");
 assert.equal(registry.list()[0].current_step, "Waiting for input");
@@ -84,6 +104,23 @@ registry.appendEvent("claude-local-1", {
   status: "applied",
 });
 assert.equal(registry.list()[0].status, "running");
+
+registry.appendEvent("claude-local-1", {
+  type: "agent.task.complete",
+});
+assert.equal(registry.list()[0].current_step, "Ready");
+registry.appendEvent("claude-local-1", {
+  type: "agent.activity",
+  activity: "rate_limit",
+  summary: "Codex rate limit status changed",
+});
+assert.equal(registry.list()[0].current_step, "Ready");
+registry.appendEvent("claude-local-1", {
+  type: "agent.activity",
+  activity: "mcp_status",
+  summary: "Codex MCP server status changed",
+});
+assert.equal(registry.list()[0].current_step, "Ready");
 
 now += 91_000;
 assert.equal(registry.list()[0].status, "stopped");

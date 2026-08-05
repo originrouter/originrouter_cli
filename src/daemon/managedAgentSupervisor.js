@@ -34,6 +34,7 @@ export class ManagedAgentSupervisor {
     catalog,
     deviceId,
     relayUrl,
+    agentBudgetStore = null,
     spawnFn = spawn,
     nodePath = process.execPath,
     binPath = fileURLToPath(new URL("../../bin/originrouter.js", import.meta.url)),
@@ -41,6 +42,7 @@ export class ManagedAgentSupervisor {
     this.catalog = catalog;
     this.deviceId = deviceId;
     this.relayUrl = relayUrl;
+    this.agentBudgetStore = agentBudgetStore;
     this.spawnFn = spawnFn;
     this.nodePath = nodePath;
     this.binPath = binPath;
@@ -83,6 +85,14 @@ export class ManagedAgentSupervisor {
     }
     if (!AGENTS.has(agent)) {
       throw launchError("UNSUPPORTED_AGENT", `Unsupported Agent: ${agent || "unknown"}`);
+    }
+    const deviceBudget = this.agentBudgetStore?.status("device");
+    const agentBudget = this.agentBudgetStore?.status("agent", agent);
+    if (deviceBudget?.blocked || agentBudget?.blocked) {
+      throw launchError(
+        "AGENT_BUDGET_EXHAUSTED",
+        `The ${agent} budget is exhausted on this device.`,
+      );
     }
     if (!PERMISSION_PROFILES.has(permissionProfile)) {
       throw launchError(

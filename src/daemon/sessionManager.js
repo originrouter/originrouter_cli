@@ -49,6 +49,7 @@ export class SessionManager {
     auditStore = null,
     agentCatalog = null,
     managedAgentSupervisor = null,
+    agentBudgetStore = null,
     onLocalControlChanged = null,
     stateDir = ensureStateDir(),
     compatibilityAutomaticUpdates = true,
@@ -66,6 +67,7 @@ export class SessionManager {
     this.auditStore = auditStore;
     this.agentCatalog = agentCatalog;
     this.managedAgentSupervisor = managedAgentSupervisor;
+    this.agentBudgetStore = agentBudgetStore;
     this.onLocalControlChanged = onLocalControlChanged;
     this.stateDir = stateDir;
     this.compatibilityAutomaticUpdates = compatibilityAutomaticUpdates;
@@ -376,6 +378,12 @@ export class SessionManager {
     }
     if (payload.type === "local_control.agent_detail.set") {
       writeConfig(setAgentDetailDefault(readConfig(), payload.profile));
+      return;
+    }
+    if (payload.type === "local_control.agent_budgets.set") {
+      if (!this.agentBudgetStore) throw new Error("Agent budget store unavailable");
+      this.agentBudgetStore.setPolicies(payload.budgets || {});
+      await this.onLocalControlChanged?.();
     }
   }
 

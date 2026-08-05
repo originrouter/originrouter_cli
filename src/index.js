@@ -50,6 +50,7 @@ import { RemoteCodingProxyManager } from "./proxy/remoteCodingProxyManager.js";
 import { runLocalAgentSession } from "./local/localAgentSession.js";
 import { readSessions } from "./persistence/sessionLog.js";
 import { AgentCatalog } from "./persistence/agentCatalog.js";
+import { AgentBudgetStore } from "./agent/agentBudgetStore.js";
 import { readApiToken, rotateApiToken } from "./persistence/authToken.js";
 import {
   ensureStateDir,
@@ -118,6 +119,7 @@ Usage:
   originrouter devices [--json]
   originrouter env print [--provider <name>] [--agent claude|codex]
   originrouter agent detail [set concise|standard|detailed]
+  originrouter agent budget [show|set|clear] [device|claude|codex] [options]
   originrouter agent setup [--cloud|--native]
   originrouter agent history [--search <text>] [--agent claude|codex] [--device <id>] [--status <status>] [--json]
   originrouter agent history show <conversation-id> [--json]
@@ -529,10 +531,59 @@ async function handleAgentSettings(args) {
     }
     return;
   }
+  if (section === "budget") {
+    const store = new AgentBudgetStore({ stateDir: ensureStateDir() });
+    try {
+      const snapshot = store.snapshot();
+      if (!action || action === "show") {
+        console.log(JSON.stringify(snapshot, null, 2));
+        return;
+      }
+      const scope = value;
+      if (!["device", "claude", "codex"].includes(scope)) {
+        throw new Error(
+          "Usage: originrouter agent budget set|clear device|claude|codex [options]",
+        );
+      }
+      const policies = {
+        device: snapshot.device.policy,
+        agents: {
+          claude: snapshot.agents.claude.policy,
+          codex: snapshot.agents.codex.policy,
+        },
+      };
+      const target = action === "clear"
+        ? {}
+        : {
+            daily_token_limit: argumentValue(args, "--daily-tokens"),
+            weekly_token_limit: argumentValue(args, "--weekly-tokens"),
+            daily_amount_limit_micros: amountMicros(
+              argumentValue(args, "--daily-amount"),
+            ),
+            weekly_amount_limit_micros: amountMicros(
+              argumentValue(args, "--weekly-amount"),
+            ),
+            currency: argumentValue(args, "--currency") || "USD",
+            enforcement: argumentValue(args, "--enforcement") || "block",
+          };
+      if (action !== "set" && action !== "clear") {
+        throw new Error(
+          "Usage: originrouter agent budget show|set|clear device|claude|codex",
+        );
+      }
+      if (scope === "device") policies.device = target;
+      else policies.agents[scope] = target;
+      console.log(JSON.stringify(store.setPolicies(policies), null, 2));
+    } finally {
+      store.close();
+    }
+    return;
+  }
   if (section !== "detail") {
     throw new Error(
       "Usage: originrouter agent setup [--cloud|--native] | " +
       "originrouter agent detail [set concise|standard|detailed] | " +
+      "originrouter agent budget [show|set|clear] | " +
       "originrouter agent history [options]",
     );
   }
@@ -546,6 +597,15 @@ async function handleAgentSettings(args) {
   const next = setAgentDetailDefault(readConfig(), value);
   writeConfig(next);
   console.log(`Agent detail default: ${agentDetailDefaultFromConfig(next)}`);
+}
+
+function amountMicros(value) {
+  if (value == null || value === "") return null;
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error("Agent budget amount must be a positive number");
+  }
+  return Math.round(amount * 1_000_000);
 }
 
 function handleClaudeConfig(args) {

@@ -1,6 +1,7 @@
 import process from "node:process";
 import { reportLocalControlRuntime } from "../agent/bridgeReporter.js";
 import { syncAgentActivityCatalog } from "../agent/agentActivityCatalogSync.js";
+import { AgentBudgetStore } from "../agent/agentBudgetStore.js";
 import {
   DEFAULT_DEVICE_ID,
   DEFAULT_EXECUTOR,
@@ -235,6 +236,7 @@ export async function startDaemon(args) {
     apiTokenPath: apiTokenFile,
   });
   const auditStore = new LocalAuditStore({ stateDir });
+  const agentBudgetStore = new AgentBudgetStore({ stateDir });
   const collaborationStore = new CollaborationStore({ stateDir });
   const collaborationCoordinator = new PlanImplementVerifyCoordinator({
     store: collaborationStore,
@@ -289,6 +291,7 @@ export async function startDaemon(args) {
     catalog: agentCatalog,
     deviceId: effectiveDeviceId,
     relayUrl,
+    agentBudgetStore,
   });
   const collaborationRuntime = new CollaborationRuntime({
     store: collaborationStore,
@@ -325,6 +328,7 @@ export async function startDaemon(args) {
     auditStore,
     agentCatalog,
     managedAgentSupervisor,
+    agentBudgetStore,
     stateDir,
     compatibilityAutomaticUpdates:
       relayMode !== "local" && process.env.ORIGINROUTER_COMPATIBILITY_UPDATES !== "off",
@@ -336,6 +340,44 @@ export async function startDaemon(args) {
   const startedAt = new Date().toISOString();
   let relayConnected = false;
   externalAgentRegistry.subscribe((notification) => {
+    if (notification.type !== "event" || notification.payload?.type !== "agent.usage") {
+      return;
+    }
+    const session = externalAgentRegistry
+      .list()
+      .find((item) => item.session_id === notification.sessionId);
+    if (!session) return;
+    try {
+      const event = notification.payload;
+      const result = agentBudgetStore.recordUsage({
+        eventId: `agent-budget-${notification.sessionId}-${event.eventId || event.localSequence}`,
+        agent: session.agent_type,
+        sampledTokens: event.sampledTokens,
+        amountMicros: event.amountMicros,
+        currency: event.currency,
+        createdAt: event.createdAt,
+      });
+      if (result.duplicate || result.ignored) return;
+      externalAgentRegistry.appendEvent(notification.sessionId, {
+        type: "agent.budget.status",
+        eventId: `agent-budget-status-${notification.sessionId}-${event.eventId || event.localSequence}`,
+        blocked: result.blocked,
+        warning: result.warning,
+        device: result.snapshot.device,
+        agent: result.snapshot.agents[session.agent_type],
+      });
+      if (result.blocked) {
+        externalAgentRegistry.enqueueCommand(notification.sessionId, {
+          type: "terminal.interrupt",
+          sessionId: notification.sessionId,
+          reason: "agent_budget_exhausted",
+        });
+      }
+    } catch (error) {
+      console.error(`[agent-budget] ${error.message}`);
+    }
+  });
+  externalAgentRegistry.subscribe((notification) => {
     if (!relayConnected) return;
     void externalAgentRelayRouter
       .forwardRegistryNotification(notification)
@@ -346,6 +388,7 @@ export async function startDaemon(args) {
   const localApiCtx = {
     sessionManager,
     auditStore,
+    agentBudgetStore,
     collaborationStore,
     collaborationCoordinator,
     collaborationRuntime,
@@ -481,6 +524,11 @@ export async function startDaemon(args) {
       console.error(`[daemon] collaboration store close: ${e.message}`);
     }
     try {
+      agentBudgetStore.close();
+    } catch (e) {
+      console.error(`[daemon] agent budget store close: ${e.message}`);
+    }
+    try {
       agentCatalog.close();
     } catch (e) {
       console.error(`[daemon] agent catalog close: ${e.message}`);
@@ -541,6 +589,7 @@ export async function startDaemon(args) {
         agentDetailProfile: agentDetailDefaultFromConfig(config),
         providers: localControlProviderSnapshot(config),
         routes: localControlRouteSnapshot(config),
+        agentBudgets: agentBudgetStore.snapshot(),
         compatibility: sessionManager.compatibilityStatus(),
       },
       { stateDir },

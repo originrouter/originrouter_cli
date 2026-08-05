@@ -65,6 +65,39 @@ function retryableDeliveryError(error) {
   );
 }
 
+function executionEventProjection(event = {}) {
+  const type = safeText(event.type, 96) || "agent.activity";
+  const activity = safeText(event.activity, 64);
+  const summary = safeText(
+    event.summary
+      || event.message
+      || event.title
+      || (activity ? activity.replaceAll("_", " ") : type.replaceAll(".", " ")),
+    1024,
+  );
+  const detail = safeText(
+    event.detail
+      || event.text
+      || event.result
+      || event.error?.message
+      || event.reason,
+    8192,
+  );
+  return {
+    type,
+    summary,
+    detail,
+    metadata: {
+      ...(activity ? { activity } : {}),
+      ...(safeText(event.kind, 64) ? { kind: safeText(event.kind, 64) } : {}),
+      ...(safeText(event.status, 32) ? { status: safeText(event.status, 32) } : {}),
+      ...(safeText(event.toolName ?? event.tool_name, 128)
+        ? { tool: safeText(event.toolName ?? event.tool_name, 128) }
+        : {}),
+    },
+  };
+}
+
 export class CollaborationRuntime {
   constructor({
     store,
@@ -691,6 +724,17 @@ export class CollaborationRuntime {
       ttlMs: this.leaseTtlMs,
     });
     const event = notification.payload || {};
+    const currentRun = this.store.getRun(binding.run_id, { includeMessages: false });
+    const currentTaskId = currentRun?.agents?.[binding.role]?.current_task_id || "";
+    const projectedEvent = executionEventProjection(event);
+    this.store.recordExecutionEvent(binding.run_id, {
+      eventId: `execution-${notification.sessionId}-${event.eventId || event.localSequence}`,
+      taskId: currentTaskId,
+      participantId: binding.role,
+      sessionId: notification.sessionId,
+      ...projectedEvent,
+      createdAt: event.createdAt,
+    });
     if (FAILED_EVENTS.has(event.type)) {
       const error = new Error(safeText(event.error || event.reason, 2048)
         || "Collaboration Agent command failed.");
@@ -897,6 +941,25 @@ export class CollaborationRuntime {
       }
       return true;
     }
+    if (payload.type === "collaboration.remote.event") {
+      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      const run = this.store.getRun(payload.runId, { includeMessages: false });
+      const role = safeText(payload.role, 32);
+      if (!run || !run.agents[role] || !run.task_ids.includes(payload.taskId)) return true;
+      if (!this.acceptsFencing(run, role, payload)) return true;
+      this.store.recordExecutionEvent(run.run_id, {
+        eventId: `remote-execution-${safeText(payload.eventId, 160)}`,
+        taskId: payload.taskId,
+        participantId: role,
+        sessionId: payload.sessionId,
+        type: payload.event?.type,
+        summary: payload.event?.summary,
+        detail: payload.event?.detail,
+        metadata: payload.event?.metadata || {},
+        createdAt: payload.createdAt,
+      });
+      return true;
+    }
     if (payload.type === "collaboration.remote.usage") {
       if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
       const run = this.store.getRun(payload.runId, { includeMessages: false });
@@ -1085,6 +1148,24 @@ export class CollaborationRuntime {
       ttlMs: this.leaseTtlMs,
     });
     const event = notification.payload || {};
+    const projectedEvent = executionEventProjection(event);
+    await this.sendRemoteDurable("collaboration.remote.event", {
+      protocolVersion: "1",
+      sourceDeviceId: this.deviceId,
+      targetDeviceId: assignment.source_device_id,
+      assignmentId: assignment.assignment_id,
+      runId: assignment.run_id,
+      taskId: assignment.task_id,
+      role: assignment.role,
+      attempt: assignment.attempt,
+      fencingToken: assignment.fencing_token,
+      eventId: `${notification.sessionId}-${event.eventId || event.localSequence}`,
+      sessionId: notification.sessionId,
+      createdAt: event.createdAt,
+      event: projectedEvent,
+    }, {
+      outboxId: `event:${compactId(`${assignment.assignment_id}-${event.eventId || event.localSequence}`, 160)}`,
+    });
     if (FAILED_EVENTS.has(event.type)) {
       const message = safeText(event.error || event.reason, 2048)
         || "Remote collaboration Agent command failed.";
