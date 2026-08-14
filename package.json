@@ -1,5 +1,5 @@
 {
-  "name": "originrouter",
+  "name": "@originrouter/cli",
   "version": "0.1.0",
   "description": "Local CLI and connector for OriginRouter Agent Control.",
   "keywords": [

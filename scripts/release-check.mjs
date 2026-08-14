@@ -11,7 +11,7 @@ assert(pkg.homepage, "homepage is required");
 assert(pkg.bugs?.url, "bugs.url is required");
 assert(pkg.files?.length, "an explicit files allowlist is required");
 assert.equal(pkg.publishConfig?.access, "public");
-assert.equal(pkg.name, "originrouter", "the public npm package name must be originrouter");
+assert.equal(pkg.name, "@originrouter/cli", "the public npm package name must be @originrouter/cli");
 assert.equal(pkg.bin?.originrouter, "bin/originrouter.js");
 assert.equal(pkg.bin?.or, "bin/originrouter.js");
 assert(constants.includes(`VERSION = "${pkg.version}"`), "src/constants.js VERSION must match package.json");

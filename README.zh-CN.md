@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/originrouter"><img alt="npm" src="https://img.shields.io/npm/v/originrouter?style=flat-square&color=ff4b16" /></a>
+  <a href="https://www.npmjs.com/package/@originrouter/cli"><img alt="npm" src="https://img.shields.io/npm/v/@originrouter/cli?style=flat-square&color=ff4b16" /></a>
   <a href="https://github.com/originrouter/originrouter_cli/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/originrouter/originrouter_cli/ci.yml?branch=main&style=flat-square&label=CI" /></a>
   <img alt="Node.js 22+" src="https://img.shields.io/badge/Node.js-22%2B-339933?style=flat-square&logo=node.js&logoColor=white" />
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-ff4b16?style=flat-square" /></a>
@@ -65,7 +65,7 @@ OriginRouter CLI daemon ─── 会话 · 策略 · 本地审计
 安装公开 npm 包：
 
 ```bash
-npm install --global originrouter
+npm install --global @originrouter/cli
 originrouter --version
 ```
 

@@ -7,9 +7,9 @@ packages. A publish becomes available when the registry accepts it. npm can
 still block or remove packages for naming conflicts, malware, policy violations,
 spam, or account/security problems.
 
-The unscoped names `originrouter-cli` and `originrouter` returned `404 Not Found`
-from the public registry on 2026-08-14. Recheck immediately before the first
-publish because availability can change.
+The scoped package `@originrouter/cli` returned `404 Not Found` from the public
+registry on 2026-08-14. The npm organization owner must publish it with public
+access. Recheck immediately before the first publish because availability can change.
 
 ## One-time npm setup
 
@@ -17,7 +17,7 @@ publish because availability can change.
 2. Enable two-factor authentication for account access and package publishing.
 3. Sign in locally with `npm login`, then confirm the expected identity with
    `npm whoami`.
-4. Confirm the final unscoped package name with `npm view originrouter`.
+4. Confirm the scoped package name with `npm view @originrouter/cli`.
 5. Make the first publish manually from a clean tagged commit:
 
    ```bash
@@ -47,7 +47,7 @@ publish because availability can change.
 5. Commit, create a signed tag such as `v0.1.0`, and publish a GitHub Release.
 6. The release event runs `.github/workflows/publish.yml`, tests again, and
    publishes with npm provenance.
-7. Verify `npm view originrouter version dist.integrity` and install the
+7. Verify `npm view @originrouter/cli version dist.integrity` and install the
    published version in a clean temporary directory.
 
 Never reuse a version. npm versions are immutable after publication. If a
