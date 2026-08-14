@@ -53,9 +53,6 @@ managed Claude SDK or Codex app-server sessions.
 >   session on `session.started`. **Read-only in 8.9** —
 >   `modeControl: "unsupported"`. Remote mode switching is
 >   Stage 9.0+.
-> - `originrouter-test/local-console.html` renders the new
->   envelope, deduplicates against the legacy event, and shows a
->   mode pill.
 >
 > **Stage 8.8 (the previous contract-only stage) shipped the
 > helper and the 10-case test. The contract is unchanged; the
@@ -79,11 +76,7 @@ events**:
 Everything else a real Claude Code / Codex remote session will
 block on — `ExitPlanMode`, `AskUserQuestion`, numeric TUI pickers,
 free-text prompts — is left to the raw terminal fallback
-(`terminal.input` → PTY stdin) with no structured envelope. If the
-App/H5 UI card model were defined against today's
-`agent.permission.*` only, the next kind of prompt would force a
-second migration. Stage 8.8 prevents that by locking the new
-envelope now.
+(`terminal.input` → PTY stdin) with no structured envelope.
 
 ## 2. Scope and non-goals
 
@@ -518,7 +511,6 @@ on `session.started`:
   confirmed current mode, and a display-safe reason code.
 - Terminal runtimes without a structured controller keep
   `modeControl: "unsupported"`.
-- The console renders this in the top-bar `Mode:` pill.
 
 ### 11.6 Test surface
 
@@ -527,12 +519,6 @@ dual-emit, resolve routing, unknown-id error, raw fallback,
 and `agent.mode.status` emission. `tests/permissionDecision.test.js`
 and `tests/codexAppServerClient.test.js` each gain a structural
 round-trip assertion.
-
-The console lives at
-`/Users/chengaoyan/Desktop/originrouter-test/local-console.html`
-(outside the CLI repo). It is validated by the manual steps in
-`docs/agent-runtime-audit.md` Stage 8.9 section, not by the
-`npm test` chain.
 
 ## 12. Semantic session mirror
 

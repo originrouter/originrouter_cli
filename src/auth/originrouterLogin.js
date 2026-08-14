@@ -10,12 +10,12 @@ import {
   requestDeviceCode,
 } from "./originrouterAuthClient.js";
 
-function loginUrlFor(h5BaseUrl) {
-  return `${h5BaseUrl.replace(/\/+$/, "")}/cli/authorize`;
+function loginUrlFor(loginBaseUrl) {
+  return `${loginBaseUrl.replace(/\/+$/, "")}/cli/authorize`;
 }
 
-function verificationUrlFor({ h5BaseUrl, userCode }) {
-  const url = new URL(loginUrlFor(h5BaseUrl));
+function verificationUrlFor({ loginBaseUrl, userCode }) {
+  const url = new URL(loginUrlFor(loginBaseUrl));
   url.searchParams.set("user_code", userCode);
   return url.toString();
 }
@@ -160,7 +160,7 @@ function sleep(ms) {
 
 export async function loginWithDeviceFlow({
   suretyBaseUrl,
-  h5BaseUrl,
+  loginBaseUrl,
   deviceId,
   deviceName,
   e2eeIdentity,
@@ -174,7 +174,7 @@ export async function loginWithDeviceFlow({
   fetchFn = globalThis.fetch,
 }) {
   if (!suretyBaseUrl) throw new Error("loginWithDeviceFlow: suretyBaseUrl is required");
-  if (!h5BaseUrl) throw new Error("loginWithDeviceFlow: h5BaseUrl is required");
+  if (!loginBaseUrl) throw new Error("loginWithDeviceFlow: loginBaseUrl is required");
   if (!deviceId) throw new Error("loginWithDeviceFlow: deviceId is required");
   if (!e2eeIdentity || typeof signEnrollmentChallenge !== "function") {
     throw new Error("loginWithDeviceFlow: E2EE identity binding is required");
@@ -202,7 +202,7 @@ export async function loginWithDeviceFlow({
     fetchFn,
   });
   const verificationUriComplete = verificationUrlFor({
-    h5BaseUrl,
+    loginBaseUrl,
     userCode: issued.user_code,
   });
   printFn("! To complete login, open this URL:");

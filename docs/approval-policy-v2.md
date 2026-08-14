@@ -463,16 +463,15 @@ The canonical registry is:
 schemas/approval-policy-registry.json
 ```
 
-It generates the CLI JavaScript registry and the App Dart registry. Published
-v1 and v2 schemas are checked against the same source during CLI tests.
+It generates the CLI JavaScript registry. Published v1 and v2 schemas are
+checked against the same source during CLI tests.
 
 ```bash
 npm run generate:approval-policy-registry
 npm run check:approval-policy-registry
 ```
 
-The generator updates the sibling `originrouter_app` checkout when present. A
-standalone CLI checkout validates its own generated JavaScript and schemas.
+The generator only updates files owned by this CLI repository.
 
 ## Example: whitelist plus blacklist
 

@@ -4,7 +4,7 @@ import {
   persistOAuthCredential,
 } from "../auth/originrouterLogin.js";
 import {
-  DEFAULT_ORIGINROUTER_H5_BASE_URL,
+  DEFAULT_ORIGINROUTER_LOGIN_BASE_URL,
   DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
   DEFAULT_SURETY_BASE_URL,
 } from "../config/providerRoutes.js";
@@ -122,8 +122,8 @@ export async function handleLogin(args, {
   const stateDir = ensureStateDir();
   const suretyBaseUrl = parseFlag(args, "surety-url") ||
     process.env.SURETY_BASE_URL || DEFAULT_SURETY_BASE_URL;
-  const h5BaseUrl = parseFlag(args, "login-url") ||
-    process.env.ORIGINROUTER_LOGIN_URL || DEFAULT_ORIGINROUTER_H5_BASE_URL;
+  const loginBaseUrl = parseFlag(args, "login-url") ||
+    process.env.ORIGINROUTER_LOGIN_URL || DEFAULT_ORIGINROUTER_LOGIN_BASE_URL;
   const requestedDeviceName = parseFlag(args, "device-name");
   let storedLogin;
   try {
@@ -176,7 +176,7 @@ export async function handleLogin(args, {
   try {
     const credential = await loginWithDeviceFlow({
       suretyBaseUrl,
-      h5BaseUrl,
+      loginBaseUrl,
       deviceId: device.deviceId,
       deviceName:
         (requestedDeviceName && cliDeviceDisplayName(requestedDeviceName)) ||

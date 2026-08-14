@@ -1,6 +1,6 @@
 # OriginRouter Agent Protocol
 
-This document is the **single source of truth** for the wire protocol that the local CLI, the relay, and any remote client (browser test page, mobile H5, native app) speak. Every event, endpoint, and field is defined here. If a producer or consumer diverges from this document, the document wins; update the code to match.
+This document is the **single source of truth** for the public CLI and relay wire protocol. Every event, endpoint, and field is defined here. If an implementation diverges from this document, update the code to match.
 
 The protocol is in-memory only in v1. The relay does no authentication, no encryption, and no persistence beyond process lifetime. This is documented and called out in §6.
 
@@ -596,19 +596,15 @@ The CLI's `~/.originrouter/sessions.jsonl` does persist a record of past session
 
 If the daemon path is used, `SessionManager.startSession` still routes `command === "claude"` through `runLocalAgentSession` (PTY path) — not the SDK. Bringing the daemon path to the SDK is on the backlog.
 
-### 6.6 Mobile clients (H5, native) not built
-
-The protocol is designed mobile-friendly (no terminal bytes in any of the structured events, no large blobs, no binary protocols), but the only consumer today is the test page (`originrouter-test/index.html`). The H5 landing point is `/app/session/:sessionId` and is on the next-batch backlog.
-
 ### 6.7 Event names are not yet stable
 
-The event names in §2.3 are stable in v1. Renames (e.g. `agent.permission.request.detected` → `agent.permission.request`) are intentionally deferred until the H5/native clients start consuming the protocol, so we only rename once across all consumers.
+The event names in §2.3 are stable in v1. Any rename must be versioned so existing integrations remain compatible.
 
 ---
 
 ## 7. Daemon local API (Stage 3)
 
-`originrouter daemon` runs an HTTP API bound to **127.0.0.1 by default**. This is the same-process control surface for the local OriginRouter daemon — what Flutter App / browser test pages consume when running on the same machine as the daemon.
+`originrouter daemon` runs an HTTP API bound to **127.0.0.1 by default**.
 
 The default path is local-only. Loopback requests are trusted as same-machine control and do not require the bearer token. LAN exposure requires the operator to pass a non-loopback `--bind` value plus `--allow-lan`. CORS is permissive (`Access-Control-Allow-Origin: *`), so non-loopback sensitive writes are protected by the bearer-token gate below.
 
@@ -642,9 +638,9 @@ All 401/403 responses include `WWW-Authenticate: Bearer realm="originrouter-loca
 
 **CORS**: `Access-Control-Allow-Headers: Content-Type, Authorization` (was just `Content-Type` before Stage 6).
 
-### 7.2 Flutter client discovery contract
+### 7.2 Local API discovery contract
 
-A Flutter client running on the same machine as the daemon discovers the local API via this exact sequence:
+Local integrations discover the API via this sequence:
 
 1. Read `~/.originrouter/daemon.state.json` to get `localApiPort`.
 2. Read `~/.originrouter/device.json` to get `deviceId`.
@@ -1068,7 +1064,7 @@ All require the bearer token (Stage 6 deny-by-default; routes are user state, no
 
 | Method | Path                                | Body                              | Effect |
 |--------|-------------------------------------|-----------------------------------|--------|
-| GET    | `/routes`                           | —                                 | Stage 8.0: returns `{ routes: { claude: { main, small }, codex: { main } }, aliases: { main, small, claude: {...}, codex: { main } } }`. The flat `aliases.main` / `aliases.small` are kept for backward compat with `local-console.html`. |
+| GET    | `/routes`                           | —                                 | Returns `{ routes: { claude: { main, small }, codex: { main } }, aliases: { claude: {...}, codex: { main } } }`. |
 | GET    | `/routes/<agent>`                   | —                                 | Same shape for one agent. `<agent>` ∈ `{claude, codex}`. |
 | PUT    | `/routes/<agent>`                   | `{ main?: { provider, model? }, small?: ... }` (use `null` to clear) | Replace full route set, auto-restart if running. `small` is rejected for `codex`. |
 | POST   | `/routes/<agent>/<slot>`            | `{ provider, model? }`            | Set a single slot. `<slot>=small` returns 400 for `codex`. |
@@ -1077,13 +1073,9 @@ All require the bearer token (Stage 6 deny-by-default; routes are user state, no
 
 `<agent>` is currently `claude`; `<slot>` is `main` or `small`. The PUT response includes `proxy: { state, mode, currentRouteHash, aliases, logPath, needsRestart }`.
 
-`POST /routes/<agent>/<slot>` with `slot=small` is the canonical way to point the fast alias at a provider (Stage 7.8). The UI's "Set as Claude Fast route" button on the provider detail view hits this endpoint with `{ provider, model }`. The CLI equivalent is `originrouter route set claude.small --provider <name> --model <model>`. When `routes.claude.small` is unset, the renderer falls back to main (see §10.2), so omitting it is safe — the proxy still gets a fast alias pointing at the same upstream as main.
+`POST /routes/<agent>/<slot>` with `slot=small` is the canonical way to point the fast alias at a provider. The CLI equivalent is `originrouter route set claude.small --provider <name> --model <model>`. When `routes.claude.small` is unset, the renderer falls back to main, so omitting it is safe.
 
-**Stage 7.9 GUI entry point:** the local console's **Routes** tab is the full-screen editor for both slots. Two routing blocks (Model, Fast Model), each with a `<select>` populated from `GET /providers` filtered to `type=litellm && model && model !== "(unset)"`, an `alias:` line (`originrouter-claude-model` / `originrouter-claude-fast-model`), a `current:` indicator, and a Save button that POSTs to the matching route endpoint. Save-button gating compares the full `{provider, model}` pair against the saved route so editing a provider's model on the Provider tab is surfaced as a saveable diff. The left Routes sidebar shows compact `claude main / claude small / codex main` rows grouped under section labels, with one clear button per set slot.
-
-**Stage 8.2 Codex block:** the Codex section renders the same shape as Claude's small slot — `<select>`, `alias:` line, `current:` indicator (showing `(unset; Codex will not start until set)` when no route is set), and Save / Clear buttons that POST/DELETE `/routes/codex/main`. Codex has no fast/small slot — see §10 above. A banner note (`Codex has one route in Stage 8.x. It does not use Claude Model or Fast Model.`) makes the isolation explicit. `renderRoutingBlock` is generalized over `(agentKey, slotKey)` so future agents can plug in the same shape; Claude's existing IDs (`routes-main-select`, `routes-small-select`, …) are preserved.
-
-**Stage 8.0:** the new endpoints `POST /routes/codex/main` and `DELETE /routes/codex/main` are first-class siblings of the Claude endpoints. `POST /routes/codex/small` returns 400 (Codex 8.0 has no small slot). The Codex section on the Routes tab was wired in Stage 8.2 to `/routes/codex/main` (see the Stage 7.9 / Stage 8.2 entry-point bullet above). `GET /routes` returns both agents and keeps the flat `aliases.main` / `aliases.small` fields (for backward compat with `local-console.html`'s `normalizeRoutesPayload`) alongside the new nested `aliases.claude` / `aliases.codex` aliases.
+`POST /routes/codex/main` and `DELETE /routes/codex/main` are first-class siblings of the Claude endpoints. `POST /routes/codex/small` returns 400 because Codex has no fast/small slot.
 
 ### 10.7 Security
 

@@ -1,6 +1,6 @@
 // Builds the `providerConfig` field that localAgentSession.js and
 // claudeSdkSession.js send on session.started. The shape is consumed by the
-// test page header and any future Flutter client.
+// compatible client header.
 //
 // The legacy `summarizeClaudeConfig` shape only knew about config.claude. The
 // new shape is the explicit, fully-resolved view: it names the source so the

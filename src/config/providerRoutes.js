@@ -64,12 +64,9 @@ export const DEFAULT_ORIGINROUTER_AI_SERVER_BASE_URL = "https://server.easytrans
 // not accidentally move /coding/v1 model traffic.
 export const DEFAULT_ORIGINROUTER_CONTROL_BASE_URL = "https://app.easytransnote.com";
 
-// Stage 9.7: the H5 device-authorize page. The CLI opens this
-// URL in the user's browser during `originrouter login` so the
-// user can review + approve the device. Independent from the
-// API gateway (different host). Override via --login-url or
-// ORIGINROUTER_LOGIN_URL.
-export const DEFAULT_ORIGINROUTER_H5_BASE_URL = "https://originrouter.com";
+// Browser authorization page opened during `originrouter login`.
+// Override via --login-url or ORIGINROUTER_LOGIN_URL.
+export const DEFAULT_ORIGINROUTER_LOGIN_BASE_URL = "https://originrouter.com";
 export const DEFAULT_SURETY_BASE_URL = "https://surety.easytransnote.com";
 
 /**

@@ -1960,19 +1960,13 @@ function projectRoutesForApi(routes, agent = "claude") {
 
 function handleRoutesList(ctx, res) {
   const config = ctx.configProvider();
-  // Stage 8.0: walk all configured agents. Per-agent nested aliases are
-  // the new canonical shape; the flat `aliases.main` / `aliases.small`
-  // fields are KEPT for backward compat with the local-console.html
-  // normalizeRoutesPayload() which reads those flat keys.
+  // Stage 8.0: walk all configured agents. Aliases use the canonical
+  // per-agent nested shape.
   const out = { routes: {}, aliases: {} };
   for (const agent of ROUTE_AGENTS) {
     out.routes[agent] = projectRoutesForApi(getAgentRoutes(config, agent), agent);
     out.aliases[agent] = { ...ROUTE_DEFS[agent].aliases };
   }
-  out.aliases = {
-    ...out.aliases.claude, // flat: main, small
-    ...out.aliases,
-  };
   return sendOk(res, out);
 }
 

@@ -191,10 +191,6 @@ for the exhaustive surface, or read the
 - Compatibility modules cannot access the filesystem, network, environment,
   processes, credentials, approval capabilities, or E2EE keys.
 
-Read the [credential architecture](docs/originrouter-login-credential-architecture.md),
-[local management security model](docs/cli-local-management-security.md), and
-[Approval Policy v2](docs/approval-policy-v2.md).
-
 ## Development
 
 ```bash
@@ -214,13 +210,8 @@ npm run test:compatibility
 
 ## Documentation
 
-- [CLI guide](https://originrouter.com/docs/originrouter-tools/cli)
-- [Native agent control](docs/native-agent-control.md)
-- [Provider route resolution](docs/provider-route-resolution.md)
-- [Agent autonomy](docs/agent-autonomy.md)
-- [Collaboration](docs/collaboration-adaptive-v2.md)
-- [Local audit ledger](docs/agent-local-audit.md)
-- [Model Compatibility Gateway](docs/model-compatibility-gateway.md)
+- [CLI documentation](https://originrouter.com/docs/originrouter-tools/cli)
+- [Command reference](https://originrouter.com/docs/originrouter-cli/commands)
 
 ## License
 

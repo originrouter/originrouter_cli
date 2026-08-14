@@ -580,16 +580,13 @@ try {
     assert.equal(body.setAgent, "codex");
   }
   {
-    // GET /routes response shape: nested per-agent routes, flat aliases
-    // (backward compat with local-console.html), nested aliases.
+    // GET /routes response shape: nested per-agent routes and aliases.
     const { status, body } = await getJson("/routes");
     assert.equal(status, 200);
     assert.equal(body.routes.claude.main.provider, "deepseek");
     assert.equal(body.routes.codex.main.provider, "deepseek");
-    // Flat aliases (kept for local-console.html normalizeRoutesPayload).
-    assert.equal(body.aliases.main,  "originrouter-claude-model");
-    assert.equal(body.aliases.small, "originrouter-claude-fast-model");
-    // Nested per-agent aliases (Stage 8.0).
+    assert.equal(body.aliases.main, undefined);
+    assert.equal(body.aliases.small, undefined);
     assert.equal(body.aliases.codex.main, "gpt-5.4");
     assert.equal(body.aliases.claude.main, "originrouter-claude-model");
   }

@@ -21,7 +21,6 @@ import { readConfig } from "../persistence/state.js";
 import { getAgentRoutes, getRoutes } from "../config/routes.js";
 import {
   DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
-  DEFAULT_ORIGINROUTER_H5_BASE_URL,
   DEFAULT_SURETY_BASE_URL,
 } from "../config/providerRoutes.js";
 
@@ -47,7 +46,6 @@ const c = (code) => (useColor ? code : "");
  * @param {string} [options.stateDir]
  * @param {object} [options.config]
  * @param {string} [options.apiBaseUrl]
- * @param {string} [options.h5BaseUrl]
  * @param {string} [options.suretyBaseUrl]
  * @param {number} [options.timeoutMs=4000]
  * @returns {Promise<CheckResult[]>}
@@ -55,7 +53,6 @@ const c = (code) => (useColor ? code : "");
 export async function runDoctor(options = {}) {
   const stateDir = options.stateDir || getStateDir();
   const apiBaseUrl = options.apiBaseUrl || DEFAULT_ORIGINROUTER_CONTROL_BASE_URL;
-  const h5BaseUrl = options.h5BaseUrl || DEFAULT_ORIGINROUTER_H5_BASE_URL;
   const suretyBaseUrl = options.suretyBaseUrl || _inferSuretyBaseUrl(apiBaseUrl);
   const timeoutMs = options.timeoutMs ?? 4000;
   const config = options.config || _readConfigSafe();

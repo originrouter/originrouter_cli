@@ -39,7 +39,7 @@ test("login URL contains only the one-time user code", () => {
     "https://app.originrouter.com/cli/authorize",
   );
   assert.equal(
-    verificationUrlFor({ h5BaseUrl: "https://app.originrouter.com", userCode: "ABCD-EFGH" }),
+    verificationUrlFor({ loginBaseUrl: "https://app.originrouter.com", userCode: "ABCD-EFGH" }),
     "https://app.originrouter.com/cli/authorize?user_code=ABCD-EFGH",
   );
 });
@@ -100,7 +100,7 @@ test("Device Flow rotates RT sequentially and builds five audience tokens", asyn
   const printed = [];
   const credential = await loginWithDeviceFlow({
     suretyBaseUrl: "https://surety.example.test",
-    h5BaseUrl: "https://app.originrouter.com",
+    loginBaseUrl: "https://app.originrouter.com",
     deviceId: "device-cli-stable",
     deviceName: "Work Mac",
     e2eeIdentity: enrollmentIdentity,
@@ -182,7 +182,7 @@ test("Device Flow accepts an atomic multi-resource token bundle", async () => {
 
   const credential = await loginWithDeviceFlow({
     suretyBaseUrl: "https://surety.example.test",
-    h5BaseUrl: "https://app.originrouter.com",
+    loginBaseUrl: "https://app.originrouter.com",
     deviceId: "device-cli-stable",
     deviceName: "Work Mac",
     e2eeIdentity: enrollmentIdentity,
@@ -207,7 +207,7 @@ test("Device Flow maps denial to a stable client error", async () => {
   await assert.rejects(
     () => loginWithDeviceFlow({
       suretyBaseUrl: "https://surety.example.test",
-      h5BaseUrl: "https://app.originrouter.com",
+      loginBaseUrl: "https://app.originrouter.com",
       deviceId: "device-cli-stable",
       noBrowser: true,
       sleepFn: async () => {},

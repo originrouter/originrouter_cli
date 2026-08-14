@@ -180,8 +180,6 @@ originrouter claude --originrouter-autonomy custom \
 - 审批策略在真正执行 Agent 的设备上评估。
 - Compatibility 模块不能访问文件系统、网络、环境变量、进程、凭据、审批能力或 E2EE key。
 
-进一步阅读：[凭据架构](docs/originrouter-login-credential-architecture.md)、[本地管理安全模型](docs/cli-local-management-security.md)和 [Approval Policy v2](docs/approval-policy-v2.md)。
-
 ## 开发
 
 ```bash
@@ -202,12 +200,7 @@ npm run test:compatibility
 ## 文档
 
 - [CLI 使用指南](https://originrouter.com/docs/originrouter-tools/cli)
-- [原生 Agent 控制](docs/native-agent-control.md)
-- [Provider 路由解析](docs/provider-route-resolution.md)
-- [Agent 自主模式](docs/agent-autonomy.md)
-- [Agent 协作](docs/collaboration-adaptive-v2.md)
-- [本地审计账本](docs/agent-local-audit.md)
-- [模型兼容网关](docs/model-compatibility-gateway.md)
+- [命令参考](https://originrouter.com/docs/originrouter-cli/commands)
 
 ## 许可证
 

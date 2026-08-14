@@ -5,7 +5,7 @@
 // Claude Code spawns this script for every registered hook event and reads
 // the hook's decision from this process's stdout. We forward the original
 // stdin JSON to OriginRouter's local hook server, which holds the request
-// open until the remote client (test page / mobile app) sends a decision.
+// open until the remote client sends a decision.
 // When the hook server finally responds, we copy its response body to our
 // own stdout so Claude Code can read the structured hook return.
 //

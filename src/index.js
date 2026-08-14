@@ -1,7 +1,4 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
 import { startDaemon } from "./daemon/daemon.js";
 import {
   CLAUDE_CONFIG_KEYS,
@@ -222,8 +219,8 @@ Provider field metadata:
   all CLI / API output.
 
 Local API auth:
-  originrouter token show                            Print the current token + browser URL
-  originrouter token rotate                          Mint a new token (invalidates all open browser tabs)
+  originrouter token show                            Print the current token + Local API URL
+  originrouter token rotate                          Mint a new token (invalidates existing clients)
   originrouter local key show                        Alias for token show
   originrouter local key rotate                      Alias for token rotate
   originrouter local config show                     Print persisted local API bind/port settings
@@ -288,7 +285,7 @@ OriginRouter OAuth login:
   Login uses RFC 8628 Device Authorization Grant directly with Surety. It prints
   an 8-character user code + verification URL, opens the browser
   (unless --no-browser), and polls Surety until you approve
-  on the H5 page. Works for SSH, Docker, CI, or any environment
+  on the browser authorization page. Works for SSH, Docker, CI, or any environment
   where the CLI cannot receive a browser redirect.
 
   --no-browser     Do not auto-open the browser; only print the
@@ -296,7 +293,7 @@ OriginRouter OAuth login:
                    / CI environments.
   --surety-url     Surety OAuth base URL. Defaults to SURETY_BASE_URL
                    or https://surety.easytransnote.com.
-  --login-url      H5 authorization page base URL.
+  --login-url      Browser authorization page base URL.
   --configure-agents  Apply OriginRouter Cloud recommended Claude/Codex models after login.
   --keep-agent-routes Keep Agent routes unchanged, including private Provider routes.
   --no-agent-setup    Alias for --keep-agent-routes; useful in scripts and CI.
@@ -1527,7 +1524,7 @@ async function handleCompatibility(args) {
 
 // ---------- token (Stage 6) ----------
 
-// Builds the canonical browser URL. Reads the daemon port from
+// Builds the canonical Local API URL. Reads the daemon port from
 // daemon.state.json; falls back to the configured local-port flag if the
 // daemon isn't running yet (e.g. immediately after `token rotate` while
 // the user is about to (re)start the daemon).
@@ -1558,25 +1555,6 @@ function buildApiUrl(stateDir, token, portOverride) {
   return `http://${urlHost}:${port}/?daemon=${urlHost}:${port}&token=${token}`;
 }
 
-function buildConsoleUrl(stateDir, token, portOverride) {
-  const port = resolveDaemonPort(portOverride) || "<port>";
-  let host = "127.0.0.1";
-  try {
-    const state = readDaemonState();
-    const bind = state?.localApiBindAddress;
-    if (bind && bind !== "0.0.0.0") host = bind;
-  } catch {}
-  const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-  const here = dirname(fileURLToPath(import.meta.url));
-  const repoRoot = dirname(here);
-  const consolePath = resolve(repoRoot, "..", "originrouter-test", "local-console.html");
-  if (!existsSync(consolePath)) return buildApiUrl(stateDir, token, portOverride);
-  const url = new URL(pathToFileURL(consolePath).toString());
-  url.searchParams.set("daemon", `${urlHost}:${port}`);
-  url.searchParams.set("token", token);
-  return url.toString();
-}
-
 function handleTokenCommand(args) {
   const stateDir = ensureStateDir();
   const [action] = args;
@@ -1585,7 +1563,6 @@ function handleTokenCommand(args) {
     console.log("Token rotated.");
     console.log(`Token file: ${stateDir}/local-api.token`);
     console.log(`Default local API port: ${DEFAULT_LOCAL_API_PORT}`);
-    console.log(`URL: ${buildConsoleUrl(stateDir, token)}`);
     console.log(`API URL: ${buildApiUrl(stateDir, token)}`);
     return;
   }
@@ -1598,7 +1575,6 @@ function handleTokenCommand(args) {
     }
     console.log(`Token file: ${stateDir}/local-api.token`);
     console.log(`Default local API port: ${DEFAULT_LOCAL_API_PORT}`);
-    console.log(`URL: ${buildConsoleUrl(stateDir, token)}`);
     console.log(`API URL: ${buildApiUrl(stateDir, token)}`);
     return;
   }

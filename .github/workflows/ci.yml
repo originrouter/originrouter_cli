@@ -11,6 +11,7 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -25,7 +26,9 @@ jobs:
       - run: npm test
 
   windows-smoke:
-    runs-on: windows-latest
+    # Pin Visual Studio 2022 so node-gyp can build native dependencies such
+    # as better-sqlite3 when a prebuilt binary is unavailable.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

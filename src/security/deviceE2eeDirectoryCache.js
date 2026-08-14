@@ -13,6 +13,7 @@ import {
   verifyDeviceE2eeIdentity,
   verifyDeviceE2eeRotation,
 } from "../crypto/deviceE2eeIdentity.js";
+import { KEY_SOURCE } from "../runtime/authContract.js";
 
 export const DEVICE_E2EE_DIRECTORY_REFRESH_MS = 15 * 60 * 1000;
 export const DEVICE_E2EE_DIRECTORY_MAX_STALE_MS = 24 * 60 * 60 * 1000;
@@ -110,7 +111,7 @@ function verifyTrustProofs(policy, identities) {
   }
   const byKey = new Map(identities.map((item) => [item.key_id, item]));
   const policyApprover = byKey.get(proof.approver_key_id);
-  if (!policyApprover || policyApprover.source !== "originrouter_app"
+  if (!policyApprover || policyApprover.source !== KEY_SOURCE.ORIGINROUTER_APP
       || policyApprover.trust_status !== "trusted"
       || proof.device_id !== policyApprover.device_id
       || !verifyProof(proof, policyApprover, "originrouter/device-policy/v2\n")) {
@@ -157,7 +158,7 @@ function verifyTrustProofs(policy, identities) {
           || admission.candidate_device_id !== deviceId
           || !candidateMatches
           || !approver
-          || approver.source !== "originrouter_app"
+          || approver.source !== KEY_SOURCE.ORIGINROUTER_APP
           || admission.approver_device_id !== approver.device_id
           || !authorizedDevices.has(approver.device_id)
           || !verifyProof(
@@ -226,7 +227,7 @@ function verifyPolicyTransition(previous, next) {
   const previouslyTrustedApp = nextSigner
     && previous.identities.some((item) =>
       item.device_id === nextSigner.device_id
-        && item.source === "originrouter_app"
+        && item.source === KEY_SOURCE.ORIGINROUTER_APP
         && item.trust_status === "trusted");
   if (!previouslyTrustedApp) {
     throw new Error("verified-device policy signer was not previously trusted");
