@@ -21,8 +21,8 @@
   },
   "type": "module",
   "bin": {
-    "originrouter": "./bin/originrouter.js",
-    "or": "./bin/originrouter.js"
+    "originrouter": "bin/originrouter.js",
+    "or": "bin/originrouter.js"
   },
   "files": [
     "bin/",
