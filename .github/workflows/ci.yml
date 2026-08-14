@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run release:check
+      - run: npm test
+
+  windows-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run release:check
+      - run: npm run test:completion
+      - run: node ./tests/serviceCommand.test.js
+      - run: node ./tests/spawnCommand.test.js
+      - run: npm pack
+      - shell: pwsh
+        run: npm install --global (Get-ChildItem originrouter-*.tgz | Select-Object -First 1).FullName
+      - run: originrouter --version
+      - run: or --version

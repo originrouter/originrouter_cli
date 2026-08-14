@@ -1,0 +1,40 @@
+<svg width="1200" height="420" viewBox="0 0 1200 420" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="40" y1="20" x2="1160" y2="400" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#071A18"/>
+      <stop offset="0.52" stop-color="#0B2522"/>
+      <stop offset="1" stop-color="#091412"/>
+    </linearGradient>
+    <linearGradient id="line" x1="240" y1="80" x2="1000" y2="350" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5EEAD4" stop-opacity="0.12"/>
+      <stop offset="0.5" stop-color="#5EEAD4"/>
+      <stop offset="1" stop-color="#A7F3D0" stop-opacity="0.18"/>
+    </linearGradient>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" stroke="#9FF3DF" stroke-opacity="0.055"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="420" rx="28" fill="url(#bg)"/>
+  <rect width="1200" height="420" rx="28" fill="url(#grid)"/>
+  <circle cx="1030" cy="70" r="150" fill="#27D3B3" fill-opacity="0.07" filter="url(#glow)"/>
+  <circle cx="190" cy="390" r="170" fill="#27D3B3" fill-opacity="0.05" filter="url(#glow)"/>
+  <g opacity="0.95">
+    <path d="M190 210H348C374 210 389 193 405 173L457 108C473 88 488 78 514 78H1010" stroke="url(#line)" stroke-width="2"/>
+    <path d="M190 210H365C391 210 405 225 421 245L469 305C485 325 501 336 527 336H1010" stroke="url(#line)" stroke-width="2"/>
+    <path d="M190 210H1010" stroke="url(#line)" stroke-width="2"/>
+    <circle cx="190" cy="210" r="9" fill="#5EEAD4"/>
+    <circle cx="1010" cy="78" r="7" fill="#A7F3D0"/>
+    <circle cx="1010" cy="210" r="7" fill="#A7F3D0"/>
+    <circle cx="1010" cy="336" r="7" fill="#A7F3D0"/>
+  </g>
+  <rect x="442" y="139" width="316" height="142" rx="22" fill="#071614" stroke="#5EEAD4" stroke-opacity="0.34"/>
+  <rect x="458" y="155" width="284" height="110" rx="14" fill="#0D2420"/>
+  <path d="M486 185L505 204L486 223" stroke="#5EEAD4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="620" y="205" fill="#ECFDF8" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="27" font-weight="700" text-anchor="middle">ORIGINROUTER</text>
+  <text x="620" y="238" fill="#78CDBB" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" letter-spacing="2.5" text-anchor="middle">LOCAL AGENT CONTROL PLANE</text>
+  <text x="70" y="62" fill="#7DD9C6" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" letter-spacing="2">ROUTE / CONTROL / AUDIT</text>
+  <text x="1130" y="380" fill="#7DD9C6" fill-opacity="0.7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" text-anchor="end">CLAUDE CODE + CODEX</text>
+</svg>

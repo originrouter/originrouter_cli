@@ -1,0 +1,34 @@
+name: Bug report
+description: Report a reproducible OriginRouter CLI problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include API keys, OAuth tokens, transcripts, source code, commands, or private filesystem paths.
+  - type: input
+    id: version
+    attributes:
+      label: OriginRouter CLI version
+      placeholder: Output of originrouter --version
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [macOS, Linux, Windows]
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide minimal, redacted steps and the expected versus actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Add relevant originrouter doctor output after reviewing it for private data.

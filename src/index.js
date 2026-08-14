@@ -75,6 +75,7 @@ import { handleAgentRouteSetup } from "./commands/agentRouteSetup.js";
 import { handleSecurityCommand } from "./commands/security.js";
 import { handleCollaborationCommand } from "./commands/collaboration.js";
 import { handleHistoryCommand } from "./commands/history.js";
+import { getCompletionCandidates, printCompletion } from "./commands/completion.js";
 import {
   rollbackCompatibilityPack,
 } from "./compatibility/patchStore.js";
@@ -114,6 +115,7 @@ function printHelp() {
 Usage:
   originrouter --help
   originrouter --version
+  originrouter completion bash|zsh|fish|powershell
   originrouter status
   originrouter doctor [provider <name>]
   originrouter sessions [--json]
@@ -181,7 +183,7 @@ originrouter provider update <name> [same flags as add]
   originrouter provider use <name> [--agent claude|codex] [--force]
   originrouter provider remove <name>
 
-Model routes (Stage 7.5 / 7.6):
+Model routes:
   originrouter route list
   originrouter route show [claude|codex]
   originrouter route set claude --provider <name> --main-model <m> --small-model <m>
@@ -195,7 +197,7 @@ Model routes (Stage 7.5 / 7.6):
   originrouter route remote set <agent>.<slot> [--device <id>] [--model <id>]
   Aliases are fixed: originrouter-claude-model, originrouter-claude-fast-model, and gpt-5.4.
 
-LiteLLM proxy (Stage 4 + Stage 7.5 + 7.6 + 7.7):
+LiteLLM proxy:
   originrouter proxy install [--version <v>]      default version 1.83.0
   originrouter proxy start --port <p>            routes mode (default; reads routes.claude)
   originrouter proxy start --provider <name> --port <p>   legacy / debug — NOT for use with originrouter claude
@@ -213,13 +215,13 @@ Model compatibility patches:
   originrouter compatibility refresh [--json]       alias for update
   originrouter compatibility rollback
 
-Provider field metadata (Stage 7.7):
+Provider field metadata:
   Every --flag maps to a catalog field for the chosen --litellm-provider.
   Unknown flags are rejected. Fields can be literal values or env references
   (e.g. --api-key os.environ/DEEPSEEK_API_KEY). Secret fields are masked in
   all CLI / API output.
 
-Local API auth (Stage 6):
+Local API auth:
   originrouter token show                            Print the current token + browser URL
   originrouter token rotate                          Mint a new token (invalidates all open browser tabs)
   originrouter local key show                        Alias for token show
@@ -250,7 +252,7 @@ Other:
 
 Examples:
   originrouter run -- bash
-  # Stage 9.0: proxy provider (LiteLLM via local proxy). The --type litellm
+  # Proxy provider (LiteLLM via local proxy). The --type litellm
   # alias and --engine litellm are equivalent to the canonical --type proxy.
   originrouter provider add minimax --type proxy --engine litellm --litellm-provider anthropic --base-url https://api.easytransnote.com/coding --api-key sk-v1-xxx --model MiniMax-M3 --small-fast-model MiniMax-M2.7
   # Login-backed source selectors: Cloud presents the available models; Remote
@@ -266,7 +268,7 @@ Examples:
   originrouter codex --model gpt-5-codex
   originrouter sessions
   originrouter sessions --json
-  # Stage 7.7: provider fields can be env references. The shell var name is
+  # Provider fields can be env references. The shell var name is
   # stored verbatim; LiteLLM reads the env itself at startup.
   originrouter provider add bedrock-irsa --type proxy --engine litellm --litellm-provider bedrock \
     --aws-region os.environ/AWS_REGION_NAME \
@@ -320,6 +322,50 @@ OriginRouter wrapper options for claude/codex:
                                                  outside_workspace, unknown_tools
   --originrouter-native-config                   Native TUI only: use the installed Claude/Codex auth, model, environment, and config; keep OriginRouter remote control only
   --originrouter-native                          Alias for --originrouter-native-config
+`);
+}
+
+function printSummaryHelp() {
+  console.log(`originrouter ${VERSION} — local control plane for Claude Code and Codex
+
+Usage:
+  originrouter <command> [options]
+  originrouter claude [native Claude Code args...]
+  originrouter codex [native Codex args...]
+
+Start here:
+  doctor                 Check dependencies, account, relay, and providers
+  service                Install, start, stop, or inspect the background service
+  agent setup            Choose native configuration or an OriginRouter route
+  claude | codex         Launch a native agent with remote control
+
+Models and routing:
+  provider               Add, update, inspect, and remove local providers
+  route                  Assign local, cloud, or remote models to agent slots
+  route list             Show every configured Agent route
+  route set <agent.slot> Assign a Provider and model to one route slot
+  proxy                  Install and manage the local LiteLLM proxy
+  compatibility          Inspect signed protocol compatibility updates
+
+  Route aliases: originrouter-claude-model, originrouter-claude-fast-model,
+                 and gpt-5.4
+
+Sessions and control:
+  sessions | devices     Inspect local sessions or authorized devices
+  history                Query display-safe Agent history
+  collaborate            Start a guided multi-agent collaboration
+  collaboration          Inspect and control collaboration runs
+  local | security       Manage the Local API and device security
+
+Account:
+  originrouter login [--no-browser]
+  originrouter logout
+  originrouter auth status
+
+Discoverability:
+  originrouter completion bash|zsh|fish|powershell
+  originrouter help all              Show the exhaustive command reference
+  https://originrouter.com/docs/originrouter-cli/commands
 `);
 }
 
@@ -2000,12 +2046,27 @@ export async function main(argv) {
   const [command, ...args] = argv;
 
   if (!command || command === "--help" || command === "-h") {
-    printHelp();
+    printSummaryHelp();
+    return;
+  }
+
+  if (command === "help") {
+    args[0] === "all" ? printHelp() : printSummaryHelp();
     return;
   }
 
   if (command === "--version" || command === "-v") {
     console.log(VERSION);
+    return;
+  }
+
+  if (command === "__complete") {
+    console.log(getCompletionCandidates(args).join("\n"));
+    return;
+  }
+
+  if (command === "completion") {
+    printCompletion(args[0]);
     return;
   }
 
@@ -2169,11 +2230,6 @@ export async function main(argv) {
 
   if (command === "security") {
     await handleSecurityCommand(args);
-    return;
-  }
-
-  if (command === "doctor") {
-    await handleDoctor(args);
     return;
   }
 
