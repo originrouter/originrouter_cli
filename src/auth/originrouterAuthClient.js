@@ -69,11 +69,12 @@ export async function requestDeviceCode({
     `${base(suretyBaseUrl)}/api/oauth/device/code`,
     [
       ["client_id", "originrouter_cli"],
-      ["scope", "control.read control.write ai.models ai.invoke coding.invoke relay.connect offline_access"],
+      ["scope", "control.read control.write ai.models ai.invoke coding.invoke relay.connect memory.read offline_access"],
       ["resource", "originrouter.control"],
       ["resource", "originrouter.ai"],
       ["resource", "originrouter.coding"],
       ["resource", "originrouter.relay"],
+      ["resource", "originrouter.memory"],
       ["device_id", deviceId],
       ["device_name", deviceName || deviceId],
     ],

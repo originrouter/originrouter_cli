@@ -301,7 +301,8 @@ the execution and update model.
 | List providers and routes      | `originrouter provider list` / `originrouter route list` |
 | Print agent environment        | `originrouter env print --agent claude`                  |
 | Inspect local sessions         | `originrouter sessions`                                  |
-| Search display-safe activity   | `originrouter agent history --search <text>`             |
+| Ask account-wide Agent history | `originrouter history "what changed the login callback?"` |
+| Search local display-safe activity | `originrouter agent history --search <text>`          |
 | Show the Local API key         | `originrouter local key show`                            |
 | Configure LAN/relay behavior   | `originrouter local config show` / `set`                 |
 | Restart the daemon             | `originrouter service restart`                           |

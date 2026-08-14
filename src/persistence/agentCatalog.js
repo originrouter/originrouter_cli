@@ -851,6 +851,15 @@ export class AgentCatalog {
     };
   }
 
+  getConversationTranscriptLocator(conversationId) {
+    const id = safeText(conversationId, 96);
+    if (!id) return "";
+    const row = this.db.prepare(
+      "SELECT transcript_locator FROM agent_conversations WHERE conversation_id = ? LIMIT 1",
+    ).get(id);
+    return canonicalPath(row?.transcript_locator);
+  }
+
   listWorkspaces({ search = "", deviceId = "", limit = DEFAULT_LIMIT } = {}) {
     const clauses = [];
     const params = {

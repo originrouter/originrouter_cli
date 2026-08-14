@@ -2,7 +2,7 @@ import { accessTokenFor, OAUTH_RESOURCES } from "./authContract.js";
 import { displaySafeToolInput } from "./displaySafeToolInput.js";
 import { ensureFreshAccessToken } from "./oauthTokenRefresher.js";
 
-const DEFAULT_ENDPOINT = "https://chat.easytransnote.com/api/v1/ai-approval/review";
+const DEFAULT_ENDPOINT = "https://app.easytransnote.com/ai/v1/ai-approval/review";
 
 function safeValue(value, depth = 0) {
   if (depth > 8 || value == null) return null;
@@ -50,6 +50,9 @@ export class AiApprovalReviewer {
           prompt: String(request.prompt || "").slice(0, 2048),
           scope: classification?.scope || null,
           classification_reason: classification?.reason || null,
+          classification_evidence: safeValue(
+            displaySafeToolInput(classification?.evidence || {}),
+          ),
           contains_secret: Boolean(request.containsSecret),
           payload: safeValue(displaySafeToolInput(request.payload || {})),
         },

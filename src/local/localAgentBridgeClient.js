@@ -113,8 +113,10 @@ export class LocalAgentBridgeClient {
 
   async sendEvent(event) {
     if (this.closed) return false;
-    this.auditStore.appendEvent(this.sessionMetadata, event);
-    if (!(await this.connect())) return false;
+    if (!(await this.connect())) {
+      this.auditStore.appendEvent(this.sessionMetadata, event);
+      return false;
+    }
     try {
       await request(
         this.endpoint,
@@ -124,6 +126,7 @@ export class LocalAgentBridgeClient {
       );
       return true;
     } catch {
+      this.auditStore.appendEvent(this.sessionMetadata, event);
       this.setEndpoint(null);
       return false;
     }

@@ -38,6 +38,7 @@ test("requestDeviceCode sends RFC 8628 form data and all resources", async () =>
     "originrouter.ai",
     "originrouter.coding",
     "originrouter.relay",
+    "originrouter.memory",
   ]);
 });
 

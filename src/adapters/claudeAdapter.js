@@ -576,6 +576,47 @@ export class ClaudeAdapter extends TerminalAdapter {
           payload.hook_event_name || payload.hookEventName,
           64,
         );
+        if (
+          hookEvent === "PostToolUse" ||
+          hookEvent === "PostToolUseFailure" ||
+          hookEvent === "PermissionDenied"
+        ) {
+          const interactionId = safeText(
+            payload.tool_use_id || payload.toolUseId,
+            191,
+          );
+          const pending = interactionId
+            ? this.pendingInteractionInputs.get(interactionId)
+            : null;
+          if (pending) {
+            const denied = hookEvent === "PermissionDenied";
+            const decision = denied ? "denied" : "approved";
+            const settled = this.hookServer?.resolvePermission({
+              callId: interactionId,
+              decision,
+              reason: "handled_in_terminal",
+            });
+            if (settled) {
+              this.pendingInteractionInputs.delete(interactionId);
+              this.pendingEvents.push({
+                type: "agent.interaction.result",
+                provider: "claude",
+                sessionId: this.sessionId,
+                interactionId,
+                responseId: `terminal:${interactionId}`,
+                status: denied ? "canceled" : "applied",
+                decisionSource: "terminal",
+              });
+              this.pendingEvents.push({
+                type: "agent.permission.resolved",
+                provider: "claude",
+                callId: interactionId,
+                decision,
+                decisionSource: "terminal",
+              });
+            }
+          }
+        }
         if (hookEvent === "UserPromptSubmit") this.taskActive = true;
         if (
           hookEvent === "Stop" ||

@@ -217,6 +217,15 @@ try {
     assert.equal(launch.env.OPENAI_MODEL, CODEX_MAIN_ALIAS);
   }
 
+  // ---- 10b. CodexAdapter uses the model resolved by non-proxy routes ----
+  {
+    const adapter = new CodexAdapter({ args: [] });
+    adapter.setRoutedModel("gpt-5.6-sol");
+    const launch = adapter.buildLaunch();
+    assert.deepEqual(launch.args.slice(0, 2), ["--model", "gpt-5.6-sol"]);
+    assert.equal(launch.env.OPENAI_MODEL, "gpt-5.6-sol");
+  }
+
   // ---- 11. CodexAdapter buildLaunch: --model X (pass-through + warning) ----
   for (const userArgs of [
     ["--model", "gpt-4"],

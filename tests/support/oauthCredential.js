@@ -22,6 +22,11 @@ export function makeOAuthCredential(overrides = {}) {
       expiresAt: accessTokenExpiresAt,
       scopes: ["relay.connect"],
     },
+    memory: {
+      token: "or_at_memory_test",
+      expiresAt: accessTokenExpiresAt,
+      scopes: ["memory.read"],
+    },
   };
   const credential = {
     kind: "oauth",

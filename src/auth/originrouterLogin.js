@@ -80,6 +80,7 @@ async function completeBundle({
     ai: bundledResourceToken(control, "originrouter.ai"),
     coding: bundledResourceToken(control, "originrouter.coding"),
     relay: bundledResourceToken(control, "originrouter.relay"),
+    memory: bundledResourceToken(control, "originrouter.memory"),
   };
   if (Object.values(bundled).every(Boolean)) {
     return {
@@ -99,6 +100,7 @@ async function completeBundle({
         ai: tokenRecord(bundled.ai),
         coding: tokenRecord(bundled.coding),
         relay: tokenRecord(bundled.relay),
+        memory: tokenRecord(bundled.memory),
       },
     };
   }
@@ -124,15 +126,22 @@ async function completeBundle({
     fetchFn,
   });
   refreshToken = rotatedRefreshToken(relay);
+  const memory = await refreshOAuthToken({
+    tokenEndpoint,
+    refreshToken,
+    resource: "originrouter.memory",
+    fetchFn,
+  });
+  refreshToken = rotatedRefreshToken(memory);
   return {
     kind: KEY_KIND.OAUTH,
     clientId: "originrouter_cli",
     source: KEY_SOURCE.ORIGINROUTER_CLI,
     deviceId,
     deviceName: deviceName || deviceId,
-    sessionId: relay.session_id || control.session_id,
+    sessionId: memory.session_id || relay.session_id || control.session_id,
     refreshToken,
-    refreshExpiresAt: Date.now() + Number(relay.refresh_expires_in || 2592000) * 1000,
+    refreshExpiresAt: Date.now() + Number(memory.refresh_expires_in || 2592000) * 1000,
     tokenEndpoint,
     revocationEndpoint,
     accessTokens: {
@@ -140,6 +149,7 @@ async function completeBundle({
       ai: tokenRecord(ai),
       coding: tokenRecord(coding),
       relay: tokenRecord(relay),
+      memory: tokenRecord(memory),
     },
   };
 }

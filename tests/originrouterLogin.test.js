@@ -44,7 +44,7 @@ test("login URL contains only the one-time user code", () => {
   );
 });
 
-test("Device Flow rotates RT sequentially and builds four audience tokens", async () => {
+test("Device Flow rotates RT sequentially and builds five audience tokens", async () => {
   const calls = [];
   let devicePolls = 0;
   const fetchFn = async (url, init) => {
@@ -83,6 +83,7 @@ test("Device Flow rotates RT sequentially and builds four audience tokens", asyn
       "originrouter.ai": ["or_rt_1", "or_at_ai_login", "or_rt_2", "ai.models ai.invoke"],
       "originrouter.coding": ["or_rt_2", "or_at_coding_login", "or_rt_3", "coding.invoke"],
       "originrouter.relay": ["or_rt_3", "or_at_relay_login", "or_rt_4", "relay.connect"],
+      "originrouter.memory": ["or_rt_4", "or_at_memory_login", "or_rt_5", "memory.read"],
     }[resource];
     assert.ok(rotation, `unexpected resource ${resource}`);
     assert.equal(body.get("refresh_token"), rotation[0]);
@@ -114,11 +115,12 @@ test("Device Flow rotates RT sequentially and builds four audience tokens", asyn
   assert.equal(credential.deviceId, "device-cli-stable");
   assert.equal(credential.deviceName, "Work Mac");
   assert.equal(credential.sessionId, "or_ses_login");
-  assert.equal(credential.refreshToken, "or_rt_4");
+  assert.equal(credential.refreshToken, "or_rt_5");
   assert.equal(credential.accessTokens.control.token, "or_at_control_login");
   assert.equal(credential.accessTokens.ai.token, "or_at_ai_login");
   assert.equal(credential.accessTokens.coding.token, "or_at_coding_login");
   assert.equal(credential.accessTokens.relay.token, "or_at_relay_login");
+  assert.equal(credential.accessTokens.memory.token, "or_at_memory_login");
   assert.equal(devicePolls, 2);
   assert.match(printed.join("\n"), /ABCD-EFGH/);
   assert.equal(calls[0].body.get("device_id"), "device-cli-stable");
@@ -169,6 +171,11 @@ test("Device Flow accepts an atomic multi-resource token bundle", async () => {
           expires_in: 600,
           scope: "relay.connect",
         },
+        "originrouter.memory": {
+          access_token: "or_at_memory_bundle",
+          expires_in: 600,
+          scope: "memory.read",
+        },
       },
     });
   };
@@ -192,6 +199,7 @@ test("Device Flow accepts an atomic multi-resource token bundle", async () => {
   assert.equal(credential.accessTokens.ai.token, "or_at_ai_bundle");
   assert.equal(credential.accessTokens.coding.token, "or_at_coding_bundle");
   assert.equal(credential.accessTokens.relay.token, "or_at_relay_bundle");
+  assert.equal(credential.accessTokens.memory.token, "or_at_memory_bundle");
 });
 
 test("Device Flow maps denial to a stable client error", async () => {

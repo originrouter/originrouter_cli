@@ -74,6 +74,7 @@ import { handleAuthCommand, handleLogin, handleLogout } from "./commands/auth.js
 import { handleAgentRouteSetup } from "./commands/agentRouteSetup.js";
 import { handleSecurityCommand } from "./commands/security.js";
 import { handleCollaborationCommand } from "./commands/collaboration.js";
+import { handleHistoryCommand } from "./commands/history.js";
 import {
   rollbackCompatibilityPack,
 } from "./compatibility/patchStore.js";
@@ -123,20 +124,41 @@ Usage:
   originrouter agent setup [--cloud|--native]
   originrouter agent history [--search <text>] [--agent claude|codex] [--device <id>] [--status <status>] [--json]
   originrouter agent history show <conversation-id> [--json]
+  originrouter history [question] [--agent claude|codex] [--device <id>] [--workspace <id>] [--since <ISO>] [--until <ISO>] [--limit N] [--archived] [--json]
 
 Agent collaboration:
+  originrouter collaborate
+  originrouter collaborate "<objective>" [--review|--yes] [--json]
   originrouter collaboration templates [--json]
-  originrouter collaboration list [--json]
+  originrouter collaboration list [--category all|attention|active|recent] [--page N] [--page-size N] [--archived] [--json]
+  originrouter collaboration drafts [--json]
+  originrouter collaboration draft show|resume|delete <draft-id>
   originrouter collaboration show <run-id> [--json]
+  originrouter collaboration attach <run-id> [--plain] [--verbose|--raw]
+      [--participant <id>] [--task <id>]
+  originrouter collaboration attention <run-id>
+  originrouter collaboration resolve <run-id> <attention-id> --action <action> [--text <reply>]
+  originrouter collaboration doctor <run-id> [--json]
   originrouter collaboration create --objective <text>
       --participant <id:claude|codex:device:workspace> [--participant ...]
       [--role <id=natural language responsibility>]
+      [--route <id=provider:model>] [--permission <id=profile>]
       [--preference <text>] [--template <id>]
       [--coordination-prompt <text>] [--concurrency <n>]
-      [--token-limit <n>] [--yes] [--no-wait] [--timeout <seconds>]
+      [--token-limit <n>] [--amount-limit <decimal>] [--currency <ISO-4217>]
+      [--yes] [--detach] [--no-wait] [--timeout <seconds>]
+  originrouter collaboration create "<objective>" [--review|--yes] [--json]
   originrouter collaboration create --spec <collaboration.json> [--yes]
+  originrouter collaboration create --draft <draft-id>
   originrouter collaboration confirm <run-id>
+  originrouter collaboration revise <run-id> [--feedback <text>]
+  originrouter collaboration pause <run-id>
+  originrouter collaboration resume <run-id>
+  originrouter collaboration retry <run-id> [--task <task-id>]
   originrouter collaboration cancel <run-id>
+  originrouter collaboration archive <run-id>
+  originrouter collaboration delete <run-id> [--yes]
+  originrouter collaboration export <run-id> [--format json|markdown]
 
 Local LiteLLM provider management:
   originrouter provider add <name> [--type proxy] [--base-url <u>] [--model <m>]
@@ -2053,8 +2075,13 @@ export async function main(argv) {
     return;
   }
 
-  if (command === "collaboration") {
-    await handleCollaborationCommand(args);
+  if (command === "history") {
+    await handleHistoryCommand(args);
+    return;
+  }
+
+  if (command === "collaboration" || command === "collaborate") {
+    await handleCollaborationCommand(command === "collaborate" ? ["create", ...args] : args);
     return;
   }
 

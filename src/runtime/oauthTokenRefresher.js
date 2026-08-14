@@ -29,12 +29,7 @@ export async function ensureFreshAccessToken({
   if (!current) return null;
   assertRefreshSessionValid(current, nowMs);
   const existing = accessTokenFor(current, resource);
-  if (!existing) {
-    const error = new Error(`Stored credential has no token for ${resource}`);
-    error.code = "OAUTH_RESOURCE_TOKEN_MISSING";
-    throw error;
-  }
-  if (!forceRefresh && nowMs < existing.expiresAt - headroomMs) return current;
+  if (!forceRefresh && existing && nowMs < existing.expiresAt - headroomMs) return current;
 
   return withCodingAuthLock(stateDir, async () => {
     const stored = readCodingAuth(stateDir);
@@ -57,6 +52,11 @@ export async function ensureFreshAccessToken({
     }
     const key = Object.entries(OAUTH_RESOURCES)
       .find(([, value]) => value === resource)?.[0]?.toLowerCase();
+    if (!key) {
+      const error = new Error(`Unsupported OAuth resource ${resource}`);
+      error.code = "OAUTH_RESOURCE_UNSUPPORTED";
+      throw error;
+    }
     const updated = {
       ...stored,
       refreshToken: response.refresh_token,

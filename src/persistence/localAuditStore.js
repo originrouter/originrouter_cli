@@ -9,6 +9,7 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 
 import { ensureStateDir } from "./state.js";
+import { analyzeRuntimeOperation } from "../runtime/operationRisk.js";
 
 const MAX_LINE_BYTES = 64 * 1024;
 const MAX_RECORDS_PER_READ = 20_000;
@@ -141,6 +142,12 @@ function approvalRequest(session, event, now) {
   const payload = event?.payload || event?.input || {};
   const tool = normalizedTool(event) || safeText(payload?.display_name, 128);
   const command = event?.containsSecret ? "" : commandFromEvent(event);
+  const operation = event?.containsSecret ? null : analyzeRuntimeOperation(session, {
+    type: "agent.tool_call.start",
+    callId: id,
+    tool,
+    input: payload,
+  });
   return {
     category: "approval",
     correlationId: id,
@@ -150,7 +157,11 @@ function approvalRequest(session, event, now) {
     summary: event?.containsSecret
       ? "Sensitive approval request"
       : safeText(event?.prompt, 1024) || "Review the requested action before continuing.",
-    risk: approvalRisk(event, session?.cwd),
+    risk: operation?.risk === "critical"
+      ? "critical"
+      : operation?.risk === "high"
+        ? "high"
+        : approvalRisk(event, session?.cwd),
     outcome: "pending",
     decisionSource: safeText(event?.source, 32) || "agent",
     tool,
@@ -162,6 +173,7 @@ function approvalRequest(session, event, now) {
           tool: payload?.tool,
           display_name: payload?.display_name,
           blocked_path: payload?.blocked_path,
+          operation,
         }),
     createdAt: eventTime(event, now),
   };
@@ -279,11 +291,16 @@ function mergeProjectedRecords(records) {
 }
 
 export class LocalAuditStore {
-  constructor({ stateDir = ensureStateDir(), now = () => Date.now() } = {}) {
+  constructor({
+    stateDir = ensureStateDir(),
+    now = () => Date.now(),
+    operationReviewer = null,
+  } = {}) {
     this.root = path.join(stateDir, "audit", "sessions");
     this.now = now;
     this.sessionState = new Map();
     this.pendingChanges = new Map();
+    this.operationReviewer = operationReviewer;
     mkdirSync(this.root, { recursive: true, mode: 0o700 });
     chmodSync(this.root, 0o700);
   }
@@ -309,32 +326,123 @@ export class LocalAuditStore {
     const callId = safeText(event?.callId || event?.id, 191);
     const pendingKey = `${sessionId}:${callId}`;
     if (type === "agent.tool_call.start" && callId) {
-      const candidate = changeCandidate(session, event);
+      const operation = analyzeRuntimeOperation(session, event);
+      const legacyCandidate = changeCandidate(session, event);
+      const semanticCandidate = operation.shouldRecord
+        || (operation.needsAiReview && this.operationReviewer);
+      const candidate = semanticCandidate
+        ? {
+            actionKind: legacyCandidate?.actionKind || operation.actions[0] || "contextual_operation",
+            risk: operation.risk === "critical" ? "critical" : (legacyCandidate?.risk || operation.risk),
+            summary: legacyCandidate?.summary || operation.title,
+            command: commandFromEvent(event),
+            cwd: safeText(event?.input?.cwd || session?.cwd, 2048),
+            target: safeText(operation.resources.map((item) => item.value).join(", "), 4096),
+            tool: normalizedTool(event),
+            operation,
+          }
+        : legacyCandidate;
       if (candidate) {
+        candidate.outcome = "started";
         this.pendingChanges.set(pendingKey, candidate);
-        records.push({
+        const auditPayload = ({
+          phase = "started",
+          outcome = "started",
+          decisionSource = "agent",
+          summary = "",
+          risk = candidate.risk,
+          detail = {},
+        } = {}) => ({
           category: "change",
           correlationId: callId,
-          phase: "started",
+          phase,
           actionKind: candidate.actionKind,
           title: candidate.summary,
-          summary: "",
-          risk: candidate.risk,
-          outcome: "started",
-          decisionSource: "agent",
+          summary,
+          risk,
+          outcome,
+          decisionSource,
           tool: candidate.tool,
           commandPreview: candidate.command,
           cwd: candidate.cwd,
           target: candidate.target || "",
-          detail: { result: "started" },
+          detail: safeObject({
+            result: outcome,
+            operation: candidate.operation || null,
+            ...detail,
+          }),
           createdAt: eventTime(event, this.now),
         });
+        const deferred = Boolean(candidate.operation?.needsAiReview && this.operationReviewer);
+        if (!deferred) {
+          records.push(auditPayload({ detail: { analysis_state: "deterministic" } }));
+        }
+        if (candidate.operation?.needsAiReview && this.operationReviewer) {
+          void this.operationReviewer.review({ session, event, analysis: candidate.operation })
+            .then((review) => {
+              candidate.reviewResult = review;
+              const deterministicHigh = candidate.operation.deterministic?.hardHigh;
+              const record = deterministicHigh ? true : Boolean(review.record);
+              candidate.reviewShouldRecord = record;
+              if (!record) return;
+              this.append(sessionId, {
+                ...auditPayload({
+                  phase: "analyzed",
+                  outcome: candidate.outcome,
+                  decisionSource: "ai_audit_reviewer",
+                  summary: safeText(review.reason, 2048),
+                  risk: deterministicHigh ? candidate.risk : safeText(review.risk, 16) || candidate.risk,
+                  detail: { aiReview: review, analysis_state: "completed" },
+                }),
+                actionKind: safeText(review.action_kind, 64) || candidate.actionKind,
+                title: safeText(review.title, 256) || candidate.summary,
+              });
+            })
+            .catch(() => {
+              candidate.reviewFailed = true;
+              this.append(sessionId, auditPayload({
+                phase: "analyzed",
+                outcome: candidate.outcome,
+                decisionSource: "deterministic_fallback",
+                summary: candidate.operation.reason,
+                detail: {
+                  analysis_source: "deterministic_fallback",
+                  analysis_state: "ai_exhausted",
+                  fallback: true,
+                },
+              }));
+            });
+        }
       }
     } else if (type === "agent.tool_call.end" && callId) {
       const candidate = this.pendingChanges.get(pendingKey);
       this.pendingChanges.delete(pendingKey);
       if (candidate) {
-        records.push({
+        candidate.outcome = event?.isError ? "failed" : "succeeded";
+        if (candidate.reviewResult && candidate.reviewShouldRecord) {
+          records.push({
+            category: "change",
+            correlationId: callId,
+            phase: "completed",
+            actionKind: safeText(candidate.reviewResult.action_kind, 64) || candidate.actionKind,
+            title: safeText(candidate.reviewResult.title, 256) || candidate.summary,
+            summary: safeText(candidate.reviewResult.reason, 2048),
+            risk: safeText(candidate.reviewResult.risk, 16) || candidate.risk,
+            outcome: candidate.outcome,
+            decisionSource: "ai_audit_reviewer",
+            tool: candidate.tool,
+            commandPreview: candidate.command,
+            cwd: candidate.cwd,
+            target: candidate.target || "",
+            detail: safeObject({
+              result: candidate.outcome,
+              operation: candidate.operation,
+              aiReview: candidate.reviewResult,
+              analysis_state: "completed",
+            }),
+            createdAt: eventTime(event, this.now),
+          });
+        } else if (!(candidate.operation?.needsAiReview && this.operationReviewer) || candidate.reviewFailed) records.push({
           category: "change",
           correlationId: callId,
           phase: "completed",
@@ -342,13 +450,16 @@ export class LocalAuditStore {
           title: candidate.summary,
           summary: "",
           risk: candidate.risk,
-          outcome: event?.isError ? "failed" : "succeeded",
+          outcome: candidate.outcome,
           decisionSource: "agent",
           tool: candidate.tool,
           commandPreview: candidate.command,
           cwd: candidate.cwd,
           target: candidate.target || "",
-          detail: safeObject({ result: event?.isError ? "failed" : "succeeded" }),
+          detail: safeObject({
+            result: event?.isError ? "failed" : "succeeded",
+            operation: candidate.operation || null,
+          }),
           createdAt: eventTime(event, this.now),
         });
       }

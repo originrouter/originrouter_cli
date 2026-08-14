@@ -275,6 +275,28 @@ export function unsetClaudeConfigValue(config, key) {
   };
 }
 
+// Claude Code resolves built-in agent definitions independently from the
+// main-loop model. In particular, an agent declared with `model: opus`,
+// `model: sonnet`, or `model: haiku` consults the matching
+// ANTHROPIC_DEFAULT_* variable, while agents without an explicit model may
+// consult CLAUDE_CODE_SUBAGENT_MODEL. Keep every one of those paths inside
+// the configured OriginRouter route instead of allowing a subagent to fall
+// back to Claude Code's first-party defaults.
+function buildClaudeModelEnv(mainModel, smallModel = mainModel) {
+  return {
+    ANTHROPIC_MODEL: mainModel,
+    ANTHROPIC_SMALL_FAST_MODEL: smallModel,
+    CLAUDE_CODE_SUBAGENT_MODEL: mainModel,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: mainModel,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: mainModel,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: smallModel,
+    // Claude Code 2.1.x also exposes the newer Fable family. Treat it as a
+    // primary-capability model so future built-in agents cannot escape the
+    // configured main route either.
+    ANTHROPIC_DEFAULT_FABLE_MODEL: mainModel,
+  };
+}
+
 // ---------- New unified entry point (Stage 7.6: single path) ----------
 
 // Returns { env, provider, source } (or { env, routes, proxy, source } for claude).
@@ -310,13 +332,13 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
     // 127.0.0.1:<port>; the proxy bridges to the worker over the relay.
     const remoteRoutes = assertClaudeRemoteRoutes(config, eff, remoteCodingProbe);
     if (remoteRoutes) {
+      const mainModel = eff.main.model || remoteRoutes.mainProvider.model;
+      const smallModel = (eff.small && (eff.small.model || remoteRoutes.smallProvider.model))
+        || mainModel;
       const env = {
         ANTHROPIC_BASE_URL: `http://${remoteCodingProbe.host || "127.0.0.1"}:${remoteCodingProbe.port}`,
         ANTHROPIC_API_KEY: NOOP_ANTHROPIC_API_KEY,
-        ANTHROPIC_MODEL: eff.main.model || remoteRoutes.mainProvider.model,
-        ANTHROPIC_SMALL_FAST_MODEL: (eff.small && (eff.small.model || remoteRoutes.smallProvider.model))
-          || eff.main.model
-          || remoteRoutes.mainProvider.model,
+        ...buildClaudeModelEnv(mainModel, smallModel),
       };
       return {
         env,
@@ -329,13 +351,13 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
     if (originrouterRoutes) {
       const managed = await readManagedCodingKeyForRuntime(options);
       const apiKey = accessTokenFor(managed, OAUTH_RESOURCES.CODING)?.token;
+      const mainModel = eff.main.model || originrouterRoutes.mainProvider.model;
+      const smallModel = (eff.small && (eff.small.model || originrouterRoutes.smallProvider.model))
+        || mainModel;
       const env = {
         ANTHROPIC_BASE_URL: originrouterBaseForRuntime(originrouterRoutes.mainProvider, "claude"),
         ANTHROPIC_API_KEY: apiKey,
-        ANTHROPIC_MODEL: eff.main.model || originrouterRoutes.mainProvider.model,
-        ANTHROPIC_SMALL_FAST_MODEL: (eff.small && (eff.small.model || originrouterRoutes.smallProvider.model))
-          || eff.main.model
-          || originrouterRoutes.mainProvider.model,
+        ...buildClaudeModelEnv(mainModel, smallModel),
       };
       return {
         env,
@@ -358,8 +380,7 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
       const env = {
         ANTHROPIC_BASE_URL: `http://${probe.host || "127.0.0.1"}:${probe.port}`,
         ANTHROPIC_API_KEY: NOOP_ANTHROPIC_API_KEY,
-        ANTHROPIC_MODEL: MAIN_ALIAS,
-        ANTHROPIC_SMALL_FAST_MODEL: SMALL_ALIAS,
+        ...buildClaudeModelEnv(MAIN_ALIAS, SMALL_ALIAS),
       };
       return {
         env,

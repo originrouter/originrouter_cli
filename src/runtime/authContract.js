@@ -12,6 +12,7 @@ export const OAUTH_RESOURCES = Object.freeze({
   AI: "originrouter.ai",
   CODING: "originrouter.coding",
   RELAY: "originrouter.relay",
+  MEMORY: "originrouter.memory",
 });
 
 export const ACCESS_TOKEN_PREFIX = "or_at_";
@@ -43,7 +44,8 @@ export function isOAuthCredentialShape(payload) {
     validAccess(tokens.control) &&
     validAccess(tokens.ai) &&
     validAccess(tokens.coding) &&
-    validAccess(tokens.relay);
+    validAccess(tokens.relay) &&
+    (tokens.memory == null || validAccess(tokens.memory));
 }
 
 export function accessTokenFor(payload, resource) {

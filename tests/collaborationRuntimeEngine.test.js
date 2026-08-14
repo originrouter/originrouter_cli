@@ -80,6 +80,28 @@ assert.equal(run.state, "researching");
 assert.equal(launches.length, 1);
 assert.equal(launches[0].agentType, "codex");
 let leadSession = run.agents.lead.originrouter_session_id;
+registry.emit(leadSession, {
+  type: "agent.interaction.requested",
+  eventId: "lead-approval-request",
+  interactionId: "permission-1",
+  kind: "permission",
+  title: "Allow a read-only command?",
+  prompt: "The lead wants to inspect the workspace.",
+});
+await runtime.queue;
+let attention = store.getSnapshot(created.run_id).attention;
+assert.equal(attention.length, 1);
+assert.equal(attention[0].kind, "approval");
+await runtime.resolveAttention(created.run_id, attention[0].attention_id, {
+  action: "allow",
+  expected_revision: attention[0].revision,
+});
+assert.ok(registry.commands.some((item) => (
+  item.sessionId === leadSession
+  && item.command.type === "agent.interaction.resolve"
+  && item.command.interactionId === "permission-1"
+)));
+assert.equal(store.getSnapshot(created.run_id).attention.length, 0);
 registry.emit(leadSession, { type: "agent.text", text: "Research brief", eventId: "lead-text-1" });
 registry.emit(leadSession, { type: "agent.task.complete", eventId: "lead-done-1" });
 await runtime.queue;

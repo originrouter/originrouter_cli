@@ -78,10 +78,12 @@ import { ExternalAgentRegistry } from "./externalAgentRegistry.js";
 import { LocalAuditStore } from "../persistence/localAuditStore.js";
 import { ProxyRequestStore } from "../persistence/proxyRequestStore.js";
 import { buildAuditEvidenceBundle } from "../inquiry/auditEvidenceAdapter.js";
+import { AiAuditQueryPlanner } from "../runtime/aiAuditQueryPlanner.js";
 import { AgentBudgetStore } from "../agent/agentBudgetStore.js";
 import { CollaborationStore } from "../collaboration/collaborationStore.js";
 import { PlanImplementVerifyCoordinator } from "../collaboration/planImplementVerifyCoordinator.js";
 import { browseAgentWorkspaces } from "../daemon/workspaceBrowser.js";
+import { buildCollaborationCapabilities } from "../collaboration/collaborationCapabilities.js";
 
 // Exported so CLI subcommands (e.g. `local api set-host`) can apply
 // the same gating as the runtime auth layer. Keep the set in lock-
@@ -92,6 +94,30 @@ function httpHost(address) {
   return String(address).includes(":") && !String(address).startsWith("[")
     ? `[${address}]`
     : address;
+}
+
+function flattenCollaborationSnapshot(snapshot) {
+  if (!snapshot) return null;
+  return {
+    ...snapshot.run,
+    schema_version: snapshot.schema_version,
+    revision: snapshot.revision,
+    last_sequence: snapshot.last_sequence,
+    plan: snapshot.plan,
+    tasks: snapshot.tasks,
+    agents: Object.fromEntries(
+      (snapshot.participants || []).map((participant) => [
+        participant.participant_id,
+        participant,
+      ]),
+    ),
+    attention: snapshot.attention,
+    artifacts: snapshot.artifacts,
+    budget: snapshot.budget,
+    usage: snapshot.usage,
+    final_report: snapshot.final_report,
+    capabilities: snapshot.capabilities,
+  };
 }
 
 // Bearer-token regex: case-insensitive 64 hex chars.
@@ -170,6 +196,7 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
     pid: ctx.pid || process.pid,
     version: ctx.version || "0.1.0",
     relayUrl: ctx.relayUrl || DEFAULT_RELAY_URL,
+    stateDir: ctx.stateDir || getStateDir(),
     relayConnected: ctx.relayConnected || (() => false),
     get deviceId() {
       return typeof ctx.deviceId === "function"
@@ -449,6 +476,51 @@ async function dispatch(ctx, req, res) {
     if (req.method === "GET" && pathname === "/providers") {
       return sendOk(res, { providers: handleProvidersList(ctx) });
     }
+    if (req.method === "GET" && pathname === "/collaboration/local/capabilities") {
+      return sendOk(res, {
+        capabilities: buildCollaborationCapabilities({
+          config: ctx.configProvider(),
+          agentCatalog: ctx.agentCatalog,
+          agentBudgetStore: ctx.agentBudgetStore,
+          deviceId: ctx.deviceId,
+          version: ctx.version,
+        }),
+      });
+    }
+    const remoteCapabilitiesMatch = pathname.match(
+      /^\/collaboration\/devices\/([^/]+)\/capabilities$/,
+    );
+    if (req.method === "GET" && remoteCapabilitiesMatch) {
+      if (!ctx.collaborationRuntime) return sendError(res, 503, "collaboration runtime unavailable");
+      try {
+        const deviceId = decodeURIComponent(remoteCapabilitiesMatch[1]);
+        return sendOk(res, {
+          capabilities: await ctx.collaborationRuntime.capabilitiesForDevice(deviceId),
+        });
+      } catch (error) {
+        return sendError(res, 503, error.message || "remote capabilities unavailable", {
+          reason: error.code || "collaboration_capabilities_unavailable",
+        });
+      }
+    }
+    const collaborationWorkspaceTrustMatch = pathname.match(
+      /^\/collaboration\/devices\/([^/]+)\/workspaces\/trust$/,
+    );
+    if (req.method === "POST" && collaborationWorkspaceTrustMatch) {
+      if (!ctx.collaborationRuntime) return sendError(res, 503, "collaboration runtime unavailable");
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      try {
+        const deviceId = decodeURIComponent(collaborationWorkspaceTrustMatch[1]);
+        return sendOk(res, {
+          workspace: await ctx.collaborationRuntime.trustWorkspaceOnDevice(deviceId, body.path),
+        });
+      } catch (error) {
+        return sendError(res, 400, error.message || "workspace could not be trusted", {
+          reason: error.code || "collaboration_workspace_trust_failed",
+        });
+      }
+    }
     if (req.method === "GET" && pathname === "/approval-policies/capabilities") {
       return sendOk(res, { capabilities: approvalPolicyCapabilities() });
     }
@@ -674,22 +746,36 @@ async function dispatch(ctx, req, res) {
     if (pathname === "/collaboration/local/runs") {
       if (req.method === "GET") {
         if (url.searchParams.has("category") || url.searchParams.has("page")) {
-          return sendOk(res, ctx.collaborationStore.listRunPage({
+          const page = ctx.collaborationStore.listRunPage({
             category: url.searchParams.get("category") || "all",
             page: url.searchParams.get("page"),
             pageSize: url.searchParams.get("page_size"),
             includeArchived: url.searchParams.get("archived") === "true",
-          }));
+          });
+          return sendOk(res, {
+            ...page,
+            runs: page.runs.map((run) =>
+              flattenCollaborationSnapshot(ctx.collaborationStore.getSnapshot(run.run_id)),
+            ),
+          });
         }
         const runs = ctx.collaborationStore.listRuns({ limit: url.searchParams.get("limit") })
-          .map((run) => ctx.collaborationStore.getRun(run.run_id));
+          .map((run) => flattenCollaborationSnapshot(
+            ctx.collaborationStore.getSnapshot(run.run_id),
+          ));
         return sendOk(res, { runs });
       }
       if (req.method === "POST") {
         const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
         if (body.__error) return sendError(res, 400, body.__error);
         try {
-          return sendOk(res, { run: ctx.collaborationCoordinator.create(body) });
+          return sendOk(res, {
+            run: ctx.collaborationCoordinator.create({
+              ...body,
+              coordinator_device_id:
+                ctx.collaborationRuntime?.deviceId || body.coordinator_device_id || "local",
+            }),
+          });
         } catch (error) {
           return sendError(res, 400, error.message || "invalid collaboration run");
         }
@@ -703,13 +789,60 @@ async function dispatch(ctx, req, res) {
       const runId = decodeURIComponent(collaborationEventsMatch[1]);
       const run = ctx.collaborationStore.getRun(runId, { includeMessages: false });
       if (!run) return sendError(res, 404, "collaboration run not found");
-      return sendOk(res, {
-        events: ctx.collaborationStore.listExecutionEvents(runId, {
-          participantId: url.searchParams.get("participant_id") || "",
-          after: url.searchParams.get("after") || "",
-          limit: url.searchParams.get("limit"),
-        }),
-      });
+      const afterSequence = Math.max(0, Number(url.searchParams.get("after_sequence")) || 0);
+      return sendOk(res, ctx.collaborationStore.listExecutionEventPage(runId, {
+        participantId: url.searchParams.get("participant_id") || "",
+        taskId: url.searchParams.get("task_id") || "",
+        afterSequence,
+        visibility: url.searchParams.get("visibility") || "",
+        limit: url.searchParams.get("limit"),
+      }));
+    }
+    const collaborationSnapshotMatch = pathname.match(
+      /^\/collaboration\/local\/runs\/([^/]+)\/snapshot$/,
+    );
+    if (collaborationSnapshotMatch && req.method === "GET") {
+      const runId = decodeURIComponent(collaborationSnapshotMatch[1]);
+      const snapshot = ctx.collaborationStore.getSnapshot(runId);
+      return snapshot
+        ? sendOk(res, { snapshot })
+        : sendError(res, 404, "collaboration run not found");
+    }
+    const collaborationDiagnosticsMatch = pathname.match(
+      /^\/collaboration\/local\/runs\/([^/]+)\/diagnostics$/,
+    );
+    if (collaborationDiagnosticsMatch && req.method === "GET") {
+      const runId = decodeURIComponent(collaborationDiagnosticsMatch[1]);
+      const diagnostics = ctx.collaborationStore.getDiagnostics(runId);
+      return diagnostics
+        ? sendOk(res, { diagnostics })
+        : sendError(res, 404, "collaboration run not found");
+    }
+    const collaborationAttentionMatch = pathname.match(
+      /^\/collaboration\/local\/runs\/([^/]+)\/attention\/([^/]+)\/resolve$/,
+    );
+    if (collaborationAttentionMatch && req.method === "POST") {
+      const runId = decodeURIComponent(collaborationAttentionMatch[1]);
+      const attentionId = decodeURIComponent(collaborationAttentionMatch[2]);
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      try {
+        return sendOk(
+          res,
+          ctx.collaborationRuntime
+            ? await ctx.collaborationRuntime.resolveAttention(runId, attentionId, body)
+            : ctx.collaborationStore.resolveAttention(runId, attentionId, body),
+        );
+      } catch (error) {
+        const status = error.code === "COLLABORATION_ATTENTION_REVISION_CONFLICT"
+          ? 409
+          : error.code === "COLLABORATION_ATTENTION_ACTION_INVALID"
+            ? 400
+            : 404;
+        return sendError(res, status, error.message, {
+          reason: error.code || "collaboration_attention_resolution_failed",
+        });
+      }
     }
     const collaborationArchiveMatch = pathname.match(
       /^\/collaboration\/local\/runs\/([^/]+)\/archive$/,
@@ -723,7 +856,7 @@ async function dispatch(ctx, req, res) {
       }
     }
     const collaborationMatch = pathname.match(
-      /^\/collaboration\/local\/runs\/([^/]+)(?:\/(start|confirm|begin-planning|begin-implementation|cancel|messages|budget))?$/,
+      /^\/collaboration\/local\/runs\/([^/]+)(?:\/(start|confirm|replan|begin-planning|begin-implementation|pause|resume|retry|cancel|messages|budget))?$/,
     );
     if (collaborationMatch) {
       const runId = decodeURIComponent(collaborationMatch[1]);
@@ -766,6 +899,10 @@ async function dispatch(ctx, req, res) {
             ? { run: ctx.collaborationRuntime
                 ? await ctx.collaborationRuntime.confirm(runId)
                 : ctx.collaborationCoordinator.confirm(runId) }
+          : action === "replan"
+            ? { run: ctx.collaborationRuntime
+                ? await ctx.collaborationRuntime.revisePlan(runId, body.feedback)
+                : ctx.collaborationStore.requestAdaptivePlanRevision(runId, body.feedback) }
           : action === "begin-planning"
             ? { run: ctx.collaborationCoordinator.beginPlanning(runId) }
             : action === "begin-implementation"
@@ -774,6 +911,20 @@ async function dispatch(ctx, req, res) {
                 ? { run: ctx.collaborationRuntime
                     ? await ctx.collaborationRuntime.cancel(runId)
                     : ctx.collaborationCoordinator.cancel(runId) }
+                : action === "pause"
+                  ? { run: ctx.collaborationRuntime
+                      ? await ctx.collaborationRuntime.pause(runId)
+                      : ctx.collaborationStore.pauseRun(runId) }
+                  : action === "resume"
+                    ? { run: ctx.collaborationRuntime
+                        ? await ctx.collaborationRuntime.resume(runId)
+                        : ctx.collaborationStore.resumeRun(runId) }
+                    : action === "retry"
+                      ? { run: ctx.collaborationRuntime
+                          ? await ctx.collaborationRuntime.retry(runId, body.task_id || body.taskId)
+                          : (body.task_id || body.taskId
+                              ? ctx.collaborationStore.retryAdaptiveTask(runId, body.task_id || body.taskId)
+                              : ctx.collaborationStore.retryRun(runId)) }
                 : action === "budget"
                   ? { run: ctx.collaborationRuntime
                       ? await ctx.collaborationRuntime.updateBudget(runId, body)
@@ -949,10 +1100,20 @@ async function dispatch(ctx, req, res) {
       const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
       if (body.__error) return sendError(res, 400, body.__error);
       try {
+        let queryPlan = null;
+        try {
+          queryPlan = await new AiAuditQueryPlanner({
+            stateDir: ctx.stateDir || getStateDir(),
+          }).plan({
+            queryId: body.query_id,
+            domain,
+            query: body.query,
+          });
+        } catch {}
         const evidenceBundle = buildAuditEvidenceBundle({
           auditStore: ctx.auditStore,
           sessionId,
-          request: { ...body, domain },
+          request: { ...body, domain, query_plan: queryPlan },
         });
         return sendOk(res, { evidence_bundle: evidenceBundle });
       } catch (error) {
@@ -1011,6 +1172,15 @@ async function dispatch(ctx, req, res) {
         }
         if (action === "events") {
           const sequence = ctx.externalAgentRegistry.appendEvent(sessionId, body.event || {});
+          let session = { sessionId };
+          try { session = ctx.externalAgentRegistry.require(sessionId); } catch {}
+          ctx.auditStore?.appendEvent({
+            sessionId,
+            cwd: session.cwd || session.workspace || "",
+            agent: session.agent || session.agentType || "",
+            runtime: session.runtime || "",
+            title: session.title || "",
+          }, body.event || {});
           return sendOk(res, { sessionId, sequence });
         }
         if (action === "message") {

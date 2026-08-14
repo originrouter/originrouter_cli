@@ -6,6 +6,71 @@ import test from "node:test";
 
 import { SessionManager } from "../src/daemon/sessionManager.js";
 
+test("SessionManager applies the resolved Codex model before building the launch", async () => {
+  const home = mkdtempSync(join(tmpdir(), "originrouter-session-model-test-"));
+  process.env.ORIGINROUTER_HOME = home;
+  let routedModel = null;
+  let startOptions = null;
+  let exitHandler = null;
+
+  const manager = new SessionManager({
+    relayClient: { send: () => Promise.resolve() },
+    deviceId: "device-test",
+    defaultExecutor: "fake",
+    createAdapterFn: () => ({
+      async beforeStart() {},
+      setRoutedModel(model) {
+        routedModel = model;
+      },
+      buildLaunch() {
+        assert.equal(routedModel, "gpt-5.6-sol");
+        return {
+          command: "codex",
+          args: ["--model", routedModel],
+          env: { OPENAI_MODEL: routedModel },
+        };
+      },
+      describe: () => ({ runtime: "codex-pty" }),
+      handleOutput: () => [],
+      cleanup() {},
+    }),
+    createExecutorFn: () => ({
+      async start(options) {
+        startOptions = options;
+        exitHandler = options.onExit;
+        return { pid: 2468, executor: "fake" };
+      },
+      write() {},
+      resize() {},
+      interrupt() {},
+      stop() {},
+    }),
+    buildAgentProviderEnvFn: async () => ({
+      env: {
+        OPENAI_BASE_URL: "https://api.example.test/codex",
+        OPENAI_API_KEY: "test-key",
+        OPENAI_MODEL: "gpt-5.6-sol",
+      },
+      provider: { name: "originrouter-cloud", model: "gpt-5.6-sol" },
+      source: "test",
+    }),
+    startApprovalDecisionPollingFn: () => () => {},
+  });
+
+  await manager.startSession({
+    sessionId: "session-model-1",
+    agent: "codex",
+    cwd: "/tmp",
+  });
+
+  assert.equal(routedModel, "gpt-5.6-sol");
+  assert.deepEqual(startOptions.args, ["--model", "gpt-5.6-sol"]);
+  assert.equal(startOptions.env.OPENAI_MODEL, "gpt-5.6-sol");
+
+  exitHandler?.({ code: 0, signal: null });
+  rmSync(home, { recursive: true, force: true });
+});
+
 test("SessionManager feeds polled approval decisions back into the running adapter", async () => {
   const home = mkdtempSync(join(tmpdir(), "originrouter-session-manager-test-"));
   process.env.ORIGINROUTER_HOME = home;

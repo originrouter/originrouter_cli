@@ -35,6 +35,16 @@ function node(deviceId, network, { stateDir, identity, identities, envelopes, co
   }, { namespace: credential.sessionId });
   const store = new CollaborationStore({ stateDir });
   const coordinator = new PlanImplementVerifyCoordinator({ store });
+  const catalog = {
+    trustWorkspace(path, { deviceId: trustedDeviceId }) {
+      return {
+        workspace_id: `workspace-${trustedDeviceId}`,
+        device_id: trustedDeviceId,
+        canonical_path: path,
+        trusted: true,
+      };
+    },
+  };
   const registry = new Registry();
   const launches = [];
   const supervisor = {
@@ -67,7 +77,14 @@ function node(deviceId, network, { stateDir, identity, identities, envelopes, co
     credentialProvider: async () => credential,
   });
   const runtime = new CollaborationRuntime({
-    store, coordinator, registry, supervisor, relayClient, deviceId,
+    store, coordinator, registry, supervisor, relayClient, deviceId, catalog,
+    capabilityProvider: () => ({
+      schema_version: 1,
+      device: { device_id: deviceId },
+      runtimes: [{ id: "codex", available: true }],
+      trusted_workspaces: [],
+      freshness: { stale: false, source: "account_e2ee" },
+    }),
     registrationTimeoutMs: 100, pollIntervalMs: 1,
   });
   const value = { store, coordinator, registry, launches, runtime, transport: relayClient };
@@ -98,6 +115,43 @@ const worker = node("device-b", network, {
   envelopes,
   controls,
 });
+const workerCapabilities = await source.runtime.capabilitiesForDevice("device-b");
+assert.equal(workerCapabilities.device.device_id, "device-b");
+assert.equal(workerCapabilities.freshness.source, "account_e2ee");
+const trustedRemoteWorkspace = await source.runtime.trustWorkspaceOnDevice(
+  "device-b",
+  workerStateDir,
+);
+assert.equal(trustedRemoteWorkspace.device_id, "device-b");
+assert.equal(trustedRemoteWorkspace.trusted, true);
+const appCreated = await worker.runtime.handleControlOperation("create", {
+  request: {
+    objective: "Exercise encrypted App collaboration control.",
+    participants: [{
+      participant_id: "planner",
+      runtime: "codex",
+      device_id: "device-b",
+      workspace_id: workerStateDir,
+      planner: true,
+    }],
+  },
+});
+assert.equal(appCreated.run.coordinator_device_id, "device-b");
+const appSnapshot = await worker.runtime.handleControlOperation("snapshot", {
+  run_id: appCreated.run.run_id,
+});
+assert.equal(appSnapshot.snapshot.schema_version, 2);
+assert.equal(appSnapshot.snapshot.run.state, "created");
+const appRuns = await worker.runtime.handleControlOperation("list_runs", {});
+assert.ok(appRuns.runs.some((item) => item.run_id === appCreated.run.run_id));
+const appRunPage = await worker.runtime.handleControlOperation("list_runs", {
+  category: "active",
+  page: 1,
+  page_size: 5,
+});
+assert.equal(appRunPage.page, 1);
+assert.equal(appRunPage.page_size, 5);
+assert.ok(appRunPage.runs.some((item) => item.run_id === appCreated.run.run_id));
 const run = source.coordinator.create({
   objective: "Implement and verify cross-device export.",
   agents: {
@@ -128,6 +182,27 @@ const assignment = worker.store.getRemoteAssignment(`assign-${run.run_id}-worker
 assert.ok(assignment);
 assert.equal(assignment.fencing_token, current.agents.worker.fencing_token);
 const workerSession = assignment.originrouter_session_id;
+worker.registry.emit(workerSession, {
+  type: "agent.interaction.requested",
+  eventId: "b-approval",
+  interactionId: "remote-permission-1",
+  kind: "permission",
+  title: "Allow remote workspace inspection?",
+  prompt: "The worker wants to inspect the remote workspace.",
+});
+await worker.runtime.queue;
+const remoteAttention = source.store.getSnapshot(run.run_id).attention[0];
+assert.ok(remoteAttention);
+assert.equal(remoteAttention.kind, "approval");
+await source.runtime.resolveAttention(run.run_id, remoteAttention.attention_id, {
+  action: "allow",
+  expected_revision: remoteAttention.revision,
+});
+assert.ok(worker.registry.commands.some((item) => (
+  item.sessionId === workerSession
+  && item.command.type === "agent.interaction.resolve"
+  && item.command.interactionId === "remote-permission-1"
+)), "remote collaboration attention must resolve over the E2EE control path");
 worker.registry.emit(workerSession, { type: "agent.text", text: "Remote plan", eventId: "b-plan" });
 worker.registry.emit(workerSession, { type: "agent.task.completed", eventId: "b-plan-done" });
 await worker.runtime.queue;

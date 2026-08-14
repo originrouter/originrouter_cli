@@ -71,6 +71,7 @@ import {
   resolveAgentDetailProfile,
 } from "../runtime/agentDetailProfile.js";
 import { LocalAgentBridgeClient } from "./localAgentBridgeClient.js";
+import { createTerminalOutputPump } from "./terminalOutputPump.js";
 
 // Fallback mode vocabularies for terminal adapters that do not expose their
 // own structured mode controller. Native Claude supplies a Hook-confirmed
@@ -438,6 +439,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
   const providerEnv = providerResult.env;
   const resolvedProvider = providerResult.provider;
   const providerSource = providerResult.source;
+  if (typeof adapter.setRoutedModel === "function") {
+    adapter.setRoutedModel(providerEnv.OPENAI_MODEL);
+  }
   const baseEnv = { ...process.env, ...providerEnv };
   let exited = false;
   let finalizing = false;
@@ -770,6 +774,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     reportRuntimeEventFn: (payload) =>
       runtimeReporter.report("terminal.activity", { summary: payload.summary }),
   });
+  const terminalOutputPump = createTerminalOutputPump({ write: writeLocal });
 
   const cleanup = () => {
     stopSessionHeartbeat();
@@ -784,6 +789,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
       adapter.cleanup();
     }
     terminalActivityReporter.stop();
+    terminalOutputPump.stop();
     if (process.stdin.isTTY) {
       process.stdin.setRawMode(false);
     }
@@ -915,14 +921,16 @@ export async function runLocalAgentSession(agent, rawArgs) {
     env: { ...baseEnv, ...launch.env },
     cols: process.stdout.columns || 100,
     rows: process.stdout.rows || 30,
+    relayToParentTty: process.stdout.isTTY === true,
     onOutput: (data) => {
-      writeLocal(data);
+      terminalOutputPump.push(data);
       terminalActivityReporter.ingest(data);
       for (const event of adapter.handleOutput(data)) {
         void sendTransientEvent(event);
       }
     },
     onExit: ({ code, signal }) => {
+      terminalOutputPump.flush();
       process.exitCode = code ?? (signal ? 1 : 0);
       Promise.race([
         finalizeSession({ code, signal }),

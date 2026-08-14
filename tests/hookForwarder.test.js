@@ -30,6 +30,7 @@ import {
 import {
   CLAUDE_INTERACTION_DECISION_TIMEOUT_MS,
   CLAUDE_PERMISSION_TIMEOUT_MS,
+  startClaudeHookServer,
 } from "../src/adapters/claude/hookServer.js";
 import { CLAUDE_INTERACTIVE_HOOK_TIMEOUT_SECONDS } from "../src/adapters/claude/hookSettings.js";
 
@@ -115,6 +116,38 @@ function makeFakeRequest({ sequence, setTimeoutSpy }) {
 
 const flush = () => new Promise((r) => setImmediate(r));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// PermissionRequest preserves Claude's native tool_use_id so a later
+// PostToolUse / PermissionDenied hook can resolve the same App interaction.
+{
+  let capturedCallId = null;
+  let capture;
+  const captured = new Promise((resolveCapture) => { capture = resolveCapture; });
+  const hookServer = await startClaudeHookServer({
+    onPermissionRequest(callId) {
+      capturedCallId = callId;
+      capture();
+    },
+  });
+  try {
+    const pendingPost = postHookBody(JSON.stringify({
+      hook_event_name: "PermissionRequest",
+      tool_name: "AskUserQuestion",
+      tool_use_id: "toolu-native-question-1",
+      tool_input: { questions: [] },
+    }), hookServer.port, { logger: () => {} });
+    await captured;
+    assert.equal(capturedCallId, "toolu-native-question-1");
+    assert.equal(hookServer.resolvePermission({
+      callId: capturedCallId,
+      decision: "approved",
+    }), true);
+    const result = await pendingPost;
+    assert.equal(result.exitCode, 0);
+  } finally {
+    hookServer.stop();
+  }
+}
 
 // ---- 1. First-attempt success ----
 

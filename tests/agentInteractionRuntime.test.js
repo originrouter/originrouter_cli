@@ -195,6 +195,55 @@ const CODEX_CALL_ID = "codex-approval-1781663500000-zyxwvu";
   assert.equal(resolvedPayload.updatedInput.answers["Which mode?"], "Build");
 }
 
+// A response entered in Claude's original terminal closes the mirrored App
+// interaction as soon as Claude reports that the tool completed.
+{
+  const hook = makeFakeHookServer();
+  let terminalResolution = null;
+  hook.fake.resolvePermission = (payload) => {
+    terminalResolution = payload;
+    return true;
+  };
+  const adapter = new ClaudeAdapter({
+    args: [],
+    cwd: "/tmp/proj",
+    hookServerFactory: hook.factory,
+  });
+  await adapter.beforeStart({ sessionId: "s-claude-terminal", send: () => {} });
+  hook.invokePermissionRequest("toolu-question-1", {
+    type: "agent.permission.request.detected",
+    provider: "claude",
+    callId: "toolu-question-1",
+    tool: "AskUserQuestion",
+    input: { questions: [] },
+  });
+  adapter.scanStructuredEvents();
+
+  hook.invokeHookEvent({
+    hook_event_name: "PostToolUse",
+    tool_name: "AskUserQuestion",
+    tool_use_id: "toolu-question-1",
+  });
+
+  assert.deepEqual(terminalResolution, {
+    callId: "toolu-question-1",
+    decision: "approved",
+    reason: "handled_in_terminal",
+  });
+  const events = adapter.scanStructuredEvents();
+  assert.ok(events.some((event) =>
+    event.type === "agent.interaction.result" &&
+    event.interactionId === "toolu-question-1" &&
+    event.status === "applied" &&
+    event.decisionSource === "terminal"
+  ));
+  assert.ok(events.some((event) =>
+    event.type === "agent.permission.resolved" &&
+    event.callId === "toolu-question-1" &&
+    event.decisionSource === "terminal"
+  ));
+}
+
 // ---- 2. Codex dual-emit (app-server available) ----
 
 {

@@ -8,6 +8,7 @@ import {
 
 const DOMAINS = new Set(["approval", "change"]);
 const RISK_ORDER = Object.freeze({ normal: 1, elevated: 2, high: 3, critical: 4 });
+const MAX_AUDIT_SCAN = 5000;
 const ACTION_SEARCH_ALIASES = Object.freeze({
   database_mutation: "database sql schema 数据库 数据表 迁移 修改",
   destructive_command: "destructive delete remove rollback reset 删除 破坏 回退",
@@ -16,6 +17,23 @@ const ACTION_SEARCH_ALIASES = Object.freeze({
   potential_script_mutation: "script migration deploy repair 脚本 迁移 部署 修复",
   outside_workspace_change: "file outside workspace 文件 工作区外 修改",
   permission: "permission approval authorize 权限 审批 授权",
+  "fs.read": "read file inspect credential secret 读取 文件 凭据 密钥",
+  "fs.write": "write file overwrite change 写入 文件 覆盖 修改",
+  "fs.patch": "patch edit file 修改 补丁 编辑",
+  "fs.move": "move rename source destination 移动 重命名 源 目标",
+  "fs.delete": "delete remove destructive 删除 移除 破坏",
+  "network.transfer.upload": "upload exfiltration remote 上传 外传 远程",
+});
+const QUERY_ALIASES = Object.freeze({
+  "谁": "who actor source user ai automatic 谁 用户 人工 自动",
+  "批准": "approve approved allowed approval decision allow 批准 允许 审批",
+  "授权": "authorization permission approval authorize 授权 权限 审批",
+  "数据库": "database db sql mysql postgres sqlite 数据库 数据表",
+  "修改": "change write update alter mutation 修改 写入 更新",
+  "危险": "risk dangerous sensitive critical high 风险 危险 敏感",
+  "读取": "read access inspect 读取 访问",
+  "写入": "write update overwrite 写入 修改 覆盖",
+  "移动": "move mv rename source destination 移动 重命名",
 });
 
 function protocolError(code) {
@@ -77,6 +95,9 @@ function normalizeRequest(sessionId, request = {}) {
     queryId,
     domain,
     query,
+    queryPlan: request.query_plan && typeof request.query_plan === "object"
+      ? request.query_plan
+      : null,
     topK,
     tokenBudget,
     since,
@@ -94,7 +115,12 @@ function normalizeRequest(sessionId, request = {}) {
 }
 
 function searchTokens(value) {
-  const normalized = boundedText(value, 32_000).toLowerCase();
+  const original = boundedText(value, 32_000).toLowerCase();
+  const expansions = Object.entries(QUERY_ALIASES)
+    .filter(([term]) => original.includes(term))
+    .map(([, aliases]) => aliases)
+    .join(" ");
+  const normalized = `${original} ${expansions}`;
   const tokens = new Set();
   for (const token of normalized.match(/[\p{L}\p{N}_-]+/gu) || []) {
     if (/^[\p{Script=Han}]+$/u.test(token)) {
@@ -144,6 +170,8 @@ function sensitivity(record) {
 }
 
 function recordSearchText(record) {
+  const operation = record.detail?.operation || {};
+  const aiReview = record.detail?.aiReview || record.detail?.ai_review || {};
   return [
     record.title,
     record.summary,
@@ -156,6 +184,13 @@ function recordSearchText(record) {
     record.commandPreview,
     record.cwd,
     record.target,
+    ...(operation.actions || []),
+    ...(operation.actions || []).map((item) => ACTION_SEARCH_ALIASES[item] || ""),
+    ...(operation.resources || []).flatMap((item) => [item.value, item.class, item.role]),
+    operation.reason,
+    aiReview.reason,
+    ...(aiReview.signals || []),
+    ...(aiReview.conditions || []),
   ].map((item) => boundedText(item, 4096)).filter(Boolean).join(" ").toLowerCase();
 }
 
@@ -167,6 +202,19 @@ function keywordScore(query, record) {
   for (const token of tokens) if (haystack.includes(token)) matches += 1;
   const phraseBonus = haystack.includes(query.trim().toLowerCase()) ? 0.25 : 0;
   return Math.min(1, matches / Math.max(1, Math.min(tokens.length, 8)) + phraseBonus);
+}
+
+function exactTokens(value) {
+  return [...new Set((boundedText(value, 32_000).match(
+    /(?:https?:\/\/\S+|(?:[A-Za-z]:)?[/\\][^\s]+|[A-Za-z][A-Za-z0-9]*(?:[_./:-][A-Za-z0-9]+)+|\b(?:[A-Z]{2,}[A-Z0-9_]*|[45]\d\d)\b)/g,
+  ) || []).map((item) => item.replace(/[.,;:!?\])}]+$/, "").toLowerCase()).filter((item) => item.length >= 3))].slice(0, 16);
+}
+
+function exactScore(query, record) {
+  const tokens = exactTokens(query);
+  if (tokens.length === 0) return 0;
+  const haystack = recordSearchText(record);
+  return tokens.filter((item) => haystack.includes(item)).length / tokens.length;
 }
 
 function temporalScore(record, now) {
@@ -182,6 +230,10 @@ function evidenceSummary(record) {
   if (record.risk) parts.push(`risk=${boundedText(record.risk, 16)}`);
   if (record.decisionSource) parts.push(`source=${boundedText(record.decisionSource, 32)}`);
   if (record.tool) parts.push(`tool=${boundedText(record.tool, 128)}`);
+  const operation = record.detail?.operation || {};
+  if (operation.reason) parts.push(`analysis=${boundedText(operation.reason, 1024)}`);
+  const aiReview = record.detail?.aiReview || record.detail?.ai_review || {};
+  if (aiReview.reason) parts.push(`ai=${boundedText(aiReview.reason, 1024)}`);
   return boundedText(parts.filter(Boolean).join("; "), 8000) || "Agent audit record";
 }
 
@@ -190,11 +242,15 @@ function evidenceExcerpt(record) {
   if (record.commandPreview) parts.push(`command: ${boundedText(record.commandPreview, 1536)}`);
   if (record.target) parts.push(`target: ${boundedText(record.target, 2048)}`);
   if (record.cwd) parts.push(`cwd: ${boundedText(record.cwd, 2048)}`);
+  const operation = record.detail?.operation || {};
+  if (Array.isArray(operation.resources) && operation.resources.length > 0) {
+    parts.push(`resources: ${boundedText(operation.resources.map((item) => `${item.role || "target"}:${item.value} (${item.class})`).join(", "), 4096)}`);
+  }
   return parts.length > 0 ? boundedText(parts.join("\n"), 16_000) : null;
 }
 
 function buildEvidenceItem(sessionId, domain, ranked) {
-  const { record, keyword, temporal, final } = ranked;
+  const { record, keyword, exact = 0, temporal, final } = ranked;
   const sourceId = boundedText(record.auditId, 191) || `audit-${record.sequence}`;
   const canonical = {
     domain,
@@ -229,8 +285,14 @@ function buildEvidenceItem(sessionId, domain, ranked) {
       decision_source: boundedText(record.decisionSource, 32),
       tool: boundedText(record.tool, 128),
       record_hash: boundedText(record.hash, 128),
+      analysis_source: boundedText(record.decisionSource, 32),
+      operation_actions: Array.isArray(record.detail?.operation?.actions)
+        ? record.detail.operation.actions.slice(0, 32)
+        : [],
+      analysis_confidence: Number(record.detail?.aiReview?.confidence ?? record.detail?.operation?.confidence ?? 0),
     },
     retrieval_signals: {
+      exact: Number(exact.toFixed(6)),
       keyword: Number(keyword.toFixed(6)),
       temporal: Number(temporal.toFixed(6)),
       final: Number(final.toFixed(6)),
@@ -256,13 +318,22 @@ export function buildAuditEvidenceBundle({
   const normalizedSessionId = boundedText(sessionId, 64);
   if (!normalizedSessionId) throw protocolError("invalid_agent_session_id");
   const input = normalizeRequest(normalizedSessionId, request);
-  const page = auditStore.list(normalizedSessionId, {
-    category: input.domain,
-    limit: 100,
-  });
+  const records = [];
+  let beforeCursor = null;
+  let hasMore = false;
+  do {
+    const page = auditStore.list(normalizedSessionId, {
+      category: input.domain,
+      beforeCursor,
+      limit: 100,
+    });
+    records.push(...page.records);
+    hasMore = page.hasMore;
+    beforeCursor = page.nextCursor;
+  } while (hasMore && beforeCursor && records.length < MAX_AUDIT_SCAN);
   const nowValue = now();
   const currentTime = nowValue instanceof Date ? nowValue : new Date(nowValue);
-  const candidates = page.records.filter((record) => {
+  const candidates = records.filter((record) => {
     const occurredAt = recordTime(record);
     if (input.since && (!occurredAt || occurredAt < input.since)) return false;
     if (input.until && (!occurredAt || occurredAt > input.until)) return false;
@@ -270,22 +341,39 @@ export function buildAuditEvidenceBundle({
     if (input.tools.length > 0 && !input.tools.includes(String(record.tool || "").toLowerCase())) return false;
     return true;
   });
+  const expandedTerms = Array.isArray(input.queryPlan?.terms)
+    ? input.queryPlan.terms.map((item) => boundedText(item, 128)).filter(Boolean).slice(0, 24)
+    : [];
+  const expandedQuery = [input.query, ...expandedTerms].join(" ");
+  const plannedActions = Array.isArray(input.queryPlan?.actions)
+    ? input.queryPlan.actions.map((item) => String(item).toLowerCase()).slice(0, 12)
+    : [];
+  const plannedOutcomes = Array.isArray(input.queryPlan?.outcomes)
+    ? input.queryPlan.outcomes.map((item) => String(item).toLowerCase()).slice(0, 8)
+    : [];
   const ranked = candidates.map((record) => {
-    const keyword = keywordScore(input.query, record);
+    const keyword = keywordScore(expandedQuery, record);
+    const exact = exactScore(input.query, record);
+    const structured = Math.max(
+      plannedActions.some((item) => recordSearchText(record).includes(item)) ? 1 : 0,
+      plannedOutcomes.includes(String(record.outcome || "").toLowerCase()) ? 1 : 0,
+    );
     const temporal = temporalScore(record, currentTime);
-    const final = keyword > 0 ? keyword * 0.8 + temporal * 0.2 : temporal * 0.15;
-    return { record, keyword, temporal, final };
+    const final = exact > 0
+      ? exact * 0.65 + keyword * 0.2 + structured * 0.1 + temporal * 0.05
+      : keyword > 0 || structured > 0
+        ? keyword * 0.78 + structured * 0.17 + temporal * 0.05
+        : 0;
+    return { record, keyword, exact, temporal, final };
   }).sort((left, right) => right.final - left.final || Number(right.record.sequence || 0) - Number(left.record.sequence || 0));
 
-  const keywordMatched = ranked.some((item) => item.keyword > 0);
-  const selected = keywordMatched
-    ? ranked.filter((item) => item.keyword > 0)
-    : ranked;
+  const matched = ranked.some((item) => item.exact > 0 || item.keyword > 0);
+  const selected = matched
+    ? ranked.filter((item) => item.exact > 0 || item.keyword > 0)
+    : [];
 
   const warnings = [];
-  if (ranked.length > 0 && !keywordMatched) {
-    warnings.push("keyword_no_match_using_recent_records");
-  }
+  if (ranked.length > 0 && !matched) warnings.push("no_relevant_audit_evidence");
   const evidence = [];
   let usedTokens = 0;
   for (const candidate of selected.slice(0, input.topK)) {
@@ -299,7 +387,7 @@ export function buildAuditEvidenceBundle({
     usedTokens += cost;
   }
   if (evidence.length === 0) warnings.push("no_matching_evidence");
-  if (page.hasMore) warnings.push("audit_scan_limited_to_latest_100_records");
+  if (hasMore) warnings.push("audit_scan_limited");
 
   const bundle = {
     protocol_version: "1",
@@ -316,12 +404,16 @@ export function buildAuditEvidenceBundle({
     warnings: [...new Set(warnings)],
     policy: { ...EVIDENCE_POLICY },
     retrieval: {
-      strategy: "audit_keyword_temporal_v1",
+      strategy: "audit_exact_structured_lexical_v2",
       candidate_count: candidates.length,
       returned_count: evidence.length,
       token_budget: input.tokenBudget,
       estimated_tokens: usedTokens,
       degraded: false,
+      scan_count: records.length,
+      exact_tokens: exactTokens(input.query),
+      query_plan: input.queryPlan || null,
+      abstained: evidence.length === 0,
     },
   };
   assertNoSecretFields(bundle);

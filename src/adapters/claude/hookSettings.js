@@ -16,6 +16,8 @@ const DISPLAY_HOOK_EVENTS = [
   "PreCompact",
   "PostCompact",
   "Notification",
+  "PostToolUse",
+  "PostToolUseFailure",
   "TeammateIdle",
   "TaskCreated",
   "TaskCompleted",

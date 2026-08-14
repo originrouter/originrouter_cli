@@ -1,6 +1,7 @@
 import process from "node:process";
 import { reportLocalControlRuntime } from "../agent/bridgeReporter.js";
 import { syncAgentActivityCatalog } from "../agent/agentActivityCatalogSync.js";
+import { syncAgentHistoryBodies } from "../agent/agentHistorySync.js";
 import { AgentBudgetStore } from "../agent/agentBudgetStore.js";
 import {
   DEFAULT_DEVICE_ID,
@@ -34,6 +35,7 @@ import { getAllRoutes } from "../config/routes.js";
 import { normalizeProviderForRead } from "../config/providers.js";
 import { remoteShareModelEntries } from "../config/providerModels.js";
 import { LocalAuditStore } from "../persistence/localAuditStore.js";
+import { AiOperationReviewer } from "../runtime/aiOperationReviewer.js";
 import { AgentCatalog } from "../persistence/agentCatalog.js";
 import { readSessions } from "../persistence/sessionLog.js";
 import { ExternalAgentRegistry } from "../local/externalAgentRegistry.js";
@@ -41,6 +43,7 @@ import { ManagedAgentSupervisor } from "./managedAgentSupervisor.js";
 import { CollaborationStore } from "../collaboration/collaborationStore.js";
 import { PlanImplementVerifyCoordinator } from "../collaboration/planImplementVerifyCoordinator.js";
 import { CollaborationRuntime } from "../collaboration/collaborationRuntime.js";
+import { buildCollaborationCapabilities } from "../collaboration/collaborationCapabilities.js";
 import { ExternalAgentRelayRouter } from "./externalAgentRelayRouter.js";
 import { ensureRemoteCodingIdentity } from "../crypto/remoteCodingE2ee.js";
 import {
@@ -235,7 +238,10 @@ export async function startDaemon(args) {
     localIdentityProvider: () => readDeviceE2eeIdentity(stateDir),
     apiTokenPath: apiTokenFile,
   });
-  const auditStore = new LocalAuditStore({ stateDir });
+  const auditStore = new LocalAuditStore({
+    stateDir,
+    operationReviewer: new AiOperationReviewer({ stateDir }),
+  });
   const agentBudgetStore = new AgentBudgetStore({ stateDir });
   const collaborationStore = new CollaborationStore({ stateDir });
   const collaborationCoordinator = new PlanImplementVerifyCoordinator({
@@ -244,6 +250,7 @@ export async function startDaemon(args) {
   const agentCatalog = new AgentCatalog({ stateDir });
   agentCatalog.migrateLegacySessions(readSessions());
   let agentActivitySyncInFlight = null;
+  let agentHistorySyncInFlight = null;
   let lastAgentActivitySyncError = null;
   const syncAgentActivityHistory = () => {
     if (agentActivitySyncInFlight) return agentActivitySyncInFlight;
@@ -278,6 +285,19 @@ export async function startDaemon(args) {
       });
     return agentActivitySyncInFlight;
   };
+  const syncAgentHistoryContent = () => {
+    if (agentHistorySyncInFlight) return agentHistorySyncInFlight;
+    agentHistorySyncInFlight = syncAgentHistoryBodies({ catalog: agentCatalog, stateDir })
+      .then((result) => {
+        if (result.ok && result.synced > 0) {
+          console.log(`[agent-history] synced ${result.synced} display-safe transcripts`);
+        }
+        return result;
+      })
+      .catch((error) => ({ ok: false, error: error?.code || error?.message || "unknown" }))
+      .finally(() => { agentHistorySyncInFlight = null; });
+    return agentHistorySyncInFlight;
+  };
   const externalAgentRegistry = new ExternalAgentRegistry({
     catalog: agentCatalog,
   });
@@ -305,6 +325,14 @@ export async function startDaemon(args) {
     // wrapper without encryption.
     relayClient: deviceE2eeRelay,
     deviceId: effectiveDeviceId,
+    capabilityProvider: () => buildCollaborationCapabilities({
+      config: readConfig(),
+      agentCatalog,
+      agentBudgetStore,
+      deviceId: effectiveDeviceId,
+      version: VERSION,
+      source: "account_e2ee",
+    }),
   });
 
   // Stage 4: ProxyManager owns the LiteLLM proxy lifecycle. The session
@@ -386,6 +414,7 @@ export async function startDaemon(args) {
       });
   });
   const localApiCtx = {
+    stateDir,
     sessionManager,
     auditStore,
     agentBudgetStore,
@@ -677,7 +706,10 @@ export async function startDaemon(args) {
   heartbeatTimer.unref?.();
   agentActivitySyncTimer = setInterval(() => {
     if (!relayConnected) return;
-    void syncAgentActivityHistory();
+    void syncAgentActivityHistory().then((result) => {
+      if (result?.ok) return syncAgentHistoryContent();
+      return null;
+    });
   }, 5 * 60_000);
   agentActivitySyncTimer.unref?.();
   deviceE2eeRefreshTimer = setInterval(() => {
@@ -881,7 +913,10 @@ export async function startDaemon(args) {
               .catch((error) => {
                 console.error(`[daemon] device E2EE registration: ${error.code || error.message}`);
               });
-            void syncAgentActivityHistory();
+            void syncAgentActivityHistory().then((result) => {
+              if (result?.ok) return syncAgentHistoryContent();
+              return null;
+            });
             void collaborationRuntime
               .refreshAccountBudgetStatus()
               .catch((error) => {

@@ -23,6 +23,7 @@ import { handleRemoteCodingRequest } from "./remoteCodingServer.js";
 import { protectOriginrouterCodingEnv } from "../runtime/originrouterCodingAuthProxy.js";
 import { setAgentDetailDefault } from "../runtime/agentDetailProfile.js";
 import { buildAuditEvidenceBundle } from "../inquiry/auditEvidenceAdapter.js";
+import { AiAuditQueryPlanner } from "../runtime/aiAuditQueryPlanner.js";
 import { browseAgentWorkspaces } from "./workspaceBrowser.js";
 import {
   approvalPolicyCapabilities,
@@ -71,6 +72,7 @@ export class SessionManager {
     this.onLocalControlChanged = onLocalControlChanged;
     this.stateDir = stateDir;
     this.compatibilityAutomaticUpdates = compatibilityAutomaticUpdates;
+    this.auditQueryPlanner = new AiAuditQueryPlanner({ stateDir });
     this.lastCompatibilityOperation = null;
     this.sessions = new Map();
     // Stage 9.2: per-requestId abort controllers for in-flight remote
@@ -513,9 +515,6 @@ export class SessionManager {
         });
       }
 
-      const launch = adapter.buildLaunch();
-      const metadata = adapter.describe();
-
       // Provider resolution goes through the same entry point as localAgentSession.
       // `payload.provider` is the forward-looking remote-supplied override; falls
       // back to currentProvider[agent] when absent. PROVIDER_UNSUPPORTED is a
@@ -550,6 +549,11 @@ export class SessionManager {
       const providerEnv = providerResult.env;
       const resolvedProvider = providerResult.provider;
       const providerSource = providerResult.source;
+      if (typeof adapter.setRoutedModel === "function") {
+        adapter.setRoutedModel(providerEnv.OPENAI_MODEL);
+      }
+      const launch = adapter.buildLaunch();
+      const metadata = adapter.describe();
       terminalActivityReporter = createTerminalActivityReporter({
         sessionId,
         agentType: agent,
@@ -893,7 +897,15 @@ export class SessionManager {
       const sessionId = String(payload.sessionId || "").slice(0, 64);
       const requestId = String(payload.requestId || "").slice(0, 96);
       if (!sessionId || !requestId || !this.auditStore) return false;
-      try {
+      Promise.resolve().then(async () => {
+        let queryPlan = null;
+        try {
+          queryPlan = await this.auditQueryPlanner.plan({
+            queryId: payload.query_id,
+            domain: payload.domain,
+            query: payload.query,
+          });
+        } catch {}
         const evidenceBundle = buildAuditEvidenceBundle({
           auditStore: this.auditStore,
           sessionId,
@@ -905,28 +917,25 @@ export class SessionManager {
             scope: payload.scope,
             top_k: payload.top_k,
             token_budget: payload.token_budget,
+            query_plan: queryPlan,
           },
         });
-        this.relayClient.send("agent.inquiry.page", {
+        return this.relayClient.send("agent.inquiry.page", {
           sessionId,
           requestId,
           domain: evidenceBundle.domain,
           queryId: evidenceBundle.query_id,
           evidenceBundle,
-        }).catch((error) => {
-          console.error(`[inquiry] ${error.message}`);
         });
-      } catch (error) {
-        this.relayClient.send("agent.inquiry.page", {
+      }).catch((error) => this.relayClient.send("agent.inquiry.page", {
           sessionId,
           requestId,
           domain: String(payload.domain || ""),
           queryId: String(payload.query_id || ""),
           error: error.code || error.message || "invalid_inquiry_request",
-        }).catch((sendError) => {
+        })).catch((sendError) => {
           console.error(`[inquiry] ${sendError.message}`);
         });
-      }
       return true;
     }
 

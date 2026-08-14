@@ -765,6 +765,56 @@ export async function reportAgentConversationMetadata(payload, {
   }
 }
 
+export async function reportAgentHistoryChunk(document, {
+  stateDir = getStateDir(),
+  fetchFn = globalThis.fetch,
+  readCodingAuthFn = readCodingAuth,
+  ensureFreshAccessTokenFn = ensureFreshAccessToken,
+  timeoutMs = 30_000,
+} = {}) {
+  if (!document || typeof document !== "object") {
+    return { ok: false, error: "invalid_history_chunk" };
+  }
+  const resolved = await resolveRelayAuth({
+    stateDir,
+    readCodingAuthFn,
+    ensureFreshAccessTokenFn,
+  });
+  if (resolved.error) return { ok: false, error: resolved.error };
+  const { credential: auth, token } = resolved;
+  if (document.device_id !== auth.deviceId) {
+    return { ok: false, error: "device_mismatch" };
+  }
+  if (typeof fetchFn !== "function") return { ok: false, error: "fetch_unavailable" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchFn(`${apiBase()}/cli/v1/agent/history/chunks`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        "X-OriginRouter-Device-Id": auth.deviceId,
+      },
+      body: JSON.stringify({ document }),
+      signal: controller.signal,
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch {}
+    return {
+      ok: response.ok,
+      status: response.status,
+      data: payload?.data,
+      error: response.ok ? null : payload?.detail?.code || payload?.code || `http_${response.status}`,
+      retryable: response.status >= 500 || response.status === 429,
+    };
+  } catch {
+    return { ok: false, error: "request_failed", retryable: true };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function reportAgentSessionHeartbeat(sessionId, {
   stateDir = getStateDir(),
   fetchFn = globalThis.fetch,

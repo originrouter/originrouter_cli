@@ -41,6 +41,12 @@ export class CodexAdapter extends TerminalAdapter {
     this.startedAt = Date.now();
     this.scanner = new CodexJsonlScanner({ cwd, startedAt: this.startedAt });
     this.nativeConfig = Boolean(nativeConfig);
+    this.routedModel = null;
+  }
+
+  setRoutedModel(model) {
+    const value = String(model || "").trim();
+    this.routedModel = value || null;
   }
 
   describe() {
@@ -70,12 +76,12 @@ export class CodexAdapter extends TerminalAdapter {
         env: {},
       };
     }
+    const launchModel = this.routedModel || CODEX_MAIN_ALIAS;
     if (!userProvidedModel(args)) {
-      // Stage 8.0: routes.codex.main is the source of truth. Inject the
-      // fixed alias so Codex Code's model lookup hits the local LiteLLM
-      // proxy, which renders gpt-5.4 from the configured
-      // upstream provider.
-      args = ["--model", CODEX_MAIN_ALIAS, ...args];
+      // routes.codex.main is the source of truth. Proxy routes resolve to the
+      // fixed gpt-5.4 alias; direct OriginRouter and remote routes resolve to
+      // their actual configured model id.
+      args = ["--model", launchModel, ...args];
     } else {
       process.stderr.write(
         "warning: --model passed on the command line; it bypasses routes.codex.main.\n" +
@@ -86,7 +92,7 @@ export class CodexAdapter extends TerminalAdapter {
       command: "codex",
       args,
       // Defensive fallback for clients that ignore --model.
-      env: { OPENAI_MODEL: CODEX_MAIN_ALIAS },
+      env: { OPENAI_MODEL: launchModel },
     };
   }
 

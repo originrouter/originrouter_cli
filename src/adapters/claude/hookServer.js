@@ -188,7 +188,15 @@ export function startClaudeHookServer({
           // Hold the response open. The forwarder reads it once we end(),
           // copies the body to its own stdout, and exits so Claude Code
           // picks up the structured decision.
-          const callId = `claude-perm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+          // Claude exposes the tool-use id on PermissionRequest and repeats it
+          // on PostToolUse / PermissionDenied. Preserve that stable id so a
+          // decision made in the original terminal can close the mirrored App
+          // interaction immediately instead of waiting for the timeout.
+          const nativeToolUseId = String(
+            payload.tool_use_id || payload.toolUseId || "",
+          ).trim().slice(0, 191);
+          const callId = nativeToolUseId
+            || `claude-perm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
           const event = buildPermissionRequestEvent(callId, payload);
 
           let timer;

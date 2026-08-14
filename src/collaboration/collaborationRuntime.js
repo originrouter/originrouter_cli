@@ -87,6 +87,16 @@ function executionEventProjection(event = {}) {
     type,
     summary,
     detail,
+    payload: type.startsWith("agent.interaction.") ? {
+      interaction_id: safeText(event.interactionId || event.callId, 191),
+      kind: safeText(event.kind, 64) || null,
+      source: safeText(event.source, 64) || null,
+      contains_secret: event.containsSecret === true,
+      expires_at: event.expiresAt || null,
+      status: safeText(event.status, 32) || null,
+      action: safeText(event.action, 64) || null,
+      decision_source: safeText(event.decisionSource, 191) || null,
+    } : {},
     metadata: {
       ...(activity ? { activity } : {}),
       ...(safeText(event.kind, 64) ? { kind: safeText(event.kind, 64) } : {}),
@@ -98,6 +108,38 @@ function executionEventProjection(event = {}) {
   };
 }
 
+function interactionAttentionKind(kind) {
+  return kind === "permission" ? "approval" : "input";
+}
+
+function interactionAttentionActions(kind) {
+  return kind === "permission" ? ["allow", "deny"] : ["submit", "cancel"];
+}
+
+function collaborationSnapshotSummary(snapshot) {
+  if (!snapshot) return null;
+  return {
+    ...snapshot.run,
+    schema_version: snapshot.schema_version,
+    revision: snapshot.revision,
+    last_sequence: snapshot.last_sequence,
+    plan: snapshot.plan,
+    tasks: snapshot.tasks,
+    agents: Object.fromEntries(
+      (snapshot.participants || []).map((participant) => [
+        participant.participant_id,
+        participant,
+      ]),
+    ),
+    attention: snapshot.attention,
+    artifacts: snapshot.artifacts,
+    budget: snapshot.budget,
+    usage: snapshot.usage,
+    final_report: snapshot.final_report,
+    capabilities: snapshot.capabilities,
+  };
+}
+
 export class CollaborationRuntime {
   constructor({
     store,
@@ -106,6 +148,7 @@ export class CollaborationRuntime {
     registry,
     catalog = null,
     relayClient = null,
+    capabilityProvider = null,
     deviceId = "local",
     registrationTimeoutMs = 15_000,
     pollIntervalMs = 100,
@@ -117,6 +160,7 @@ export class CollaborationRuntime {
     this.registry = registry;
     this.catalog = catalog;
     this.relayClient = relayClient;
+    this.capabilityProvider = capabilityProvider;
     this.deviceId = deviceId;
     this.registrationTimeoutMs = registrationTimeoutMs;
     this.pollIntervalMs = pollIntervalMs;
@@ -129,6 +173,8 @@ export class CollaborationRuntime {
     this.outboxDeliveries = new Map();
     this.outboxRetryTimer = null;
     this.mcpRequests = new Map();
+    this.capabilityRequests = new Map();
+    this.workspaceTrustRequests = new Map();
     this.unsubscribe = registry?.subscribe?.((notification) => this.enqueue(notification)) || (() => {});
   }
 
@@ -332,6 +378,24 @@ export class CollaborationRuntime {
         mode: task.kind,
       },
     });
+    this.store.recordExecutionEvent(run.run_id, {
+      type: "task.handoff",
+      taskId: task.task_id,
+      participantId: sourceRole,
+      summary: `${sourceRole} delegated work to ${participantId}.`,
+      payload: {
+        delegated_task_id: task.task_id,
+        source_participant_id: sourceRole,
+        target_participant_id: participantId,
+        mode: task.kind,
+      },
+      metadata: {
+        source_participant_id: sourceRole,
+        target_participant_id: participantId,
+      },
+      correlationId: requestId,
+      idempotencyKey: `agent-mcp-handoff-${requestId}`,
+    });
     await this.dispatchForState(run.run_id);
     const current = this.store.getRun(run.run_id, { includeMessages: false });
     const created = current.tasks.find((item) => item.task_id === task.task_id);
@@ -365,6 +429,13 @@ export class CollaborationRuntime {
 
   async confirm(runId) {
     const run = this.coordinator.confirm(runId);
+    void this.syncRun(runId);
+    await this.dispatchForState(runId);
+    return this.store.getRun(run.run_id);
+  }
+
+  async revisePlan(runId, feedback) {
+    const run = this.store.requestAdaptivePlanRevision(runId, feedback);
     void this.syncRun(runId);
     await this.dispatchForState(runId);
     return this.store.getRun(run.run_id);
@@ -436,6 +507,234 @@ export class CollaborationRuntime {
       void this.dispatchForState(runId, { recovery: true }).catch((error) => this.fail(runId, error));
     }
     return run;
+  }
+
+  async pause(runId) {
+    const before = this.store.getRun(runId, { includeMessages: false });
+    const run = this.store.pauseRun(runId);
+    const remotePauses = [];
+    for (const [role, agent] of Object.entries(before?.agents || {})) {
+      if (!agent.current_task_id || !agent.originrouter_session_id && agent.device_id === this.deviceId) continue;
+      const remote = agent.device_id !== this.deviceId && agent.device_id !== "local";
+      if (remote) {
+        const task = before.tasks?.find((item) => item.task_id === agent.current_task_id);
+        const assignmentId = compactId(
+          before.template_id === ADAPTIVE_TEMPLATE_ID
+            ? `assign-${before.run_id}-${role}-${task?.task_key || agent.current_task_id}`
+            : `assign-${before.run_id}-${role}`,
+          96,
+        );
+        remotePauses.push(this.sendRemoteDurable("collaboration.remote.pause", {
+          protocolVersion: "1",
+          sourceDeviceId: this.deviceId,
+          targetDeviceId: agent.device_id,
+          runId: before.run_id,
+          taskId: agent.current_task_id,
+          role,
+          assignmentId,
+          attempt: agent.attempt,
+          fencingToken: agent.fencing_token,
+          deliveryId: compactId(`pause-${before.run_id}-${role}-${agent.attempt}`, 96),
+        }, {
+          outboxId: `pause:${before.run_id}:${role}:${agent.attempt}`,
+        }).catch(() => null));
+      } else if (agent.originrouter_session_id) {
+        try {
+          this.registry.enqueueCommand(agent.originrouter_session_id, {
+            type: "terminal.interrupt",
+            sessionId: agent.originrouter_session_id,
+          });
+        } catch {}
+      }
+    }
+    await Promise.all(remotePauses);
+    void this.syncRun(runId);
+    return run;
+  }
+
+  async resume(runId) {
+    const run = this.store.resumeRun(runId);
+    void this.syncRun(runId);
+    await this.dispatchForState(runId, { recovery: true });
+    return this.store.getRun(run.run_id);
+  }
+
+  async retry(runId, taskReference = "") {
+    if (safeText(taskReference, 195)) {
+      const run = this.store.retryAdaptiveTask(runId, taskReference);
+      void this.syncRun(runId);
+      await this.dispatchForState(runId, { recovery: true });
+      return this.store.getRun(run.run_id);
+    }
+    const run = this.store.retryRun(runId);
+    return this.start(run.run_id);
+  }
+
+  async capabilitiesForDevice(deviceId) {
+    const targetDeviceId = safeText(deviceId, 191);
+    if (!targetDeviceId) throw new Error("target device id is required");
+    if (targetDeviceId === this.deviceId || targetDeviceId === "local") {
+      if (!this.capabilityProvider) throw new Error("local capability provider unavailable");
+      return this.capabilityProvider();
+    }
+    if (!this.relayClient) {
+      const error = new Error("OriginRouter virtual network is unavailable");
+      error.code = "COLLABORATION_CAPABILITY_RELAY_UNAVAILABLE";
+      throw error;
+    }
+    const requestId = compactId(`capability-${randomUUID()}`, 64);
+    const response = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.capabilityRequests.delete(requestId);
+        const error = new Error("remote device capability request timed out");
+        error.code = "COLLABORATION_CAPABILITY_TIMEOUT";
+        reject(error);
+      }, 10_000);
+      timer.unref?.();
+      this.capabilityRequests.set(requestId, { resolve, reject, timer, targetDeviceId });
+    });
+    try {
+      const sent = await this.relayClient.send("collaboration.capabilities.request", {
+        protocolVersion: "1",
+        requestId,
+        sourceDeviceId: this.deviceId,
+        targetDeviceId,
+      });
+      const delivery = sent?.data || sent || {};
+      if (delivery.accepted === false && !delivery.queued) {
+        const error = new Error(delivery.reason || "remote capability request was rejected");
+        error.code = safeText(delivery.reason, 96) || "COLLABORATION_CAPABILITY_REJECTED";
+        throw error;
+      }
+      return await response;
+    } catch (error) {
+      const pending = this.capabilityRequests.get(requestId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.capabilityRequests.delete(requestId);
+      }
+      throw error;
+    }
+  }
+
+  async trustWorkspaceOnDevice(deviceId, path) {
+    const targetDeviceId = safeText(deviceId, 191);
+    const requestedPath = safeText(path, 4096);
+    if (!targetDeviceId || !requestedPath) throw new Error("device id and workspace path are required");
+    if (targetDeviceId === this.deviceId || targetDeviceId === "local") {
+      if (!this.catalog) throw new Error("Agent workspace catalog unavailable");
+      return this.catalog.trustWorkspace(requestedPath, { deviceId: this.deviceId });
+    }
+    if (!this.relayClient) {
+      const error = new Error("OriginRouter virtual network is unavailable");
+      error.code = "COLLABORATION_WORKSPACE_RELAY_UNAVAILABLE";
+      throw error;
+    }
+    const requestId = compactId(`workspace-trust-${randomUUID()}`, 64);
+    const response = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.workspaceTrustRequests.delete(requestId);
+        const error = new Error("remote workspace trust request timed out");
+        error.code = "COLLABORATION_WORKSPACE_TRUST_TIMEOUT";
+        reject(error);
+      }, 15_000);
+      timer.unref?.();
+      this.workspaceTrustRequests.set(requestId, { resolve, reject, timer, targetDeviceId });
+    });
+    try {
+      const sent = await this.relayClient.send("collaboration.workspace.trust.request", {
+        protocolVersion: "1",
+        requestId,
+        sourceDeviceId: this.deviceId,
+        targetDeviceId,
+        path: requestedPath,
+      });
+      const delivery = sent?.data || sent || {};
+      if (delivery.accepted === false && !delivery.queued) {
+        const error = new Error(delivery.reason || "remote workspace trust request was rejected");
+        error.code = safeText(delivery.reason, 96) || "COLLABORATION_WORKSPACE_TRUST_REJECTED";
+        throw error;
+      }
+      return await response;
+    } catch (error) {
+      const pending = this.workspaceTrustRequests.get(requestId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.workspaceTrustRequests.delete(requestId);
+      }
+      throw error;
+    }
+  }
+
+  async resolveAttention(runId, attentionId, input = {}) {
+    const run = this.store.getRun(runId, { includeMessages: false });
+    if (!run) throw new Error("collaboration run not found");
+    const item = this.store.listAttention(runId, { status: "" })
+      .find((candidate) => candidate.attention_id === attentionId);
+    if (!item) throw new Error("collaboration attention item not found");
+    if (item.status !== "pending") return { item, duplicate: true };
+    const action = safeText(input.action || input.resolution, 64).toLowerCase();
+    if (!item.actions.includes(action)) {
+      const error = new Error(`unsupported attention action '${action || "(empty)"}'`);
+      error.code = "COLLABORATION_ATTENTION_ACTION_INVALID";
+      throw error;
+    }
+    const sessionId = safeText(item.payload?.session_id, 64);
+    const interactionId = safeText(item.payload?.interaction_id, 191);
+    if (["approval", "input"].includes(item.kind)) {
+      if (!sessionId || !interactionId) {
+        const error = new Error("attention item is missing its Agent interaction binding");
+        error.code = "COLLABORATION_ATTENTION_BINDING_MISSING";
+        throw error;
+      }
+      const agent = run.agents?.[item.participant_id];
+      const command = {
+        type: "agent.interaction.resolve",
+        sessionId,
+        interactionId,
+        responseId: safeText(input.response_id ?? input.responseId, 191)
+          || compactId(`attention-${item.attention_id}-${item.revision}`, 191),
+        kind: safeText(item.payload?.kind, 64) || null,
+        action,
+        response: input.response && typeof input.response === "object" ? input.response : {},
+        decisionSource: safeText(input.resolved_by ?? input.resolvedBy, 191) || "originrouter-user",
+      };
+      const remote = agent && agent.device_id !== this.deviceId && agent.device_id !== "local";
+      if (remote) {
+        await this.sendRemoteDurable("collaboration.remote.interaction.resolve", {
+          protocolVersion: "1",
+          sourceDeviceId: this.deviceId,
+          targetDeviceId: agent.device_id,
+          runId: run.run_id,
+          taskId: item.task_id,
+          role: item.participant_id,
+          sessionId,
+          interactionId,
+          command,
+          deliveryId: compactId(`attention-${item.attention_id}-${item.revision}`, 96),
+        }, {
+          outboxId: `attention:${item.attention_id}:${item.revision}`,
+        });
+      } else {
+        this.registry.enqueueCommand(sessionId, command);
+      }
+    }
+    const resolved = this.store.resolveAttention(runId, attentionId, {
+      ...input,
+      resolution: action,
+    });
+    this.store.recordExecutionEvent(runId, {
+      type: item.kind === "approval" ? "approval.resolved" : "interaction.resolved",
+      taskId: item.task_id,
+      participantId: item.participant_id,
+      sessionId,
+      summary: item.kind === "approval"
+        ? `Agent permission ${action === "allow" ? "approved" : "denied"}.`
+        : "Agent input was submitted.",
+      payload: { attention_id: item.attention_id, action },
+      idempotencyKey: `attention-resolved:${item.attention_id}:${item.revision}`,
+    });
+    return resolved;
   }
 
   async recover() {
@@ -735,6 +1034,56 @@ export class CollaborationRuntime {
       ...projectedEvent,
       createdAt: event.createdAt,
     });
+    if (event.type === "agent.interaction.requested") {
+      const interactionId = safeText(event.interactionId || event.callId, 191);
+      if (interactionId) {
+        const kind = safeText(event.kind, 64) || "input";
+        const containsSecret = event.containsSecret === true;
+        this.store.createAttention(binding.run_id, {
+          taskId: currentTaskId,
+          participantId: binding.role,
+          kind: interactionAttentionKind(kind),
+          title: safeText(event.title, 256)
+            || (kind === "permission" ? "Agent permission required" : "Agent needs your input"),
+          summary: containsSecret
+            ? "The Agent is waiting for a sensitive response. Open the request to continue."
+            : safeText(event.prompt || event.message, 2048)
+              || `The ${binding.role} Agent is waiting for ${kind.replaceAll("_", " ")}.`,
+          risk: kind === "permission" ? "normal" : "low",
+          actions: interactionAttentionActions(kind),
+          payload: {
+            interaction_id: interactionId,
+            session_id: notification.sessionId,
+            kind,
+            source: safeText(event.source, 64) || null,
+            contains_secret: containsSecret,
+          },
+          expiresAt: event.expiresAt || null,
+          idempotencyKey: `interaction:${notification.sessionId}:${interactionId}`,
+          createdAt: event.createdAt,
+        });
+      }
+      return;
+    }
+    if (event.type === "agent.interaction.result") {
+      const interactionId = safeText(event.interactionId || event.callId, 191);
+      const terminalResult = ["applied", "expired", "failed", "canceled", "cancelled"]
+        .includes(safeText(event.status, 32).toLowerCase());
+      if (interactionId && terminalResult) {
+        const attention = this.store.findAttentionByIdempotency(
+          binding.run_id,
+          `interaction:${notification.sessionId}:${interactionId}`,
+        );
+        if (attention?.status === "pending") {
+          this.store.resolveAttention(binding.run_id, attention.attention_id, {
+            expectedRevision: attention.revision,
+            resolvedBy: safeText(event.decisionSource, 191) || "agent-runtime",
+            resolution: safeText(event.action || event.status, 64) || "resolved",
+          });
+        }
+      }
+      return;
+    }
     if (FAILED_EVENTS.has(event.type)) {
       const error = new Error(safeText(event.error || event.reason, 2048)
         || "Collaboration Agent command failed.");
@@ -785,7 +1134,193 @@ export class CollaborationRuntime {
     await this.handleTurnCompleted(binding.run_id, binding.role, output, completionKey);
   }
 
+  async handleControlOperation(operation, input = {}) {
+    const runId = safeText(input.run_id ?? input.runId, 195);
+    if (operation === "list_runs") {
+      if (input.category || input.page || input.page_size || input.pageSize) {
+        const page = this.store.listRunPage({
+          category: safeText(input.category, 32) || "all",
+          page: input.page,
+          pageSize: input.page_size ?? input.pageSize,
+          includeArchived: input.archived === true,
+        });
+        return {
+          ...page,
+          runs: page.runs.map((run) =>
+            collaborationSnapshotSummary(this.store.getSnapshot(run.run_id))),
+        };
+      }
+      return {
+        runs: this.store.listRuns({ limit: input.limit || 200 })
+          .map((run) => collaborationSnapshotSummary(this.store.getSnapshot(run.run_id))),
+      };
+    }
+    if (operation === "create") {
+      return {
+        run: this.coordinator.create({
+          ...(input.request || {}),
+          coordinator_device_id: this.deviceId,
+        }),
+      };
+    }
+    if (!runId) throw new Error("collaboration run_id is required");
+    if (operation === "snapshot") {
+      const snapshot = this.store.getSnapshot(runId);
+      if (!snapshot) throw new Error("collaboration run not found");
+      return { snapshot };
+    }
+    if (operation === "diagnostics") {
+      const diagnostics = this.store.getDiagnostics(runId);
+      if (!diagnostics) throw new Error("collaboration run not found");
+      return { diagnostics };
+    }
+    if (operation === "events") {
+      const afterSequence = Math.max(0, Number(input.after_sequence ?? input.afterSequence) || 0);
+      const page = this.store.listExecutionEventPage(runId, {
+        participantId: safeText(input.participant_id ?? input.participantId, 32),
+        afterSequence,
+        visibility: safeText(input.visibility, 96),
+        limit: input.limit || 200,
+      });
+      if (!page) throw new Error("collaboration run not found");
+      return page;
+    }
+    if (operation === "start") return { run: await this.start(runId) };
+    if (operation === "confirm") return { run: await this.confirm(runId) };
+    if (operation === "replan") {
+      return { run: await this.revisePlan(runId, input.feedback) };
+    }
+    if (operation === "pause") return { run: await this.pause(runId) };
+    if (operation === "resume") return { run: await this.resume(runId) };
+    if (operation === "cancel") return { run: await this.cancel(runId) };
+    if (operation === "retry") {
+      return { run: await this.retry(runId, safeText(input.task_id ?? input.taskId, 195)) };
+    }
+    if (operation === "budget") return { run: await this.updateBudget(runId, input.budget || {}) };
+    if (operation === "archive") return { run: this.store.archiveRun(runId, true) };
+    if (operation === "delete") {
+      return { deleted: this.store.deleteRun(runId), run_id: runId };
+    }
+    if (operation === "resolve_attention") {
+      return this.resolveAttention(
+        runId,
+        safeText(input.attention_id ?? input.attentionId, 195),
+        input.resolution || {},
+      );
+    }
+    throw new Error(`unsupported collaboration control operation '${safeText(operation, 64)}'`);
+  }
+
   async handleRelayEvent(payload = {}) {
+    if (payload.type === "collaboration.control.request") {
+      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      let data = null;
+      let errorPayload = null;
+      try {
+        data = await this.handleControlOperation(
+          safeText(payload.operation, 64),
+          payload.input || {},
+        );
+      } catch (error) {
+        errorPayload = {
+          code: safeText(error?.code, 96) || "COLLABORATION_CONTROL_REJECTED",
+          message: safeText(error?.message, 2048) || "collaboration control request failed",
+        };
+      }
+      await this.relayClient?.send?.("collaboration.control.response", {
+        protocolVersion: "1",
+        requestId: safeText(payload.requestId, 64),
+        sourceDeviceId: this.deviceId,
+        targetDeviceId: safeText(payload.sourceDeviceId, 191),
+        ...(errorPayload ? { error: errorPayload } : { data }),
+      });
+      return true;
+    }
+    if (payload.type === "collaboration.capabilities.request") {
+      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      let capabilities = null;
+      let errorPayload = null;
+      try {
+        if (!this.capabilityProvider) throw new Error("capability provider unavailable");
+        capabilities = await this.capabilityProvider();
+      } catch (error) {
+        errorPayload = {
+          code: safeText(error?.code, 96) || "COLLABORATION_CAPABILITY_UNAVAILABLE",
+          message: safeText(error?.message, 2048) || "remote capabilities unavailable",
+        };
+      }
+      await this.relayClient?.send?.("collaboration.capabilities.response", {
+        protocolVersion: "1",
+        requestId: safeText(payload.requestId, 64),
+        sourceDeviceId: this.deviceId,
+        targetDeviceId: safeText(payload.sourceDeviceId, 191),
+        ...(errorPayload ? { error: errorPayload } : { capabilities }),
+      });
+      return true;
+    }
+    if (payload.type === "collaboration.capabilities.response") {
+      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      const requestId = safeText(payload.requestId, 64);
+      const pending = this.capabilityRequests.get(requestId);
+      if (!pending) return true;
+      clearTimeout(pending.timer);
+      this.capabilityRequests.delete(requestId);
+      if (payload.error) {
+        const error = new Error(safeText(payload.error.message, 2048) || "remote capabilities unavailable");
+        error.code = safeText(payload.error.code, 96) || "COLLABORATION_CAPABILITY_UNAVAILABLE";
+        pending.reject(error);
+      } else {
+        const capabilities = payload.capabilities || {};
+        capabilities.freshness = {
+          ...(capabilities.freshness || {}),
+          source: "account_e2ee",
+          stale: false,
+          received_at: new Date().toISOString(),
+        };
+        pending.resolve(capabilities);
+      }
+      return true;
+    }
+    if (payload.type === "collaboration.workspace.trust.request") {
+      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      let workspace = null;
+      let errorPayload = null;
+      try {
+        if (!this.catalog) throw new Error("Agent workspace catalog unavailable");
+        workspace = this.catalog.trustWorkspace(safeText(payload.path, 4096), {
+          deviceId: this.deviceId,
+        });
+      } catch (error) {
+        errorPayload = {
+          code: safeText(error?.code, 96) || "COLLABORATION_WORKSPACE_TRUST_FAILED",
+          message: safeText(error?.message, 2048) || "workspace could not be trusted",
+        };
+      }
+      await this.relayClient?.send?.("collaboration.workspace.trust.response", {
+        protocolVersion: "1",
+        requestId: safeText(payload.requestId, 64),
+        sourceDeviceId: this.deviceId,
+        targetDeviceId: safeText(payload.sourceDeviceId, 191),
+        ...(errorPayload ? { error: errorPayload } : { workspace }),
+      });
+      return true;
+    }
+    if (payload.type === "collaboration.workspace.trust.response") {
+      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      const requestId = safeText(payload.requestId, 64);
+      const pending = this.workspaceTrustRequests.get(requestId);
+      if (!pending) return true;
+      clearTimeout(pending.timer);
+      this.workspaceTrustRequests.delete(requestId);
+      if (payload.error) {
+        const error = new Error(safeText(payload.error.message, 2048) || "workspace could not be trusted");
+        error.code = safeText(payload.error.code, 96) || "COLLABORATION_WORKSPACE_TRUST_FAILED";
+        pending.reject(error);
+      } else {
+        pending.resolve(payload.workspace || {});
+      }
+      return true;
+    }
     if (payload.type === "collaboration.budget.status") {
       if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
       const blocked = Boolean(payload.blocked);
@@ -955,9 +1490,91 @@ export class CollaborationRuntime {
         type: payload.event?.type,
         summary: payload.event?.summary,
         detail: payload.event?.detail,
+        payload: payload.event?.payload || {},
         metadata: payload.event?.metadata || {},
         createdAt: payload.createdAt,
       });
+      if (payload.event?.type === "agent.interaction.requested") {
+        const interactionId = safeText(payload.event?.payload?.interaction_id, 191);
+        if (interactionId) {
+          const kind = safeText(payload.event?.payload?.kind, 64) || "input";
+          this.store.createAttention(run.run_id, {
+            taskId: payload.taskId,
+            participantId: role,
+            kind: interactionAttentionKind(kind),
+            title: kind === "permission" ? "Agent permission required" : "Agent needs your input",
+            summary: payload.event?.payload?.contains_secret
+              ? "The remote Agent is waiting for a sensitive response. Open the request to continue."
+              : safeText(payload.event?.detail || payload.event?.summary, 2048),
+            risk: kind === "permission" ? "normal" : "low",
+            actions: interactionAttentionActions(kind),
+            payload: {
+              interaction_id: interactionId,
+              session_id: safeText(payload.sessionId, 64),
+              kind,
+              source: safeText(payload.event?.payload?.source, 64) || null,
+              contains_secret: payload.event?.payload?.contains_secret === true,
+            },
+            expiresAt: payload.event?.payload?.expires_at || null,
+            idempotencyKey: `interaction:${safeText(payload.sessionId, 64)}:${interactionId}`,
+            createdAt: payload.createdAt,
+          });
+        }
+      }
+      if (payload.event?.type === "agent.interaction.result") {
+        const interactionId = safeText(payload.event?.payload?.interaction_id, 191);
+        const terminalResult = ["applied", "expired", "failed", "canceled", "cancelled"]
+          .includes(safeText(payload.event?.payload?.status, 32).toLowerCase());
+        if (interactionId && terminalResult) {
+          const attention = this.store.findAttentionByIdempotency(
+            run.run_id,
+            `interaction:${safeText(payload.sessionId, 64)}:${interactionId}`,
+          );
+          if (attention?.status === "pending") {
+            this.store.resolveAttention(run.run_id, attention.attention_id, {
+              expectedRevision: attention.revision,
+              resolvedBy: safeText(payload.event?.payload?.decision_source, 191) || "agent-runtime",
+              resolution: safeText(payload.event?.payload?.action || payload.event?.payload?.status, 64),
+            });
+          }
+        }
+      }
+      return true;
+    }
+    if (payload.type === "collaboration.remote.interaction.resolve") {
+      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      const assignment = this.store.findRemoteAssignmentBySession(payload.sessionId);
+      if (!assignment
+          || assignment.run_id !== safeText(payload.runId, 195)
+          || assignment.role !== safeText(payload.role, 32)) {
+        const error = new Error("remote Agent interaction binding is unavailable");
+        error.code = "COLLABORATION_REMOTE_INTERACTION_STALE";
+        throw error;
+      }
+      this.registry.enqueueCommand(assignment.originrouter_session_id, {
+        ...(payload.command || {}),
+        type: "agent.interaction.resolve",
+        sessionId: assignment.originrouter_session_id,
+        interactionId: safeText(payload.interactionId, 191),
+      });
+      return true;
+    }
+    if (payload.type === "collaboration.remote.pause") {
+      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      const assignment = this.store.getRemoteAssignment(payload.assignmentId)
+        || this.store.findRemoteAssignmentBySession(payload.sessionId);
+      if (!assignment
+          || assignment.run_id !== safeText(payload.runId, 195)
+          || assignment.role !== safeText(payload.role, 32)) return true;
+      if (assignment.originrouter_session_id) {
+        try {
+          this.registry.enqueueCommand(assignment.originrouter_session_id, {
+            type: "terminal.interrupt",
+            sessionId: assignment.originrouter_session_id,
+          });
+        } catch {}
+      }
+      this.store.updateRemoteAssignment(assignment.assignment_id, { status: "paused" });
       return true;
     }
     if (payload.type === "collaboration.remote.usage") {
@@ -1604,5 +2221,19 @@ export class CollaborationRuntime {
       pending.reject(error);
     }
     this.mcpRequests.clear();
+    for (const pending of this.capabilityRequests.values()) {
+      clearTimeout(pending.timer);
+      const error = new Error("collaboration capability discovery stopped");
+      error.code = "COLLABORATION_CAPABILITY_STOPPED";
+      pending.reject(error);
+    }
+    this.capabilityRequests.clear();
+    for (const pending of this.workspaceTrustRequests.values()) {
+      clearTimeout(pending.timer);
+      const error = new Error("collaboration workspace trust stopped");
+      error.code = "COLLABORATION_WORKSPACE_TRUST_STOPPED";
+      pending.reject(error);
+    }
+    this.workspaceTrustRequests.clear();
   }
 }

@@ -106,6 +106,11 @@ try {
     assert.equal(out.env.ANTHROPIC_API_KEY, "sk-noop-litellm-passthrough");
     assert.equal(out.env.ANTHROPIC_MODEL, MAIN_ALIAS);
     assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, SMALL_ALIAS);
+    assert.equal(out.env.CLAUDE_CODE_SUBAGENT_MODEL, MAIN_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, MAIN_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_SONNET_MODEL, MAIN_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, SMALL_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_FABLE_MODEL, MAIN_ALIAS);
   }
 
   // ---- (3) Routes set, main + small: both fixed aliases (small explicit) ----
@@ -277,6 +282,9 @@ try {
     assert.equal(out.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
     // small falls back to main
     assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, "claude-sonnet-4-6");
+    assert.equal(out.env.CLAUDE_CODE_SUBAGENT_MODEL, "claude-sonnet-4-6");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "claude-sonnet-4-6");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "claude-sonnet-4-6");
   }
 
   // ---- (14) codex originrouter direct smoke ----

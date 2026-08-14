@@ -225,46 +225,61 @@ export function classifyPermissionScope(request, workspaceRoot) {
       return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
     });
   });
-  if (actions.has("secret.input")) return { scope: null, reason: "secret_input" };
+  const evidence = {
+    actions: [...actions],
+    resources: normalized.atoms.map((atom) => ({
+      action: atom.action,
+      risk: atom.risk,
+      confidence: atom.confidence,
+      resource: atom.resource || null,
+      command: atom.command || null,
+      code: atom.code || null,
+      database: atom.database || null,
+      network: atom.network || null,
+    })),
+    workspace: root,
+  };
+  const result = (scope, reason) => ({ scope, reason, evidence });
+  if (actions.has("secret.input")) return result(null, "secret_input");
   if (actions.has("permission.additional")) {
-    return { scope: "additional_permissions", reason: "additional_sandbox_permissions" };
+    return result("additional_permissions", "additional_sandbox_permissions");
   }
   if (["tool.unknown", "fs.unknown", "db.unknown", "process.opaque", "shell.dynamic", "code.opaque"]
     .some((action) => actions.has(action))) {
-    return { scope: "unknown_tools", reason: "insufficient_classification" };
+    return result("unknown_tools", "insufficient_classification");
   }
-  if (outside) return { scope: "outside_workspace", reason: "path_outside_workspace" };
+  if (outside) return result("outside_workspace", "path_outside_workspace");
   if ([
     "fs.delete", "fs.permissions.write", "vcs.destructive", "db.delete",
     "db.schema.drop", "infra.destroy",
   ].some((action) => actions.has(action))) {
-    return { scope: "destructive_commands", reason: "destructive_operation" };
+    return result("destructive_commands", "destructive_operation");
   }
   if ([
     "system.service.manage", "system.identity.manage", "system.schedule.manage",
     "system.storage.manage", "infra.write", "infra.destroy",
   ].some((action) => actions.has(action))) {
-    return { scope: "elevated_commands", reason: "elevated_operation" };
+    return result("elevated_commands", "elevated_operation");
   }
   if ([
     "network.connect", "network.listen", "network.http.read", "network.http.write",
     "network.transfer.upload", "network.transfer.download", "vcs.remote.write",
     "package.publish",
   ].some((action) => actions.has(action))) {
-    return { scope: "network_mutations", reason: "network_operation" };
+    return result("network_mutations", "network_operation");
   }
   if (["fs.create", "fs.write", "fs.append", "fs.patch", "fs.copy", "fs.move"]
     .some((action) => actions.has(action))) {
-    return { scope: "workspace_edits", reason: "workspace_file_change" };
+    return result("workspace_edits", "workspace_file_change");
   }
   if (["process.exec", "package.read", "vcs.read", "vcs.write", "infra.read"]
     .some((action) => actions.has(action))) {
-    return { scope: "workspace_commands", reason: "routine_workspace_command" };
+    return result("workspace_commands", "routine_workspace_command");
   }
   if (["fs.read", "fs.list", "fs.search"].some((action) => actions.has(action))) {
-    return { scope: "read_tools", reason: "routine_read_tool" };
+    return result("read_tools", "routine_read_tool");
   }
-  return { scope: "unknown_tools", reason: "unknown_tool" };
+  return result("unknown_tools", "unknown_tool");
 }
 
 function affirmativeQuestionResponse(request) {
@@ -672,8 +687,11 @@ export async function resolveWithAutonomy({
         decision: review.decision,
         risk: review.risk,
         confidence: review.confidence,
+        reason: review.reason || null,
+        conditions: Array.isArray(review.conditions) ? review.conditions.slice(0, 8) : [],
         reviewer: review.reviewer,
         decisionMethod: review.decision_method,
+        userConfirmationRequired: Boolean(review.user_confirmation_required),
         templateId: aiReviewPolicy?.template_id || null,
         templateVersion: aiReviewPolicy?.version ?? null,
         templateHash: aiReviewPolicy?.content_hash || null,

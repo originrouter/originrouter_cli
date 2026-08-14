@@ -90,6 +90,10 @@ assert.equal(delegatedTask.parent_task_id, run.agents.requester.current_task_id)
 assert.equal(delegatedTask.participant_id, "reviewer");
 assert.equal(delegatedTask.state, "active");
 assert.ok(run.messages.some((message) => message.type === "agent.mcp.delegated"));
+const handoff = store.listExecutionEvents(created.run_id, { limit: 100 })
+  .find((event) => event.type === "task.handoff");
+assert.equal(handoff?.metadata?.source_participant_id, "requester");
+assert.equal(handoff?.metadata?.target_participant_id, "reviewer");
 
 const reviewerSession = run.agents.reviewer.originrouter_session_id;
 registry.emit(reviewerSession, { type: "agent.text", text: "REVIEWER_MCP_OK", eventId: "review-text" });
