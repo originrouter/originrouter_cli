@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, platform, userInfo } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { join, posix as posixPath, resolve, win32 as win32Path } from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { readApiToken } from "../persistence/authToken.js";
@@ -62,7 +62,8 @@ export function buildServiceEnvironmentPath({
   inheritedPath = process.env.PATH,
   currentPlatform = platform(),
 } = {}) {
-  const separator = currentPlatform === "win32" ? ";" : delimiter;
+  const pathApi = currentPlatform === "win32" ? win32Path : posixPath;
+  const separator = pathApi.delimiter;
   const inherited = String(inheritedPath || "")
     .split(separator)
     .map((item) => item.trim())
@@ -80,8 +81,8 @@ export function buildServiceEnvironmentPath({
         "/sbin",
       ];
   return [...new Set([
-    nodePath ? dirname(nodePath) : "",
-    cliPath ? dirname(cliPath) : "",
+    nodePath ? pathApi.dirname(nodePath) : "",
+    cliPath ? pathApi.dirname(cliPath) : "",
     ...inherited,
     ...fallbacks,
   ].filter(Boolean))].join(separator);

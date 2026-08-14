@@ -33,6 +33,20 @@ const common = {
 }
 
 {
+  const value = buildServiceEnvironmentPath({
+    nodePath: "C:\\Program Files\\nodejs\\node.exe",
+    cliPath: "C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@originrouter\\cli\\bin\\originrouter.js",
+    inheritedPath: "C:\\custom;C:\\Windows\\System32;C:\\custom",
+    currentPlatform: "win32",
+  });
+  const entries = value.split(";");
+  assert.equal(entries[0], "C:\\Program Files\\nodejs");
+  assert.equal(entries[1], "C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@originrouter\\cli\\bin");
+  assert.equal(entries.filter((item) => item === "C:\\custom").length, 1);
+  assert.ok(entries.includes("C:\\Windows\\System32"));
+}
+
+{
   const plist = buildLaunchdPlist(common);
   assert.match(plist, /<string>com\.originrouter\.daemon<\/string>/);
   assert.match(plist, /<key>RunAtLoad<\/key>\s*<true\/>/);
