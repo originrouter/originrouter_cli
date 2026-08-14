@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="assets/readme-hero.svg" alt="OriginRouter CLI — local agent control plane" width="100%" />
+  <img src="assets/readme-hero-en.webp" alt="OriginRouter CLI — Claude Code and Codex. One local control plane." width="100%" />
+</p>
+
+<p align="center">
+  <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
@@ -8,10 +12,10 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/originrouter"><img alt="npm" src="https://img.shields.io/npm/v/originrouter?style=flat-square&color=10b981" /></a>
+  <a href="https://www.npmjs.com/package/originrouter"><img alt="npm" src="https://img.shields.io/npm/v/originrouter?style=flat-square&color=ff4b16" /></a>
   <a href="https://github.com/originrouter/originrouter_cli/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/originrouter/originrouter_cli/ci.yml?branch=main&style=flat-square&label=CI" /></a>
   <img alt="Node.js 22+" src="https://img.shields.io/badge/Node.js-22%2B-339933?style=flat-square&logo=node.js&logoColor=white" />
-  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-0f766e?style=flat-square" /></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-ff4b16?style=flat-square" /></a>
 </p>
 
 <p align="center">

@@ -32,8 +32,10 @@
     "scripts/claude-session-hook-forwarder-impl.cjs",
     "scripts/fix-node-pty-permissions.cjs",
     "schemas/",
-    "assets/readme-hero.svg",
+    "assets/readme-hero-en.webp",
+    "assets/readme-hero-zh.webp",
     "README.md",
+    "README.zh-CN.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
