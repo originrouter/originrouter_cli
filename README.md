@@ -15,7 +15,7 @@
   <a href="https://www.npmjs.com/package/@originrouter/cli"><img alt="npm" src="https://img.shields.io/npm/v/@originrouter/cli?style=flat-square&color=ff4b16" /></a>
   <a href="https://github.com/originrouter/originrouter_cli/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/originrouter/originrouter_cli/ci.yml?branch=main&style=flat-square&label=CI" /></a>
   <img alt="Node.js 22+" src="https://img.shields.io/badge/Node.js-22%2B-339933?style=flat-square&logo=node.js&logoColor=white" />
-  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-ff4b16?style=flat-square" /></a>
+  <a href="LICENSE"><img alt="Apache-2.0 license" src="https://img.shields.io/badge/license-Apache--2.0-ff4b16?style=flat-square" /></a>
 </p>
 
 <p align="center">
@@ -93,6 +93,13 @@ originrouter doctor
 # Install the user-level background service
 originrouter service install
 originrouter service start
+
+# Open Agent Workspace in the current project
+originrouter
+
+# Or run one objective directly; Codex is the default coordinator
+originrouter "Fix the login timeout and add regression tests"
+originrouter -c claude --mode build-review "Implement and review the change"
 
 # Launch with the agent's existing configuration
 originrouter claude --originrouter-native-config
@@ -173,6 +180,7 @@ path resolution fail closed to user review.
 | Models | `provider`, `route`, `proxy`, `compatibility` |
 | Account | `login`, `logout`, `auth`, `security` |
 | Control | `service`, `local`, `token`, `daemon` |
+| Agent Workspace | `originrouter`, `-c`, `--mode` |
 | Collaboration | `collaborate`, `collaboration` |
 | Utilities | `history`, `completion`, `run -- <command>` |
 
@@ -213,6 +221,26 @@ npm run test:compatibility
 - [CLI documentation](https://originrouter.com/docs/originrouter-tools/cli)
 - [Command reference](https://originrouter.com/docs/originrouter-cli/commands)
 
+## Third-party products and legal notice
+
+OriginRouter is an independent open-source project. It is not affiliated with,
+endorsed by, or sponsored by Anthropic or OpenAI.
+
+OriginRouter interoperates with third-party developer tools and services,
+including Claude Code and Codex. Users must obtain and maintain their own
+accounts, subscriptions, licenses, and access rights, and must comply with the
+applicable third-party terms and policies.
+
+Third-party software and dependencies remain subject to their own licenses and
+terms. Product names and marks belong to their respective owners; references
+identify compatible products and do not imply endorsement or partnership.
+
+AI-generated outputs and actions may be inaccurate, incomplete, or unsafe.
+Users are responsible for reviewing them before relying on or executing them.
+
+See [Third-party notices](THIRD_PARTY_NOTICES.md) for dependency and runtime
+licensing details.
+
 ## License
 
-[MIT](LICENSE)
+[Apache License 2.0](LICENSE)

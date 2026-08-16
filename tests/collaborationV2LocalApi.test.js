@@ -33,6 +33,50 @@ const base = `http://127.0.0.1:${handle.port}`;
 const headers = { Authorization: `Bearer ${token}` };
 
 try {
+  const modeCreateResponse = await fetch(`${base}/collaboration/local/runs`, {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      objective: "Deploy the production database migration",
+      workspace_mode: "auto",
+      coordinator_runtime: "claude",
+      participants: [{
+        participant_id: "planner",
+        runtime: "claude",
+        device_id: "local",
+        workspace_id: "/project",
+        planner: true,
+      }],
+      budget: { max_concurrency: 1 },
+    }),
+  });
+  assert.equal(modeCreateResponse.status, 200);
+  const modeCreatePayload = await modeCreateResponse.json();
+  assert.equal(modeCreatePayload.run.workspace_mode, "auto");
+  assert.equal(modeCreatePayload.run.resolved_workspace_mode, "plan_build_verify");
+  assert.equal(modeCreatePayload.run.coordinator_runtime, "claude");
+  assert.equal(modeCreatePayload.run.planning_source, "local");
+  assert.equal(modeCreatePayload.run.risk_tier, "red");
+
+  const invalidRemoteResponse = await fetch(`${base}/collaboration/local/runs`, {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      objective: "Check service status on the remote server",
+      workspace_mode: "auto",
+      participants: [{
+        participant_id: "planner",
+        runtime: "codex",
+        device_id: "local",
+        workspace_id: "/project",
+        planner: true,
+      }],
+    }),
+  });
+  assert.equal(invalidRemoteResponse.status, 400);
+  const invalidRemotePayload = await invalidRemoteResponse.json();
+  assert.match(invalidRemotePayload.error, /different trusted device/i);
+
   const capabilitiesResponse = await fetch(
     `${base}/collaboration/local/capabilities`,
     { headers },

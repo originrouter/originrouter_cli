@@ -1,6 +1,23 @@
 node_modules/
 dist/
 .env
+.env.*
+!.env.example
 .DS_Store
 *.log
 .originrouter/
+
+# Local secrets and certificates
+*.pem
+*.p12
+*.pfx
+
+# Test and build output
+coverage/
+.nyc_output/
+.cache/
+*.tgz
+
+# Local editor settings
+.idea/
+.vscode/

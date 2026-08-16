@@ -160,4 +160,33 @@ assert.equal(store.getRun(recoveryCreated.run_id).state, "completed");
 
 recoveredRuntime.close();
 store.close();
+
+const writerStateDir = mkdtempSync(join(tmpdir(), "originrouter-writer-serialization-"));
+const writerStore = new CollaborationStore({ stateDir: writerStateDir });
+const writerCoordinator = new PlanImplementVerifyCoordinator({ store: writerStore });
+const writerRun = writerCoordinator.create({
+  objective: "Safely coordinate two independent edits in one workspace.",
+  participants: [
+    { participant_id: "writer_a", runtime: "codex", device_id: "local", workspace_id: "/shared", planner: true },
+    { participant_id: "writer_b", runtime: "claude", device_id: "local", workspace_id: "/shared" },
+  ],
+  budget: { max_concurrency: 2 },
+});
+writerCoordinator.start(writerRun.run_id);
+writerStore.setAdaptivePlan(writerRun.run_id, {
+  version: 1,
+  title: "Serialized writer plan",
+  summary: "Both tasks target the same workspace.",
+  tasks: [
+    { id: "write_a", title: "Edit A", instructions: "Edit A.", participant_id: "writer_a", depends_on: [], mode: "workspace_write", deliverable: "A" },
+    { id: "write_b", title: "Edit B", instructions: "Edit B.", participant_id: "writer_b", depends_on: [], mode: "workspace_write", deliverable: "B" },
+  ],
+});
+writerStore.confirmAdaptivePlan(writerRun.run_id);
+assert.equal(
+  writerStore.runnableAdaptiveTasks(writerRun.run_id).length,
+  1,
+  "same-workspace writers must be serialized even when concurrency allows both",
+);
+writerStore.close();
 console.log("adaptive collaboration tests passed");

@@ -84,6 +84,13 @@ import { CollaborationStore } from "../collaboration/collaborationStore.js";
 import { PlanImplementVerifyCoordinator } from "../collaboration/planImplementVerifyCoordinator.js";
 import { browseAgentWorkspaces } from "../daemon/workspaceBrowser.js";
 import { buildCollaborationCapabilities } from "../collaboration/collaborationCapabilities.js";
+import {
+  classifyWorkspaceRisk,
+  inferWorkspaceMode,
+  normalizeCoordinator,
+  normalizeWorkspaceMode,
+  workspaceModeDefinition,
+} from "../collaboration/workspaceModes.js";
 
 // Exported so CLI subcommands (e.g. `local api set-host`) can apply
 // the same gating as the runtime auth layer. Keep the set in lock-
@@ -769,15 +776,44 @@ async function dispatch(ctx, req, res) {
         const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
         if (body.__error) return sendError(res, 400, body.__error);
         try {
+          const requestedMode = normalizeWorkspaceMode(body.workspace_mode || "auto");
+          const resolvedMode = requestedMode === "auto"
+            ? inferWorkspaceMode(body.objective)
+            : requestedMode;
+          const planner = Array.isArray(body.participants)
+            ? body.participants.find((participant) => participant?.planner === true) || body.participants[0]
+            : null;
+          const coordinatorRuntime = normalizeCoordinator(
+            body.coordinator_runtime || planner?.runtime || "codex",
+          );
+          const riskTier = classifyWorkspaceRisk(body.objective, resolvedMode);
+          const coordinatorDeviceId =
+            ctx.collaborationRuntime?.deviceId || body.coordinator_device_id || "local";
+          if (resolvedMode === "remote_ops" && !body.participants?.some(
+            (participant) => String(participant?.device_id || participant?.deviceId || "")
+              !== String(coordinatorDeviceId),
+          )) {
+            const error = new Error("Remote Ops requires a participant on a different trusted device.");
+            error.code = "COLLABORATION_REMOTE_PARTICIPANT_REQUIRED";
+            throw error;
+          }
           return sendOk(res, {
             run: ctx.collaborationCoordinator.create({
               ...body,
-              coordinator_device_id:
-                ctx.collaborationRuntime?.deviceId || body.coordinator_device_id || "local",
+              workspace_mode: requestedMode,
+              resolved_workspace_mode: resolvedMode,
+              coordinator_runtime: coordinatorRuntime,
+              planning_source: requestedMode === "auto" ? "local" : "manual",
+              risk_tier: riskTier,
+              workflow_template_id:
+                body.workflow_template_id || workspaceModeDefinition(resolvedMode).templateId,
+              coordinator_device_id: coordinatorDeviceId,
             }),
           });
         } catch (error) {
-          return sendError(res, 400, error.message || "invalid collaboration run");
+          return sendError(res, 400, error.message || "invalid collaboration run", {
+            reason: error.code || "invalid_collaboration_run",
+          });
         }
       }
       return sendError(res, 405, `method ${req.method} not allowed`);

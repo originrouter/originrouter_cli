@@ -9,5 +9,8 @@ assert(getCompletionCandidates(["route", "cloud", ""]).includes("models"));
 assert.deepEqual(getCompletionCandidates(["claude", "--originrouter-autonomy", "g"]), ["guarded"]);
 assert(getCompletionCandidates(["history", "--a"]).includes("--agent"));
 assert(getCompletionCandidates(["completion", "p"]).includes("powershell"));
+assert(getCompletionCandidates(["-"]).includes("--mode"));
+assert.deepEqual(getCompletionCandidates(["--coordinator", "c"]), ["claude", "codex"]);
+assert(getCompletionCandidates(["--mode", "p"]).includes("plan-build-verify"));
 
 console.log("completion tests ok");

@@ -1,4 +1,4 @@
-export const VERSION = "0.1.1";
+export const VERSION = "0.2.0";
 export const DEFAULT_RELAY_URL = "https://app.easytransnote.com";
 export const DEFAULT_DEVICE_ID = "local-dev";
 export const DEFAULT_EXECUTOR = "pty";

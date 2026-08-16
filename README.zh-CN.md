@@ -15,7 +15,7 @@
   <a href="https://www.npmjs.com/package/@originrouter/cli"><img alt="npm" src="https://img.shields.io/npm/v/@originrouter/cli?style=flat-square&color=ff4b16" /></a>
   <a href="https://github.com/originrouter/originrouter_cli/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/originrouter/originrouter_cli/ci.yml?branch=main&style=flat-square&label=CI" /></a>
   <img alt="Node.js 22+" src="https://img.shields.io/badge/Node.js-22%2B-339933?style=flat-square&logo=node.js&logoColor=white" />
-  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-ff4b16?style=flat-square" /></a>
+  <a href="LICENSE"><img alt="Apache-2.0 license" src="https://img.shields.io/badge/license-Apache--2.0-ff4b16?style=flat-square" /></a>
 </p>
 
 <p align="center">
@@ -89,6 +89,13 @@ originrouter doctor
 # 安装并启动用户级后台服务
 originrouter service install
 originrouter service start
+
+# 在当前项目中打开统一 Agent Workspace
+originrouter
+
+# 或直接提交目标；默认由 Codex 担任协调者
+originrouter "修复登录超时并补充回归测试"
+originrouter -c claude --mode build-review "实现并独立审查这个修改"
 
 # 使用 Agent 已有的登录、模型和环境配置启动
 originrouter claude --originrouter-native-config
@@ -167,6 +174,7 @@ originrouter claude --originrouter-autonomy custom \
 | 模型 | `provider`、`route`、`proxy`、`compatibility` |
 | 账户 | `login`、`logout`、`auth`、`security` |
 | 本地控制 | `service`、`local`、`token`、`daemon` |
+| Agent Workspace | `originrouter`、`-c`、`--mode` |
 | 协作 | `collaborate`、`collaboration` |
 | 工具 | `history`、`completion`、`run -- <command>` |
 
@@ -202,6 +210,23 @@ npm run test:compatibility
 - [CLI 使用指南](https://originrouter.com/docs/originrouter-tools/cli)
 - [命令参考](https://originrouter.com/docs/originrouter-cli/commands)
 
+## 第三方产品与法律声明
+
+OriginRouter 是独立的开源项目，与 Anthropic 或 OpenAI 不存在隶属、赞助、
+认可或合作关系。
+
+OriginRouter 可与包括 Claude Code 和 Codex 在内的第三方开发工具及服务进行
+互操作。用户需要自行取得并维护相应的账户、订阅、许可证和访问权限，并遵守
+适用的第三方条款与政策。
+
+第三方软件及依赖项继续受其各自许可证和使用条款约束。产品名称和标识归其
+各自权利人所有；相关名称仅用于说明兼容性，不代表任何认可或合作关系。
+
+AI 生成的内容和操作可能不准确、不完整或不安全。用户有责任在依赖或执行前
+进行审核。
+
+依赖项和运行时组件的许可详情参见[第三方声明](THIRD_PARTY_NOTICES.md)。
+
 ## 许可证
 
-[MIT](LICENSE)
+[Apache License 2.0](LICENSE)

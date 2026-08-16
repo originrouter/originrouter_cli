@@ -37,6 +37,7 @@ const NESTED = {
 };
 
 const OPTIONS = {
+  workspace: ["-c", "--coordinator", "-m", "--mode", "--team", "--review", "--yes", "--detach", "--cloud-advice"],
   doctor: ["--json"],
   sessions: ["--json"],
   devices: ["--json"],
@@ -59,6 +60,10 @@ function providerNames() {
 }
 
 function valuesFor(previous) {
+  if (["-c", "--coordinator"].includes(previous)) return ["codex", "claude"];
+  if (["-m", "--mode", "--team"].includes(previous)) {
+    return ["auto", "solo", "build-review", "plan-build-verify", "parallel-research", "review-panel", "remote-ops"];
+  }
   if (previous === "--agent") return ["claude", "codex"];
   if (previous === "--type") return ["proxy", "litellm"];
   if (previous === "--engine") return ["litellm"];
@@ -91,7 +96,7 @@ export function getCompletionCandidates(argv = []) {
   }
 
   if (current.startsWith("-") || candidates.length === 0) {
-    candidates = [...candidates, ...(OPTIONS[first] || [])];
+    candidates = [...candidates, ...(OPTIONS[first] || []), ...(completed.length === 0 ? OPTIONS.workspace : [])];
   }
 
   if (["provider", "route"].includes(first) && ["show", "use", "remove", "update"].includes(second)) {

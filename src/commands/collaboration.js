@@ -22,6 +22,13 @@ import { handleServiceCommand } from "./service.js";
 import { readApiToken } from "../persistence/authToken.js";
 import { ensureStateDir, readDaemonState } from "../persistence/state.js";
 import { redactDisplayText, redactDisplayValue } from "../security/displayRedaction.js";
+import {
+  buildLocalWorkspaceConfiguration,
+  normalizeCoordinator,
+  normalizeWorkspaceMode,
+  workspaceModeDefinition,
+} from "../collaboration/workspaceModes.js";
+import { requestCollaborationAdvice } from "../collaboration/collaborationAdviceClient.js";
 
 class CollaborationCliError extends Error {
   constructor(message, {
@@ -1224,6 +1231,10 @@ async function resolveAutoConfigurationAmbiguity(error, {
 export async function automaticCreatePayload({
   objective,
   prompt = null,
+  workspaceMode = null,
+  coordinator = "codex",
+  currentDirectory = cwd(),
+  cloudAdvice = false,
   requestFn = request,
   loadDeviceDirectoryFn = (options) => loadCliDeviceDirectory(options),
   cacheCapabilitiesFn = cacheCollaborationCapabilities,
@@ -1239,6 +1250,68 @@ export async function automaticCreatePayload({
   });
   if (!devices.length) {
     throw Object.assign(new Error("No trusted device has a usable collaboration capability snapshot."), { code: "AUTO_CONFIG_CAPABILITIES_UNAVAILABLE" });
+  }
+  if (workspaceMode) {
+    let advisedMode = workspaceMode;
+    let advice = null;
+    if (cloudAdvice) {
+      try {
+        advice = await requestCollaborationAdvice({
+          objective,
+          requestedMode: workspaceMode,
+          coordinator,
+          devices,
+        }, { stateDir: ensureStateDir() });
+        if (workspaceMode === "auto") advisedMode = advice.recommended_mode;
+      } catch (error) {
+        advice = { error_code: error.code || "COLLABORATION_ADVICE_FAILED" };
+      }
+    }
+    let configured;
+    try {
+      configured = buildLocalWorkspaceConfiguration({
+        objective,
+        mode: advisedMode,
+        coordinator,
+        devices,
+        currentDirectory,
+      });
+    } catch (error) {
+      if (!cloudAdvice || workspaceMode !== "auto" || advisedMode === "auto") throw error;
+      configured = buildLocalWorkspaceConfiguration({
+        objective,
+        mode: "auto",
+        coordinator,
+        devices,
+        currentDirectory,
+      });
+      advice = { error_code: error.code || "COLLABORATION_ADVICE_UNAVAILABLE_MODE" };
+    }
+    if (workspaceMode === "auto") {
+      configured.workspace_mode = "auto";
+      configured.auto_configuration.workspace_mode = "auto";
+    }
+    if (advice && !advice.error_code) {
+      const ranks = { green: 0, yellow: 1, red: 2 };
+      if (ranks[advice.risk_tier] > ranks[configured.risk_tier]) {
+        configured.risk_tier = advice.risk_tier;
+        configured.auto_configuration.risk_tier = advice.risk_tier;
+        configured.auto_configuration.safe_to_skip_confirmation = false;
+        configured.auto_configuration.requires_explicit_confirmation = true;
+      }
+      configured.planning_source = "cloud_advice";
+      configured.auto_configuration.advice = {
+        reason: String(advice.reason || "").slice(0, 2000),
+        planning_notes: Array.isArray(advice.planning_notes)
+          ? advice.planning_notes.map((item) => String(item).slice(0, 500)).slice(0, 12)
+          : [],
+        system_model: String(advice.system_model || "").slice(0, 191),
+      };
+    } else if (cloudAdvice) {
+      configured.planning_source = "local_fallback";
+      configured.auto_configuration.advice_error = advice?.error_code || "COLLABORATION_ADVICE_FAILED";
+    }
+    return configured;
   }
   try {
     return await autoConfigureCollaboration({
@@ -1309,7 +1382,14 @@ function printAutoConfiguration(payload) {
     const wait = participant.waiting_for_device ? " · waiting for device" : "";
     console.log(`  ${participant.display_name.padEnd(12)} ${runtime.padEnd(12)} ${participant.device_id} · ${participant.workspace_id}${wait}`);
   }
-  console.log(`\n  Method: ${payload.auto_configuration?.independent_review ? "implementation with independent review" : "adaptive collaboration"}`);
+  const requestedMode = payload.auto_configuration?.workspace_mode;
+  const resolvedMode = payload.auto_configuration?.resolved_workspace_mode;
+  const modeLabel = requestedMode
+    ? workspaceModeDefinition(resolvedMode || requestedMode).label
+    : payload.auto_configuration?.independent_review
+      ? "implementation with independent review"
+      : "adaptive collaboration";
+  console.log(`\n  Method: ${requestedMode === "auto" ? `Auto → ${modeLabel}` : modeLabel}`);
   console.log(`  Permission: ${[...new Set(payload.participants.map((item) => item.permission_profile))].join(", ")}`);
   console.log(`  Concurrency: ${payload.budget.max_concurrency}`);
   console.log(`  Model: ${payload.participants.some((item) => item.provider) ? "selected routes shown above" : "use each device's default route"}`);
@@ -2029,6 +2109,11 @@ async function handleCollaborationCommandImpl(args) {
       throw new Error(`Collaboration draft '${draftId}' was not found.`);
     }
     const objective = positionalObjective(rest) || value(args, "objective") || "";
+    const workspaceMode = value(args, "workspace-mode");
+    const cloudAdvice = has(args, "cloud-advice");
+    const coordinator = value(args, "coordinator") || "codex";
+    if (workspaceMode) normalizeWorkspaceMode(workspaceMode);
+    normalizeCoordinator(coordinator);
     const scripted = value(args, "spec") || values(args, "participant").length > 0;
     let payload;
     if (scripted) {
@@ -2042,10 +2127,16 @@ async function handleCollaborationCommandImpl(args) {
       const ownsPrompt = input.isTTY && output.isTTY;
       if (ownsPrompt) prompt = createInterface({ input, output });
       try {
-        payload = await automaticCreatePayload({ objective, prompt });
+        payload = await automaticCreatePayload({
+          objective,
+          prompt,
+          workspaceMode,
+          coordinator,
+          cloudAdvice,
+        });
         if (!json) printAutoConfiguration(payload);
         const configurationConfirmationRequired = has(args, "review")
-          || !payload.auto_configuration?.safe_to_skip_confirmation;
+          || (!workspaceMode && !payload.auto_configuration?.safe_to_skip_confirmation);
         if (configurationConfirmationRequired) {
           if (!prompt) {
             throw new Error("The generated configuration requires explicit interactive confirmation.");

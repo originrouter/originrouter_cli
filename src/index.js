@@ -71,6 +71,7 @@ import { handleAuthCommand, handleLogin, handleLogout } from "./commands/auth.js
 import { handleAgentRouteSetup } from "./commands/agentRouteSetup.js";
 import { handleSecurityCommand } from "./commands/security.js";
 import { handleCollaborationCommand } from "./commands/collaboration.js";
+import { handleAgentWorkspaceCommand } from "./commands/agentWorkspace.js";
 import { handleHistoryCommand } from "./commands/history.js";
 import { getCompletionCandidates, printCompletion } from "./commands/completion.js";
 import {
@@ -110,6 +111,8 @@ function printHelp() {
   console.log(`originrouter ${VERSION}
 
 Usage:
+  originrouter
+  originrouter "<objective>" [-c codex|claude] [--mode <mode>]
   originrouter --help
   originrouter --version
   originrouter completion bash|zsh|fish|powershell
@@ -326,6 +329,11 @@ function printSummaryHelp() {
   console.log(`originrouter ${VERSION} — local control plane for Claude Code and Codex
 
 Usage:
+  originrouter                       Open Agent Workspace in the current folder
+  originrouter "<objective>"         Run an objective with an auto-managed team
+  originrouter -c codex|claude       Choose the default coordinator
+  originrouter --mode <mode>         auto, solo, build-review, plan-build-verify,
+                                    parallel-research, review-panel, or remote-ops
   originrouter <command> [options]
   originrouter claude [native Claude Code args...]
   originrouter codex [native Codex args...]
@@ -2021,8 +2029,25 @@ async function printDoctor(args = []) {
 export async function main(argv) {
   const [command, ...args] = argv;
 
-  if (!command || command === "--help" || command === "-h") {
+  if (!command) {
+    if (process.stdin.isTTY && process.stdout.isTTY) await handleAgentWorkspaceCommand([]);
+    else printSummaryHelp();
+    return;
+  }
+
+  if (command === "--help" || command === "-h") {
     printSummaryHelp();
+    return;
+  }
+
+  if ([
+    "-c", "--coordinator", "-m", "--mode", "--team",
+    "--detach", "--json", "--no-wait", "--plain", "--raw", "--review",
+    "--verbose", "--yes", "--cloud-advice", "--timeout",
+  ].some((option) => (
+    command === option || command.startsWith(`${option}=`)
+  ))) {
+    await handleAgentWorkspaceCommand([command, ...args]);
     return;
   }
 
@@ -2227,10 +2252,7 @@ export async function main(argv) {
     await runLocalAgentSession(agentCommand.agent, agentCommand.args);
     return;
   }
-
-  console.error(`Unknown command: ${command}`);
-  console.error("Run `originrouter --help` for usage.");
-  process.exitCode = 1;
+  await handleAgentWorkspaceCommand([command, ...args]);
 }
 
 function _parseFlag(args, name) {

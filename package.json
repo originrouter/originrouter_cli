@@ -1,6 +1,6 @@
 {
   "name": "@originrouter/cli",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Local CLI and connector for OriginRouter Agent Control.",
   "keywords": [
     "ai-agent",
@@ -36,6 +36,8 @@
     "README.md",
     "README.zh-CN.md",
     "CHANGELOG.md",
+    "THIRD_PARTY_NOTICES.md",
+    "NOTICE",
     "LICENSE"
   ],
   "publishConfig": {
@@ -51,6 +53,7 @@
     "test:relay-agent": "node ./tests/agentRelayPolicy.test.js && node ./tests/externalAgentRelayRouter.test.js",
     "test:audit": "node ./tests/operationRisk.test.js && node ./tests/aiOperationAudit.test.js && node ./tests/localAuditStore.test.js && node ./tests/auditEvidenceAdapter.test.js",
     "test:collaboration-auto": "node --test ./tests/collaborationAutoConfig.test.js",
+    "test:workspace": "node ./tests/agentWorkspace.test.js && node --test ./tests/collaborationAdviceClient.test.js",
     "test:collaboration": "node ./tests/collaborationRuntime.test.js && node ./tests/collaborationRuntimeEngine.test.js && node ./tests/collaborationAdaptive.test.js && node ./tests/collaborationStateV2.test.js && node ./tests/collaborationV2LocalApi.test.js && node ./tests/collaborationCliWizard.test.js && node ./tests/collaborationDraftStore.test.js && node ./tests/collaborationCapabilityCache.test.js && node ./tests/collaborationCrossDevice.test.js && node ./tests/collaborationReliability.test.js && node ./tests/collaborationProductionReliability.test.js && node ./tests/collaborationSecurity.test.js && node ./tests/collaborationBudget.test.js && node ./tests/agentMcpGatewayConfig.test.js && node ./tests/agentMcpServer.test.js && node ./tests/agentMcpGateway.test.js && node ./tests/agentMcpGatewayCrossDevice.test.js && node ./tests/agentUsageMapping.test.js",
     "test:compatibility": "node ./tests/compatibilityEngine.test.js && node ./tests/compatibilityWasm.test.js && node ./tests/compatibilityPatchStore.test.js && node ./tests/compatibilityGateway.test.js && node ./tests/compatibilityGatewayProcess.test.js && node ./tests/proxyManager.test.js",
     "test:agent-budget": "node ./tests/agentBudgetStore.test.js && node ./tests/managedAgentSupervisor.test.js",
@@ -66,7 +69,7 @@
   "engines": {
     "node": ">=22"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.161",
     "@modelcontextprotocol/sdk": "^1.30.0",

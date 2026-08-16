@@ -113,6 +113,11 @@ function publicRun(row) {
     preferences: row.preferences || "",
     coordination_prompt: row.coordination_prompt || "",
     workflow_template_id: row.workflow_template_id || "plan_implement_verify",
+    workspace_mode: row.workspace_mode || "",
+    resolved_workspace_mode: row.resolved_workspace_mode || "",
+    coordinator_runtime: row.coordinator_runtime || "",
+    planning_source: row.planning_source || "local",
+    risk_tier: row.risk_tier || "green",
     planner_role: row.planner_role || "lead",
     plan_status: row.plan_status || (row.template_id === ADAPTIVE_TEMPLATE_ID ? "draft" : "confirmed"),
     plan_revision: Number(row.plan_revision || 0),
@@ -164,6 +169,11 @@ export class CollaborationStore {
         preferences TEXT NOT NULL DEFAULT '',
         coordination_prompt TEXT NOT NULL DEFAULT '',
         workflow_template_id TEXT NOT NULL DEFAULT 'plan_implement_verify',
+        workspace_mode TEXT NOT NULL DEFAULT '',
+        resolved_workspace_mode TEXT NOT NULL DEFAULT '',
+        coordinator_runtime TEXT NOT NULL DEFAULT '',
+        planning_source TEXT NOT NULL DEFAULT 'local',
+        risk_tier TEXT NOT NULL DEFAULT 'green',
         planner_role TEXT NOT NULL DEFAULT 'lead',
         plan_status TEXT NOT NULL DEFAULT 'confirmed',
         plan_revision INTEGER NOT NULL DEFAULT 0,
@@ -439,6 +449,11 @@ export class CollaborationStore {
     this.ensureColumn("collaboration_runs", "preferences", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_runs", "coordination_prompt", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_runs", "workflow_template_id", "TEXT NOT NULL DEFAULT 'plan_implement_verify'");
+    this.ensureColumn("collaboration_runs", "workspace_mode", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_runs", "resolved_workspace_mode", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_runs", "coordinator_runtime", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_runs", "planning_source", "TEXT NOT NULL DEFAULT 'local'");
+    this.ensureColumn("collaboration_runs", "risk_tier", "TEXT NOT NULL DEFAULT 'green'");
     this.ensureColumn("collaboration_runs", "planner_role", "TEXT NOT NULL DEFAULT 'lead'");
     this.ensureColumn("collaboration_runs", "plan_status", "TEXT NOT NULL DEFAULT 'confirmed'");
     this.ensureColumn("collaboration_runs", "plan_revision", "INTEGER NOT NULL DEFAULT 0");
@@ -614,15 +629,24 @@ export class CollaborationStore {
       this.db.prepare(`
         INSERT INTO collaboration_runs(
           run_id, conversation_id, template_id, template_version, objective,
-          preferences, coordination_prompt, workflow_template_id, planner_role,
+          preferences, coordination_prompt, workflow_template_id,
+          workspace_mode, resolved_workspace_mode, coordinator_runtime,
+          planning_source, risk_tier, planner_role,
           plan_status, plan_json, state, gates_json, budget_json, usage_json,
           counters_json, account_budget_blocked, resume_state, coordinator_device_id,
           created_at, updated_at, finished_at
-        ) VALUES (?, ?, ?, '2', ?, ?, ?, ?, ?, 'draft', '', 'created', '{}', ?, ?, '{}', 0, '', ?, ?, ?, NULL)
+        ) VALUES (?, ?, ?, '2', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', '', 'created', '{}', ?, ?, '{}', 0, '', ?, ?, ?, NULL)
       `).run(
         runId, conversationId, ADAPTIVE_TEMPLATE_ID, objective,
         safeText(input.preferences, 16_000), safeText(input.coordination_prompt ?? input.coordinationPrompt, 16_000),
         safeText(input.workflow_template_id ?? input.workflowTemplateId, 64) || "adaptive",
+        safeText(input.workspace_mode ?? input.workspaceMode, 32),
+        safeText(input.resolved_workspace_mode ?? input.resolvedWorkspaceMode, 32),
+        safeText(input.coordinator_runtime ?? input.coordinatorRuntime, 16),
+        safeText(input.planning_source ?? input.planningSource, 32) || "local",
+        ["green", "yellow", "red"].includes(input.risk_tier ?? input.riskTier)
+          ? (input.risk_tier ?? input.riskTier)
+          : "green",
         planner.participant_id, JSON.stringify(budget),
         JSON.stringify({ sampled_tokens: 0, amount_micros: 0, currency: null, unpriced_events: 0 }),
         safeText(input.coordinator_device_id ?? input.coordinatorDeviceId, 191),
@@ -1113,12 +1137,25 @@ export class CollaborationStore {
     const busyParticipants = new Set(run.tasks.filter((task) => task.state === "active").map((task) => task.participant_id));
     const activeCount = run.tasks.filter((task) => task.state === "active").length;
     const capacity = Math.max(0, Number(run.budget.max_concurrency || 1) - activeCount);
+    const workspaceFor = (task) => run.agents?.[task.participant_id]?.workspace_id || "";
+    const activeWriterWorkspaces = new Set(run.tasks
+      .filter((task) => task.state === "active" && task.kind === "workspace_write")
+      .map(workspaceFor)
+      .filter(Boolean));
+    const selectedWriterWorkspaces = new Set();
     return run.tasks.filter((task) => (
       task.task_key !== "__planner__"
       && task.state === "pending"
       && !busyParticipants.has(task.participant_id)
       && task.depends_on.every((dependency) => complete.has(dependency))
-    )).slice(0, capacity);
+    )).filter((task) => {
+      if (task.kind !== "workspace_write") return true;
+      const workspace = workspaceFor(task);
+      if (!workspace) return false;
+      if (activeWriterWorkspaces.has(workspace) || selectedWriterWorkspaces.has(workspace)) return false;
+      selectedWriterWorkspaces.add(workspace);
+      return true;
+    }).slice(0, capacity);
   }
 
   resetAdaptiveActiveTasks(runId) {
@@ -1931,6 +1968,11 @@ export class CollaborationStore {
         preferences: source.preferences,
         coordination_prompt: source.coordination_prompt,
         workflow_template_id: source.workflow_template_id,
+        workspace_mode: source.workspace_mode,
+        resolved_workspace_mode: source.resolved_workspace_mode,
+        coordinator_runtime: source.coordinator_runtime,
+        planning_source: source.planning_source,
+        risk_tier: source.risk_tier,
         coordinator_device_id: source.coordinator_device_id,
         participants: Object.entries(source.agents).map(([participantId, agent]) => ({
           participant_id: participantId,

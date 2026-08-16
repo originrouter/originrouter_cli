@@ -5,7 +5,7 @@ const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url
 const constants = await readFile(new URL("../src/constants.js", import.meta.url), "utf8");
 
 assert.equal(pkg.private, undefined, "package.json must not set private=true");
-assert.equal(pkg.license, "MIT");
+assert.equal(pkg.license, "Apache-2.0");
 assert(pkg.repository?.url, "repository.url is required");
 assert(pkg.homepage, "homepage is required");
 assert(pkg.bugs?.url, "bugs.url is required");
@@ -17,6 +17,8 @@ assert.equal(pkg.bin?.or, "bin/originrouter.js");
 assert(constants.includes(`VERSION = "${pkg.version}"`), "src/constants.js VERSION must match package.json");
 
 await access(new URL("../LICENSE", import.meta.url));
+await access(new URL("../NOTICE", import.meta.url));
+await access(new URL("../THIRD_PARTY_NOTICES.md", import.meta.url));
 await access(new URL("../README.md", import.meta.url));
 await access(new URL("../bin/originrouter.js", import.meta.url));
 
