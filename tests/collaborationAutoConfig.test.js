@@ -10,6 +10,7 @@ import {
 import {
   automaticCreatePayload,
   autoConfigurationView,
+  runAgentWorkspaceCollaboration,
 } from "../src/commands/collaboration.js";
 
 function budgetPolicy(overrides = {}) {
@@ -252,6 +253,68 @@ test("automatic payload collection supports a mixed team without interactive pro
   });
   assert.equal(payload.participants.length, 2);
   assert.equal(payload.budget.max_concurrency, 2);
+});
+
+test("workspace lifecycle does not create a Run before an unsafe configuration is confirmed", async () => {
+  const requests = [];
+  const result = await runAgentWorkspaceCollaboration({
+    objective: "Inspect the remote computer",
+    confirmation: "safe",
+    automaticCreatePayloadFn: async () => ({
+      objective: "Inspect the remote computer",
+      workspace_mode: "auto",
+      resolved_workspace_mode: "solo",
+      planning_source: "local_fallback",
+      participants: [{ participant_id: "coordinator", device_id: "local" }],
+      auto_configuration: { safe_to_skip_confirmation: true },
+    }),
+    requestFn: async (...args) => {
+      requests.push(args);
+      throw new Error("a Run must not be created");
+    },
+    onConfigurationConfirmation: async () => "leave",
+  });
+  assert.equal(result.run.state, "configuration_pending");
+  assert.equal(requests.length, 0);
+});
+
+test("workspace lifecycle streams a snapshot and completes without terminal logging", async () => {
+  const updates = [];
+  const paths = [];
+  const result = await runAgentWorkspaceCollaboration({
+    objective: "Inspect the remote computer",
+    confirmation: "always",
+    automaticCreatePayloadFn: async () => ({
+      objective: "Inspect the remote computer",
+      workspace_mode: "auto",
+      resolved_workspace_mode: "remote_ops",
+      planning_source: "cloud_advice",
+      participants: [
+        { participant_id: "coordinator", device_id: "local" },
+        { participant_id: "remote_operator", device_id: "remote" },
+      ],
+      auto_configuration: { safe_to_skip_confirmation: false },
+    }),
+    requestFn: async (path) => {
+      paths.push(path);
+      if (path === "/collaboration/local/runs") return { run: { run_id: "acr_test", state: "created" } };
+      if (path.endsWith("/start")) return { run: { run_id: "acr_test", state: "designing" } };
+      if (path.includes("/snapshot")) {
+        return { snapshot: {
+          last_sequence: 1,
+          run: { run_id: "acr_test", state: "completed", phase: "completed" },
+          tasks: [{ task_key: "inspect", title: "Inspect remote status", state: "completed" }],
+          final_report: { summary: "Remote inspection completed." },
+        } };
+      }
+      if (path.includes("/events?")) return { events: [{ sequence: 1, summary: "Remote inspection completed." }] };
+      throw new Error(`unexpected path ${path}`);
+    },
+    onUpdate: (update) => updates.push(update),
+  });
+  assert.equal(result.run.state, "completed");
+  assert(paths.some((path) => path.includes("/snapshot")));
+  assert(updates.some((update) => update.type === "snapshot" && update.events.length === 1));
 });
 
 test("JSON automation projection is stable and excludes capability secrets and paths", () => {

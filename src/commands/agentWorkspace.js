@@ -6,7 +6,12 @@ import {
   moveCursor,
 } from "node:readline";
 
-import { handleCollaborationCommand } from "./collaboration.js";
+import {
+  controlCollaborationRun,
+  handleCollaborationCommand,
+  runAgentWorkspaceCollaboration,
+  trustCollaborationWorkspace,
+} from "./collaboration.js";
 import {
   WORKSPACE_MODES,
   nextWorkspaceMode,
@@ -14,7 +19,6 @@ import {
   normalizeWorkspaceMode,
   workspaceModeDefinition,
   workspaceModeSummary,
-  workspaceRequiresPlanReview,
 } from "../collaboration/workspaceModes.js";
 
 const FORWARDED_FLAGS = new Set([
@@ -228,12 +232,189 @@ function panelRow(value, width, { heading = false } = {}) {
   return muted(text);
 }
 
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+function wrapDisplayText(value, width) {
+  const limit = Math.max(1, width);
+  const lines = [];
+  let line = "";
+  for (const char of stripAnsi(String(value ?? ""))) {
+    if (char === "\n") {
+      lines.push(line);
+      line = "";
+      continue;
+    }
+    if (promptDisplayWidth(`${line}${char}`) > limit) {
+      lines.push(line);
+      line = char;
+    } else {
+      line += char;
+    }
+  }
+  lines.push(line);
+  return lines;
+}
+
+function elapsedText(startedAt = Date.now()) {
+  const seconds = Math.max(0, Math.floor((Date.now() - Number(startedAt || Date.now())) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+function runtimePhase(runtime) {
+  const snapshot = runtime.snapshot;
+  const state = snapshot?.run?.state;
+  const phase = snapshot?.run?.phase || runtime.phase;
+  if (runtime.phase === "needs_setup") return "Setup required";
+  if (runtime.phase === "configuring") return "Choosing the Agent team";
+  if (runtime.phase === "awaiting_configuration") return "Review the proposed team";
+  if (state === "awaiting_confirmation") return "Plan ready for review";
+  if (state === "completed") return "Completed";
+  if (state === "failed") return "Failed";
+  if (state === "cancelled") return "Cancelled";
+  if (state === "paused") return "Paused";
+  if (state === "blocked") return "Needs attention";
+  if (["planning", "created"].includes(state) || runtime.phase === "planning") return "Planner is preparing the work";
+  if (["running", "queued"].includes(state) || runtime.phase === "executing") {
+    if (phase === "verification") return "Verifying the result";
+    if (phase === "implementation") return "Agents are implementing";
+    return "Agents are working";
+  }
+  if (runtime.phase === "interrupted") return "Interrupting the collaboration";
+  if (runtime.phase === "error") return "Could not start the collaboration";
+  return "Working";
+}
+
+function taskMarker(state) {
+  if (state === "completed") return styled("✓", ANSI.cyan);
+  if (["running", "active"].includes(state)) return accent("●");
+  if (["failed", "cancelled", "blocked"].includes(state)) return "×";
+  return muted("○");
+}
+
+function buildRuntimeRows(runtime, columns, maxRows) {
+  const width = Math.max(20, columns - 4);
+  const lines = [];
+  const push = (value = "", style = null) => {
+    for (const row of wrapDisplayText(value, width)) {
+      lines.push(`  ${style ? style(row) : row}`);
+    }
+  };
+  push("");
+  for (const [index, line] of wrapDisplayText(runtime.objective || "", width - 2).entries()) {
+    push(`${index === 0 ? "› " : "  "}${line}`, index === 0 ? strong : null);
+  }
+  push("");
+  const terminal = ["completed", "failed", "cancelled", "expired"].includes(runtime.snapshot?.run?.state);
+  const spinner = terminal || ["needs_setup", "error"].includes(runtime.phase)
+    ? (runtime.snapshot?.run?.state === "completed" ? "✓" : "!")
+    : SPINNER_FRAMES[Math.floor(Date.now() / 100) % SPINNER_FRAMES.length];
+  push(`${spinner} ${runtimePhase(runtime)}${runtime.startedAt ? ` (${elapsedText(runtime.startedAt)})` : ""}`, strong);
+
+  const configured = runtime.configuration;
+  if (configured) {
+    const resolved = configured.resolved_workspace_mode
+      || configured.auto_configuration?.resolved_workspace_mode
+      || configured.workspace_mode;
+    const deviceCount = new Set((configured.participants || []).map((item) => item.device_id)).size;
+    push(`${workspaceModeDefinition(resolved || "auto").label} · ${(configured.participants || []).length} Agent${configured.participants?.length === 1 ? "" : "s"} · ${deviceCount} device${deviceCount === 1 ? "" : "s"}`, muted);
+  }
+  if (runtime.runId) push(`Run ${runtime.runId}`, muted);
+
+  if (runtime.phase === "needs_setup" && runtime.setup) {
+    push("");
+    push(`${runtime.setup.device_name} is online and trusted, but no workspace is authorized.`, strong);
+    push(runtime.setup.remote
+      ? "Authorize a folder before a remote Agent can inspect this device."
+      : "Authorize a folder before an Agent can work in this workspace.", muted);
+    push("");
+    push(`Folder  ${runtime.setupPath || runtime.setup.default_path || "Enter a path"}▌`);
+  } else if (runtime.error) {
+    push("");
+    push(String(runtime.error.message || runtime.error).split("\n")[0], strong);
+  }
+
+  const plan = runtime.snapshot?.plan;
+  if (runtime.snapshot?.run?.state === "awaiting_confirmation" && plan) {
+    push("");
+    push(plan.title || "Proposed plan", strong);
+    if (plan.summary) push(plan.summary, muted);
+  }
+
+  const tasks = (runtime.snapshot?.tasks || []).filter((task) => task.task_key !== "__planner__");
+  if (tasks.length) {
+    push("");
+    for (const task of tasks.slice(0, 6)) {
+      push(`${taskMarker(task.state)} ${task.title || task.task_key}  ${muted(task.participant_id || "unassigned")}`);
+    }
+  }
+
+  const report = runtime.snapshot?.final_report;
+  if (report?.summary) {
+    push("");
+    push(report.summary, runtime.snapshot?.run?.state === "completed" ? strong : null);
+    for (const task of (report.completed_tasks || []).slice(0, 3)) {
+      if (task.result) push(`  ${task.result}`, muted);
+    }
+  } else {
+    const events = (runtime.events || []).filter((event) => event.visibility !== "diagnostic").slice(-4);
+    if (events.length) {
+      push("");
+      for (const event of events) push(`  ${event.summary || String(event.type || "activity").replaceAll(".", " ")}`, muted);
+    }
+  }
+  return lines.slice(0, Math.max(0, maxRows));
+}
+
+function runtimeControls(runtime, columns) {
+  const mode = workspaceModeDefinition(runtime.mode || "auto").label;
+  let text = runtime.notice || "Enter queues next objective · ctrl+c interrupts · ← agents";
+  if (runtime.queuedObjective) text = "next objective queued · ctrl+c interrupts · ← agents";
+  if (runtime.phase === "needs_setup") text = "Enter authorizes this folder · esc cancels";
+  if (runtime.phase === "awaiting_configuration") text = "Enter uses this team · esc cancels before creating a Run";
+  if (runtime.snapshot?.run?.state === "awaiting_confirmation") text = "Enter starts the plan · esc leaves it pending";
+  if (["completed", "failed", "cancelled", "error"].includes(runtime.snapshot?.run?.state || runtime.phase)) {
+    text = "returning to the objective prompt";
+  }
+  return padDisplayRight(muted(`  ${mode} · ${text}`), columns);
+}
+
+function composerStatus(columns) {
+  const status = "● guarded · /access";
+  return `${" ".repeat(Math.max(0, columns - promptDisplayWidth(status) - 2))}${accent(status)}  `;
+}
+
+function runtimeComposer(runtime, columns) {
+  let value = runtime.composerBuffer || "";
+  if (runtime.phase === "needs_setup") value = runtime.setupPath || runtime.setup?.default_path || "";
+  const prompt = `› ${value}`;
+  return padDisplayRight(strong(fitDisplayText(prompt, Math.max(1, columns - 1))), columns);
+}
+
+function runtimeHeaderPanel(runtime) {
+  const configured = runtime.configuration;
+  const resolved = configured?.resolved_workspace_mode
+    || configured?.auto_configuration?.resolved_workspace_mode;
+  return {
+    title: runtimePhase(runtime),
+    lines: [
+      runtime.runId ? `Run ${runtime.runId}` : "Preparing a collaboration Run",
+      resolved ? `${workspaceModeDefinition(resolved).label} · ${(configured.participants || []).length} Agents` : "Resolving mode and participants",
+      runtime.startedAt ? `Elapsed ${elapsedText(runtime.startedAt)}` : "",
+      runtime.phase === "needs_setup"
+        ? "Workspace authorization required"
+        : runtime.runId ? "OriginRouter service owns the task" : "No Run has been created yet",
+    ].filter(Boolean),
+  };
+}
+
 export function buildWorkspaceAppScreen({
   coordinator = "codex",
   mode = "auto",
   columns = 80,
   rows = 24,
   panel = null,
+  runtime = null,
 } = {}) {
   const terminalColumns = Math.max(40, Number(columns) || 80);
   const terminalRows = Math.max(14, Number(rows) || 24);
@@ -266,23 +447,37 @@ export function buildWorkspaceAppScreen({
     (_, index) => pair(leftRows[index] || padDisplayRight("", leftWidth), rightRows[index] || "", index),
   );
 
-  const screenRows = [
+  const headerRows = [
     titleLine("OriginRouter", frameWidth),
     appLine("", contentWidth),
     ...detailRows,
     bottomLine(frameWidth),
   ];
+  const reservedRows = 5;
+  const activityRows = runtime
+    ? buildRuntimeRows(runtime, terminalColumns, Math.max(3, terminalRows - headerRows.length - reservedRows))
+    : [];
+  const screenRows = [...headerRows, ...activityRows];
   const separator = border("─".repeat(terminalColumns));
-  const blankRows = Math.max(1, terminalRows - screenRows.length - 3);
-  return `${screenRows.join("\n")}\n${"\n".repeat(blankRows)}${separator}\n`;
+  const blankRows = Math.max(0, terminalRows - screenRows.length - reservedRows);
+  const body = `${screenRows.join("\n")}\n${"\n".repeat(blankRows)}`;
+  if (!runtime) return `${body}${composerStatus(terminalColumns)}\n${separator}\n`;
+  return [
+    `${body}${composerStatus(terminalColumns)}`,
+    separator,
+    runtimeComposer(runtime, terminalColumns),
+    separator,
+    runtimeControls(runtime, terminalColumns),
+  ].join("\n");
 }
 
-function redrawWorkspaceApp(output, { coordinator, mode, panel = null }) {
+function redrawWorkspaceApp(output, { coordinator, mode, panel = null, runtime = null }) {
   output.write("\x1b[2J\x1b[H");
   output.write(buildWorkspaceAppScreen({
     coordinator,
     mode,
     panel,
+    runtime,
     columns: output.columns,
     rows: output.rows,
   }));
@@ -314,7 +509,7 @@ function promptText(buffer) {
 
 function promptFooter(mode, notice = "") {
   if (notice) return accent(`  ${notice}`);
-  return muted(`  ${workspaceModeDefinition(mode).label} · Guarded · ${workspaceDirectoryName()}`);
+  return muted(`  ${workspaceModeDefinition(mode).label} · shift+tab to cycle · /help for commands`);
 }
 
 function isWideCodePoint(codePoint) {
@@ -367,12 +562,11 @@ export function redrawPrompt(output, buffer, mode, previousRows = 0, { notice = 
   clearScreenDown(output);
   const columns = Number.isFinite(output.columns) && output.columns > 0 ? output.columns : 80;
   const promptVisible = promptText(buffer);
-  const promptLine = strong(promptVisible);
   const promptWidth = promptDisplayWidth(promptVisible);
   const promptColumn = promptWidth % columns;
-  const prompt = `${promptLine}${" ".repeat(Math.max(0, columns - promptWidth))}`;
-  output.write(`${styled(prompt, ANSI.bgSoft)}\n${footer}`);
-  moveCursor(output, 0, -1);
+  const separator = border("─".repeat(columns));
+  output.write(`${strong(promptVisible)}\n${separator}\n${footer}`);
+  moveCursor(output, 0, -2);
   cursorTo(output, promptColumn);
   return renderedRows;
 }
@@ -501,11 +695,6 @@ function collaborationArgs({ objective, coordinator, mode, forwarded }) {
   if (mode === "auto" && !forwarded.includes("--cloud-advice")) {
     args.push("--cloud-advice");
   }
-  const explicitlyReviewed = forwarded.includes("--review");
-  const explicitlyConfirmed = forwarded.includes("--yes");
-  if (!explicitlyReviewed && !explicitlyConfirmed && !workspaceRequiresPlanReview(objective, mode)) {
-    args.push("--yes");
-  }
   return args;
 }
 
@@ -515,14 +704,300 @@ function isInterrupted(error) {
     || error?.cause?.code === "ORIGINROUTER_INTERRUPTED";
 }
 
+async function readRuntimeDecision({ input, runtime, render, kind }) {
+  emitKeypressEvents(input);
+  input.setRawMode(true);
+  input.resume();
+  runtime.interaction = true;
+  let buffer = kind === "setup" ? String(runtime.setupPath || "") : "";
+  runtime.setupPath = buffer;
+  render();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      input.off("keypress", onKeypress);
+      input.off("error", onError);
+      runtime.interaction = false;
+    };
+    const finish = (value) => {
+      cleanup();
+      resolve(value);
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const onKeypress = (text, key = {}) => {
+      if (key.name === "escape" || (key.ctrl && key.name === "c")) {
+        finish(kind === "setup" ? null : "leave");
+        return;
+      }
+      if (key.name === "return" || key.name === "enter") {
+        finish(kind === "setup" ? buffer.trim() || null : "confirm");
+        return;
+      }
+      if (kind !== "setup") return;
+      if (key.name === "backspace") {
+        buffer = [...buffer].slice(0, -1).join("");
+      } else if (!key.ctrl && !key.meta && text && !key.name?.startsWith("f")) {
+        buffer += text;
+      } else {
+        return;
+      }
+      runtime.setupPath = buffer;
+      render();
+    };
+    input.on("keypress", onKeypress);
+    input.once("error", onError);
+  });
+}
+
+function completionPanel(runtime) {
+  const snapshot = runtime.snapshot;
+  const state = snapshot?.run?.state || runtime.phase;
+  const report = snapshot?.final_report;
+  if (state === "completed") {
+    return {
+      title: "Last collaboration completed",
+      lines: [
+        report?.summary || "The collaboration completed.",
+        runtime.runId ? `Run ${runtime.runId}` : "",
+        "Enter another objective below.",
+      ].filter(Boolean),
+    };
+  }
+  if (state === "awaiting_confirmation") {
+    return {
+      title: "Plan left pending",
+      lines: [
+        runtime.runId ? `Run ${runtime.runId}` : "",
+        "The service still owns this Run.",
+        "Use collaboration attach to review it later.",
+      ].filter(Boolean),
+    };
+  }
+  if (state === "configuration_pending") {
+    return {
+      title: "Configuration not started",
+      lines: [
+        "No collaboration Run was created.",
+        "Change mode or enter a clearer objective.",
+        "Enter another objective below.",
+      ],
+    };
+  }
+  return {
+    title: state === "cancelled" || runtime.phase === "interrupted" ? "Collaboration stopped" : "Collaboration needs attention",
+    lines: [
+      runtime.error ? String(runtime.error.message || runtime.error).split("\n")[0] : report?.summary || runtimePhase(runtime),
+      runtime.runId ? `Run ${runtime.runId}` : "No Run was created.",
+      runtime.runId ? "Use collaboration retry to continue from this Run." : "Enter another objective below.",
+    ],
+  };
+}
+
+async function runWorkspaceObjective({
+  objective,
+  coordinator,
+  mode,
+  forwarded,
+  input,
+  output,
+  collaborationRunner,
+  cancelCollaborationRun,
+}) {
+  const runtime = {
+    phase: "configuring",
+    objective,
+    coordinator,
+    mode,
+    startedAt: Date.now(),
+    events: [],
+    runId: "",
+    snapshot: null,
+    configuration: null,
+    setup: null,
+    setupPath: "",
+    composerBuffer: "",
+    queuedObjective: "",
+    notice: "",
+    interaction: false,
+    error: null,
+  };
+  const render = () => redrawWorkspaceApp(output, {
+    coordinator,
+    mode,
+    panel: runtimeHeaderPanel(runtime),
+    runtime,
+  });
+  const onResize = () => render();
+  const timer = setInterval(render, 250);
+  timer.unref?.();
+  output.on?.("resize", onResize);
+  render();
+
+  const controller = new AbortController();
+  let interruptRequested = false;
+  let cancelPromise = Promise.resolve();
+  const onActiveInterrupt = () => {
+    if (interruptRequested) return;
+    interruptRequested = true;
+    runtime.phase = "interrupted";
+    controller.abort();
+    if (runtime.runId) {
+      cancelPromise = Promise.resolve(cancelCollaborationRun(runtime.runId)).catch((error) => {
+        runtime.error = error;
+      });
+    }
+    render();
+  };
+  process.on("SIGINT", onActiveInterrupt);
+  emitKeypressEvents(input);
+  input.setRawMode(true);
+  input.resume();
+  let noticeTimer = null;
+  const showNotice = (notice, duration = 1600) => {
+    runtime.notice = notice;
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => {
+      runtime.notice = "";
+      render();
+    }, duration);
+    noticeTimer.unref?.();
+    render();
+  };
+  const onActiveKeypress = (text, key = {}) => {
+    if (runtime.interaction) return;
+    if (key.ctrl && key.name === "c") {
+      onActiveInterrupt();
+      return;
+    }
+    if (key.name === "return" || key.name === "enter") {
+      const objectiveText = runtime.composerBuffer.trim();
+      if (!objectiveText) return;
+      runtime.queuedObjective = objectiveText;
+      runtime.composerBuffer = "";
+      showNotice("Next objective queued");
+      return;
+    }
+    if (key.name === "backspace") {
+      runtime.composerBuffer = [...runtime.composerBuffer].slice(0, -1).join("");
+      render();
+      return;
+    }
+    if ((key.shift && key.name === "tab") || key.sequence === "\x1b[Z") {
+      showNotice("Team mode is fixed for the current Run");
+      return;
+    }
+    if (key.name === "escape" || key.ctrl || key.meta) return;
+    if (text && !key.name?.startsWith("f")) {
+      runtime.composerBuffer += text;
+      render();
+    }
+  };
+  input.on("keypress", onActiveKeypress);
+  try {
+    while (true) {
+      try {
+        if (collaborationRunner !== handleCollaborationCommand) {
+          await collaborationRunner(collaborationArgs({ objective, coordinator, mode, forwarded }), {
+            signal: controller.signal,
+            onRunId: (runId) => {
+              runtime.runId = runId || runtime.runId;
+            },
+          });
+          runtime.phase = "completed";
+          runtime.snapshot = { run: { state: "completed" }, tasks: [], final_report: null };
+          return runtime;
+        }
+        const confirmation = forwarded.includes("--yes")
+          ? "always"
+          : forwarded.includes("--review") ? "never" : "safe";
+        const snapshot = await runAgentWorkspaceCollaboration({
+          objective,
+          workspaceMode: mode,
+          coordinator,
+          cloudAdvice: mode === "auto" || forwarded.includes("--cloud-advice"),
+          confirmation,
+          signal: controller.signal,
+          onRunId: (runId) => {
+            runtime.runId = runId || runtime.runId;
+            render();
+          },
+          onUpdate: (update) => {
+            if (update.phase) runtime.phase = update.phase;
+            if (update.payload) runtime.configuration = update.payload;
+            if (update.snapshot) runtime.snapshot = update.snapshot;
+            if (update.events?.length) {
+              const merged = new Map(runtime.events.map((event) => [event.sequence, event]));
+              for (const event of update.events) merged.set(event.sequence, event);
+              runtime.events = [...merged.values()].sort((a, b) => Number(a.sequence) - Number(b.sequence)).slice(-20);
+            }
+            render();
+          },
+          onConfigurationConfirmation: async (configuration) => {
+            runtime.configuration = configuration;
+            runtime.phase = "awaiting_configuration";
+            runtime.composerBuffer = "";
+            return readRuntimeDecision({ input, runtime, render, kind: "configuration" });
+          },
+          onPlanConfirmation: async (snapshotForReview) => {
+            runtime.snapshot = snapshotForReview;
+            runtime.phase = "awaiting_confirmation";
+            runtime.composerBuffer = "";
+            return readRuntimeDecision({ input, runtime, render, kind: "plan" });
+          },
+        });
+        runtime.snapshot = snapshot;
+        runtime.phase = snapshot?.run?.state || "completed";
+        return runtime;
+      } catch (error) {
+        if (isInterrupted(error)) {
+          runtime.phase = "interrupted";
+          runtime.snapshot = runtime.snapshot || { run: { state: "cancelled" }, tasks: [] };
+          return runtime;
+        }
+        if (["AUTO_CONFIG_WORKSPACE_REQUIRED", "AUTO_CONFIG_REMOTE_WORKSPACE_REQUIRED"].includes(error?.code) && error.setup) {
+          runtime.phase = "needs_setup";
+          runtime.setup = error.setup;
+          runtime.setupPath = error.setup.default_path || "";
+          runtime.error = null;
+          const path = await readRuntimeDecision({ input, runtime, render, kind: "setup" });
+          if (!path) {
+            runtime.phase = "cancelled";
+            return runtime;
+          }
+          runtime.phase = "configuring";
+          await trustCollaborationWorkspace(error.setup.device_id, path, { signal: controller.signal });
+          runtime.setup = null;
+          runtime.setupPath = "";
+          continue;
+        }
+        runtime.phase = "error";
+        runtime.error = error;
+        return runtime;
+      }
+    }
+  } finally {
+    process.removeListener("SIGINT", onActiveInterrupt);
+    input.off("keypress", onActiveKeypress);
+    if (noticeTimer) clearTimeout(noticeTimer);
+    input.setRawMode(false);
+    input.pause();
+    output.off?.("resize", onResize);
+    clearInterval(timer);
+    await cancelPromise;
+    render();
+  }
+}
+
 export async function handleAgentWorkspaceCommand(argv = [], {
   input = defaultInput,
   output = defaultOutput,
   collaborationRunner = handleCollaborationCommand,
-  cancelCollaborationRun = async (runId) => handleCollaborationCommand(["cancel", runId]),
+  cancelCollaborationRun = async (runId) => controlCollaborationRun(runId, "cancel"),
 } = {}) {
   const parsed = parseAgentWorkspaceArgs(argv);
-  if (parsed.objective) {
+  if (parsed.objective && (!input.isTTY || !output.isTTY)) {
     await collaborationRunner(collaborationArgs(parsed));
     return;
   }
@@ -532,23 +1007,25 @@ export async function handleAgentWorkspaceCommand(argv = [], {
   let coordinator = parsed.coordinator;
   let mode = parsed.mode;
   let panel = null;
+  let pendingObjective = parsed.objective;
   const exitApp = enterWorkspaceApp(output);
   try {
     redrawWorkspaceApp(output, { coordinator, mode, panel });
     while (true) {
-      const line = await readWorkspaceLine({
-        input,
-        output,
-        mode,
-        coordinator,
-        panel,
-        onModeChange: () => {
-          const next = nextWorkspaceMode(mode);
-          mode = next.id;
-          panel = null;
-          return next;
-        },
-      });
+      const line = pendingObjective || await readWorkspaceLine({
+          input,
+          output,
+          mode,
+          coordinator,
+          panel,
+          onModeChange: () => {
+            const next = nextWorkspaceMode(mode);
+            mode = next.id;
+            panel = null;
+            return next;
+          },
+        });
+      pendingObjective = "";
       if (!line) {
         redrawWorkspaceApp(output, { coordinator, mode, panel });
         continue;
@@ -582,51 +1059,19 @@ export async function handleAgentWorkspaceCommand(argv = [], {
         continue;
       }
       panel = null;
-      const controller = new AbortController();
-      let activeRunId = "";
-      let interruptRequested = false;
-      let cancelPromise = Promise.resolve();
-      const onActiveInterrupt = () => {
-        if (interruptRequested) {
-          output.write("\nInterrupt already requested. Waiting for the current run to stop.\n");
-          return;
-        }
-        interruptRequested = true;
-        controller.abort();
-        if (activeRunId) {
-          output.write(`\nInterrupt requested. Cancelling ${activeRunId}…\n`);
-          cancelPromise = Promise.resolve()
-            .then(() => cancelCollaborationRun(activeRunId))
-            .catch((error) => {
-              output.write(`Cancel failed: ${error.message}\n`);
-            });
-        } else {
-          output.write("\nInterrupt requested. Stopping before a collaboration run is created.\n");
-        }
-      };
-      process.on("SIGINT", onActiveInterrupt);
-      try {
-        await collaborationRunner(collaborationArgs({
-          objective: line,
-          coordinator,
-          mode,
-          forwarded: parsed.forwarded,
-        }), {
-          signal: controller.signal,
-          onRunId: (runId) => {
-            activeRunId = runId || activeRunId;
-          },
-        });
-      } catch (error) {
-        if (!isInterrupted(error)) throw error;
-        output.write(activeRunId
-          ? `\nStopped following ${activeRunId}. Resume with: originrouter collaboration attach ${activeRunId}\n`
-          : "\nCurrent objective was interrupted before a run was created.\n");
-      } finally {
-        process.removeListener("SIGINT", onActiveInterrupt);
-        await cancelPromise;
-      }
-      output.write("\nReady for another objective.\n");
+      const runtime = await runWorkspaceObjective({
+        objective: line,
+        coordinator,
+        mode,
+        forwarded: parsed.forwarded,
+        input,
+        output,
+        collaborationRunner,
+        cancelCollaborationRun,
+      });
+      panel = completionPanel(runtime);
+      pendingObjective = runtime.queuedObjective || "";
+      redrawWorkspaceApp(output, { coordinator, mode, panel });
     }
   } finally {
     exitApp();

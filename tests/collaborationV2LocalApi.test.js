@@ -39,6 +39,7 @@ try {
     body: JSON.stringify({
       objective: "Deploy the production database migration",
       workspace_mode: "auto",
+      planning_source: "cloud_advice",
       coordinator_runtime: "claude",
       participants: [{
         participant_id: "planner",
@@ -55,7 +56,7 @@ try {
   assert.equal(modeCreatePayload.run.workspace_mode, "auto");
   assert.equal(modeCreatePayload.run.resolved_workspace_mode, "plan_build_verify");
   assert.equal(modeCreatePayload.run.coordinator_runtime, "claude");
-  assert.equal(modeCreatePayload.run.planning_source, "local");
+  assert.equal(modeCreatePayload.run.planning_source, "cloud_advice");
   assert.equal(modeCreatePayload.run.risk_tier, "red");
 
   const invalidRemoteResponse = await fetch(`${base}/collaboration/local/runs`, {
@@ -64,6 +65,7 @@ try {
     body: JSON.stringify({
       objective: "Check service status on the remote server",
       workspace_mode: "auto",
+      resolved_workspace_mode: "remote_ops",
       participants: [{
         participant_id: "planner",
         runtime: "codex",

@@ -777,8 +777,9 @@ async function dispatch(ctx, req, res) {
         if (body.__error) return sendError(res, 400, body.__error);
         try {
           const requestedMode = normalizeWorkspaceMode(body.workspace_mode || "auto");
+          const suppliedResolvedMode = normalizeWorkspaceMode(body.resolved_workspace_mode || "auto");
           const resolvedMode = requestedMode === "auto"
-            ? inferWorkspaceMode(body.objective)
+            ? (suppliedResolvedMode === "auto" ? inferWorkspaceMode(body.objective) : suppliedResolvedMode)
             : requestedMode;
           const planner = Array.isArray(body.participants)
             ? body.participants.find((participant) => participant?.planner === true) || body.participants[0]
@@ -803,7 +804,8 @@ async function dispatch(ctx, req, res) {
               workspace_mode: requestedMode,
               resolved_workspace_mode: resolvedMode,
               coordinator_runtime: coordinatorRuntime,
-              planning_source: requestedMode === "auto" ? "local" : "manual",
+              planning_source: String(body.planning_source || "").trim()
+                || (requestedMode === "auto" ? "local" : "manual"),
               risk_tier: riskTier,
               workflow_template_id:
                 body.workflow_template_id || workspaceModeDefinition(resolvedMode).templateId,

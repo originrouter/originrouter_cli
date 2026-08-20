@@ -1280,26 +1280,13 @@ export async function automaticCreatePayload({
         advice = { error_code: error.code || "COLLABORATION_ADVICE_FAILED" };
       }
     }
-    let configured;
-    try {
-      configured = buildLocalWorkspaceConfiguration({
-        objective,
-        mode: advisedMode,
-        coordinator,
-        devices,
-        currentDirectory,
-      });
-    } catch (error) {
-      if (!cloudAdvice || workspaceMode !== "auto" || advisedMode === "auto") throw error;
-      configured = buildLocalWorkspaceConfiguration({
-        objective,
-        mode: "auto",
-        coordinator,
-        devices,
-        currentDirectory,
-      });
-      advice = { error_code: error.code || "COLLABORATION_ADVICE_UNAVAILABLE_MODE" };
-    }
+    const configured = buildLocalWorkspaceConfiguration({
+      objective,
+      mode: advisedMode,
+      coordinator,
+      devices,
+      currentDirectory,
+    });
     if (workspaceMode === "auto") {
       configured.workspace_mode = "auto";
       configured.auto_configuration.workspace_mode = "auto";
@@ -1323,6 +1310,8 @@ export async function automaticCreatePayload({
     } else if (cloudAdvice) {
       configured.planning_source = "local_fallback";
       configured.auto_configuration.advice_error = advice?.error_code || "COLLABORATION_ADVICE_FAILED";
+      configured.auto_configuration.safe_to_skip_confirmation = false;
+      configured.auto_configuration.requires_explicit_confirmation = true;
     }
     return configured;
   }
@@ -1740,10 +1729,150 @@ async function waitForPlan(runId, timeoutSeconds, { signal } = {}) {
   while (Date.now() < deadline) {
     throwIfAborted(signal);
     run = (await request(`/collaboration/local/runs/${encodeURIComponent(runId)}`, { signal })).run;
-    if (["awaiting_plan_confirmation", "failed", "cancelled", "expired"].includes(run.state)) return run;
+    if (!["created", "designing", "researching", "decomposing", "planning"].includes(run.state)) return run;
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   return run;
+}
+
+function abortableDelay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(interruptedError());
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(interruptedError());
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export async function trustCollaborationWorkspace(deviceId, path, { signal } = {}) {
+  const data = await request(
+    `/collaboration/devices/${encodeURIComponent(deviceId)}/workspaces/trust`,
+    { method: "POST", body: { path }, signal },
+  );
+  return data.workspace;
+}
+
+export async function controlCollaborationRun(runId, action, { signal, body = {} } = {}) {
+  if (!new Set(["start", "confirm", "pause", "resume", "cancel"]).has(action)) {
+    throw new Error(`Unsupported collaboration control '${action}'.`);
+  }
+  return (await request(
+    `/collaboration/local/runs/${encodeURIComponent(runId)}/${action}`,
+    { method: "POST", body, signal },
+  )).run;
+}
+
+export async function runAgentWorkspaceCollaboration({
+  objective,
+  workspaceMode = "auto",
+  coordinator = "codex",
+  cloudAdvice = true,
+  confirmation = "safe",
+  signal,
+  onUpdate = () => {},
+  onRunId = () => {},
+  onConfigurationConfirmation = async () => "leave",
+  onPlanConfirmation = async () => "leave",
+  interval = 750,
+  requestFn = request,
+  automaticCreatePayloadFn = automaticCreatePayload,
+} = {}) {
+  throwIfAborted(signal);
+  onUpdate({ type: "phase", phase: "configuring" });
+  const payload = await automaticCreatePayloadFn({
+    objective,
+    workspaceMode,
+    coordinator,
+    cloudAdvice,
+  });
+  throwIfAborted(signal);
+  onUpdate({ type: "configuration", payload });
+  const configurationSafe = payload.auto_configuration?.safe_to_skip_confirmation === true
+    && payload.planning_source !== "local_fallback";
+  if (confirmation !== "always" && (confirmation === "never" || !configurationSafe)) {
+    const decision = await onConfigurationConfirmation(payload);
+    throwIfAborted(signal);
+    if (decision !== "confirm") {
+      return {
+        run: { state: "configuration_pending" },
+        tasks: [],
+        participants: payload.participants || [],
+        configuration: payload,
+      };
+    }
+  }
+
+  let run = (await requestFn("/collaboration/local/runs", {
+    method: "POST",
+    body: payload,
+    signal,
+  })).run;
+  onRunId(run.run_id);
+  onUpdate({ type: "run", run });
+  run = (await requestFn(
+    `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/start`,
+    { method: "POST", body: {}, signal },
+  )).run;
+  onRunId(run.run_id);
+  onUpdate({ type: "phase", phase: "planning", run });
+
+  let cursor = 0;
+  let confirmationHandled = false;
+  while (true) {
+    throwIfAborted(signal);
+    const snapshot = (await requestFn(
+      `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/snapshot`,
+      { signal },
+    )).snapshot;
+    if (cursor === 0) cursor = Math.max(0, Number(snapshot.last_sequence || 0) - 30);
+    const eventData = await requestFn(
+      `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/events?after_sequence=${cursor}&limit=200`,
+      { signal },
+    );
+    const events = eventData.events || [];
+    for (const event of events) cursor = Math.max(cursor, Number(event.sequence || 0));
+    onUpdate({ type: "snapshot", snapshot, events });
+
+    const state = snapshot.run?.state;
+    if (TERMINAL_VIEW_STATES.has(state)) return snapshot;
+    if (state === "awaiting_confirmation" && !confirmationHandled) {
+      confirmationHandled = true;
+      const safeToSkip = payload.auto_configuration?.safe_to_skip_confirmation === true;
+      const decision = confirmation === "always" || (confirmation === "safe" && safeToSkip)
+        ? "confirm"
+        : await onPlanConfirmation(snapshot);
+      throwIfAborted(signal);
+      if (decision === "confirm") {
+        run = (await requestFn(
+          `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/confirm`,
+          { method: "POST", body: {}, signal },
+        )).run;
+        onUpdate({ type: "phase", phase: "executing", run });
+        continue;
+      }
+      if (decision?.action === "revise" && String(decision.feedback || "").trim()) {
+        run = (await requestFn(
+          `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/replan`,
+          { method: "POST", body: { feedback: String(decision.feedback).trim() }, signal },
+        )).run;
+        confirmationHandled = false;
+        onUpdate({ type: "phase", phase: "planning", run });
+        continue;
+      }
+      return snapshot;
+    }
+    await abortableDelay(Math.max(250, Math.min(5000, Number(interval) || 750)), signal);
+  }
 }
 
 async function confirmInteractively(run, args) {

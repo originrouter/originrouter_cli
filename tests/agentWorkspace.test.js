@@ -118,6 +118,21 @@ assert.equal(remote.participants.length, 2);
 assert.equal(remote.participants[1].device_id, "server-a");
 assert.equal(remote.auto_configuration.safe_to_skip_confirmation, false);
 
+assert.throws(
+  () => buildLocalWorkspaceConfiguration({
+    objective: "Inspect the remote computer",
+    mode: "remote-ops",
+    coordinator: "codex",
+    devices: devices.map((device) => device.local ? device : {
+      ...device,
+      capabilities: { ...device.capabilities, trusted_workspaces: [] },
+    }),
+    currentDirectory: "/project",
+  }),
+  (error) => error.code === "AUTO_CONFIG_REMOTE_WORKSPACE_REQUIRED"
+    && error.setup?.device_id === "server-a",
+);
+
 const workspaceScreen = buildWorkspaceAppScreen({
   coordinator: "codex",
   mode: "auto",
@@ -129,6 +144,7 @@ assert.match(workspaceScreen, /OriginRouter/);
 assert.match(workspaceScreen, /Agent Workspace/);
 assert.match(workspaceScreen, /Team      Auto/);
 assert.match(workspaceScreen, /Access    Guarded/);
+assert.match(workspaceScreen, /● guarded · \/access/);
 assert.doesNotMatch(workspaceScreen, /^OriginRouter\nWorkspace/m);
 
 const launchScreen = buildAgentLaunchScreen({
@@ -162,7 +178,7 @@ assert(rows > 1);
 rows = redrawPrompt(output, "我想分析一下我远程电脑的状态，包括机器状态和版本信息", "auto", rows);
 assert.match(writes.join(""), /\x1b\[1A/);
 assert.match(writes.join(""), /› 我想分析一下/);
-assert.match(writes.join(""), /Auto · Guarded ·/);
+assert.match(writes.join(""), /Auto · shift\+tab to cycle/);
 assert.doesNotMatch(writes.join(""), /\[Auto\] >/);
 
 function fakeTerminal(columns = 80, rows = 24) {
@@ -238,10 +254,10 @@ const activeInterruptRun = handleAgentWorkspaceCommand([], {
   },
   cancelCollaborationRun: async (runId) => {
     cancelledRuns.push(runId);
-    setImmediate(() => {
+    setTimeout(() => {
       emitText(activeInterruptTerminal.input, "/exit");
       activeInterruptTerminal.input.emit("keypress", undefined, { name: "return" });
-    });
+    }, 20);
   },
 });
 await new Promise((resolve) => setImmediate(resolve));
@@ -250,7 +266,39 @@ activeInterruptTerminal.input.emit("keypress", undefined, { name: "return" });
 await activeInterruptRun;
 assert.equal(activeRunnerStarted, true);
 assert.deepEqual(cancelledRuns, ["acr_test_interrupt"]);
-assert.match(activeInterruptTerminal.writes.join(""), /Cancelling acr_test_interrupt/);
+assert.match(activeInterruptTerminal.writes.join(""), /Interrupting the collaboration/);
+assert.match(activeInterruptTerminal.writes.join(""), /acr_test_interrupt/);
+
+const queuedTerminal = fakeTerminal();
+const queuedCalls = [];
+const queuedRun = handleAgentWorkspaceCommand([], {
+  input: queuedTerminal.input,
+  output: queuedTerminal.output,
+  collaborationRunner: async (args) => {
+    queuedCalls.push(args);
+    if (queuedCalls.length === 1) {
+      await new Promise((resolve) => {
+        setImmediate(() => {
+          emitText(queuedTerminal.input, "inspect next device");
+          queuedTerminal.input.emit("keypress", undefined, { name: "return" });
+          setTimeout(resolve, 10);
+        });
+      });
+      return;
+    }
+    setTimeout(() => {
+      emitText(queuedTerminal.input, "/exit");
+      queuedTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 20);
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(queuedTerminal.input, "first objective");
+queuedTerminal.input.emit("keypress", undefined, { name: "return" });
+await queuedRun;
+assert.equal(queuedCalls.length, 2);
+assert.equal(queuedCalls[1][1], "inspect next device");
+assert.match(queuedTerminal.writes.join(""), /next objective queued/i);
 
 const calls = [];
 await handleAgentWorkspaceCommand([
@@ -262,13 +310,46 @@ assert.equal(calls.length, 1);
 assert.deepEqual(calls[0].slice(0, 6), [
   "create", "explain this module", "--workspace-mode", "solo", "--coordinator", "codex",
 ]);
-assert(calls[0].includes("--yes"));
+assert.equal(calls[0].includes("--yes"), false);
 
 const remoteCalls = [];
 await handleAgentWorkspaceCommand(["check", "service", "status", "on", "server", "A"], {
   collaborationRunner: async (args) => remoteCalls.push(args),
 });
 assert.equal(remoteCalls[0].includes("--cloud-advice"), true, "Auto mode asks the advisory model to choose a team");
-assert.equal(remoteCalls[0].includes("--yes"), true, "Conservative local fallback remains a solo task");
+assert.equal(remoteCalls[0].includes("--yes"), false, "Auto mode waits for the resolved configuration before deciding confirmation");
+
+const runtimeScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 80,
+  rows: 24,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "executing",
+    mode: "auto",
+    startedAt: Date.now() - 2500,
+    runId: "acr_runtime",
+    configuration: {
+      resolved_workspace_mode: "remote_ops",
+      participants: [
+        { participant_id: "coordinator", device_id: "local-device" },
+        { participant_id: "remote_operator", device_id: "server-a" },
+      ],
+    },
+    snapshot: {
+      run: { state: "running", phase: "execution" },
+      tasks: [{ task_key: "inspect", title: "Inspect remote status", state: "running", participant_id: "remote_operator" }],
+    },
+    events: [{ sequence: 1, summary: "Remote Agent connected", visibility: "summary" }],
+    composerBuffer: "queue another check",
+  },
+});
+assert.match(runtimeScreen, /Agents are working/);
+assert.match(runtimeScreen, /Remote Ops · 2 Agents · 2 devices/);
+assert.match(runtimeScreen, /Inspect remote status/);
+assert.match(runtimeScreen, /acr_runtime/);
+assert.match(runtimeScreen, /› queue another check/);
+assert.match(runtimeScreen, /Enter queues next objective/);
 
 console.log("agent workspace tests passed");

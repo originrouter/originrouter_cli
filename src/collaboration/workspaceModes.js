@@ -254,7 +254,18 @@ function createParticipant(definition, devices, currentDirectory, usedIds) {
   }
   const workspaceId = chooseWorkspace(device, currentDirectory);
   if (!workspaceId) {
-    throw new Error(`Choose a trusted workspace for ${device.deviceName || device.deviceId} before using Agent Workspace auto configuration.`);
+    const error = new Error(`Choose a trusted workspace for ${device.deviceName || device.deviceId} before using Agent Workspace auto configuration.`);
+    error.code = device.local === true
+      ? "AUTO_CONFIG_WORKSPACE_REQUIRED"
+      : "AUTO_CONFIG_REMOTE_WORKSPACE_REQUIRED";
+    error.setup = {
+      kind: "workspace_trust",
+      device_id: device.deviceId,
+      device_name: device.deviceName || device.deviceId,
+      default_path: capabilitiesFor(device)?.device?.default_workspace_path || "",
+      remote: device.local !== true,
+    };
+    throw error;
   }
   const capabilities = capabilitiesFor(device);
   const profiles = new Set((capabilities?.permission_profiles || []).map((profile) => profile.id));
