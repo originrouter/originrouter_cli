@@ -103,6 +103,8 @@ const ANSI = {
   bgSoft: "\x1b[48;5;255m",
 };
 
+const workspaceScreenCache = new WeakMap();
+
 function colorEnabled() {
   return process.env.ORIGINROUTER_NO_COLOR == null && process.env.TERM !== "dumb";
 }
@@ -265,7 +267,9 @@ function runtimePhase(runtime) {
   const snapshot = runtime.snapshot;
   const state = snapshot?.run?.state;
   const phase = snapshot?.run?.phase || runtime.phase;
-  if (runtime.phase === "needs_setup") return "Setup required";
+  if (runtime.phase === "needs_setup") {
+    return runtime.setup?.workspaces?.length ? "Choose a workspace" : "Setup required";
+  }
   if (runtime.phase === "configuring") return "Choosing the Agent team";
   if (runtime.phase === "awaiting_configuration") return "Review the proposed team";
   if (state === "awaiting_confirmation") return "Plan ready for review";
@@ -297,7 +301,7 @@ function buildRuntimeRows(runtime, columns, maxRows) {
   const lines = [];
   const push = (value = "", style = null) => {
     for (const row of wrapDisplayText(value, width)) {
-      lines.push(`  ${style ? style(row) : row}`);
+      lines.push(style ? style(row) : row);
     }
   };
   push("");
@@ -322,13 +326,27 @@ function buildRuntimeRows(runtime, columns, maxRows) {
   if (runtime.runId) push(`Run ${runtime.runId}`, muted);
 
   if (runtime.phase === "needs_setup" && runtime.setup) {
+    const workspaces = runtime.setup.workspaces || [];
     push("");
-    push(`${runtime.setup.device_name} is online and trusted, but no workspace is authorized.`, strong);
-    push(runtime.setup.remote
-      ? "Authorize a folder before a remote Agent can inspect this device."
-      : "Authorize a folder before an Agent can work in this workspace.", muted);
-    push("");
-    push(`Folder  ${runtime.setupPath || runtime.setup.default_path || "Enter a path"}▌`);
+    if (workspaces.length && runtime.setupMode !== "path") {
+      push(`${runtime.setup.device_name} has multiple authorized workspaces.`, strong);
+      push("Choose the folder this collaboration should use.", muted);
+      push("");
+      for (const [index, workspace] of workspaces.slice(0, 6).entries()) {
+        const marker = index === runtime.setupSelection ? "›" : " ";
+        push(`${marker} ${workspace.display_name}  ${workspace.canonical_path}`);
+      }
+      const customIndex = workspaces.length;
+      push(`${runtime.setupSelection === customIndex ? "›" : " "} Enter another folder path`);
+    } else {
+      push(runtime.setupMode === "path"
+        ? `${runtime.setup.device_name} folder path`
+        : `${runtime.setup.device_name} is online and trusted, but no workspace is authorized.`, strong);
+      push(runtime.setup.remote
+        ? "Authorize a folder before a remote Agent can inspect this device."
+        : "Authorize a folder before an Agent can work in this workspace.", muted);
+      if (runtime.setupMode === "path") push(`Path  ${runtime.setupPath || runtime.setup.default_path || "Enter a path"}▌`);
+    }
   } else if (runtime.error) {
     push("");
     push(String(runtime.error.message || runtime.error).split("\n")[0], strong);
@@ -370,7 +388,9 @@ function runtimeControls(runtime, columns) {
   const mode = workspaceModeDefinition(runtime.mode || "auto").label;
   let text = runtime.notice || "Enter queues next objective · ctrl+c interrupts · ← agents";
   if (runtime.queuedObjective) text = "next objective queued · ctrl+c interrupts · ← agents";
-  if (runtime.phase === "needs_setup") text = "Enter authorizes this folder · esc cancels";
+  if (runtime.phase === "needs_setup") text = runtime.setup?.workspaces?.length && runtime.setupMode !== "path"
+    ? "↑/↓ selects · Enter confirms · esc cancels"
+    : "Enter authorizes this folder · ctrl+u clears · esc cancels";
   if (runtime.phase === "awaiting_configuration") text = "Enter uses this team · esc cancels before creating a Run";
   if (runtime.snapshot?.run?.state === "awaiting_confirmation") text = "Enter starts the plan · esc leaves it pending";
   if (["completed", "failed", "cancelled", "error"].includes(runtime.snapshot?.run?.state || runtime.phase)) {
@@ -386,9 +406,55 @@ function composerStatus(columns) {
 
 function runtimeComposer(runtime, columns) {
   let value = runtime.composerBuffer || "";
-  if (runtime.phase === "needs_setup") value = runtime.setupPath || runtime.setup?.default_path || "";
+  if (runtime.phase === "needs_setup") {
+    const selected = runtime.setupMode === "path"
+      ? null
+      : runtime.setup?.workspaces?.[runtime.setupSelection || 0];
+    value = selected?.canonical_path || runtime.setupPath || runtime.setup?.default_path || "";
+  }
   const prompt = `› ${value}`;
   return padDisplayRight(strong(fitDisplayText(prompt, Math.max(1, columns - 1))), columns);
+}
+
+function interactionComposer(runtime, columns) {
+  const kind = runtime.interactionKind;
+  let lines;
+  if (kind === "workspace") {
+    lines = [
+      "? Choose a workspace",
+      "↑/↓ select · Enter confirm · type a path for another folder · Esc cancel",
+    ];
+  } else if (kind === "setup") {
+    lines = [
+      "? Authorize a remote workspace",
+      `› ${runtime.setupPath || runtime.setup?.default_path || ""}▌`,
+      "Enter authorize · Ctrl+U clear · ←/→ edit · Esc cancel",
+    ];
+  } else if (kind === "configuration") {
+    lines = [
+      "? Use this collaboration team?",
+      "Enter confirm · Esc cancel before creating a Run",
+    ];
+  } else if (kind === "plan") {
+    lines = [
+      "? Start this plan?",
+      "Enter start · Esc leave pending",
+    ];
+  } else {
+    lines = ["? OriginRouter needs your input", "Enter confirm · Esc cancel"];
+  }
+  const width = Math.max(1, columns - 1);
+  return lines.map((line) => padDisplayRight(strong(fitDisplayText(line, width)), columns)).join("\n");
+}
+
+function interactionStatus(runtime, columns) {
+  const labels = {
+    workspace: "selecting workspace",
+    setup: "authorizing workspace",
+    configuration: "reviewing team",
+    plan: "reviewing plan",
+  };
+  return padDisplayRight(muted(`  ${labels[runtime.interactionKind] || "waiting for input"}`), columns);
 }
 
 function runtimeHeaderPanel(runtime) {
@@ -462,25 +528,56 @@ export function buildWorkspaceAppScreen({
   const blankRows = Math.max(0, terminalRows - screenRows.length - reservedRows);
   const body = `${screenRows.join("\n")}\n${"\n".repeat(blankRows)}`;
   if (!runtime) return `${body}${composerStatus(terminalColumns)}\n${separator}\n`;
+  const composer = runtime.interaction
+    ? interactionComposer(runtime, terminalColumns)
+    : runtimeComposer(runtime, terminalColumns);
+  const status = runtime.interaction
+    ? interactionStatus(runtime, terminalColumns)
+    : composerStatus(terminalColumns);
   return [
-    `${body}${composerStatus(terminalColumns)}`,
+    `${body}${status}`,
     separator,
-    runtimeComposer(runtime, terminalColumns),
+    composer,
     separator,
     runtimeControls(runtime, terminalColumns),
   ].join("\n");
 }
 
-function redrawWorkspaceApp(output, { coordinator, mode, panel = null, runtime = null }) {
-  output.write("\x1b[2J\x1b[H");
-  output.write(buildWorkspaceAppScreen({
+function redrawWorkspaceApp(output, {
+  coordinator,
+  mode,
+  panel = null,
+  runtime = null,
+  force = false,
+} = {}) {
+  const screen = buildWorkspaceAppScreen({
     coordinator,
     mode,
     panel,
     runtime,
     columns: output.columns,
     rows: output.rows,
-  }));
+  });
+  const nextLines = screen.replace(/\n$/, "").split("\n");
+  const previous = workspaceScreenCache.get(output);
+  if (force || !previous || previous.columns !== output.columns || previous.rows !== output.rows) {
+    output.write("\x1b[2J\x1b[H");
+    output.write(screen);
+  } else {
+    const maxRows = Math.max(previous.lines.length, nextLines.length);
+    for (let index = 0; index < maxRows; index += 1) {
+      const next = nextLines[index] || "";
+      const old = previous.lines[index] || "";
+      if (next === old) continue;
+      output.write(`\x1b[${index + 1};1H\x1b[2K${next}`);
+    }
+    output.write(`\x1b[${Math.max(1, nextLines.length)};1H`);
+  }
+  workspaceScreenCache.set(output, {
+    columns: output.columns,
+    rows: output.rows,
+    lines: nextLines,
+  });
 }
 
 function supportsAppScreen(output) {
@@ -494,6 +591,7 @@ function enterWorkspaceApp(output) {
   const exit = () => {
     if (exited) return;
     exited = true;
+    workspaceScreenCache.delete(output);
     output.write("\x1b[?1049l");
   };
   process.once("exit", exit);
@@ -615,7 +713,8 @@ async function readWorkspaceLine({ input, output, mode, coordinator, panel, onMo
       renderedRows = redrawPrompt(output, buffer, mode, 0, { notice });
     };
     const onResize = () => {
-      redrawLine();
+      redrawWorkspaceApp(output, { coordinator, mode, panel, force: true });
+      renderedRows = redrawPrompt(output, buffer, mode, 0, { notice });
     };
     const onKeypress = (text, key = {}) => {
       if (key.ctrl && key.name === "c") {
@@ -709,7 +808,9 @@ async function readRuntimeDecision({ input, runtime, render, kind }) {
   input.setRawMode(true);
   input.resume();
   runtime.interaction = true;
+  runtime.interactionKind = kind;
   let buffer = kind === "setup" ? String(runtime.setupPath || "") : "";
+  let cursor = [...buffer].length;
   runtime.setupPath = buffer;
   render();
   return new Promise((resolve, reject) => {
@@ -717,6 +818,7 @@ async function readRuntimeDecision({ input, runtime, render, kind }) {
       input.off("keypress", onKeypress);
       input.off("error", onError);
       runtime.interaction = false;
+      runtime.interactionKind = "";
     };
     const finish = (value) => {
       cleanup();
@@ -728,18 +830,76 @@ async function readRuntimeDecision({ input, runtime, render, kind }) {
     };
     const onKeypress = (text, key = {}) => {
       if (key.name === "escape" || (key.ctrl && key.name === "c")) {
-        finish(kind === "setup" ? null : "leave");
+        finish(["setup", "workspace"].includes(kind) ? null : "leave");
         return;
       }
       if (key.name === "return" || key.name === "enter") {
-        finish(kind === "setup" ? buffer.trim() || null : "confirm");
+        if (kind === "workspace") {
+          const workspaces = runtime.setup?.workspaces || [];
+          finish(runtime.setupSelection >= workspaces.length
+            ? "__custom_workspace_path__"
+            : workspaces[runtime.setupSelection || 0] || null);
+        } else {
+          finish(kind === "setup" ? buffer.trim() || null : "confirm");
+        }
+        return;
+      }
+      if (kind === "workspace") {
+        const workspaces = runtime.setup?.workspaces || [];
+        if (!workspaces.length) return;
+        if (!key.ctrl && !key.meta && text && !key.name?.startsWith("f")) {
+          kind = "setup";
+          runtime.interactionKind = "setup";
+          runtime.setupMode = "path";
+          buffer = text;
+          cursor = [...buffer].length;
+          runtime.setupPath = buffer;
+          render();
+          return;
+        }
+        if (key.name === "up") {
+          runtime.setupSelection = (runtime.setupSelection - 1 + workspaces.length + 1) % (workspaces.length + 1);
+        } else if (key.name === "down" || key.name === "tab") {
+          runtime.setupSelection = (runtime.setupSelection + 1) % (workspaces.length + 1);
+        } else if (/^[1-9]$/.test(text || "") && Number(text) <= workspaces.length + 1) {
+          runtime.setupSelection = Number(text) - 1;
+        } else {
+          return;
+        }
+        if (runtime.setupSelection === workspaces.length) {
+          runtime.setupMode = "path-choice";
+        } else {
+          runtime.setupMode = "workspace";
+        }
+        render();
         return;
       }
       if (kind !== "setup") return;
+      const chars = [...buffer];
       if (key.name === "backspace") {
-        buffer = [...buffer].slice(0, -1).join("");
+        if (cursor > 0) {
+          chars.splice(cursor - 1, 1);
+          cursor -= 1;
+        }
+        buffer = chars.join("");
+      } else if (key.name === "delete") {
+        chars.splice(cursor, 1);
+        buffer = chars.join("");
+      } else if (key.name === "left") {
+        cursor = Math.max(0, cursor - 1);
+      } else if (key.name === "right") {
+        cursor = Math.min(chars.length, cursor + 1);
+      } else if (key.name === "home" || (key.ctrl && key.name === "a")) {
+        cursor = 0;
+      } else if (key.name === "end" || (key.ctrl && key.name === "e")) {
+        cursor = chars.length;
+      } else if (key.ctrl && key.name === "u") {
+        buffer = "";
+        cursor = 0;
       } else if (!key.ctrl && !key.meta && text && !key.name?.startsWith("f")) {
-        buffer += text;
+        chars.splice(cursor, 0, ...text);
+        cursor += [...text].length;
+        buffer = chars.join("");
       } else {
         return;
       }
@@ -817,10 +977,12 @@ async function runWorkspaceObjective({
     configuration: null,
     setup: null,
     setupPath: "",
+    setupSelection: 0,
     composerBuffer: "",
     queuedObjective: "",
     notice: "",
     interaction: false,
+    interactionKind: "",
     error: null,
   };
   const render = () => redrawWorkspaceApp(output, {
@@ -829,13 +991,24 @@ async function runWorkspaceObjective({
     panel: runtimeHeaderPanel(runtime),
     runtime,
   });
-  const onResize = () => render();
-  const timer = setInterval(render, 250);
+  const onResize = () => redrawWorkspaceApp(output, {
+    coordinator,
+    mode,
+    panel: runtimeHeaderPanel(runtime),
+    runtime,
+    force: true,
+  });
+  const timer = setInterval(() => {
+    // Do not invalidate native terminal text selection while a setup/composer
+    // interaction is active. State is redrawn on keypress and resize.
+    if (!runtime.interaction) render();
+  }, 1000);
   timer.unref?.();
   output.on?.("resize", onResize);
   render();
 
   const controller = new AbortController();
+  const workspaceSelections = {};
   let interruptRequested = false;
   let cancelPromise = Promise.resolve();
   const onActiveInterrupt = () => {
@@ -917,6 +1090,7 @@ async function runWorkspaceObjective({
           workspaceMode: mode,
           coordinator,
           cloudAdvice: mode === "auto" || forwarded.includes("--cloud-advice"),
+          workspaceSelections,
           confirmation,
           signal: controller.signal,
           onRunId: (runId) => {
@@ -960,14 +1134,47 @@ async function runWorkspaceObjective({
           runtime.phase = "needs_setup";
           runtime.setup = error.setup;
           runtime.setupPath = error.setup.default_path || "";
+          runtime.setupSelection = 0;
           runtime.error = null;
-          const path = await readRuntimeDecision({ input, runtime, render, kind: "setup" });
-          if (!path) {
+      const workspaces = error.setup.workspaces || [];
+          runtime.setupMode = workspaces.length ? "workspace" : "path";
+          const selected = await readRuntimeDecision({
+            input,
+            runtime,
+            render,
+            kind: workspaces.length ? "workspace" : "setup",
+          });
+          if (!selected) {
             runtime.phase = "cancelled";
             return runtime;
           }
+          if (selected === "__custom_workspace_path__") {
+            runtime.setupMode = "path";
+            const path = await readRuntimeDecision({ input, runtime, render, kind: "setup" });
+            if (!path) {
+              runtime.phase = "cancelled";
+              return runtime;
+            }
+            runtime.phase = "configuring";
+            const workspace = await trustCollaborationWorkspace(error.setup.device_id, path, { signal: controller.signal });
+            workspaceSelections[error.setup.device_id] = workspace.workspace_id || workspace.canonical_path || path;
+            runtime.setup = null;
+            runtime.setupPath = "";
+            continue;
+          }
           runtime.phase = "configuring";
-          await trustCollaborationWorkspace(error.setup.device_id, path, { signal: controller.signal });
+          if (workspaces.length) {
+            workspaceSelections[error.setup.device_id] = selected.workspace_id || selected.canonical_path;
+          } else {
+            const workspace = await trustCollaborationWorkspace(
+              error.setup.device_id,
+              selected,
+              { signal: controller.signal },
+            );
+            workspaceSelections[error.setup.device_id] = workspace.workspace_id
+              || workspace.canonical_path
+              || selected;
+          }
           runtime.setup = null;
           runtime.setupPath = "";
           continue;

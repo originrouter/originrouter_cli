@@ -1254,6 +1254,7 @@ export async function automaticCreatePayload({
   getCachedCapabilitiesFn = getCachedCollaborationCapabilities,
   modelFn,
   modelOptions = {},
+  workspaceSelections = {},
 } = {}) {
   const devices = await collectAutoConfigurationDevices({
     requestFn,
@@ -1286,6 +1287,7 @@ export async function automaticCreatePayload({
       coordinator,
       devices,
       currentDirectory,
+      workspaceSelections,
     });
     if (workspaceMode === "auto") {
       configured.workspace_mode = "auto";
@@ -1786,6 +1788,7 @@ export async function runAgentWorkspaceCollaboration({
   interval = 750,
   requestFn = request,
   automaticCreatePayloadFn = automaticCreatePayload,
+  workspaceSelections = {},
 } = {}) {
   throwIfAborted(signal);
   onUpdate({ type: "phase", phase: "configuring" });
@@ -1794,6 +1797,7 @@ export async function runAgentWorkspaceCollaboration({
     workspaceMode,
     coordinator,
     cloudAdvice,
+    workspaceSelections,
   });
   throwIfAborted(signal);
   onUpdate({ type: "configuration", payload });

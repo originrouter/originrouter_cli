@@ -133,6 +133,25 @@ assert.throws(
     && error.setup?.device_id === "server-a",
 );
 
+const selectedRemote = buildLocalWorkspaceConfiguration({
+  objective: "Inspect the remote computer",
+  mode: "remote-ops",
+  coordinator: "codex",
+  devices: devices.map((device) => device.local ? device : {
+    ...device,
+    capabilities: {
+      ...device.capabilities,
+      trusted_workspaces: [
+        { workspace_id: "workspace-a", canonical_path: "/srv/a" },
+        { workspace_id: "workspace-b", canonical_path: "/srv/b" },
+      ],
+    },
+  }),
+  currentDirectory: "/project",
+  workspaceSelections: { "server-a": "workspace-b" },
+});
+assert.equal(selectedRemote.participants[1].workspace_id, "workspace-b");
+
 const workspaceScreen = buildWorkspaceAppScreen({
   coordinator: "codex",
   mode: "auto",
@@ -351,5 +370,28 @@ assert.match(runtimeScreen, /Inspect remote status/);
 assert.match(runtimeScreen, /acr_runtime/);
 assert.match(runtimeScreen, /› queue another check/);
 assert.match(runtimeScreen, /Enter queues next objective/);
+assert.match(runtimeScreen.replace(/\x1b\[[0-9;]*m/g, ""), /\n› Inspect the remote computer/);
+
+const interactionScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 80,
+  rows: 24,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "needs_setup",
+    mode: "auto",
+    startedAt: Date.now(),
+    interaction: true,
+    interactionKind: "setup",
+    setupPath: "/Users/chengaoyan",
+    setup: { default_path: "/Users/chengaoyan" },
+    composerBuffer: "queued objective is preserved",
+    snapshot: { run: { state: "running" }, tasks: [] },
+  },
+});
+assert.match(interactionScreen, /\? Authorize a remote workspace/);
+assert.match(interactionScreen, /Enter authorize/);
+assert.doesNotMatch(interactionScreen, /queued objective is preserved/);
 
 console.log("agent workspace tests passed");

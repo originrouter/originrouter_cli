@@ -172,9 +172,15 @@ function chooseDevice(devices, runtime, { remote = false } = {}) {
   return preferred || eligible[0] || null;
 }
 
-function chooseWorkspace(device, currentDirectory) {
+function chooseWorkspace(device, currentDirectory, preferredWorkspaceId = "") {
   const capabilities = capabilitiesFor(device);
   const workspaces = capabilities?.trusted_workspaces || [];
+  const preferred = workspaces.find((workspace) => (
+    workspace.workspace_id === preferredWorkspaceId
+    || workspace.canonical_path === preferredWorkspaceId
+    || workspace.repo_root === preferredWorkspaceId
+  ));
+  if (preferred) return preferred.workspace_id || preferred.canonical_path;
   const exact = workspaces.find((workspace) => (
     workspace.workspace_id === currentDirectory
     || workspace.canonical_path === currentDirectory
@@ -238,7 +244,7 @@ function roleDefinitions(mode, coordinator) {
   return definitions[mode] || [];
 }
 
-function createParticipant(definition, devices, currentDirectory, usedIds) {
+function createParticipant(definition, devices, currentDirectory, usedIds, workspaceSelections = {}) {
   let device = chooseDevice(devices, definition.runtime, { remote: definition.remote });
   let runtime = definition.runtime;
   if (!device) {
@@ -252,7 +258,7 @@ function createParticipant(definition, devices, currentDirectory, usedIds) {
   if (definition.remote && device.local === true) {
     throw new Error("Remote Ops requires an online or cached trusted remote device capability snapshot.");
   }
-  const workspaceId = chooseWorkspace(device, currentDirectory);
+  const workspaceId = chooseWorkspace(device, currentDirectory, workspaceSelections[device.deviceId]);
   if (!workspaceId) {
     const error = new Error(`Choose a trusted workspace for ${device.deviceName || device.deviceId} before using Agent Workspace auto configuration.`);
     error.code = device.local === true
@@ -264,6 +270,11 @@ function createParticipant(definition, devices, currentDirectory, usedIds) {
       device_name: device.deviceName || device.deviceId,
       default_path: capabilitiesFor(device)?.device?.default_workspace_path || "",
       remote: device.local !== true,
+      workspaces: (capabilitiesFor(device)?.trusted_workspaces || []).map((workspace) => ({
+        workspace_id: workspace.workspace_id || workspace.canonical_path,
+        display_name: workspace.display_name || workspace.canonical_path,
+        canonical_path: workspace.canonical_path,
+      })),
     };
     throw error;
   }
@@ -293,6 +304,7 @@ export function applyWorkspaceConfiguration(payload, {
   coordinator = "codex",
   devices = [],
   currentDirectory = processCwd(),
+  workspaceSelections = {},
 } = {}) {
   const selectedMode = workspaceModeDefinition(mode);
   const selectedCoordinator = normalizeCoordinator(coordinator);
@@ -307,7 +319,7 @@ export function applyWorkspaceConfiguration(payload, {
         name: "Coordinator",
         runtime: selectedCoordinator,
         role: "Understand the objective, coordinate the task graph, and own the final result.",
-      }, devices, currentDirectory, used);
+      }, devices, currentDirectory, used, workspaceSelections);
       next.participants.unshift(planner);
     }
     for (const participant of next.participants) participant.planner = participant === planner;
@@ -325,7 +337,13 @@ export function applyWorkspaceConfiguration(payload, {
 
   const usedIds = new Set();
   const participants = roleDefinitions(selectedMode.id, selectedCoordinator)
-    .map((definition) => createParticipant(definition, devices, currentDirectory, usedIds));
+    .map((definition) => createParticipant(
+      definition,
+      devices,
+      currentDirectory,
+      usedIds,
+      workspaceSelections,
+    ));
   next.participants = participants;
   next.workflow_template_id = selectedMode.templateId;
   next.preferences = [next.preferences, MODE_PREFERENCES[selectedMode.id]]
@@ -355,6 +373,7 @@ export function buildLocalWorkspaceConfiguration({
   coordinator = "codex",
   devices = [],
   currentDirectory = processCwd(),
+  workspaceSelections = {},
 } = {}) {
   const requestedMode = normalizeWorkspaceMode(mode);
   const resolvedMode = requestedMode === "auto" ? inferWorkspaceMode(objective) : requestedMode;
@@ -378,6 +397,7 @@ export function buildLocalWorkspaceConfiguration({
     coordinator,
     devices,
     currentDirectory,
+    workspaceSelections,
   });
   configured.auto_configuration.workspace_mode = requestedMode;
   configured.auto_configuration.resolved_workspace_mode = resolvedMode;
