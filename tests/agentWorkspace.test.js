@@ -5,6 +5,7 @@ import {
   buildWorkspaceAppScreen,
   createWorkspaceFrameScheduler,
   handleAgentWorkspaceCommand,
+  normalizeWorkspacePathInput,
   parseAgentWorkspaceArgs,
   redrawPrompt,
 } from "../src/commands/agentWorkspace.js";
@@ -14,6 +15,7 @@ import {
   inferWorkspaceMode,
   nextWorkspaceMode,
   normalizeWorkspaceMode,
+  objectiveMentionsRemoteTarget,
   workspaceRequiresPlanReview,
 } from "../src/collaboration/workspaceModes.js";
 
@@ -81,6 +83,10 @@ assert.equal(inferWorkspaceMode("check service status on server A"), "solo");
 assert.equal(workspaceRequiresPlanReview("deploy to production", "auto"), true);
 assert.equal(workspaceRequiresPlanReview("check service status on server A", "auto"), false);
 assert.equal(workspaceRequiresPlanReview("check service status on server A", "remote-ops"), true);
+assert.equal(objectiveMentionsRemoteTarget("我想分析一下我远程电脑的状态"), true);
+assert.equal(objectiveMentionsRemoteTarget("explain this local module"), false);
+assert.equal(normalizeWorkspacePathInput('  "/Users/chengaoyan/Desktop/originrouter-cli"  '), "/Users/chengaoyan/Desktop/originrouter-cli");
+assert.equal(normalizeWorkspacePathInput(" '/Users/chengaoyan/project'\n"), "/Users/chengaoyan/project");
 
 const buildReview = buildLocalWorkspaceConfiguration({
   objective: "Fix login and add tests",
@@ -173,7 +179,7 @@ const inputScreen = buildWorkspaceAppScreen({
   columns: 80,
   rows: 24,
   composerBuffer: "draft objective",
-  composerCursor: 5,
+  composerCursor: 4,
 });
 assert.match(inputScreen, /› draf▌t objective/);
 assert.match(inputScreen, /Enter submits · Ctrl\+C clears/);
@@ -268,6 +274,11 @@ clearInputTerminal.input.emit("keypress", undefined, { name: "return" });
 await clearInputRun;
 assert.equal(clearInputCalls.length, 0);
 assert.match(clearInputTerminal.writes.join(""), /Input cleared/);
+assert.equal(
+  clearInputTerminal.writes.filter((chunk) => chunk === "\n").length,
+  0,
+  "full-screen input transitions must not scroll the terminal with a bare newline",
+);
 
 const doubleExitTerminal = fakeTerminal();
 const doubleExitRun = handleAgentWorkspaceCommand([], {
@@ -319,6 +330,44 @@ assert.deepEqual(cancelledRuns, ["acr_test_interrupt"]);
 assert.match(activeInterruptTerminal.writes.join(""), /Interrupting the collaboration/);
 assert.match(activeInterruptTerminal.writes.join(""), /acr_test_interrupt/);
 
+const runtimeClearTerminal = fakeTerminal();
+const runtimeClearCancelled = [];
+let runtimeClearResolve;
+const runtimeClearRun = handleAgentWorkspaceCommand([], {
+  input: runtimeClearTerminal.input,
+  output: runtimeClearTerminal.output,
+  collaborationRunner: async (_args, options = {}) => {
+    options.onRunId?.("acr_runtime_clear");
+    await new Promise((resolve, reject) => {
+      runtimeClearResolve = resolve;
+      options.signal?.addEventListener("abort", () => {
+        const error = new Error("interrupted");
+        error.code = "ORIGINROUTER_INTERRUPTED";
+        reject(error);
+      }, { once: true });
+    });
+  },
+  cancelCollaborationRun: async (runId) => {
+    runtimeClearCancelled.push(runId);
+    runtimeClearResolve?.();
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(runtimeClearTerminal.input, "run something");
+runtimeClearTerminal.input.emit("keypress", undefined, { name: "return" });
+await new Promise((resolve) => setImmediate(resolve));
+emitText(runtimeClearTerminal.input, "queued text");
+runtimeClearTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" });
+assert.deepEqual(runtimeClearCancelled, [], "Ctrl+C clears queued runtime input before cancelling");
+assert.match(runtimeClearTerminal.writes.join(""), /Input cleared/);
+runtimeClearTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" });
+setTimeout(() => {
+  emitText(runtimeClearTerminal.input, "/exit");
+  runtimeClearTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 30);
+await runtimeClearRun;
+assert.deepEqual(runtimeClearCancelled, ["acr_runtime_clear"]);
+
 const queuedTerminal = fakeTerminal();
 const queuedCalls = [];
 const queuedRun = handleAgentWorkspaceCommand([], {
@@ -344,11 +393,22 @@ const queuedRun = handleAgentWorkspaceCommand([], {
 });
 await new Promise((resolve) => setImmediate(resolve));
 emitText(queuedTerminal.input, "first objective");
+const objectiveTransitionWriteIndex = queuedTerminal.writes.length;
 queuedTerminal.input.emit("keypress", undefined, { name: "return" });
 await queuedRun;
 assert.equal(queuedCalls.length, 2);
 assert.equal(queuedCalls[1][1], "inspect next device");
 assert.match(queuedTerminal.writes.join(""), /next objective queued/i);
+assert.equal(
+  queuedTerminal.writes.slice(objectiveTransitionWriteIndex).some((chunk) => chunk.includes("\x1b[2J\x1b[H")),
+  true,
+  "submitting an objective starts the runtime with a complete frame",
+);
+assert.equal(
+  queuedTerminal.writes.filter((chunk) => chunk === "\n").length,
+  0,
+  "runtime and prompt transitions must stay inside the frame renderer",
+);
 
 const calls = [];
 await handleAgentWorkspaceCommand([
@@ -421,8 +481,73 @@ const interactionScreen = buildWorkspaceAppScreen({
     snapshot: { run: { state: "running" }, tasks: [] },
   },
 });
-assert.match(interactionScreen, /\? Authorize a remote workspace/);
+assert.match(interactionScreen, /\? Enter a folder path to authorize/);
 assert.match(interactionScreen, /Enter authorize/);
+assert.doesNotMatch(interactionScreen, /undefined is online/);
+
+const emptyPathScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 80,
+  rows: 24,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "needs_setup",
+    mode: "auto",
+    interaction: true,
+    interactionKind: "setup",
+    setupPath: "",
+    setupCursor: 0,
+    setup: { default_path: "/Users/chengaoyan", device_name: "Remote Mac mini" },
+    snapshot: { run: { state: "running" }, tasks: [] },
+  },
+});
+assert.match(emptyPathScreen, /› ▌/);
+assert.match(emptyPathScreen, /example: \/Users\/chengaoyan/);
+assert.doesNotMatch(emptyPathScreen, /Path  \/Users\/chengaoyan/);
 assert.doesNotMatch(interactionScreen, /queued objective is preserved/);
+
+const manyWorkspaceScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 100,
+  rows: 30,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "needs_setup",
+    interaction: true,
+    interactionKind: "workspace",
+    setupSelection: 7,
+    setup: {
+      device_name: "Remote Mac mini",
+      workspaces: Array.from({ length: 10 }, (_, index) => ({
+        workspace_id: `workspace-${index + 1}`,
+        display_name: `Workspace ${index + 1}`,
+        canonical_path: `/Users/chengaoyan/project-${index + 1}`,
+      })),
+    },
+  },
+});
+assert.match(manyWorkspaceScreen, /Workspace 8/);
+assert.match(manyWorkspaceScreen, /Workspace 10/);
+assert.doesNotMatch(manyWorkspaceScreen, /Workspace 1  \/Users\/chengaoyan\/project-1/);
+assert.match(manyWorkspaceScreen, /P\. Enter another folder path/);
+
+const reconnectingScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 80,
+  rows: 24,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "reconnecting",
+    startedAt: Date.now() - 2200,
+    connectionAttempts: 2,
+    snapshot: { run: { state: "running" }, tasks: [] },
+  },
+});
+assert.match(reconnectingScreen, /Reconnecting to the collaboration/);
+assert.match(reconnectingScreen, /Connection interrupted · retry 2\/30/);
+assert.match(reconnectingScreen, /retrying automatically/);
 
 console.log("agent workspace tests passed");

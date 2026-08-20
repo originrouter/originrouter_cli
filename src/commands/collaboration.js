@@ -26,6 +26,7 @@ import {
   buildLocalWorkspaceConfiguration,
   normalizeCoordinator,
   normalizeWorkspaceMode,
+  objectiveMentionsRemoteTarget,
   workspaceModeDefinition,
 } from "../collaboration/workspaceModes.js";
 import { requestCollaborationAdvice } from "../collaboration/collaborationAdviceClient.js";
@@ -1253,6 +1254,7 @@ export async function automaticCreatePayload({
   cacheCapabilitiesFn = cacheCollaborationCapabilities,
   getCachedCapabilitiesFn = getCachedCollaborationCapabilities,
   modelFn,
+  adviceFn = requestCollaborationAdvice,
   modelOptions = {},
   workspaceSelections = {},
 } = {}) {
@@ -1270,7 +1272,7 @@ export async function automaticCreatePayload({
     let advice = null;
     if (cloudAdvice) {
       try {
-        advice = await requestCollaborationAdvice({
+        advice = await adviceFn({
           objective,
           requestedMode: workspaceMode,
           coordinator,
@@ -1314,6 +1316,14 @@ export async function automaticCreatePayload({
       configured.auto_configuration.advice_error = advice?.error_code || "COLLABORATION_ADVICE_FAILED";
       configured.auto_configuration.safe_to_skip_confirmation = false;
       configured.auto_configuration.requires_explicit_confirmation = true;
+      if (workspaceMode === "auto" && objectiveMentionsRemoteTarget(objective)) {
+        const error = new Error(
+          "Auto could not safely choose a remote team because the advisory model is unavailable. Retry, or select Remote Ops with Shift+Tab.",
+        );
+        error.code = "AUTO_CONFIG_REMOTE_ADVICE_REQUIRED";
+        error.cause = advice?.error_code;
+        throw error;
+      }
     }
     return configured;
   }
@@ -1756,12 +1766,21 @@ function abortableDelay(ms, signal) {
   });
 }
 
-export async function trustCollaborationWorkspace(deviceId, path, { signal } = {}) {
-  const data = await request(
+export async function trustCollaborationWorkspace(deviceId, path, {
+  signal,
+  requestFn = request,
+} = {}) {
+  const data = await requestFn(
     `/collaboration/devices/${encodeURIComponent(deviceId)}/workspaces/trust`,
     { method: "POST", body: { path }, signal },
   );
   return data.workspace;
+}
+
+function isRetryableCollaborationReadError(error) {
+  const code = String(error?.diagnosticCode || error?.code || "").toUpperCase();
+  const message = String(error?.message || "").toUpperCase();
+  return /LOCAL_API_CONNECTION_FAILED|TIMEOUT|CONNECTION|RELAY|UNAVAILABLE|ECONN|ETIMEDOUT/.test(`${code} ${message}`);
 }
 
 export async function controlCollaborationRun(runId, action, { signal, body = {} } = {}) {
@@ -1800,6 +1819,7 @@ export async function runAgentWorkspaceCollaboration({
     workspaceMode,
     coordinator,
     cloudAdvice,
+    requestFn,
     workspaceSelections,
   });
   throwIfAborted(signal);
@@ -1835,16 +1855,38 @@ export async function runAgentWorkspaceCollaboration({
 
   let cursor = 0;
   let confirmationHandled = false;
+  let reconnectAttempts = 0;
+  const readSnapshot = async (path) => {
+    while (true) {
+      throwIfAborted(signal);
+      try {
+        const result = await requestFn(path, { signal });
+        if (reconnectAttempts > 0) {
+          reconnectAttempts = 0;
+          onUpdate({ type: "connection", connectionAttempts: 0, message: "" });
+        }
+        return result;
+      } catch (error) {
+        if (!isRetryableCollaborationReadError(error) || reconnectAttempts >= 30) throw error;
+        reconnectAttempts += 1;
+        onUpdate({
+          type: "connection",
+          phase: "reconnecting",
+          connectionAttempts: reconnectAttempts,
+          message: `Connection interrupted; retry ${reconnectAttempts}/30`,
+        });
+        await abortableDelay(Math.min(5000, 500 + reconnectAttempts * 250), signal);
+      }
+    }
+  };
   while (true) {
     throwIfAborted(signal);
-    const snapshot = (await requestFn(
+    const snapshot = (await readSnapshot(
       `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/snapshot`,
-      { signal },
     )).snapshot;
     if (cursor === 0) cursor = Math.max(0, Number(snapshot.last_sequence || 0) - 30);
-    const eventData = await requestFn(
+    const eventData = await readSnapshot(
       `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/events?after_sequence=${cursor}&limit=200`,
-      { signal },
     );
     const events = eventData.events || [];
     for (const event of events) cursor = Math.max(cursor, Number(event.sequence || 0));

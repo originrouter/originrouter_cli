@@ -121,6 +121,11 @@ export function inferWorkspaceMode(objective) {
   return "solo";
 }
 
+export function objectiveMentionsRemoteTarget(objective) {
+  const text = clean(objective);
+  return /\b(?:remote|server|host|machine|device|mac mini|workstation|vm|vps)\b|远程|服务器|远端|另一台|其他电脑|远程电脑|远程机器/i.test(text);
+}
+
 export function workspaceRequiresPlanReview(objective, mode = "auto") {
   return classifyWorkspaceRisk(objective, mode) !== "green";
 }

@@ -11,6 +11,7 @@ import {
   automaticCreatePayload,
   autoConfigurationView,
   runAgentWorkspaceCollaboration,
+  trustCollaborationWorkspace,
 } from "../src/commands/collaboration.js";
 
 function budgetPolicy(overrides = {}) {
@@ -255,6 +256,25 @@ test("automatic payload collection supports a mixed team without interactive pro
   assert.equal(payload.budget.max_concurrency, 2);
 });
 
+test("Auto never silently downgrades an explicit remote objective to Solo when advice is unavailable", async () => {
+  await assert.rejects(
+    automaticCreatePayload({
+      objective: "Inspect my remote computer status",
+      workspaceMode: "auto",
+      cloudAdvice: true,
+      requestFn: async () => ({ capabilities: capabilities() }),
+      loadDeviceDirectoryFn: async () => [],
+      cacheCapabilitiesFn: (value) => value,
+      getCachedCapabilitiesFn: () => null,
+      adviceFn: async () => {
+        throw Object.assign(new Error("advice offline"), { code: "COLLABORATION_ADVICE_UNAVAILABLE" });
+      },
+    }),
+    (error) => error.code === "AUTO_CONFIG_REMOTE_ADVICE_REQUIRED"
+      && /Remote Ops/.test(error.message),
+  );
+});
+
 test("workspace lifecycle does not create a Run before an unsafe configuration is confirmed", async () => {
   const requests = [];
   const result = await runAgentWorkspaceCollaboration({
@@ -315,6 +335,98 @@ test("workspace lifecycle streams a snapshot and completes without terminal logg
   assert.equal(result.run.state, "completed");
   assert(paths.some((path) => path.includes("/snapshot")));
   assert(updates.some((update) => update.type === "snapshot" && update.events.length === 1));
+});
+
+test("workspace lifecycle reconnects transient snapshot failures without recreating the Run", async () => {
+  const updates = [];
+  const calls = [];
+  let snapshotAttempts = 0;
+  const result = await runAgentWorkspaceCollaboration({
+    objective: "Inspect the remote computer",
+    confirmation: "always",
+    interval: 0,
+    automaticCreatePayloadFn: async () => ({
+      objective: "Inspect the remote computer",
+      workspace_mode: "auto",
+      resolved_workspace_mode: "remote_ops",
+      planning_source: "cloud_advice",
+      participants: [{ participant_id: "coordinator", device_id: "local" }],
+      auto_configuration: { safe_to_skip_confirmation: true },
+    }),
+    requestFn: async (path, options = {}) => {
+      calls.push({ path, method: options.method || "GET" });
+      if (path === "/collaboration/local/runs") {
+        return { run: { run_id: "acr_reconnect", state: "created" } };
+      }
+      if (path.endsWith("/start")) {
+        return { run: { run_id: "acr_reconnect", state: "designing" } };
+      }
+      if (path.includes("/snapshot")) {
+        snapshotAttempts += 1;
+        if (snapshotAttempts === 1) {
+          throw Object.assign(new Error("local API connection failed"), {
+            code: "LOCAL_API_CONNECTION_FAILED",
+          });
+        }
+        return {
+          snapshot: {
+            last_sequence: 1,
+            run: { run_id: "acr_reconnect", state: "completed", phase: "completed" },
+            tasks: [],
+            final_report: { summary: "Recovered and completed." },
+          },
+        };
+      }
+      if (path.includes("/events?")) return { events: [{ sequence: 1, summary: "Recovered" }] };
+      throw new Error(`unexpected path ${path}`);
+    },
+    onUpdate: (update) => updates.push(update),
+  });
+  assert.equal(result.run.state, "completed");
+  assert.equal(calls.filter((call) => call.method === "POST").length, 2, "Run creation and start happen once");
+  assert.equal(calls.filter((call) => call.path.includes("/snapshot")).length, 2);
+  assert.equal(updates[0].phase, "configuring");
+  assert(updates.some((update) => update.phase === "reconnecting" && update.connectionAttempts === 1));
+  assert(updates.some((update) => update.type === "connection" && update.connectionAttempts === 0));
+});
+
+test("workspace lifecycle does not retry non-transient authorization errors", async () => {
+  let calls = 0;
+  await assert.rejects(
+    runAgentWorkspaceCollaboration({
+      objective: "Inspect the remote computer",
+      confirmation: "always",
+      automaticCreatePayloadFn: async () => ({
+        objective: "Inspect the remote computer",
+        workspace_mode: "solo",
+        resolved_workspace_mode: "solo",
+        participants: [{ participant_id: "coordinator", device_id: "local" }],
+        auto_configuration: { safe_to_skip_confirmation: true },
+      }),
+      requestFn: async (path) => {
+        calls += 1;
+        if (path === "/collaboration/local/runs") return { run: { run_id: "acr_auth", state: "created" } };
+        if (path.endsWith("/start")) return { run: { run_id: "acr_auth", state: "running" } };
+        throw Object.assign(new Error("forbidden"), { code: "HTTP_403" });
+      },
+    }),
+    (error) => error.code === "HTTP_403",
+  );
+  assert.equal(calls, 3, "creation, start, and one snapshot read only");
+});
+
+test("workspace authorization uses the injected authenticated request client", async () => {
+  let captured;
+  const workspace = await trustCollaborationWorkspace("remote/device", " '/srv/project' ", {
+    requestFn: async (path, options) => {
+      captured = { path, options };
+      return { workspace: { workspace_id: "workspace-remote", canonical_path: options.body.path } };
+    },
+  });
+  assert.equal(captured.path, "/collaboration/devices/remote%2Fdevice/workspaces/trust");
+  assert.equal(captured.options.method, "POST");
+  assert.equal(captured.options.body.path, " '/srv/project' ");
+  assert.equal(workspace.workspace_id, "workspace-remote");
 });
 
 test("JSON automation projection is stable and excludes capability secrets and paths", () => {
