@@ -6,6 +6,7 @@ import {
   parsePlannerOutput,
   taskPrompt,
 } from "./adaptivePlan.js";
+import { browseAgentWorkspaces } from "../daemon/workspaceBrowser.js";
 
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "expired"]);
 const COMPLETE_EVENTS = new Set(["agent.task.complete", "agent.task.completed"]);
@@ -175,6 +176,7 @@ export class CollaborationRuntime {
     this.mcpRequests = new Map();
     this.capabilityRequests = new Map();
     this.workspaceTrustRequests = new Map();
+    this.workspaceBrowseRequests = new Map();
     this.unsubscribe = registry?.subscribe?.((notification) => this.enqueue(notification)) || (() => {});
   }
 
@@ -661,6 +663,60 @@ export class CollaborationRuntime {
       if (pending) {
         clearTimeout(pending.timer);
         this.workspaceTrustRequests.delete(requestId);
+      }
+      throw error;
+    }
+  }
+
+  async browseWorkspacesOnDevice(deviceId, { path = "", query = "", limit = 8 } = {}) {
+    const targetDeviceId = safeText(deviceId, 191);
+    if (!targetDeviceId) throw new Error("device id is required");
+    if (targetDeviceId === this.deviceId || targetDeviceId === "local") {
+      return browseAgentWorkspaces({
+        path,
+        query,
+        limit,
+        catalog: this.catalog,
+        deviceId: this.deviceId,
+      });
+    }
+    if (!this.relayClient) {
+      const error = new Error("OriginRouter virtual network is unavailable");
+      error.code = "COLLABORATION_WORKSPACE_RELAY_UNAVAILABLE";
+      throw error;
+    }
+    const requestId = compactId(`workspace-browse-${randomUUID()}`, 64);
+    const response = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.workspaceBrowseRequests.delete(requestId);
+        const error = new Error("remote workspace browse request timed out");
+        error.code = "COLLABORATION_WORKSPACE_BROWSE_TIMEOUT";
+        reject(error);
+      }, 10_000);
+      timer.unref?.();
+      this.workspaceBrowseRequests.set(requestId, { resolve, reject, timer, targetDeviceId });
+    });
+    try {
+      const sent = await this.relayClient.send("agent.workspace.browse", {
+        requestId,
+        sourceDeviceId: this.deviceId,
+        targetDeviceId,
+        path: safeText(path, 4096),
+        query: safeText(query, 256),
+        limit: Math.max(1, Math.min(20, Number(limit) || 8)),
+      });
+      const delivery = sent?.data || sent || {};
+      if (delivery.accepted === false && !delivery.queued) {
+        const error = new Error(delivery.reason || "remote workspace browse request was rejected");
+        error.code = safeText(delivery.reason, 96) || "COLLABORATION_WORKSPACE_BROWSE_REJECTED";
+        throw error;
+      }
+      return await response;
+    } catch (error) {
+      const pending = this.workspaceBrowseRequests.get(requestId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.workspaceBrowseRequests.delete(requestId);
       }
       throw error;
     }
@@ -1212,6 +1268,53 @@ export class CollaborationRuntime {
   }
 
   async handleRelayEvent(payload = {}) {
+    if (payload.type === "agent.workspace.browse") {
+      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      let page = null;
+      let errorPayload = null;
+      try {
+        page = await browseAgentWorkspaces({
+          path: payload.path,
+          query: payload.query,
+          limit: payload.limit,
+          catalog: this.catalog,
+          deviceId: this.deviceId,
+        });
+      } catch (error) {
+        errorPayload = {
+          error: safeText(error?.message, 2048) || "workspace browse failed",
+          reason: safeText(error?.code, 96) || "workspace_browse_failed",
+        };
+      }
+      await this.relayClient?.send?.("agent.workspace.page", {
+        requestId: safeText(payload.requestId, 64),
+        sourceDeviceId: this.deviceId,
+        targetDeviceId: safeText(payload.sourceDeviceId, 191),
+        ...(errorPayload || page || {}),
+      });
+      return true;
+    }
+    if (payload.type === "agent.workspace.page") {
+      const requestId = safeText(payload.requestId, 64);
+      const pending = this.workspaceBrowseRequests.get(requestId);
+      if (!pending) return false;
+      clearTimeout(pending.timer);
+      this.workspaceBrowseRequests.delete(requestId);
+      if (payload.error) {
+        const error = new Error(safeText(payload.error, 2048) || "remote workspace browse failed");
+        error.code = safeText(payload.reason, 96) || "COLLABORATION_WORKSPACE_BROWSE_FAILED";
+        pending.reject(error);
+      } else {
+        pending.resolve({
+          current_path: safeText(payload.current_path, 4096),
+          parent_path: safeText(payload.parent_path, 4096),
+          query: safeText(payload.query, 256),
+          entries: Array.isArray(payload.entries) ? payload.entries.slice(0, 20) : [],
+          truncated: payload.truncated === true,
+        });
+      }
+      return true;
+    }
     if (payload.type === "collaboration.control.request") {
       if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
       let data = null;
@@ -2249,5 +2352,12 @@ export class CollaborationRuntime {
       pending.reject(error);
     }
     this.workspaceTrustRequests.clear();
+    for (const pending of this.workspaceBrowseRequests.values()) {
+      clearTimeout(pending.timer);
+      const error = new Error("collaboration workspace browser stopped");
+      error.code = "COLLABORATION_WORKSPACE_BROWSE_STOPPED";
+      pending.reject(error);
+    }
+    this.workspaceBrowseRequests.clear();
   }
 }

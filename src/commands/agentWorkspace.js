@@ -7,8 +7,10 @@ import {
 } from "node:readline";
 
 import {
+  browseCollaborationWorkspaces,
   controlCollaborationRun,
   handleCollaborationCommand,
+  retryAgentWorkspaceCollaboration,
   runAgentWorkspaceCollaboration,
   trustCollaborationWorkspace,
 } from "./collaboration.js";
@@ -354,7 +356,7 @@ function buildRuntimeRows(runtime, columns, maxRows) {
   const terminal = ["completed", "failed", "cancelled", "expired"].includes(runtime.snapshot?.run?.state);
   const spinner = terminal || ["needs_setup", "error"].includes(runtime.phase)
     ? (runtime.snapshot?.run?.state === "completed" ? "✓" : "!")
-    : SPINNER_FRAMES[Math.floor(Date.now() / 100) % SPINNER_FRAMES.length];
+    : SPINNER_FRAMES[Number(runtime.animationFrame || 0) % SPINNER_FRAMES.length];
   push(`${spinner} ${runtimePhase(runtime)}${runtime.startedAt ? ` (${elapsedText(runtime.startedAt)})` : ""}`, strong);
 
   const configured = runtime.configuration;
@@ -409,7 +411,48 @@ function buildRuntimeRows(runtime, columns, maxRows) {
         push(runtime.setupPath
           ? "The folder path is being edited below."
           : `Type the folder path below. Example: ${runtime.setup.default_path || "/path/to/workspace"}`, muted);
+        if (runtime.setupBrowseLoading) push("Searching folders…", muted);
+        const suggestions = runtime.setupSuggestions || [];
+        if (suggestions.length) {
+          push("");
+          push("Matching folders", strong);
+          for (const [index, suggestion] of suggestions.slice(0, 6).entries()) {
+            const marker = index === runtime.setupSuggestionSelection ? "›" : " ";
+            push(`${marker} ${suggestion.path || suggestion.name}`);
+          }
+          push("Tab completes the selected folder.", muted);
+        } else if (runtime.setupBrowseError) {
+          push(`Folder suggestions unavailable: ${runtime.setupBrowseError}`, muted);
+        }
       }
+    }
+  } else if (runtime.phase === "awaiting_configuration" && configured) {
+    push("");
+    push("Proposed collaboration team", strong);
+    const advice = configured.auto_configuration?.advice;
+    if (advice?.reason) push(advice.reason, muted);
+    push(`Risk ${configured.risk_tier || "green"} · ${configured.planning_source === "cloud_advice" ? "advisory model" : "local policy"}`, muted);
+    for (const participant of configured.participants || []) {
+      const runtimeName = participant.runtime === "claude" ? "Claude Code" : "Codex";
+      push(`${participant.planner ? "●" : "○"} ${participant.display_name || participant.participant_id} · ${runtimeName}`, strong);
+      push(`  ${participant.device_id} · ${participant.workspace_id || "workspace pending"} · ${participant.permission_profile || "manual"}`, muted);
+      if (participant.role_hint) push(`  ${participant.role_hint}`, muted);
+    }
+  } else if (runtime.interactionKind === "attention" && runtime.attention) {
+    push("");
+    push(runtime.attention.title || "Agent needs your input", strong);
+    if (runtime.attention.summary) push(runtime.attention.summary, muted);
+    if (runtime.attention.risk) push(`Risk: ${runtime.attention.risk}`, muted);
+    push("");
+    for (const [index, action] of (runtime.attention.actions || []).entries()) {
+      push(`${index === runtime.attentionSelection ? "›" : " "} ${index + 1}. ${action}`);
+    }
+  } else if (runtime.interactionKind === "paused") {
+    push("");
+    push("This collaboration is paused.", strong);
+    push(runtime.snapshot?.run?.pause_reason || "The OriginRouter service is preserving the Run state.", muted);
+    if (runtime.snapshot?.run?.account_budget_blocked) {
+      push("The account or device budget must be changed before this Run can resume.", muted);
     }
   } else if (runtime.error) {
     push("");
@@ -421,6 +464,11 @@ function buildRuntimeRows(runtime, columns, maxRows) {
     push("");
     push(plan.title || "Proposed plan", strong);
     if (plan.summary) push(plan.summary, muted);
+    for (const [index, task] of (plan.tasks || []).entries()) {
+      const dependencies = task.depends_on?.length ? ` · after ${task.depends_on.join(", ")}` : "";
+      push(`${index + 1}. ${task.title || task.id} · ${task.participant_id || "unassigned"}${dependencies}`);
+      if (task.deliverable) push(`   ${task.deliverable}`, muted);
+    }
   }
 
   const tasks = (runtime.snapshot?.tasks || []).filter((task) => task.task_key !== "__planner__");
@@ -451,21 +499,27 @@ function buildRuntimeRows(runtime, columns, maxRows) {
       }
     }
   }
-  return lines.slice(0, Math.max(0, maxRows));
+  runtime.contentLineCount = lines.length;
+  const visibleRows = Math.max(0, maxRows);
+  const maxStart = Math.max(0, lines.length - visibleRows);
+  const start = Math.max(0, Math.min(maxStart, Number(runtime.scrollOffset) || 0));
+  return lines.slice(start, start + visibleRows);
 }
 
 function runtimeControls(runtime, columns) {
   const mode = workspaceModeDefinition(runtime.mode || "auto").label;
-  let text = runtime.notice || "Enter queues next objective · ctrl+c interrupts · ← agents";
+  let text = runtime.notice || "Enter queues next objective · ctrl+c interrupts · ctrl+t freezes · PgUp/PgDn reviews";
+  if (runtime.screenPaused) text = "screen frozen for copying · ctrl+t resumes updates";
   if (runtime.queuedObjective) text = "next objective queued · ctrl+c interrupts · ← agents";
   if (runtime.phase === "needs_setup") text = runtime.setup?.workspaces?.length && runtime.setupMode !== "path"
     ? "↑/↓ selects · Enter confirms · type a path · esc cancels"
     : runtime.setup?.workspaces?.length
-      ? "Type a path · Enter authorizes · Ctrl+U clears · Esc back"
-      : "Type a path · Enter authorizes · Ctrl+U clears · Esc cancels";
-  if (runtime.phase === "awaiting_configuration") text = "Enter uses this team · esc cancels before creating a Run";
+      ? "Tab completes · Enter authorizes · Ctrl+U clears · Esc back"
+      : "Tab completes · Enter authorizes · Ctrl+U clears · Esc cancels";
+  if (runtime.phase === "awaiting_configuration") text = "Enter uses this team · PgUp/PgDn reviews · Esc returns to the objective";
   if (runtime.phase === "reconnecting") text = "connection interrupted · retrying automatically · ctrl+c cancels";
-  if (runtime.snapshot?.run?.state === "awaiting_confirmation") text = "Enter starts the plan · esc leaves it pending";
+  if (runtime.snapshot?.run?.state === "awaiting_confirmation") text = "Enter starts · E requests changes · PgUp/PgDn reviews · Esc leaves pending";
+  if (["attention", "attention_reply"].includes(runtime.interactionKind)) text = "Agent is waiting for your response";
   if (["completed", "failed", "cancelled", "error"].includes(runtime.snapshot?.run?.state || runtime.phase)) {
     text = "returning to the objective prompt";
   }
@@ -509,7 +563,7 @@ function interactionComposer(runtime, columns) {
   if (kind === "workspace") {
     lines = [
       "? Choose an authorized workspace",
-      "↑/↓ select · 1-9 jump · Enter confirm · type a path for another folder",
+      "↑/↓ select · number selects an item · Enter confirm · P enters a path",
       "Esc cancel",
     ];
   } else if (kind === "setup") {
@@ -528,18 +582,51 @@ function interactionComposer(runtime, columns) {
         ? `› ${pathWithCursor}`
         : `› ${pathWithCursor}  ${muted(`example: ${runtime.setup?.default_path || "/path/to/workspace"}`)}`,
       runtime.setup?.workspaces?.length
-        ? "Enter authorize · Ctrl+U clears · Esc back to workspace list"
-        : "Enter authorize · Ctrl+U clears · Esc cancels",
+        ? "Tab completes · ↑/↓ suggestions · Enter authorize · Esc back"
+        : "Tab completes · ↑/↓ suggestions · Enter authorize · Esc cancels",
     ];
   } else if (kind === "configuration") {
     lines = [
       "? Use this collaboration team?",
-      "Enter confirm · Esc cancel before creating a Run",
+      "Enter confirm · PgUp/PgDn review · Esc return to objective",
     ];
   } else if (kind === "plan") {
     lines = [
       "? Start this plan?",
-      "Enter start · Esc leave pending",
+      "Enter start · E request changes · PgUp/PgDn review · Esc leave pending",
+    ];
+  } else if (kind === "plan_revision") {
+    const feedback = String(runtime.decisionBuffer || "");
+    const feedbackChars = [...feedback];
+    const feedbackCursor = Math.max(0, Math.min(runtime.decisionCursor || 0, feedbackChars.length));
+    lines = [
+      "? What should the Planner change?",
+      composerLine(feedback, feedbackCursor, columns),
+      "Enter submit changes · Ctrl+U clears · Esc back to plan",
+    ];
+  } else if (kind === "completion") {
+    const canRetry = ["failed", "cancelled", "expired"].includes(runtime.snapshot?.run?.state);
+    lines = [
+      `? ${runtime.snapshot?.run?.state === "completed" ? "Collaboration complete" : "Collaboration stopped"}`,
+      canRetry
+        ? "R retry this Run · PgUp/PgDn review · Enter return to objective prompt"
+        : "PgUp/PgDn review result · Enter return to objective prompt",
+    ];
+  } else if (kind === "attention") {
+    lines = [
+      "? Agent needs your decision",
+      "↑/↓ select · number selects · Enter confirms · Esc leaves pending",
+    ];
+  } else if (kind === "attention_reply") {
+    lines = [
+      "? Reply to the Agent",
+      composerLine(runtime.decisionBuffer || "", runtime.decisionCursor || 0, columns),
+      "Enter sends reply · Ctrl+U clears · Esc back to actions",
+    ];
+  } else if (kind === "paused") {
+    lines = [
+      "? Resume this collaboration?",
+      "Enter resume · Esc leave it paused",
     ];
   } else {
     lines = ["? OriginRouter needs your input", "Enter confirm · Esc cancel"];
@@ -551,9 +638,14 @@ function interactionComposer(runtime, columns) {
 function interactionStatus(runtime, columns) {
   const labels = {
     workspace: "selecting workspace",
-    setup: "authorizing workspace",
+    setup: "choosing folder",
     configuration: "reviewing team",
     plan: "reviewing plan",
+    plan_revision: "requesting plan changes",
+    completion: "reviewing result",
+    attention: "Agent needs input",
+    attention_reply: "replying to Agent",
+    paused: "collaboration paused",
   };
   return padDisplayRight(muted(`  ${labels[runtime.interactionKind] || "waiting for input"}`), columns);
 }
@@ -586,9 +678,9 @@ export function buildWorkspaceAppScreen({
   composerCursor = 0,
   composerNotice = "",
 } = {}) {
-  const terminalColumns = Math.max(40, Number(columns) || 80);
-  const terminalRows = Math.max(14, Number(rows) || 24);
-  const frameWidth = Math.max(56, Math.min(terminalColumns, 96) - 2);
+  const terminalColumns = Math.max(20, Number(columns) || 80);
+  const terminalRows = Math.max(8, Number(rows) || 24);
+  const frameWidth = Math.max(18, Math.min(terminalColumns - 2, 94));
   const contentWidth = frameWidth - 4;
   const modeLabel = workspaceModeDefinition(mode).label;
   const lead = coordinatorLabel(coordinator);
@@ -617,15 +709,34 @@ export function buildWorkspaceAppScreen({
     (_, index) => pair(leftRows[index] || padDisplayRight("", leftWidth), rightRows[index] || "", index),
   );
 
-  const headerRows = [
-    titleLine("OriginRouter", frameWidth),
-    appLine("", contentWidth),
-    ...detailRows,
-    bottomLine(frameWidth),
-  ];
-  const reservedRows = 5;
+  const compactHeader = runtime || terminalRows < 14 || terminalColumns < 56;
+  const headerRows = compactHeader
+    ? [
+        titleLine("OriginRouter", frameWidth),
+        appLine(
+          runtime
+            ? `${workspace} · ${modeLabel} · ${runtimePhase(runtime)}${runtime.runId ? ` · ${runtime.runId}` : ""}`
+            : `${workspace} · ${modeLabel} · Ready for an objective`,
+          contentWidth,
+        ),
+        bottomLine(frameWidth),
+      ]
+    : [
+        titleLine("OriginRouter", frameWidth),
+        appLine("", contentWidth),
+        ...detailRows,
+        bottomLine(frameWidth),
+      ];
+  const runtimeComposerBlock = runtime
+    ? runtime.interaction
+      ? interactionComposer(runtime, terminalColumns)
+      : runtimeComposer(runtime, terminalColumns)
+    : "";
+  const reservedRows = runtime
+    ? 4 + runtimeComposerBlock.split("\n").length
+    : 5;
   const activityRows = runtime
-    ? buildRuntimeRows(runtime, terminalColumns, Math.max(3, terminalRows - headerRows.length - reservedRows))
+    ? buildRuntimeRows(runtime, terminalColumns, Math.max(0, terminalRows - headerRows.length - reservedRows))
     : [];
   const screenRows = [...headerRows, ...activityRows];
   const separator = border("─".repeat(terminalColumns));
@@ -641,9 +752,7 @@ export function buildWorkspaceAppScreen({
       muted("  Enter submits · Ctrl+C clears · Ctrl+D exits · /help for commands"),
     ].join("\n");
   }
-  const composer = runtime.interaction
-    ? interactionComposer(runtime, terminalColumns)
-    : runtimeComposer(runtime, terminalColumns);
+  const composer = runtimeComposerBlock;
   const status = runtime.interaction
     ? interactionStatus(runtime, terminalColumns)
     : composerStatus(terminalColumns);
@@ -824,15 +933,15 @@ export function redrawPrompt(output, buffer, mode, previousRows = 0, { notice = 
   return renderedRows;
 }
 
-async function readWorkspaceLine({ input, output, mode, coordinator, panel, onModeChange }) {
+async function readWorkspaceLine({ input, output, mode, coordinator, panel, onModeChange, initialBuffer = "" }) {
   if (!input.isTTY || !output.isTTY || typeof input.setRawMode !== "function") {
     throw new Error("Interactive Agent Workspace requires a terminal. Pass an objective, for example: originrouter \"fix the failing test\"");
   }
   emitKeypressEvents(input);
   input.setRawMode(true);
   input.resume();
-  let buffer = "";
-  let cursor = 0;
+  let buffer = String(initialBuffer || "");
+  let cursor = [...buffer].length;
   let notice = "";
   let exitArmed = false;
   let noticeTimer = null;
@@ -1014,19 +1123,68 @@ function isInterrupted(error) {
     || error?.cause?.code === "ORIGINROUTER_INTERRUPTED";
 }
 
-async function readRuntimeDecision({ input, runtime, render, kind }) {
+async function readRuntimeDecision({ input, runtime, render, kind, browseWorkspaceFn = null }) {
   emitKeypressEvents(input);
   input.setRawMode(true);
   input.resume();
   runtime.interaction = true;
   runtime.interactionKind = kind;
+  runtime.scrollOffset = 0;
   let buffer = kind === "setup" ? String(runtime.setupPath || "") : "";
   let cursor = [...buffer].length;
   runtime.setupPath = buffer;
   runtime.setupCursor = cursor;
+  runtime.setupSuggestions = [];
+  runtime.setupSuggestionSelection = 0;
+  runtime.setupBrowseLoading = false;
+  runtime.setupBrowseError = "";
+  runtime.decisionBuffer = ["plan_revision", "attention_reply"].includes(kind)
+    ? String(runtime.decisionBuffer || "")
+    : "";
+  runtime.decisionCursor = [...runtime.decisionBuffer].length;
+  let browseTimer = null;
+  let browseGeneration = 0;
+  const scheduleBrowse = () => {
+    if (kind !== "setup" || typeof browseWorkspaceFn !== "function") return;
+    if (browseTimer) clearTimeout(browseTimer);
+    const generation = ++browseGeneration;
+    runtime.setupBrowseLoading = Boolean(buffer);
+    runtime.setupBrowseError = "";
+    runtime.setupSuggestions = [];
+    runtime.setupSuggestionSelection = 0;
+    if (!buffer) {
+      runtime.setupBrowseLoading = false;
+      render(true);
+      return;
+    }
+    browseTimer = setTimeout(() => {
+      browseTimer = null;
+      Promise.resolve(browseWorkspaceFn(runtime.setup?.device_id, buffer))
+        .then((page) => {
+          if (generation !== browseGeneration || kind !== "setup" || !runtime.interaction) return;
+          runtime.setupBrowseLoading = false;
+          runtime.setupSuggestions = (page?.entries || [])
+            .filter((entry) => entry?.path)
+            .slice(0, 6);
+          runtime.setupSuggestionSelection = 0;
+          render(true);
+        })
+        .catch((error) => {
+          if (generation !== browseGeneration || kind !== "setup" || !runtime.interaction) return;
+          runtime.setupBrowseLoading = false;
+          runtime.setupSuggestions = [];
+          runtime.setupBrowseError = String(error?.message || error).split("\n")[0];
+          render(true);
+        });
+    }, 180);
+    browseTimer.unref?.();
+  };
   render(true);
+  if (kind === "setup" && buffer) scheduleBrowse();
   return new Promise((resolve, reject) => {
     const cleanup = () => {
+      if (browseTimer) clearTimeout(browseTimer);
+      browseGeneration += 1;
       input.off("keypress", onKeypress);
       input.off("error", onError);
       runtime.interaction = false;
@@ -1041,13 +1199,42 @@ async function readRuntimeDecision({ input, runtime, render, kind }) {
       reject(error);
     };
     const onKeypress = (text, key = {}) => {
+      if (["pageup", "pagedown"].includes(key.name)) {
+        const direction = key.name === "pageup" ? -1 : 1;
+        const pageSize = 6;
+        const maxOffset = Math.max(0, Number(runtime.contentLineCount || 0) - 3);
+        runtime.scrollOffset = Math.max(0, Math.min(
+          maxOffset,
+          Number(runtime.scrollOffset || 0) + direction * pageSize,
+        ));
+        render(true);
+        return;
+      }
       if (key.name === "escape" || (key.ctrl && key.name === "c")) {
+        if (kind === "plan_revision") {
+          kind = "plan";
+          runtime.interactionKind = "plan";
+          runtime.decisionBuffer = "";
+          runtime.decisionCursor = 0;
+          render(true);
+          return;
+        }
+        if (kind === "attention_reply") {
+          kind = "attention";
+          runtime.interactionKind = "attention";
+          runtime.decisionBuffer = "";
+          runtime.decisionCursor = 0;
+          render(true);
+          return;
+        }
         if (kind === "setup" && runtime.setup?.workspaces?.length) {
           runtime.interactionKind = "workspace";
           runtime.setupMode = "workspace";
           runtime.setupSelection = 0;
           runtime.setupPath = "";
           runtime.setupCursor = 0;
+          runtime.setupSuggestions = [];
+          runtime.setupBrowseLoading = false;
           kind = "workspace";
           buffer = "";
           cursor = 0;
@@ -1073,10 +1260,72 @@ async function readRuntimeDecision({ input, runtime, render, kind }) {
             }
             runtime.notice = "";
             finish(path);
+          } else if (kind === "plan_revision") {
+            const feedback = String(runtime.decisionBuffer || "").trim();
+            if (!feedback) {
+              runtime.notice = "Describe the required plan change before submitting";
+              render(true);
+              return;
+            }
+            finish({ action: "revise", feedback });
+          } else if (kind === "attention") {
+            const action = runtime.attention?.actions?.[runtime.attentionSelection || 0];
+            if (!action) return;
+            if (runtime.attention?.kind === "input" && action === "submit") {
+              kind = "attention_reply";
+              runtime.interactionKind = "attention_reply";
+              runtime.decisionBuffer = "";
+              runtime.decisionCursor = 0;
+              render(true);
+              return;
+            }
+            finish({ action, response: {} });
+          } else if (kind === "attention_reply") {
+            const reply = String(runtime.decisionBuffer || "").trim();
+            if (!reply) {
+              runtime.notice = "Enter a reply before submitting";
+              render(true);
+              return;
+            }
+            finish({ action: "submit", response: { text: reply } });
+          } else if (kind === "completion") {
+            finish("continue");
+          } else if (kind === "paused") {
+            finish("resume");
           } else {
             finish("confirm");
           }
         }
+        return;
+      }
+      if (kind === "plan" && !key.ctrl && !key.meta && /^[eE]$/.test(text || "")) {
+        kind = "plan_revision";
+        runtime.interactionKind = "plan_revision";
+        runtime.decisionBuffer = "";
+        runtime.decisionCursor = 0;
+        runtime.notice = "";
+        render(true);
+        return;
+      }
+      if (kind === "completion" && !key.ctrl && !key.meta && /^[rR]$/.test(text || "")) {
+        if (["failed", "cancelled", "expired"].includes(runtime.snapshot?.run?.state)) {
+          finish("retry");
+        }
+        return;
+      }
+      if (kind === "attention") {
+        const actions = runtime.attention?.actions || [];
+        if (!actions.length) return;
+        if (key.name === "up") {
+          runtime.attentionSelection = (runtime.attentionSelection - 1 + actions.length) % actions.length;
+        } else if (key.name === "down" || key.name === "tab") {
+          runtime.attentionSelection = (runtime.attentionSelection + 1) % actions.length;
+        } else if (/^[1-9]$/.test(text || "") && Number(text) <= actions.length) {
+          runtime.attentionSelection = Number(text) - 1;
+        } else {
+          return;
+        }
+        render(true);
         return;
       }
       if (kind === "workspace") {
@@ -1108,6 +1357,7 @@ async function readRuntimeDecision({ input, runtime, render, kind }) {
           runtime.setupCursor = cursor;
           runtime.notice = "";
           render(true);
+          scheduleBrowse();
           return;
         }
         if (key.name === "up") {
@@ -1127,7 +1377,64 @@ async function readRuntimeDecision({ input, runtime, render, kind }) {
         render(true);
         return;
       }
+      if (["plan_revision", "attention_reply"].includes(kind)) {
+        const chars = [...runtime.decisionBuffer];
+        let decisionCursor = runtime.decisionCursor;
+        if (key.name === "backspace") {
+          if (decisionCursor > 0) {
+            chars.splice(decisionCursor - 1, 1);
+            decisionCursor -= 1;
+          }
+        } else if (key.name === "delete") {
+          chars.splice(decisionCursor, 1);
+        } else if (key.name === "left") {
+          decisionCursor = Math.max(0, decisionCursor - 1);
+        } else if (key.name === "right") {
+          decisionCursor = Math.min(chars.length, decisionCursor + 1);
+        } else if (key.name === "home" || (key.ctrl && key.name === "a")) {
+          decisionCursor = 0;
+        } else if (key.name === "end" || (key.ctrl && key.name === "e")) {
+          decisionCursor = chars.length;
+        } else if (key.ctrl && key.name === "u") {
+          chars.splice(0, chars.length);
+          decisionCursor = 0;
+        } else if (!key.ctrl && !key.meta && text && !key.name?.startsWith("f")) {
+          text = cleanInsertedText(text);
+          if (!text) return;
+          chars.splice(decisionCursor, 0, ...text);
+          decisionCursor += [...text].length;
+        } else {
+          return;
+        }
+        runtime.decisionBuffer = chars.join("");
+        runtime.decisionCursor = decisionCursor;
+        runtime.notice = "";
+        render(true);
+        return;
+      }
       if (kind !== "setup") return;
+      const suggestions = runtime.setupSuggestions || [];
+      if (key.name === "tab" && suggestions.length) {
+        const selected = suggestions[runtime.setupSuggestionSelection || 0] || suggestions[0];
+        buffer = String(selected.path || "");
+        cursor = [...buffer].length;
+        runtime.setupPath = buffer;
+        runtime.setupCursor = cursor;
+        runtime.setupSuggestions = [];
+        runtime.setupSuggestionSelection = 0;
+        runtime.notice = "Folder completed; press Enter to authorize";
+        render(true);
+        scheduleBrowse();
+        return;
+      }
+      if (["up", "down"].includes(key.name) && suggestions.length) {
+        const direction = key.name === "up" ? -1 : 1;
+        runtime.setupSuggestionSelection = (
+          runtime.setupSuggestionSelection + direction + suggestions.length
+        ) % suggestions.length;
+        render(true);
+        return;
+      }
       const chars = [...buffer];
       if (key.name === "backspace") {
         if (cursor > 0) {
@@ -1162,6 +1469,7 @@ async function readRuntimeDecision({ input, runtime, render, kind }) {
       runtime.setupCursor = cursor;
       runtime.notice = "";
       render(true);
+      scheduleBrowse();
     };
     input.on("keypress", onKeypress);
     input.once("error", onError);
@@ -1207,7 +1515,7 @@ function completionPanel(runtime) {
     lines: [
       runtime.error ? String(runtime.error.message || runtime.error).split("\n")[0] : report?.summary || runtimePhase(runtime),
       runtime.runId ? `Run ${runtime.runId}` : "No Run was created.",
-      runtime.runId ? "Use collaboration retry to continue from this Run." : "Enter another objective below.",
+      runtime.runId ? `Use originrouter collaboration retry ${runtime.runId} to continue it later.` : "Enter another objective below.",
     ],
   };
 }
@@ -1220,8 +1528,11 @@ async function runWorkspaceObjective({
   input,
   output,
   collaborationRunner,
+  workspaceRunner = runAgentWorkspaceCollaboration,
+  retryRunner = retryAgentWorkspaceCollaboration,
   cancelCollaborationRun,
   trustWorkspaceFn = trustCollaborationWorkspace,
+  browseWorkspaceFn = browseCollaborationWorkspaces,
 }) {
   const runtime = {
     phase: "configuring",
@@ -1237,6 +1548,10 @@ async function runWorkspaceObjective({
     setupPath: "",
     setupCursor: 0,
     setupSelection: 0,
+    setupSuggestions: [],
+    setupSuggestionSelection: 0,
+    setupBrowseLoading: false,
+    setupBrowseError: "",
     composerBuffer: "",
     composerCursor: 0,
     queuedObjective: "",
@@ -1245,6 +1560,15 @@ async function runWorkspaceObjective({
     interactionKind: "",
     error: null,
     connectionAttempts: 0,
+    animationFrame: 0,
+    scrollOffset: 0,
+    contentLineCount: 0,
+    decisionBuffer: "",
+    decisionCursor: 0,
+    draftObjective: "",
+    screenPaused: false,
+    attention: null,
+    attentionSelection: 0,
   };
   const render = (force = false) => redrawWorkspaceApp(output, {
     coordinator,
@@ -1254,13 +1578,21 @@ async function runWorkspaceObjective({
     force,
   });
   const frameScheduler = createWorkspaceFrameScheduler({ render });
-  const scheduleRender = () => frameScheduler.request(false);
+  const scheduleRender = () => {
+    if (!runtime.screenPaused) frameScheduler.request(false);
+  };
   const onResize = () => scheduleRender();
   const timer = setInterval(() => {
     // Do not invalidate native terminal text selection while a setup/composer
     // interaction is active. State is redrawn on keypress and resize.
-    if (!runtime.interaction) scheduleRender();
-  }, 1000);
+    const terminal = ["completed", "failed", "cancelled", "expired", "error"].includes(
+      runtime.snapshot?.run?.state || runtime.phase,
+    );
+    if (!runtime.interaction && !runtime.screenPaused && !terminal && runtime.phase !== "needs_setup") {
+      runtime.animationFrame = (runtime.animationFrame + 1) % SPINNER_FRAMES.length;
+      scheduleRender();
+    }
+  }, 100);
   timer.unref?.();
   output.on?.("resize", onResize);
   // Entering the runtime changes the bottom-pane layout. Start it with a
@@ -1301,6 +1633,22 @@ async function runWorkspaceObjective({
   };
   const onActiveKeypress = (text, key = {}) => {
     if (runtime.interaction) return;
+    if (key.ctrl && key.name === "t") {
+      runtime.screenPaused = !runtime.screenPaused;
+      runtime.notice = runtime.screenPaused ? "Screen frozen for copying" : "Screen updates resumed";
+      render(true);
+      return;
+    }
+    if (["pageup", "pagedown"].includes(key.name)) {
+      const direction = key.name === "pageup" ? -1 : 1;
+      const maxOffset = Math.max(0, Number(runtime.contentLineCount || 0) - 3);
+      runtime.scrollOffset = Math.max(0, Math.min(
+        maxOffset,
+        Number(runtime.scrollOffset || 0) + direction * 6,
+      ));
+      render(true);
+      return;
+    }
     if (key.ctrl && key.name === "c") {
       if (runtime.composerBuffer) {
         runtime.composerBuffer = "";
@@ -1379,6 +1727,53 @@ async function runWorkspaceObjective({
     }
   };
   input.on("keypress", onActiveKeypress);
+  const applyRuntimeUpdate = (update) => {
+    if (update.phase) runtime.phase = update.phase;
+    if (Number.isFinite(update.connectionAttempts)) runtime.connectionAttempts = update.connectionAttempts;
+    if (typeof update.message === "string") runtime.notice = update.message;
+    if (update.payload) runtime.configuration = update.payload;
+    if (update.snapshot) {
+      runtime.snapshot = update.snapshot;
+      if (runtime.phase === "reconnecting" && runtime.connectionAttempts === 0) {
+        const state = update.snapshot.run?.state;
+        runtime.phase = ["planning", "created", "designing", "researching", "decomposing"].includes(state)
+          ? "planning"
+          : ["running", "queued"].includes(state) ? "executing" : state || "working";
+      }
+    }
+    if (update.events?.length) {
+      const eventKey = (event, index) => event.sequence ?? event.event_id
+        ?? `${event.type || "event"}:${event.created_at || ""}:${event.summary || ""}:${index}`;
+      const merged = new Map(runtime.events.map((event, index) => [eventKey(event, index), event]));
+      for (const [index, event] of update.events.entries()) merged.set(eventKey(event, index), event);
+      runtime.events = [...merged.values()].sort(
+        (a, b) => Number(a.sequence || 0) - Number(b.sequence || 0),
+      ).slice(-20);
+    }
+    scheduleRender();
+  };
+  const reviewPlan = async (snapshotForReview) => {
+    runtime.snapshot = snapshotForReview;
+    runtime.phase = "awaiting_confirmation";
+    runtime.composerBuffer = "";
+    return readRuntimeDecision({ input, runtime, render, kind: "plan" });
+  };
+  const reviewAttention = async (attention, snapshotForReview) => {
+    runtime.snapshot = snapshotForReview;
+    runtime.attention = attention;
+    runtime.attentionSelection = 0;
+    runtime.phase = "blocked";
+    runtime.composerBuffer = "";
+    const decision = await readRuntimeDecision({ input, runtime, render, kind: "attention" });
+    runtime.attention = null;
+    return decision;
+  };
+  const reviewPause = async (snapshotForReview) => {
+    runtime.snapshot = snapshotForReview;
+    runtime.phase = "paused";
+    runtime.composerBuffer = "";
+    return readRuntimeDecision({ input, runtime, render, kind: "paused" });
+  };
   try {
     while (true) {
       try {
@@ -1396,7 +1791,7 @@ async function runWorkspaceObjective({
         const confirmation = forwarded.includes("--yes")
           ? "always"
           : forwarded.includes("--review") ? "never" : "safe";
-        const snapshot = await runAgentWorkspaceCollaboration({
+        const snapshot = await workspaceRunner({
           objective,
           workspaceMode: mode,
           coordinator,
@@ -1408,48 +1803,38 @@ async function runWorkspaceObjective({
             runtime.runId = runId || runtime.runId;
             render(true);
           },
-          onUpdate: (update) => {
-            if (update.phase) runtime.phase = update.phase;
-            if (Number.isFinite(update.connectionAttempts)) {
-              runtime.connectionAttempts = update.connectionAttempts;
-            }
-            if (typeof update.message === "string") runtime.notice = update.message;
-            if (update.payload) runtime.configuration = update.payload;
-            if (update.snapshot) {
-              runtime.snapshot = update.snapshot;
-              if (runtime.phase === "reconnecting" && runtime.connectionAttempts === 0) {
-                const state = update.snapshot.run?.state;
-                runtime.phase = ["planning", "created", "designing", "researching", "decomposing"].includes(state)
-                  ? "planning"
-                  : ["running", "queued"].includes(state) ? "executing" : state || "working";
-              }
-            }
-            if (update.events?.length) {
-              const eventKey = (event, index) => event.sequence ?? event.event_id
-                ?? `${event.type || "event"}:${event.created_at || ""}:${event.summary || ""}:${index}`;
-              const merged = new Map(runtime.events.map((event, index) => [eventKey(event, index), event]));
-              for (const [index, event] of update.events.entries()) merged.set(eventKey(event, index), event);
-              runtime.events = [...merged.values()].sort(
-                (a, b) => Number(a.sequence || 0) - Number(b.sequence || 0),
-              ).slice(-20);
-            }
-            scheduleRender();
-          },
+          onUpdate: applyRuntimeUpdate,
           onConfigurationConfirmation: async (configuration) => {
             runtime.configuration = configuration;
             runtime.phase = "awaiting_configuration";
             runtime.composerBuffer = "";
-            return readRuntimeDecision({ input, runtime, render, kind: "configuration" });
+            const decision = await readRuntimeDecision({ input, runtime, render, kind: "configuration" });
+            if (decision !== "confirm") runtime.draftObjective = objective;
+            return decision;
           },
-          onPlanConfirmation: async (snapshotForReview) => {
-            runtime.snapshot = snapshotForReview;
-            runtime.phase = "awaiting_confirmation";
-            runtime.composerBuffer = "";
-            return readRuntimeDecision({ input, runtime, render, kind: "plan" });
-          },
+          onPlanConfirmation: reviewPlan,
+          onAttention: reviewAttention,
+          onPaused: reviewPause,
         });
-        runtime.snapshot = snapshot;
-        runtime.phase = snapshot?.run?.state || "completed";
+        let currentSnapshot = snapshot;
+        runtime.snapshot = currentSnapshot;
+        runtime.phase = currentSnapshot?.run?.state || "completed";
+        while (["completed", "failed", "cancelled", "expired"].includes(runtime.phase) && !runtime.queuedObjective) {
+          const decision = await readRuntimeDecision({ input, runtime, render, kind: "completion" });
+          if (decision !== "retry" || !runtime.runId) break;
+          runtime.phase = "planning";
+          runtime.error = null;
+          runtime.events = [];
+          currentSnapshot = await retryRunner(runtime.runId, {
+            signal: controller.signal,
+            onUpdate: applyRuntimeUpdate,
+            onPlanConfirmation: reviewPlan,
+            onAttention: reviewAttention,
+            onPaused: reviewPause,
+          });
+          runtime.snapshot = currentSnapshot;
+          runtime.phase = currentSnapshot?.run?.state || "failed";
+        }
         return runtime;
       } catch (error) {
         if (isInterrupted(error)) {
@@ -1474,17 +1859,25 @@ async function runWorkspaceObjective({
             runtime,
             render,
             kind: workspaces.length ? "workspace" : "setup",
+            browseWorkspaceFn,
           });
           while (true) {
             if (!selected) {
               runtime.phase = "cancelled";
+              runtime.draftObjective = objective;
               return runtime;
             }
             if (selected === "__custom_workspace_path__") {
               runtime.setupMode = "path";
               runtime.setupPath = "";
               runtime.setupCursor = 0;
-              selected = await readRuntimeDecision({ input, runtime, render, kind: "setup" });
+              selected = await readRuntimeDecision({
+                input,
+                runtime,
+                render,
+                kind: "setup",
+                browseWorkspaceFn,
+              });
               continue;
             }
             if (typeof selected === "object") {
@@ -1510,7 +1903,13 @@ async function runWorkspaceObjective({
               runtime.setupPath = String(selected);
               runtime.setupCursor = [...runtime.setupPath].length;
               runtime.notice = `Could not authorize folder: ${String(authorizationError.message || authorizationError).split("\n")[0]}`;
-              selected = await readRuntimeDecision({ input, runtime, render, kind: "setup" });
+              selected = await readRuntimeDecision({
+                input,
+                runtime,
+                render,
+                kind: "setup",
+                browseWorkspaceFn,
+              });
             }
           }
           runtime.phase = "configuring";
@@ -1521,6 +1920,7 @@ async function runWorkspaceObjective({
         }
         runtime.phase = "error";
         runtime.error = error;
+        if (!runtime.runId) runtime.draftObjective = objective;
         return runtime;
       }
     }
@@ -1542,8 +1942,11 @@ export async function handleAgentWorkspaceCommand(argv = [], {
   input = defaultInput,
   output = defaultOutput,
   collaborationRunner = handleCollaborationCommand,
+  workspaceRunner = runAgentWorkspaceCollaboration,
+  retryRunner = retryAgentWorkspaceCollaboration,
   cancelCollaborationRun = async (runId) => controlCollaborationRun(runId, "cancel"),
   trustWorkspaceFn = trustCollaborationWorkspace,
+  browseWorkspaceFn = browseCollaborationWorkspaces,
 } = {}) {
   const parsed = parseAgentWorkspaceArgs(argv);
   if (parsed.objective && (!input.isTTY || !output.isTTY)) {
@@ -1557,6 +1960,7 @@ export async function handleAgentWorkspaceCommand(argv = [], {
   let mode = parsed.mode;
   let panel = null;
   let pendingObjective = parsed.objective;
+  let draftObjective = "";
   const exitApp = enterWorkspaceApp(output);
   try {
     redrawWorkspaceApp(output, { coordinator, mode, panel });
@@ -1567,6 +1971,7 @@ export async function handleAgentWorkspaceCommand(argv = [], {
           mode,
           coordinator,
           panel,
+          initialBuffer: draftObjective,
           onModeChange: () => {
             const next = nextWorkspaceMode(mode);
             mode = next.id;
@@ -1575,6 +1980,7 @@ export async function handleAgentWorkspaceCommand(argv = [], {
           },
         });
       pendingObjective = "";
+      draftObjective = "";
       if (!line) {
         redrawWorkspaceApp(output, { coordinator, mode, panel, force: true });
         continue;
@@ -1616,11 +2022,15 @@ export async function handleAgentWorkspaceCommand(argv = [], {
         input,
         output,
         collaborationRunner,
+        workspaceRunner,
+        retryRunner,
         cancelCollaborationRun,
         trustWorkspaceFn,
+        browseWorkspaceFn,
       });
       panel = completionPanel(runtime);
       pendingObjective = runtime.queuedObjective || "";
+      draftObjective = pendingObjective ? "" : runtime.draftObjective || "";
       redrawWorkspaceApp(output, { coordinator, mode, panel, force: true });
     }
   } finally {

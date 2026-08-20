@@ -37,10 +37,20 @@ async function resolveBrowseLocation(rawPath, rawQuery) {
     return { currentPath: await canonicalDirectory(requested), prefix: query };
   } catch (error) {
     if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
-    return {
-      currentPath: await canonicalDirectory(dirname(requested)),
-      prefix: query || basename(requested),
-    };
+    let candidate = requested;
+    while (true) {
+      const parent = dirname(candidate);
+      try {
+        return {
+          currentPath: await canonicalDirectory(parent),
+          prefix: query || basename(candidate),
+        };
+      } catch (parentError) {
+        if (parentError?.code !== "ENOENT" && parentError?.code !== "ENOTDIR") throw parentError;
+        if (parent === candidate) throw error;
+        candidate = parent;
+      }
+    }
   }
 }
 

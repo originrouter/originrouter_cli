@@ -10,6 +10,8 @@ import {
 import {
   automaticCreatePayload,
   autoConfigurationView,
+  browseCollaborationWorkspaces,
+  retryAgentWorkspaceCollaboration,
   runAgentWorkspaceCollaboration,
   trustCollaborationWorkspace,
 } from "../src/commands/collaboration.js";
@@ -315,6 +317,7 @@ test("workspace lifecycle streams a snapshot and completes without terminal logg
       ],
       auto_configuration: { safe_to_skip_confirmation: false },
     }),
+    onConfigurationConfirmation: async () => "confirm",
     requestFn: async (path) => {
       paths.push(path);
       if (path === "/collaboration/local/runs") return { run: { run_id: "acr_test", state: "created" } };
@@ -390,6 +393,139 @@ test("workspace lifecycle reconnects transient snapshot failures without recreat
   assert(updates.some((update) => update.type === "connection" && update.connectionAttempts === 0));
 });
 
+test("plan review can request changes and waits for the replacement plan", async () => {
+  const paths = [];
+  let snapshotReads = 0;
+  const decisions = [];
+  const result = await runAgentWorkspaceCollaboration({
+    objective: "Inspect the remote computer",
+    confirmation: "never",
+    interval: 0,
+    automaticCreatePayloadFn: async () => ({
+      objective: "Inspect the remote computer",
+      participants: [{ participant_id: "coordinator", device_id: "local" }],
+      auto_configuration: { safe_to_skip_confirmation: false },
+    }),
+    onConfigurationConfirmation: async () => "confirm",
+    requestFn: async (path) => {
+      paths.push(path);
+      if (path === "/collaboration/local/runs") return { run: { run_id: "acr_replan", state: "created" } };
+      if (path.endsWith("/start")) return { run: { run_id: "acr_replan", state: "designing" } };
+      if (path.endsWith("/replan")) return { run: { run_id: "acr_replan", state: "designing" } };
+      if (path.includes("/events?")) return { events: [] };
+      if (path.includes("/snapshot")) {
+        snapshotReads += 1;
+        if (snapshotReads === 1) {
+          return { snapshot: { last_sequence: 0, run: { run_id: "acr_replan", state: "awaiting_confirmation" }, plan: { title: "First plan", tasks: [] }, tasks: [] } };
+        }
+        return { snapshot: { last_sequence: 0, run: { run_id: "acr_replan", state: "completed" }, plan: { title: "Revised plan", tasks: [] }, tasks: [] } };
+      }
+      throw new Error(`unexpected path ${path}`);
+    },
+    onPlanConfirmation: async () => {
+      const decision = { action: "revise", feedback: "Do not modify the remote machine." };
+      decisions.push(decision);
+      return decision;
+    },
+  });
+  assert.equal(result.run.state, "completed");
+  assert.equal(decisions.length, 1);
+  assert(paths.some((path) => path.endsWith("/replan")));
+});
+
+test("a failed workspace Run can be retried and followed in place", async () => {
+  const paths = [];
+  const result = await retryAgentWorkspaceCollaboration("acr_failed", {
+    interval: 0,
+    requestFn: async (path) => {
+      paths.push(path);
+      if (path.endsWith("/retry")) return { run: { run_id: "acr_failed", state: "planning" } };
+      if (path.includes("/snapshot")) {
+        return { snapshot: { last_sequence: 1, run: { run_id: "acr_failed", state: "completed" }, tasks: [], final_report: { summary: "Recovered." } } };
+      }
+      if (path.includes("/events?")) return { events: [{ sequence: 1, summary: "Retry completed" }] };
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+  assert.equal(result.run.state, "completed");
+  assert.equal(paths.filter((path) => path.endsWith("/retry")).length, 1);
+});
+
+test("workspace lifecycle resolves an Agent attention request and continues", async () => {
+  let snapshotReads = 0;
+  const resolutions = [];
+  const result = await runAgentWorkspaceCollaboration({
+    objective: "Inspect the remote computer",
+    confirmation: "always",
+    interval: 0,
+    automaticCreatePayloadFn: async () => ({
+      objective: "Inspect the remote computer",
+      participants: [{ participant_id: "coordinator", device_id: "local" }],
+      auto_configuration: { safe_to_skip_confirmation: true },
+    }),
+    requestFn: async (path, options = {}) => {
+      if (path === "/collaboration/local/runs") return { run: { run_id: "acr_attention", state: "created" } };
+      if (path.endsWith("/start")) return { run: { run_id: "acr_attention", state: "running" } };
+      if (path.includes("/attention/") && path.endsWith("/resolve")) {
+        resolutions.push(options.body);
+        return { item: { status: "resolved" } };
+      }
+      if (path.includes("/events?")) return { events: [] };
+      if (path.includes("/snapshot")) {
+        snapshotReads += 1;
+        if (snapshotReads === 1) {
+          return { snapshot: {
+            last_sequence: 0,
+            run: { run_id: "acr_attention", state: "blocked" },
+            tasks: [],
+            attention: [{ attention_id: "att_1", revision: 1, status: "pending", kind: "approval", actions: ["allow", "deny"] }],
+          } };
+        }
+        return { snapshot: { last_sequence: 0, run: { run_id: "acr_attention", state: "completed" }, tasks: [], attention: [] } };
+      }
+      throw new Error(`unexpected path ${path}`);
+    },
+    onAttention: async () => ({ action: "allow", response: {} }),
+  });
+  assert.equal(result.run.state, "completed");
+  assert.deepEqual(resolutions, [{ expected_revision: 1, action: "allow", response: {} }]);
+});
+
+test("workspace lifecycle resumes a paused Run in place", async () => {
+  let snapshotReads = 0;
+  let resumeCalls = 0;
+  const result = await runAgentWorkspaceCollaboration({
+    objective: "Inspect the remote computer",
+    confirmation: "always",
+    interval: 0,
+    automaticCreatePayloadFn: async () => ({
+      objective: "Inspect the remote computer",
+      participants: [{ participant_id: "coordinator", device_id: "local" }],
+      auto_configuration: { safe_to_skip_confirmation: true },
+    }),
+    requestFn: async (path) => {
+      if (path === "/collaboration/local/runs") return { run: { run_id: "acr_paused", state: "created" } };
+      if (path.endsWith("/start")) return { run: { run_id: "acr_paused", state: "running" } };
+      if (path.endsWith("/resume")) {
+        resumeCalls += 1;
+        return { run: { run_id: "acr_paused", state: "running" } };
+      }
+      if (path.includes("/events?")) return { events: [] };
+      if (path.includes("/snapshot")) {
+        snapshotReads += 1;
+        if (snapshotReads === 1) {
+          return { snapshot: { revision: 2, last_sequence: 0, run: { run_id: "acr_paused", state: "paused", pause_reason: "device temporarily unavailable" }, tasks: [], attention: [] } };
+        }
+        return { snapshot: { revision: 3, last_sequence: 0, run: { run_id: "acr_paused", state: "completed" }, tasks: [], attention: [] } };
+      }
+      throw new Error(`unexpected path ${path}`);
+    },
+    onPaused: async () => "resume",
+  });
+  assert.equal(result.run.state, "completed");
+  assert.equal(resumeCalls, 1);
+});
+
 test("workspace lifecycle does not retry non-transient authorization errors", async () => {
   let calls = 0;
   await assert.rejects(
@@ -427,6 +563,22 @@ test("workspace authorization uses the injected authenticated request client", a
   assert.equal(captured.options.method, "POST");
   assert.equal(captured.options.body.path, " '/srv/project' ");
   assert.equal(workspace.workspace_id, "workspace-remote");
+});
+
+test("workspace browser encodes partial paths for remote completion", async () => {
+  let captured;
+  const page = await browseCollaborationWorkspaces("remote/device", "/Users/cheng", {
+    limit: 6,
+    requestFn: async (path, options) => {
+      captured = { path, options };
+      return { entries: [{ name: "chengaoyan", path: "/Users/chengaoyan" }] };
+    },
+  });
+  assert.match(captured.path, /^\/collaboration\/devices\/remote%2Fdevice\/workspaces\/browse\?/);
+  assert.match(captured.path, /path=%2FUsers%2Fcheng/);
+  assert.match(captured.path, /limit=6/);
+  assert.equal(captured.options.signal, undefined);
+  assert.equal(page.entries[0].path, "/Users/chengaoyan");
 });
 
 test("JSON automation projection is stable and excludes capability secrets and paths", () => {

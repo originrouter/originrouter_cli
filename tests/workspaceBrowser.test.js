@@ -17,6 +17,7 @@ mkdirSync(nested, { recursive: true });
 mkdirSync(outside);
 symlinkSync(outside, join(alpha, "outside-link"));
 mkdirSync(join(projects, "beta-app"), { recursive: true });
+mkdirSync(join(projects, "missing-parent-project"));
 mkdirSync(join(projects, ".hidden-app"));
 writeFileSync(join(projects, "notes.txt"), "not a directory");
 
@@ -24,7 +25,7 @@ const catalog = new AgentCatalog({ stateDir });
 try {
   let page = await browseAgentWorkspaces({ path: projects, catalog, deviceId: "device-1" });
   assert.equal(page.current_path, realpathSync(projects));
-  assert.deepEqual(page.entries.map((item) => item.name), ["alpha-app", "beta-app"]);
+  assert.deepEqual(page.entries.map((item) => item.name), ["alpha-app", "beta-app", "missing-parent-project"]);
   assert.equal(page.entries.every((item) => item.trusted === false), true);
 
   page = await browseAgentWorkspaces({
@@ -34,6 +35,18 @@ try {
   });
   assert.equal(page.current_path, realpathSync(projects));
   assert.deepEqual(page.entries.map((item) => item.name), ["alpha-app"]);
+
+  page = await browseAgentWorkspaces({
+    path: join(projects, "missing-parent", "alpha"),
+    catalog,
+    deviceId: "device-1",
+  });
+  assert.equal(page.current_path, realpathSync(projects));
+  assert.deepEqual(
+    page.entries.map((item) => item.name),
+    ["missing-parent-project"],
+    "the first missing path segment is completed before deeper text",
+  );
 
   page = await browseAgentWorkspaces({
     path: projects,

@@ -294,6 +294,29 @@ doubleExitTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" });
 await doubleExitRun;
 assert.match(doubleExitTerminal.writes.join(""), /Press Ctrl\+C again to exit/);
 
+const resizeTerminal = fakeTerminal(80, 24);
+const resizeRun = handleAgentWorkspaceCommand([], {
+  input: resizeTerminal.input,
+  output: resizeTerminal.output,
+  collaborationRunner: async () => {
+    throw new Error("collaboration should not start");
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+const resizeWriteIndex = resizeTerminal.writes.length;
+resizeTerminal.output.columns = 48;
+resizeTerminal.output.rows = 14;
+resizeTerminal.output.emit("resize");
+await new Promise((resolve) => setTimeout(resolve, 25));
+resizeTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" });
+resizeTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" });
+await resizeRun;
+assert.equal(
+  resizeTerminal.writes.slice(resizeWriteIndex).some((chunk) => chunk.includes("\x1b[2J\x1b[H")),
+  true,
+  "terminal resize forces a complete frame at the new dimensions",
+);
+
 const activeInterruptTerminal = fakeTerminal();
 const cancelledRuns = [];
 let activeRunnerStarted = false;
@@ -410,6 +433,137 @@ assert.equal(
   "runtime and prompt transitions must stay inside the frame renderer",
 );
 
+const configurationDraftTerminal = fakeTerminal();
+let configurationDecision;
+const configurationDraftRun = handleAgentWorkspaceCommand([], {
+  input: configurationDraftTerminal.input,
+  output: configurationDraftTerminal.output,
+  workspaceRunner: async (options) => {
+    setImmediate(() => configurationDraftTerminal.input.emit("keypress", undefined, { name: "escape" }));
+    configurationDecision = await options.onConfigurationConfirmation({
+      resolved_workspace_mode: "remote_ops",
+      planning_source: "cloud_advice",
+      risk_tier: "yellow",
+      participants: [{ participant_id: "coordinator", display_name: "Coordinator", runtime: "codex", device_id: "local", workspace_id: "workspace", permission_profile: "guarded", planner: true }],
+      auto_configuration: { advice: { reason: "Remote inspection requested." } },
+    });
+    setTimeout(() => {
+      configurationDraftTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" });
+      emitText(configurationDraftTerminal.input, "/exit");
+      configurationDraftTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 20);
+    return { run: { state: "configuration_pending" }, tasks: [] };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(configurationDraftTerminal.input, "inspect remote machine");
+configurationDraftTerminal.input.emit("keypress", undefined, { name: "return" });
+await configurationDraftRun;
+assert.equal(configurationDecision, "leave");
+assert.match(configurationDraftTerminal.writes.join(""), /› inspect remote machine▌/);
+
+const planRevisionTerminal = fakeTerminal();
+let planDecision;
+const planRevisionRun = handleAgentWorkspaceCommand([], {
+  input: planRevisionTerminal.input,
+  output: planRevisionTerminal.output,
+  workspaceRunner: async (options) => {
+    options.onRunId?.("acr_plan_revision");
+    setImmediate(() => {
+      planRevisionTerminal.input.emit("keypress", "e", { name: "e" });
+      emitText(planRevisionTerminal.input, "keep the remote task read-only");
+      planRevisionTerminal.input.emit("keypress", undefined, { name: "return" });
+    });
+    planDecision = await options.onPlanConfirmation({
+      run: { run_id: "acr_plan_revision", state: "awaiting_confirmation" },
+      plan: { title: "Inspect remote device", summary: "Inspect status.", tasks: [] },
+      tasks: [],
+    });
+    setTimeout(() => planRevisionTerminal.input.emit("keypress", undefined, { name: "return" }), 20);
+    setTimeout(() => {
+      emitText(planRevisionTerminal.input, "/exit");
+      planRevisionTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 45);
+    return { run: { run_id: "acr_plan_revision", state: "completed" }, tasks: [], final_report: { summary: "Done." } };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(planRevisionTerminal.input, "inspect remote machine");
+planRevisionTerminal.input.emit("keypress", undefined, { name: "return" });
+await planRevisionRun;
+assert.deepEqual(planDecision, { action: "revise", feedback: "keep the remote task read-only" });
+assert.match(planRevisionTerminal.writes.join(""), /What should the Planner change/);
+
+const attentionReplyTerminal = fakeTerminal();
+let attentionDecision;
+const attentionReplyRun = handleAgentWorkspaceCommand([], {
+  input: attentionReplyTerminal.input,
+  output: attentionReplyTerminal.output,
+  workspaceRunner: async (options) => {
+    options.onRunId?.("acr_attention_reply");
+    setImmediate(() => {
+      attentionReplyTerminal.input.emit("keypress", undefined, { name: "return" });
+      emitText(attentionReplyTerminal.input, "only inspect version and service status");
+      attentionReplyTerminal.input.emit("keypress", undefined, { name: "return" });
+    });
+    attentionDecision = await options.onAttention({
+      attention_id: "attention-input",
+      revision: 1,
+      kind: "input",
+      title: "What should the remote Agent inspect?",
+      summary: "The Agent needs a precise read-only scope.",
+      actions: ["submit", "cancel"],
+    }, {
+      run: { run_id: "acr_attention_reply", state: "blocked" },
+      tasks: [],
+    });
+    setTimeout(() => attentionReplyTerminal.input.emit("keypress", undefined, { name: "return" }), 20);
+    setTimeout(() => {
+      emitText(attentionReplyTerminal.input, "/exit");
+      attentionReplyTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 45);
+    return { run: { run_id: "acr_attention_reply", state: "completed" }, tasks: [], final_report: { summary: "Done." } };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(attentionReplyTerminal.input, "inspect remote machine");
+attentionReplyTerminal.input.emit("keypress", undefined, { name: "return" });
+await attentionReplyRun;
+assert.deepEqual(attentionDecision, {
+  action: "submit",
+  response: { text: "only inspect version and service status" },
+});
+assert.match(attentionReplyTerminal.writes.join(""), /What should the remote Agent inspect/);
+assert.match(attentionReplyTerminal.writes.join(""), /Reply to the Agent/);
+
+const pausedTerminal = fakeTerminal();
+let pausedDecision;
+const pausedRun = handleAgentWorkspaceCommand([], {
+  input: pausedTerminal.input,
+  output: pausedTerminal.output,
+  workspaceRunner: async (options) => {
+    options.onRunId?.("acr_paused");
+    setImmediate(() => pausedTerminal.input.emit("keypress", undefined, { name: "return" }));
+    pausedDecision = await options.onPaused({
+      run: { run_id: "acr_paused", state: "paused", pause_reason: "Waiting for the remote device." },
+      tasks: [],
+    });
+    setTimeout(() => pausedTerminal.input.emit("keypress", undefined, { name: "return" }), 20);
+    setTimeout(() => {
+      emitText(pausedTerminal.input, "/exit");
+      pausedTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 45);
+    return { run: { run_id: "acr_paused", state: "completed" }, tasks: [], final_report: { summary: "Done." } };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(pausedTerminal.input, "inspect remote machine");
+pausedTerminal.input.emit("keypress", undefined, { name: "return" });
+await pausedRun;
+assert.equal(pausedDecision, "resume");
+assert.match(pausedTerminal.writes.join(""), /Waiting for the remote device/);
+assert.match(pausedTerminal.writes.join(""), /Resume this collaboration/);
+
 const calls = [];
 await handleAgentWorkspaceCommand([
   "-c", "codex", "--mode", "solo", "explain", "this", "module",
@@ -507,6 +661,33 @@ assert.match(emptyPathScreen, /example: \/Users\/chengaoyan/);
 assert.doesNotMatch(emptyPathScreen, /Path  \/Users\/chengaoyan/);
 assert.doesNotMatch(interactionScreen, /queued objective is preserved/);
 
+const pathSuggestionScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 90,
+  rows: 28,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "needs_setup",
+    mode: "auto",
+    interaction: true,
+    interactionKind: "setup",
+    setupMode: "path",
+    setupPath: "/Users/cheng",
+    setupCursor: 12,
+    setupSuggestionSelection: 1,
+    setupSuggestions: [
+      { name: "cheng", path: "/Users/cheng" },
+      { name: "chengaoyan", path: "/Users/chengaoyan" },
+    ],
+    setup: { device_name: "Remote Mac mini", device_id: "remote-device", remote: true },
+  },
+});
+assert.match(pathSuggestionScreen, /Matching folders/);
+assert.match(pathSuggestionScreen, /› \/Users\/chengaoyan/);
+assert.match(pathSuggestionScreen, /Tab completes the selected folder/);
+assert.match(pathSuggestionScreen, /Tab completes · ↑\/↓ suggestions/);
+
 const manyWorkspaceScreen = buildWorkspaceAppScreen({
   coordinator: "codex",
   mode: "auto",
@@ -549,5 +730,130 @@ const reconnectingScreen = buildWorkspaceAppScreen({
 assert.match(reconnectingScreen, /Reconnecting to the collaboration/);
 assert.match(reconnectingScreen, /Connection interrupted · retry 2\/30/);
 assert.match(reconnectingScreen, /retrying automatically/);
+
+const spinnerFrameA = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 80,
+  rows: 24,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "configuring",
+    animationFrame: 0,
+    snapshot: { run: { state: "created" }, tasks: [] },
+  },
+});
+const spinnerFrameB = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 80,
+  rows: 24,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "configuring",
+    animationFrame: 1,
+    snapshot: { run: { state: "created" }, tasks: [] },
+  },
+});
+assert.match(spinnerFrameA, /⠋ Choosing the Agent team/);
+assert.match(spinnerFrameB, /⠙ Choosing the Agent team/);
+
+const configurationReviewScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 90,
+  rows: 24,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "awaiting_configuration",
+    interaction: true,
+    interactionKind: "configuration",
+    configuration: {
+      resolved_workspace_mode: "remote_ops",
+      planning_source: "cloud_advice",
+      risk_tier: "yellow",
+      auto_configuration: { advice: { reason: "A remote operator is required." } },
+      participants: [
+        { participant_id: "coordinator", display_name: "Coordinator", runtime: "codex", device_id: "local", workspace_id: "local-workspace", permission_profile: "guarded", planner: true, role_hint: "Coordinate the inspection." },
+        { participant_id: "remote_operator", display_name: "Remote Operator", runtime: "claude", device_id: "remote", workspace_id: "remote-workspace", permission_profile: "guarded", role_hint: "Inspect the remote machine." },
+      ],
+    },
+  },
+});
+assert.match(configurationReviewScreen, /Proposed collaboration team/);
+assert.match(configurationReviewScreen, /A remote operator is required/);
+assert.match(configurationReviewScreen, /Remote Operator · Claude Code/);
+assert.match(configurationReviewScreen, /Esc return to objective/);
+assert.equal(configurationReviewScreen.split("\n").length <= 24, true, "interaction layout fits the terminal height");
+
+const planReviewScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 90,
+  rows: 24,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "awaiting_confirmation",
+    interaction: true,
+    interactionKind: "plan",
+    snapshot: {
+      run: { state: "awaiting_confirmation" },
+      plan: {
+        title: "Inspect the remote Mac",
+        summary: "Collect machine and CLI status without changing the device.",
+        tasks: [{ id: "inspect", title: "Collect machine status", participant_id: "remote_operator", deliverable: "Version and health report", depends_on: [] }],
+      },
+      tasks: [],
+    },
+  },
+});
+assert.match(planReviewScreen, /Inspect the remote Mac/);
+assert.match(planReviewScreen, /Collect machine status · remote_operator/);
+assert.match(planReviewScreen, /E request changes/);
+assert.equal(planReviewScreen.split("\n").length <= 24, true, "plan review layout fits the terminal height");
+
+const attentionScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 90,
+  rows: 24,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "blocked",
+    interaction: true,
+    interactionKind: "attention",
+    attentionSelection: 1,
+    attention: {
+      kind: "approval",
+      title: "Allow a read-only command?",
+      summary: "The remote operator wants to inspect system status.",
+      risk: "low",
+      actions: ["allow", "deny"],
+    },
+    snapshot: { run: { state: "blocked" }, tasks: [] },
+  },
+});
+assert.match(attentionScreen, /Allow a read-only command/);
+assert.match(attentionScreen, /› 2\. deny/);
+assert.match(attentionScreen, /Agent needs your decision/);
+assert.equal(attentionScreen.split("\n").length <= 24, true, "attention layout fits the terminal height");
+
+const narrowScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 40,
+  rows: 12,
+  runtime: {
+    objective: "Inspect remote status",
+    phase: "executing",
+    animationFrame: 2,
+    snapshot: { run: { state: "running" }, tasks: [] },
+  },
+});
+const narrowPlainLines = narrowScreen
+  .replace(/\x1b\[[0-9;]*m/g, "")
+  .split("\n");
+assert.equal(narrowPlainLines.length <= 12, true, "narrow runtime fits the terminal height");
+assert.equal(narrowPlainLines.every((line) => [...line].length <= 40), true, "narrow runtime never exceeds terminal width");
 
 console.log("agent workspace tests passed");

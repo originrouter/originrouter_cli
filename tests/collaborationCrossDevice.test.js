@@ -36,6 +36,8 @@ function node(deviceId, network, { stateDir, identity, identities, envelopes, co
   const store = new CollaborationStore({ stateDir });
   const coordinator = new PlanImplementVerifyCoordinator({ store });
   const catalog = {
+    getWorkspace() { return null; },
+    getTrustedWorkspaceForPath() { return null; },
     trustWorkspace(path, { deviceId: trustedDeviceId }) {
       return {
         workspace_id: `workspace-${trustedDeviceId}`,
@@ -118,6 +120,11 @@ const worker = node("device-b", network, {
 const workerCapabilities = await source.runtime.capabilitiesForDevice("device-b");
 assert.equal(workerCapabilities.device.device_id, "device-b");
 assert.equal(workerCapabilities.freshness.source, "account_e2ee");
+const remoteBrowsePage = await source.runtime.browseWorkspacesOnDevice("device-b", {
+  path: root,
+  query: "device-b",
+});
+assert.equal(remoteBrowsePage.entries.some((entry) => entry.name === "device-b"), true);
 const trustedRemoteWorkspace = await source.runtime.trustWorkspaceOnDevice(
   "device-b",
   workerStateDir,

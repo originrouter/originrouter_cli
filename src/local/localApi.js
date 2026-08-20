@@ -513,6 +513,24 @@ async function dispatch(ctx, req, res) {
     const collaborationWorkspaceTrustMatch = pathname.match(
       /^\/collaboration\/devices\/([^/]+)\/workspaces\/trust$/,
     );
+    const collaborationWorkspaceBrowseMatch = pathname.match(
+      /^\/collaboration\/devices\/([^/]+)\/workspaces\/browse$/,
+    );
+    if (req.method === "GET" && collaborationWorkspaceBrowseMatch) {
+      if (!ctx.collaborationRuntime) return sendError(res, 503, "collaboration runtime unavailable");
+      try {
+        const deviceId = decodeURIComponent(collaborationWorkspaceBrowseMatch[1]);
+        return sendOk(res, await ctx.collaborationRuntime.browseWorkspacesOnDevice(deviceId, {
+          path: url.searchParams.get("path") || "",
+          query: url.searchParams.get("query") || "",
+          limit: url.searchParams.get("limit") || 8,
+        }));
+      } catch (error) {
+        return sendError(res, 400, error.message || "workspace browse failed", {
+          reason: error.code || "collaboration_workspace_browse_failed",
+        });
+      }
+    }
     if (req.method === "POST" && collaborationWorkspaceTrustMatch) {
       if (!ctx.collaborationRuntime) return sendError(res, 503, "collaboration runtime unavailable");
       const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));

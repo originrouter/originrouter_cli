@@ -1777,6 +1777,21 @@ export async function trustCollaborationWorkspace(deviceId, path, {
   return data.workspace;
 }
 
+export async function browseCollaborationWorkspaces(deviceId, path, {
+  signal,
+  limit = 8,
+  requestFn = request,
+} = {}) {
+  const query = new URLSearchParams({
+    path: String(path || ""),
+    limit: String(Math.max(1, Math.min(20, Number(limit) || 8))),
+  });
+  return requestFn(
+    `/collaboration/devices/${encodeURIComponent(deviceId)}/workspaces/browse?${query}`,
+    { signal },
+  );
+}
+
 function isRetryableCollaborationReadError(error) {
   const code = String(error?.diagnosticCode || error?.code || "").toUpperCase();
   const message = String(error?.message || "").toUpperCase();
@@ -1784,13 +1799,148 @@ function isRetryableCollaborationReadError(error) {
 }
 
 export async function controlCollaborationRun(runId, action, { signal, body = {} } = {}) {
-  if (!new Set(["start", "confirm", "pause", "resume", "cancel"]).has(action)) {
+  if (!new Set(["start", "confirm", "pause", "resume", "cancel", "retry"]).has(action)) {
     throw new Error(`Unsupported collaboration control '${action}'.`);
   }
   return (await request(
     `/collaboration/local/runs/${encodeURIComponent(runId)}/${action}`,
     { method: "POST", body, signal },
   )).run;
+}
+
+async function followAgentWorkspaceCollaboration({
+  run,
+  payload = {},
+  confirmation = "never",
+  signal,
+  onUpdate = () => {},
+  onPlanConfirmation = async () => "leave",
+  onAttention = async () => "leave",
+  onPaused = async () => "leave",
+  interval = 300,
+  requestFn = request,
+}) {
+  let cursor = 0;
+  let confirmationHandled = false;
+  const handledAttention = new Set();
+  let pauseHandledRevision = -1;
+  let reconnectAttempts = 0;
+  const readSnapshot = async (path) => {
+    while (true) {
+      throwIfAborted(signal);
+      try {
+        const result = await requestFn(path, { signal });
+        if (reconnectAttempts > 0) {
+          reconnectAttempts = 0;
+          onUpdate({ type: "connection", connectionAttempts: 0, message: "" });
+        }
+        return result;
+      } catch (error) {
+        if (!isRetryableCollaborationReadError(error) || reconnectAttempts >= 30) throw error;
+        reconnectAttempts += 1;
+        onUpdate({ type: "connection", phase: "reconnecting", connectionAttempts: reconnectAttempts, message: `Connection interrupted; retry ${reconnectAttempts}/30` });
+        await abortableDelay(Math.min(5000, 500 + reconnectAttempts * 250), signal);
+      }
+    }
+  };
+  while (true) {
+    throwIfAborted(signal);
+    const snapshot = (await readSnapshot(`/collaboration/local/runs/${encodeURIComponent(run.run_id)}/snapshot`)).snapshot;
+    if (cursor === 0) cursor = Math.max(0, Number(snapshot.last_sequence || 0) - 30);
+    const eventData = await readSnapshot(`/collaboration/local/runs/${encodeURIComponent(run.run_id)}/events?after_sequence=${cursor}&limit=200`);
+    const events = eventData.events || [];
+    for (const event of events) cursor = Math.max(cursor, Number(event.sequence || 0));
+    onUpdate({ type: "snapshot", snapshot, events });
+    const state = snapshot.run?.state;
+    if (TERMINAL_VIEW_STATES.has(state)) return snapshot;
+    if (state === "paused" && pauseHandledRevision !== Number(snapshot.revision || 0)) {
+      pauseHandledRevision = Number(snapshot.revision || 0);
+      const decision = await onPaused(snapshot);
+      throwIfAborted(signal);
+      if (decision === "resume") {
+        run = (await requestFn(
+          `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/resume`,
+          { method: "POST", body: {}, signal },
+        )).run;
+        onUpdate({ type: "phase", phase: "executing", run });
+        continue;
+      }
+      return snapshot;
+    }
+    const attention = (snapshot.attention || []).find((item) => (
+      item.status === "pending"
+      && item.kind !== "plan_confirmation"
+      && !handledAttention.has(`${item.attention_id}:${item.revision}`)
+    ));
+    if (attention) {
+      const attentionKey = `${attention.attention_id}:${attention.revision}`;
+      handledAttention.add(attentionKey);
+      const decision = await onAttention(attention, snapshot);
+      throwIfAborted(signal);
+      if (!decision || decision === "leave") return snapshot;
+      await requestFn(
+        `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/attention/${encodeURIComponent(attention.attention_id)}/resolve`,
+        {
+          method: "POST",
+          body: {
+            expected_revision: attention.revision,
+            action: decision.action,
+            response: decision.response || {},
+          },
+          signal,
+        },
+      );
+      continue;
+    }
+    if (state === "awaiting_confirmation" && !confirmationHandled) {
+      confirmationHandled = true;
+      const safeToSkip = payload.auto_configuration?.safe_to_skip_confirmation === true;
+      const decision = confirmation === "always" || (confirmation === "safe" && safeToSkip)
+        ? "confirm"
+        : await onPlanConfirmation(snapshot);
+      throwIfAborted(signal);
+      if (decision === "confirm") {
+        run = (await requestFn(`/collaboration/local/runs/${encodeURIComponent(run.run_id)}/confirm`, { method: "POST", body: {}, signal })).run;
+        onUpdate({ type: "phase", phase: "executing", run });
+        continue;
+      }
+      if (decision?.action === "revise" && String(decision.feedback || "").trim()) {
+        run = (await requestFn(`/collaboration/local/runs/${encodeURIComponent(run.run_id)}/replan`, { method: "POST", body: { feedback: String(decision.feedback).trim() }, signal })).run;
+        confirmationHandled = false;
+        onUpdate({ type: "phase", phase: "planning", run });
+        continue;
+      }
+      return snapshot;
+    }
+    await abortableDelay(Math.max(250, Math.min(5000, Number(interval) || 750)), signal);
+  }
+}
+
+export async function retryAgentWorkspaceCollaboration(runId, {
+  signal,
+  onUpdate = () => {},
+  onPlanConfirmation = async () => "leave",
+  onAttention = async () => "leave",
+  onPaused = async () => "leave",
+  interval = 300,
+  requestFn = request,
+} = {}) {
+  const run = (await requestFn(
+    `/collaboration/local/runs/${encodeURIComponent(runId)}/retry`,
+    { method: "POST", body: {}, signal },
+  )).run;
+  onUpdate({ type: "phase", phase: "planning", run });
+  return followAgentWorkspaceCollaboration({
+    run,
+    confirmation: "never",
+    signal,
+    onUpdate,
+    onPlanConfirmation,
+    onAttention,
+    onPaused,
+    interval,
+    requestFn,
+  });
 }
 
 export async function runAgentWorkspaceCollaboration({
@@ -1804,6 +1954,8 @@ export async function runAgentWorkspaceCollaboration({
   onRunId = () => {},
   onConfigurationConfirmation = async () => "leave",
   onPlanConfirmation = async () => "leave",
+  onAttention = async () => "leave",
+  onPaused = async () => "leave",
   // Keep the interactive workspace responsive while still coalescing redraws
   // in the TUI frame scheduler. The local API remains cursor-based, so this
   // does not duplicate events.
@@ -1852,76 +2004,18 @@ export async function runAgentWorkspaceCollaboration({
   )).run;
   onRunId(run.run_id);
   onUpdate({ type: "phase", phase: "planning", run });
-
-  let cursor = 0;
-  let confirmationHandled = false;
-  let reconnectAttempts = 0;
-  const readSnapshot = async (path) => {
-    while (true) {
-      throwIfAborted(signal);
-      try {
-        const result = await requestFn(path, { signal });
-        if (reconnectAttempts > 0) {
-          reconnectAttempts = 0;
-          onUpdate({ type: "connection", connectionAttempts: 0, message: "" });
-        }
-        return result;
-      } catch (error) {
-        if (!isRetryableCollaborationReadError(error) || reconnectAttempts >= 30) throw error;
-        reconnectAttempts += 1;
-        onUpdate({
-          type: "connection",
-          phase: "reconnecting",
-          connectionAttempts: reconnectAttempts,
-          message: `Connection interrupted; retry ${reconnectAttempts}/30`,
-        });
-        await abortableDelay(Math.min(5000, 500 + reconnectAttempts * 250), signal);
-      }
-    }
-  };
-  while (true) {
-    throwIfAborted(signal);
-    const snapshot = (await readSnapshot(
-      `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/snapshot`,
-    )).snapshot;
-    if (cursor === 0) cursor = Math.max(0, Number(snapshot.last_sequence || 0) - 30);
-    const eventData = await readSnapshot(
-      `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/events?after_sequence=${cursor}&limit=200`,
-    );
-    const events = eventData.events || [];
-    for (const event of events) cursor = Math.max(cursor, Number(event.sequence || 0));
-    onUpdate({ type: "snapshot", snapshot, events });
-
-    const state = snapshot.run?.state;
-    if (TERMINAL_VIEW_STATES.has(state)) return snapshot;
-    if (state === "awaiting_confirmation" && !confirmationHandled) {
-      confirmationHandled = true;
-      const safeToSkip = payload.auto_configuration?.safe_to_skip_confirmation === true;
-      const decision = confirmation === "always" || (confirmation === "safe" && safeToSkip)
-        ? "confirm"
-        : await onPlanConfirmation(snapshot);
-      throwIfAborted(signal);
-      if (decision === "confirm") {
-        run = (await requestFn(
-          `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/confirm`,
-          { method: "POST", body: {}, signal },
-        )).run;
-        onUpdate({ type: "phase", phase: "executing", run });
-        continue;
-      }
-      if (decision?.action === "revise" && String(decision.feedback || "").trim()) {
-        run = (await requestFn(
-          `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/replan`,
-          { method: "POST", body: { feedback: String(decision.feedback).trim() }, signal },
-        )).run;
-        confirmationHandled = false;
-        onUpdate({ type: "phase", phase: "planning", run });
-        continue;
-      }
-      return snapshot;
-    }
-    await abortableDelay(Math.max(250, Math.min(5000, Number(interval) || 750)), signal);
-  }
+  return followAgentWorkspaceCollaboration({
+    run,
+    payload,
+    confirmation,
+    signal,
+    onUpdate,
+    onPlanConfirmation,
+    onAttention,
+    onPaused,
+    interval,
+    requestFn,
+  });
 }
 
 async function confirmInteractively(run, args) {
