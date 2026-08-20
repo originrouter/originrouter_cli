@@ -17,8 +17,8 @@ import {
   willRouteRemoteCoding,
 } from "../config/claudeConfig.js";
 import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
-import { DEFAULT_DEVICE_ID, DEFAULT_RELAY_URL } from "../constants.js";
-import { createExecutor } from "../executors/createExecutor.js";
+import { DEFAULT_DEVICE_ID, DEFAULT_EXECUTOR, DEFAULT_RELAY_URL } from "../constants.js";
+import { createExecutor, normalizeExecutor } from "../executors/createExecutor.js";
 import {
   appendSessionStart,
   patchSessionExit,
@@ -70,6 +70,7 @@ import {
   AGENT_DETAIL_PROFILES,
   resolveAgentDetailProfile,
 } from "../runtime/agentDetailProfile.js";
+import { showAgentLaunchScreen } from "./agentLaunchScreen.js";
 import { LocalAgentBridgeClient } from "./localAgentBridgeClient.js";
 import { createTerminalOutputPump } from "./terminalOutputPump.js";
 
@@ -262,6 +263,11 @@ export function extractOriginRouterOptions(args) {
       index += 1;
       continue;
     }
+    if (arg === "--originrouter-executor") {
+      options.executor = args[index + 1];
+      index += 1;
+      continue;
+    }
     if (arg === "--originrouter-conversation") {
       options.conversationId = args[index + 1];
       index += 1;
@@ -355,7 +361,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID,
   );
   const sessionId = options.session || `${agent}-${Date.now()}`;
-  const conversationId = options.conversationId || sessionId;
+  let conversationId = options.conversationId || sessionId;
   const sessionStartedAt = new Date().toISOString();
   const cwd = process.cwd();
   const workspaceApprovalPolicy = readWorkspaceApprovalPolicySafe(cwd);
@@ -385,7 +391,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
     cwd,
     nativeConfig: useNativeConfig,
   });
-  const executor = createExecutor("pty");
+  const executor = createExecutor(
+    normalizeExecutor(options.executor || DEFAULT_EXECUTOR),
+  );
   const localConfig = readConfig();
   const detail = resolveAgentDetailProfile({
     config: localConfig,
@@ -395,6 +403,21 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // When LiteLLM is running for the selected openai-compatible provider,
   // buildAgentProviderEnv routes Claude Code through it.
   const proxyStatus = staticProxyStatusFn(readLocalProxySnapshot());
+
+  const launchAllowed = await showAgentLaunchScreen({
+    input: process.stdin,
+    output: process.stdout,
+    agent,
+    workspaceName: basename(cwd),
+    cwd,
+    detailLabel: detail.label,
+    controlLabel: relayModeDescription(relayPlan),
+    sessionLabel: agent === "claude" ? "Claude Code native session" : "Codex native session",
+  });
+  if (!launchAllowed) {
+    process.exitCode = 130;
+    return;
+  }
 
   // Stage 9.2: when the resolved route is type=remote, target=proxy, the
   // local wrapper owns the caller-side `RemoteCodingRelayProxy`. We
@@ -731,16 +754,34 @@ export async function runLocalAgentSession(agent, rawArgs) {
       if (typeof adapter.scanStructuredEvents !== "function") return;
       for (const event of adapter.scanStructuredEvents()) {
         let displayEvent = event;
-        if (event.type === "agent.session.start" && event.transcriptPath) {
+        if (event.type === "agent.session.start") {
+          const nextNativeSessionId = String(event.sessionId || "").slice(0, 191);
+          const nextConversationId = nextNativeSessionId
+            ? `${agent}:${nextNativeSessionId}`.slice(0, 96)
+            : conversationId;
+          const conversationChanged = nextConversationId !== conversationId;
+          if (nextNativeSessionId) nativeSessionId = nextNativeSessionId;
+          conversationId = nextConversationId;
+          if (conversationChanged) {
+            recentEvents.length = 0;
+            registeredInteractions.clear();
+            activitySnapshot.summary = "";
+            activitySnapshot.firstPromptPreview = "";
+            activitySnapshot.lastMessagePreview = "";
+            activitySnapshot.lastAgentPreview = "";
+          }
           await localAgentBridge?.update({
             transcriptPath: event.transcriptPath,
+            nativeSessionId,
+            conversationId,
           });
-          const {
-            transcriptPath: _transcriptPath,
-            raw: _raw,
-            ...safeEvent
-          } = event;
-          displayEvent = safeEvent;
+          displayEvent = {
+            type: "agent.conversation.changed",
+            provider: agent,
+            conversationId,
+            nativeSessionId,
+            reason: conversationChanged ? "session_switched" : "session_ready",
+          };
         }
         if (event.type === "agent.permission.request.detected") continue;
         if (event.type === "agent.interaction.requested") {
@@ -1136,18 +1177,29 @@ export async function runLocalAgentSession(agent, rawArgs) {
 
   const handleRemoteEventBound = async (payload) => {
     if (payload?.type === "agent.history.request") {
-      const history =
-        typeof adapter.readConversationHistory === "function"
-          ? adapter.readConversationHistory({
-              beforeCursor: payload.beforeCursor,
-              limit: payload.limit,
-            })
-          : { messages: [], nextCursor: null, hasMore: false };
+      let history = { messages: [], nextCursor: null, hasMore: false };
+      try {
+        if (typeof adapter.readConversationHistory === "function") {
+          history = adapter.readConversationHistory({
+            beforeCursor: payload.beforeCursor,
+            limit: payload.limit,
+          });
+        }
+      } catch (error) {
+        await sendTransientEvent({
+          type: "agent.adapter.status",
+          provider: agent,
+          state: "history_read_failed",
+          message: error.message,
+        });
+      }
       await send("agent.history.page", {
         requestId: payload.requestId,
         messages: history.messages,
         nextCursor: history.nextCursor,
         hasMore: history.hasMore,
+        conversationId,
+        nativeSessionId,
         detailProfile: detail.profile,
         detailSource: detail.source,
       });

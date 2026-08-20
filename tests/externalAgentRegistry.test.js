@@ -122,6 +122,37 @@ registry.appendEvent("claude-local-1", {
 });
 assert.equal(registry.list()[0].current_step, "Ready");
 
+registry.appendEvent("claude-local-1", {
+  type: "agent.interaction.requested",
+  interactionId: "old-conversation-input",
+  kind: "questions",
+});
+registry.update("claude-local-1", {
+  conversationId: "claude:native-session-2",
+  nativeSessionId: "native-session-2",
+  transcriptPath: "/tmp/native-session-2.jsonl",
+});
+assert.equal(registry.eventsAfter(0).events.length, 0);
+assert.equal(registry.list()[0].pending_approval_count, 0);
+assert.equal(registry.list()[0].conversation_id, "claude:native-session-2");
+assert.equal(registry.list()[0].native_session_id, "native-session-2");
+assert.equal(registry.list()[0].current_step, "Running locally");
+
+registry.appendEvent("claude-local-1", {
+  type: "agent.text",
+  text: "new conversation",
+});
+registry.register({
+  sessionId: "claude-local-1",
+  agent: "claude",
+  conversationId: "claude:native-session-3",
+  nativeSessionId: "native-session-3",
+  transcriptPath: "/tmp/native-session-3.jsonl",
+});
+assert.equal(registry.eventsAfter(0).events.length, 0);
+assert.equal(registry.list()[0].conversation_id, "claude:native-session-3");
+assert.equal(registry.list()[0].native_session_id, "native-session-3");
+
 now += 91_000;
 assert.equal(registry.list()[0].status, "stopped");
 

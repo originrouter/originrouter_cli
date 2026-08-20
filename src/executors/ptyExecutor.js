@@ -1,5 +1,7 @@
 import { execFileSync } from "node:child_process";
 
+import { scheduleForceKill } from "./processTreeKill.js";
+
 function ttyUsesOutputPostprocessing({ input = process.stdin, exec = execFileSync } = {}) {
   if (!input?.isTTY) return false;
   try {
@@ -40,8 +42,13 @@ export function disableNestedPtyOutputPostprocessing(
 }
 
 export class PtyExecutor {
-  constructor() {
+  constructor({ forceKillMs } = {}) {
     this.terminal = null;
+    this._exited = false;
+    this._stopTimer = null;
+    // SIGTERM→SIGKILL escalation window. Injected so unit tests can use a
+    // short window (mirrors CodexAppServerClient.forceKillMs).
+    this.forceKillMs = forceKillMs;
   }
 
   async start({
@@ -56,6 +63,10 @@ export class PtyExecutor {
     onExit,
     onError,
   }) {
+    // The exit flag starts fresh for a (re)started session.
+    this._exited = false;
+    if (this._stopTimer) { clearTimeout(this._stopTimer); this._stopTimer = null; }
+
     let pty;
     try {
       pty = await import("node-pty");
@@ -84,7 +95,11 @@ export class PtyExecutor {
     }
 
     this.terminal.onData((data) => onOutput(data));
-    this.terminal.onExit((event) => onExit?.({ code: event.exitCode, signal: event.signal }));
+    this.terminal.onExit((event) => {
+      this._exited = true;
+      if (this._stopTimer) { clearTimeout(this._stopTimer); this._stopTimer = null; }
+      onExit?.({ code: event.exitCode, signal: event.signal });
+    });
     this.terminal.on("error", (error) => onError?.(error));
 
     return {
@@ -114,6 +129,28 @@ export class PtyExecutor {
   }
 
   stop() {
-    this.terminal?.kill();
+    const terminal = this.terminal;
+    const pid = terminal?.pid;
+    if (!terminal || !Number.isInteger(pid) || pid <= 0) return;
+
+    if (this._stopTimer) { clearTimeout(this._stopTimer); this._stopTimer = null; }
+
+    // Keep node-pty's own teardown (closes the master fd; a no-op if the
+    // child already exited) so the PTY resources are released even when the
+    // child ignores the signal below.
+    if (typeof terminal.kill === "function") {
+      try { terminal.kill(); } catch {}
+    }
+
+    // Graceful SIGTERM to the whole process group first. If the session the
+    // forkpty() child leads is still alive after the escalation window, hard
+    // kill it with SIGKILL. The exit handler clears the timer on a real exit,
+    // so a fast exit never waits the full window. pty children are session
+    // leaders, so groupLead=true lets -pid reach the whole tree.
+    this._stopTimer = scheduleForceKill(pid, {
+      groupLead: true,
+      graceMs: this.forceKillMs,
+      isExited: () => this._exited,
+    });
   }
 }

@@ -106,9 +106,6 @@ export function workspaceModeDefinition(value = "auto") {
 
 export function inferWorkspaceMode(objective) {
   const text = clean(objective).toLowerCase();
-  if (/\b(?:server|remote|ssh|service status|systemd|kubernetes|k8s|pod|container)\b|服务器|远程|服务状态|线上环境/.test(text)) {
-    return "remote_ops";
-  }
   if (/\b(?:debate|compare approaches|trade-?offs?|architecture decision|rfc)\b|方案对比|技术选型|架构决策|辩论/.test(text)) {
     return "review_panel";
   }

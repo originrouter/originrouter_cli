@@ -205,6 +205,31 @@ assert.equal(
   }).pagination.total,
   0,
 );
+
+catalog.upsertSession({
+  sessionId: "claude-wrapper-session",
+  conversationId: "claude:native-before-clear",
+  runId: "claude-wrapper-run",
+  agent: "claude",
+  deviceId: "server-2",
+  cwd: stateDir,
+  runtime: "claude-pty",
+});
+catalog.updateSession("claude-wrapper-session", {
+  conversationId: "claude:native-after-clear",
+  nativeSessionId: "native-after-clear",
+  transcriptPath: join(stateDir, "claude-after-clear.jsonl"),
+});
+const switchedConversation = catalog.getConversation(
+  "claude:native-after-clear",
+);
+assert.equal(switchedConversation.runs.length, 1);
+assert.equal(
+  switchedConversation.runs[0].originrouter_session_id,
+  "claude-wrapper-session",
+);
+assert.equal(switchedConversation.native_session_id, "native-after-clear");
+
 catalog.close();
 
 const reopened = new AgentCatalog({ stateDir, now });

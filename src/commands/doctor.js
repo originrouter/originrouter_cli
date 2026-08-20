@@ -106,7 +106,7 @@ export function printDoctorResults(checks, options = {}) {
     verdictText = `${failed} check${failed === 1 ? "" : "s"} failed — fix the items above and run doctor again.`;
   } else if (warned > 0) {
     verdict = "warn";
-    verdictText = `${passed} passed, ${warned} warning — you're good to go.`;
+    verdictText = `${passed} passed, ${warned} warning${warned === 1 ? "" : "s"} — review the affected features above before relying on them.`;
   } else {
     verdict = "ok";
     verdictText = `${passed} passed — everything looks good.`;
@@ -181,14 +181,15 @@ async function _checkTokenVerify(stateDir) {
     return {
       name: "Token",
       status: "warn",
-      detail: `${expired.length} access token(s) need refresh; refresh session valid for ${refreshMinutes} min`,
-      next: "The next authenticated request will refresh the required audience token.",
+      detail: `${expired.length} access token(s) need refresh; local refresh expiry is ${refreshMinutes} min away (not server-verified)`,
+      next: "Run `originrouter auth verify` before using cloud, relay, or remote-device features.",
     };
   }
   return {
     name: "Token",
-    status: "pass",
-    detail: `4 audience tokens cached; refresh session valid for ${refreshMinutes} min`,
+    status: "warn",
+    detail: `audience tokens are cached; local refresh expiry is ${refreshMinutes} min away (not server-verified)`,
+    next: "Run `originrouter auth verify` before relying on cloud, relay, or remote-device features.",
   };
 }
 

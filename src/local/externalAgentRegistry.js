@@ -89,6 +89,12 @@ export class ExternalAgentRegistry {
     const sessionId = safeText(payload?.sessionId, 64);
     if (!sessionId) throw new Error("sessionId is required");
     const existing = this.sessions.get(sessionId);
+    const incomingConversationId = safeText(payload?.conversationId, 96);
+    const conversationChanged = Boolean(
+      existing &&
+        incomingConversationId &&
+        incomingConversationId !== existing.conversationId,
+    );
     const session = {
       sessionId,
       agent: safeText(payload?.agent, 32) || "unknown",
@@ -99,6 +105,14 @@ export class ExternalAgentRegistry {
       cwd: safeText(payload?.cwd, 1024),
       pid: Number(payload?.pid) || null,
       status: "running",
+      conversationId:
+        incomingConversationId ||
+        existing?.conversationId ||
+        sessionId,
+      nativeSessionId:
+        safeText(payload?.nativeSessionId, 191) ||
+        existing?.nativeSessionId ||
+        "",
       transcriptPath:
         safeText(payload?.transcriptPath, 4096) ||
         existing?.transcriptPath ||
@@ -106,19 +120,25 @@ export class ExternalAgentRegistry {
       startedAt:
         safeText(payload?.startedAt, 64) || existing?.startedAt || nowIso(),
       lastSeenAtMs: this.now(),
-      events: existing?.events || [],
+      events: conversationChanged ? [] : existing?.events || [],
       eventIds:
-        existing?.eventIds ||
+        (!conversationChanged && existing?.eventIds) ||
         new Set(
-          (existing?.events || [])
+          (conversationChanged ? [] : existing?.events || [])
             .map((event) => safeText(event?.eventId, 96))
             .filter(Boolean),
         ),
-      eventSequence: existing?.eventSequence || 0,
+      eventSequence: conversationChanged ? 0 : existing?.eventSequence || 0,
       commands: existing?.commands || [],
       commandSequence: existing?.commandSequence || 0,
-      pendingInteractions: existing?.pendingInteractions || new Set(),
-      pendingInteractionKinds: existing?.pendingInteractionKinds || new Map(),
+      pendingInteractions:
+        conversationChanged
+          ? new Set()
+          : existing?.pendingInteractions || new Set(),
+      pendingInteractionKinds:
+        conversationChanged
+          ? new Map()
+          : existing?.pendingInteractionKinds || new Map(),
       mode: safeText(payload?.mode, 32) || existing?.mode || "default",
       modeControl:
         safeText(payload?.modeControl, 16) ||
@@ -162,7 +182,9 @@ export class ExternalAgentRegistry {
         safeText(payload?.detailSource, 32) ||
         existing?.detailSource ||
         "builtin_default",
-      currentStep: existing?.currentStep || "Running locally",
+      currentStep: conversationChanged
+        ? "Running locally"
+        : existing?.currentStep || "Running locally",
     };
     this.sessions.set(sessionId, session);
     try {
@@ -177,6 +199,19 @@ export class ExternalAgentRegistry {
 
   update(sessionId, payload = {}) {
     const session = this.require(sessionId);
+    const nextConversationId = safeText(payload.conversationId, 96);
+    if (nextConversationId && nextConversationId !== session.conversationId) {
+      session.conversationId = nextConversationId;
+      session.events = [];
+      session.eventIds = new Set();
+      session.eventSequence = 0;
+      session.pendingInteractions = new Set();
+      session.pendingInteractionKinds = new Map();
+      session.currentStep = "Running locally";
+    }
+    if (payload.nativeSessionId) {
+      session.nativeSessionId = safeText(payload.nativeSessionId, 191);
+    }
     if (payload.transcriptPath) {
       session.transcriptPath = safeText(payload.transcriptPath, 4096);
     }
@@ -370,6 +405,8 @@ export class ExternalAgentRegistry {
     if (session.agent === "claude") {
       return {
         ...readClaudeConversationHistory(session.transcriptPath, options),
+        conversationId: session.conversationId,
+        nativeSessionId: session.nativeSessionId,
         detailProfile: session.detailProfile,
         detailSource: session.detailSource,
       };
@@ -377,6 +414,8 @@ export class ExternalAgentRegistry {
     if (session.agent === "codex") {
       return {
         ...readCodexConversationHistory(session.transcriptPath, options),
+        conversationId: session.conversationId,
+        nativeSessionId: session.nativeSessionId,
         detailProfile: session.detailProfile,
         detailSource: session.detailSource,
       };
@@ -385,6 +424,8 @@ export class ExternalAgentRegistry {
       messages: [],
       nextCursor: null,
       hasMore: false,
+      conversationId: session.conversationId,
+      nativeSessionId: session.nativeSessionId,
       detailProfile: session.detailProfile,
       detailSource: session.detailSource,
     };
@@ -439,6 +480,8 @@ export class ExternalAgentRegistry {
     const status = this.publicStatus(session);
     return {
       session_id: session.sessionId,
+      conversation_id: session.conversationId,
+      native_session_id: session.nativeSessionId,
       agent_type: session.agent,
       title: session.title,
       status,

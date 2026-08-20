@@ -3,7 +3,7 @@ import { readConfig } from "../persistence/state.js";
 const TOP_LEVEL = [
   "status", "doctor", "sessions", "devices", "env", "agent", "history",
   "collaborate", "collaboration", "provider", "route", "proxy",
-  "compatibility", "login", "logout", "auth", "security", "service",
+  "compatibility", "login", "logout", "auth", "security", "service", "services",
   "local", "completion", "help", "claude", "codex", "run",
 ];
 
@@ -21,6 +21,7 @@ const SUBCOMMANDS = {
   route: ["list", "show", "set", "clear", "cloud", "remote"],
   security: ["status", "rotate"],
   service: ["install", "start", "stop", "restart", "status", "uninstall"],
+  services: ["install", "start", "stop", "restart", "status", "uninstall"],
 };
 
 const NESTED = {

@@ -60,10 +60,24 @@ export class ExternalAgentRelayRouter {
     if (!sessionId || !this.registry.has(sessionId)) return false;
 
     if (payload.type === "agent.history.request") {
-      const history = this.registry.history(sessionId, {
-        beforeCursor: payload.beforeCursor,
-        limit: payload.limit,
-      });
+      let history;
+      try {
+        history = this.registry.history(sessionId, {
+          beforeCursor: payload.beforeCursor,
+          limit: payload.limit,
+        });
+      } catch {
+        const session = this.registry
+          .list?.()
+          .find((item) => item.session_id === sessionId);
+        history = {
+          messages: [],
+          nextCursor: null,
+          hasMore: false,
+          conversationId: session?.conversation_id,
+          nativeSessionId: session?.native_session_id,
+        };
+      }
       await this.relayClient.send("agent.history.page", {
         sessionId,
         requestId: payload.requestId,

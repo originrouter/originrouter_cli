@@ -484,4 +484,34 @@ assert.equal(remoteError.payload.code, "COLLABORATION_AGENT_COMMAND_FAILED");
 assert.match(remoteError.payload.message, /turn\/start/);
 failureRuntime.close();
 failureStore.close();
+
+const projectionRuntime = Object.create(CollaborationRuntime.prototype);
+projectionRuntime.deviceId = "device-a";
+projectionRuntime.store = {
+  getRun: () => ({
+    run_id: "run-projection",
+    template_id: "plan_implement_verify",
+    workflow_template_id: "plan_implement_verify",
+    workspace_mode: "shared",
+    resolved_workspace_mode: "shared",
+    coordinator_runtime: "codex",
+    planning_source: "agent",
+    risk_tier: "standard",
+    state: "running",
+    budget: {},
+    usage: {},
+    counters: {},
+    created_at: "2026-08-16T00:00:00.000Z",
+    finished_at: null,
+  }),
+};
+projectionRuntime.relayClient = {
+  async send() {
+    const error = new Error("Unauthorized");
+    error.status = 401;
+    throw error;
+  },
+};
+assert.equal(await projectionRuntime.syncRun("run-projection"), false);
+
 console.log("collaboration reliability tests passed");

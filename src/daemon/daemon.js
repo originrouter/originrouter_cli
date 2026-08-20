@@ -13,6 +13,7 @@ import {
 } from "../constants.js";
 import { startLocalApi } from "../local/localApi.js";
 import { DeviceE2eeLocalGateway } from "../local/deviceE2eeLocalGateway.js";
+import { normalizeExecutor } from "../executors/createExecutor.js";
 import { ProxyManager } from "../proxy/manager.js";
 import { apiTokenPath, ensureApiToken } from "../persistence/authToken.js";
 import {
@@ -170,7 +171,7 @@ export async function startDaemon(args) {
   const device = ensureDevice(
     options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID,
   );
-  const executor = DEFAULT_EXECUTOR;
+  const executor = normalizeExecutor(options.executor || DEFAULT_EXECUTOR);
   const bindAddress =
     options.bind ||
     process.env.ORIGINROUTER_LOCAL_BIND ||

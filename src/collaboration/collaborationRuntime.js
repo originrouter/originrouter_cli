@@ -2139,29 +2139,37 @@ export class CollaborationRuntime {
   }
 
   async syncRun(runId) {
-    if (!this.relayClient) return;
+    if (!this.relayClient) return false;
     const run = this.store.getRun(runId, { includeMessages: false });
-    if (!run) return;
-    await this.relayClient.send("collaboration.run.project", {
-      sourceDeviceId: this.deviceId,
-      runId: run.run_id,
-      templateId: run.template_id,
-      workflowTemplateId: run.workflow_template_id,
-      workspaceMode: run.workspace_mode,
-      resolvedWorkspaceMode: run.resolved_workspace_mode,
-      coordinatorRuntime: run.coordinator_runtime,
-      planningSource: run.planning_source,
-      riskTier: run.risk_tier,
-      objectivePreview: "",
-      state: run.state,
-      taskTitle: "",
-      contentRedacted: true,
-      budget: run.budget,
-      usage: run.usage,
-      counters: run.counters,
-      createdAt: Math.floor(new Date(run.created_at).getTime() / 1000),
-      finishedAt: run.finished_at ? Math.floor(new Date(run.finished_at).getTime() / 1000) : null,
-    });
+    if (!run) return false;
+    try {
+      await this.relayClient.send("collaboration.run.project", {
+        sourceDeviceId: this.deviceId,
+        runId: run.run_id,
+        templateId: run.template_id,
+        workflowTemplateId: run.workflow_template_id,
+        workspaceMode: run.workspace_mode,
+        resolvedWorkspaceMode: run.resolved_workspace_mode,
+        coordinatorRuntime: run.coordinator_runtime,
+        planningSource: run.planning_source,
+        riskTier: run.risk_tier,
+        objectivePreview: "",
+        state: run.state,
+        taskTitle: "",
+        contentRedacted: true,
+        budget: run.budget,
+        usage: run.usage,
+        counters: run.counters,
+        createdAt: Math.floor(new Date(run.created_at).getTime() / 1000),
+        finishedAt: run.finished_at ? Math.floor(new Date(run.finished_at).getTime() / 1000) : null,
+      });
+      return true;
+    } catch {
+      // Collaboration projection is best-effort. Local state remains
+      // canonical, and an expired relay login must never terminate the daemon
+      // that owns Agent history, control, and E2EE routing.
+      return false;
+    }
   }
 
   async reportUsage(runId, usageId, usage) {

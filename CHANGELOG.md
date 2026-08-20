@@ -3,6 +3,31 @@
 All notable changes to OriginRouter CLI will be documented here. The project
 uses Semantic Versioning and follows the Keep a Changelog structure.
 
+## Unreleased
+
+### Fixed
+
+- Fixed terminating a running Codex / Claude Code session from the App: the
+  `session.stop` command previously only sent a single SIGHUP to the PTY leader
+  (node-pty's default), which Node CLI children often ignore, leaving the agent
+  process running. Termination now sends SIGTERM to the whole process group
+  (negative pid) — reaching every descendant, not just the PTY leader — and
+  escalates to SIGKILL after a grace window if the process has not exited.
+  Because both App-side session stops and workspace / collaboration-run stops
+  funnel through the same `PtyExecutor.stop()`, this fixes both entry points.
+
+### Changed
+
+- Executors now share a single SIGTERM → SIGKILL escalation helper
+  (`src/executors/processTreeKill.js`). The pipe executor also escalates to
+  SIGKILL (signaling only its own pid, since a non-detached child is not a
+  process-group leader); the tmux executor already tears down its whole pane
+  tree via `tmux kill-session`.
+- The parsed `--executor` (daemon) and `--originrouter-executor` (local session)
+  options are now honored instead of being hard-coded to `pty`. The executor
+  kind is validated and falls back to `pty` for any unknown value, preserving
+  the existing default.
+
 ## 0.2.0 - 2026-08-16
 
 ### Added

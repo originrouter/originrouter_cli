@@ -520,7 +520,7 @@ export class AgentCatalog {
     `).get(safeText(sessionId, 64));
     return this.upsertSession({
       sessionId,
-      conversationId: current?.conversation_id,
+      conversationId: payload.conversationId || current?.conversation_id,
       runId: current?.run_id,
       agent: current?.agent_type,
       title: current?.title,

@@ -4,6 +4,8 @@ import { getCompletionCandidates } from "../src/commands/completion.js";
 
 assert(getCompletionCandidates([""]).includes("provider"));
 assert.deepEqual(getCompletionCandidates(["pro"]), ["provider", "proxy"]);
+assert(getCompletionCandidates(["serv"]).includes("services"));
+assert(getCompletionCandidates(["services", "r"]).includes("restart"));
 assert(getCompletionCandidates(["route", ""]).includes("set"));
 assert(getCompletionCandidates(["route", "cloud", ""]).includes("models"));
 assert.deepEqual(getCompletionCandidates(["claude", "--originrouter-autonomy", "g"]), ["guarded"]);

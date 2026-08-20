@@ -282,7 +282,7 @@ OriginRouter OAuth login:
                      [--no-browser]
                      [--configure-agents|--keep-agent-routes|--no-agent-setup]
   originrouter logout [--remove-device]
-  originrouter auth status
+  originrouter auth status|verify
   originrouter security status|rotate
 
   Login uses RFC 8628 Device Authorization Grant directly with Surety. It prints
@@ -365,7 +365,7 @@ Sessions and control:
 Account:
   originrouter login [--no-browser]
   originrouter logout
-  originrouter auth status
+  originrouter auth status|verify
 
 Discoverability:
   originrouter completion bash|zsh|fish|powershell
@@ -2173,7 +2173,7 @@ export async function main(argv) {
     return;
   }
 
-  if (command === "service") {
+  if (command === "service" || command === "services") {
     await handleServiceCommand(args);
     return;
   }

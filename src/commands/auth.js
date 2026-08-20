@@ -108,6 +108,30 @@ export async function inspectStoredLogin({
   }
 }
 
+// Unlike `inspectStoredLogin`, this is safe for diagnostics: an invalid
+// server-side session is reported but never removes the local credential.
+export async function verifyStoredLogin({
+  stateDir,
+  fetchFn = globalThis.fetch,
+} = {}) {
+  const stored = readCodingAuth(stateDir);
+  if (!stored) return { state: "missing", credential: null };
+  try {
+    const credential = await ensureFreshAccessToken({
+      stateDir,
+      forceRefresh: true,
+      fetchFn,
+    });
+    return { state: "active", credential };
+  } catch (error) {
+    return {
+      state: storedLoginIsInvalid(error) ? "invalid" : "unavailable",
+      credential: null,
+      error,
+    };
+  }
+}
+
 export async function handleLogin(args, {
   fetchFn = globalThis.fetch,
   agentRouteSetupFn = maybeConfigureAgentRoutesAfterLogin,
@@ -331,14 +355,38 @@ function handleAuthStatus() {
   }
 }
 
+async function handleAuthVerify() {
+  const result = await verifyStoredLogin({ stateDir: ensureStateDir() });
+  if (result.state === "active") {
+    console.log("OriginRouter login verified with Surety.");
+    return;
+  }
+  if (result.state === "missing") {
+    console.log("Not logged in.");
+    process.exitCode = 1;
+    return;
+  }
+  if (result.state === "invalid") {
+    console.log(`OriginRouter login is no longer valid: ${result.error?.message || "refresh token rejected"}`);
+    console.log("Run `originrouter login` to sign in again. Your local credential was kept unchanged.");
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`OriginRouter login could not be verified: ${result.error?.message || "network or service unavailable"}`);
+  console.log("Your local credential was kept unchanged. Check connectivity and try again.");
+  process.exitCode = 1;
+}
+
 export async function handleAuthCommand(args) {
   const [sub] = args;
   if (!sub || sub === "--help" || sub === "-h") {
     console.log("OriginRouter auth subcommands:");
     console.log("  status    Show the local OAuth session without contacting a server.");
+    console.log("  verify    Refresh and verify the session with Surety without clearing it on failure.");
     return;
   }
   if (sub === "status") return handleAuthStatus();
+  if (sub === "verify") return handleAuthVerify();
   reportCliError(`Unknown auth subcommand: ${sub}`, {
     next: "Run `originrouter --help` for usage.",
   });

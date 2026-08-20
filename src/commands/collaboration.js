@@ -116,12 +116,24 @@ function localApi() {
   return { baseUrl: `http://${urlHost}:${state.localApiPort}`, token };
 }
 
-async function request(path, { method = "GET", body } = {}) {
+function interruptedError(message = "Operation interrupted.") {
+  const error = new Error(message);
+  error.code = "ORIGINROUTER_INTERRUPTED";
+  return error;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw interruptedError();
+}
+
+async function request(path, { method = "GET", body, signal } = {}) {
   const api = localApi();
   let response;
   try {
+    throwIfAborted(signal);
     response = await fetch(`${api.baseUrl}${path}`, {
       method,
+      signal,
       headers: {
         Authorization: `Bearer ${api.token}`,
         ...(body == null ? {} : { "Content-Type": "application/json" }),
@@ -129,6 +141,7 @@ async function request(path, { method = "GET", body } = {}) {
       body: body == null ? undefined : JSON.stringify(body),
     });
   } catch (error) {
+    if (signal?.aborted) throw interruptedError();
     throw new CollaborationCliError(
       "Could not connect to the local OriginRouter service.",
       {
@@ -1539,7 +1552,7 @@ function printFinalReport(report, { participantId = "", taskId = "" } = {}) {
   }
 }
 
-async function attachRun(runId, args = []) {
+async function attachRun(runId, args = [], { signal } = {}) {
   if (!runId) throw new Error("Usage: originrouter collaboration attach <run-id> [--plain|--verbose|--raw] [--participant <id>] [--task <id>]");
   const raw = has(args, "raw");
   const verbose = raw || has(args, "verbose");
@@ -1569,9 +1582,15 @@ async function attachRun(runId, args = []) {
     stopped = true;
     if (!json) console.log("\nDetached. The collaboration continues in the OriginRouter service.");
   };
-  process.once("SIGINT", onInterrupt);
+  const onAbort = () => {
+    stopped = true;
+    if (!json) console.log("\nInterrupted. Leaving follow mode.");
+  };
+  if (!signal) process.once("SIGINT", onInterrupt);
+  signal?.addEventListener("abort", onAbort, { once: true });
   try {
-    let data = await request(`/collaboration/local/runs/${encodeURIComponent(runId)}/snapshot`);
+    throwIfAborted(signal);
+    let data = await request(`/collaboration/local/runs/${encodeURIComponent(runId)}/snapshot`, { signal });
     let snapshot = data.snapshot;
     if (json) console.log(JSON.stringify({ type: "snapshot", snapshot }));
     else if (!raw) printAttachSnapshot(snapshot, { participantId, taskId });
@@ -1670,9 +1689,11 @@ async function attachRun(runId, args = []) {
     while (!stopped) {
       await new Promise((resolve) => setTimeout(resolve, interval));
       if (stopped) break;
+      throwIfAborted(signal);
       try {
         const eventData = await request(
           eventQuery(cursor),
+          { signal },
         );
         for (const event of eventData.events || []) {
           cursor = Math.max(cursor, Number(event.sequence || 0));
@@ -1683,7 +1704,7 @@ async function attachRun(runId, args = []) {
           if (json) console.log(JSON.stringify({ type: "event", event }));
           else printAttachEvent(event, { raw, verbose, plain });
         }
-        data = await request(`/collaboration/local/runs/${encodeURIComponent(runId)}/snapshot`);
+        data = await request(`/collaboration/local/runs/${encodeURIComponent(runId)}/snapshot`, { signal });
         snapshot = data.snapshot;
         if (connectionFailures > 0 && !json) {
           console.log("Connection restored. Snapshot and event cursor are synchronized.");
@@ -1708,15 +1729,17 @@ async function attachRun(runId, args = []) {
   } finally {
     commandInterface?.close();
     await commandQueue.catch(() => {});
-    process.removeListener("SIGINT", onInterrupt);
+    if (!signal) process.removeListener("SIGINT", onInterrupt);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
-async function waitForPlan(runId, timeoutSeconds) {
+async function waitForPlan(runId, timeoutSeconds, { signal } = {}) {
   const deadline = Date.now() + timeoutSeconds * 1000;
   let run;
   while (Date.now() < deadline) {
-    run = (await request(`/collaboration/local/runs/${encodeURIComponent(runId)}`)).run;
+    throwIfAborted(signal);
+    run = (await request(`/collaboration/local/runs/${encodeURIComponent(runId)}`, { signal })).run;
     if (["awaiting_plan_confirmation", "failed", "cancelled", "expired"].includes(run.state)) return run;
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
@@ -1904,7 +1927,7 @@ async function printDiagnostics(runId, { json = false } = {}) {
   console.log("\nThis report excludes prompts, result content, credentials, and raw environment data.");
 }
 
-async function handleCollaborationCommandImpl(args) {
+async function handleCollaborationCommandImpl(args, options = {}) {
   const [action = "list", ...rest] = args;
   const json = has(args, "json");
   if (action === "templates") {
@@ -2001,7 +2024,7 @@ async function handleCollaborationCommandImpl(args) {
     return;
   }
   if (action === "attach") {
-    const snapshot = await attachRun(rest[0], args);
+    const snapshot = await attachRun(rest[0], args, { signal: options.signal });
     if (snapshot?.run?.state === "failed") process.exitCode = 6;
     if (snapshot?.run?.state === "budget_exhausted") process.exitCode = 7;
     return;
@@ -2051,7 +2074,7 @@ async function handleCollaborationCommandImpl(args) {
       { method: "POST", body: { feedback: feedback.trim() } },
     )).run;
     printRun(run, { json });
-    if (!has(args, "detach") && !json) await attachRun(run.run_id, args);
+    if (!has(args, "detach") && !json) await attachRun(run.run_id, args, { signal: options.signal });
     return;
   }
   if (action === "retry") {
@@ -2062,7 +2085,7 @@ async function handleCollaborationCommandImpl(args) {
       { method: "POST", body: { task_id: value(args, "task") || null } },
     )).run;
     printRun(run, { json });
-    if (!has(args, "detach") && !json) await attachRun(run.run_id, args);
+    if (!has(args, "detach") && !json) await attachRun(run.run_id, args, { signal: options.signal });
     return;
   }
   if (action === "archive") {
@@ -2168,15 +2191,18 @@ async function handleCollaborationCommandImpl(args) {
     } else {
       payload = await interactiveCreatePayload({ initialDraft });
     }
-    let run = (await request("/collaboration/local/runs", { method: "POST", body: payload })).run;
-    run = (await request(`/collaboration/local/runs/${encodeURIComponent(run.run_id)}/start`, { method: "POST", body: {} })).run;
+    throwIfAborted(options.signal);
+    let run = (await request("/collaboration/local/runs", { method: "POST", body: payload, signal: options.signal })).run;
+    options.onRunId?.(run.run_id);
+    run = (await request(`/collaboration/local/runs/${encodeURIComponent(run.run_id)}/start`, { method: "POST", body: {}, signal: options.signal })).run;
+    options.onRunId?.(run.run_id);
     if (has(args, "no-wait")) {
       printRun(run, { json });
       return;
     }
     const timeout = Math.max(30, Math.min(900, Number(value(args, "timeout") || 300)));
     if (!json) console.log(`Planner is preparing a collaboration plan (${run.run_id})…`);
-    run = await waitForPlan(run.run_id, timeout);
+    run = await waitForPlan(run.run_id, timeout, { signal: options.signal });
     if (!run || run.state !== "awaiting_plan_confirmation") {
       printRun(run || { run_id: payload.run_id || "", state: "unknown", objective: payload.objective }, { json });
       if (run?.state === "failed") process.exitCode = 6;
@@ -2186,7 +2212,7 @@ async function handleCollaborationCommandImpl(args) {
     }
     if (json) {
       if (has(args, "yes") && !has(args, "review")) {
-        const confirmed = (await request(`/collaboration/local/runs/${encodeURIComponent(run.run_id)}/confirm`, { method: "POST", body: {} })).run;
+        const confirmed = (await request(`/collaboration/local/runs/${encodeURIComponent(run.run_id)}/confirm`, { method: "POST", body: {}, signal: options.signal })).run;
         printRun(confirmed, { json: true });
       } else {
         printRun(run, { json: true });
@@ -2202,7 +2228,7 @@ async function handleCollaborationCommandImpl(args) {
         { method: "POST", body: { feedback: decision.feedback } },
       )).run;
       console.log("\nPlanner is revising the collaboration plan…");
-      run = await waitForPlan(run.run_id, timeout);
+      run = await waitForPlan(run.run_id, timeout, { signal: options.signal });
       if (!run || run.state !== "awaiting_plan_confirmation") {
         printRun(run || { run_id: "", state: "unknown", objective: payload.objective });
         if (run?.state === "failed") process.exitCode = 6;
@@ -2214,9 +2240,9 @@ async function handleCollaborationCommandImpl(args) {
       decision = await confirmInteractively(run, args);
     }
     if (decision.action === "confirm") {
-      const confirmed = (await request(`/collaboration/local/runs/${encodeURIComponent(run.run_id)}/confirm`, { method: "POST", body: {} })).run;
+      const confirmed = (await request(`/collaboration/local/runs/${encodeURIComponent(run.run_id)}/confirm`, { method: "POST", body: {}, signal: options.signal })).run;
       console.log(`\nCollaboration started: ${confirmed.run_id}`);
-      if (!has(args, "detach")) await attachRun(confirmed.run_id, args);
+      if (!has(args, "detach")) await attachRun(confirmed.run_id, args, { signal: options.signal });
     } else {
       console.log(`\nThe plan has not started. Review it, then run: originrouter collaboration confirm ${run.run_id}`);
       if (!input.isTTY || !output.isTTY) process.exitCode = 8;
@@ -2226,10 +2252,11 @@ async function handleCollaborationCommandImpl(args) {
   throw new Error("Usage: originrouter collaboration templates|list|drafts|draft|show|attach|attention|resolve|doctor|create|start|confirm|revise|pause|resume|retry|cancel|archive|delete|export");
 }
 
-export async function handleCollaborationCommand(args) {
+export async function handleCollaborationCommand(args, options = {}) {
   try {
-    return await handleCollaborationCommandImpl(args);
+    return await handleCollaborationCommandImpl(args, options);
   } catch (error) {
+    if (error?.code === "ORIGINROUTER_INTERRUPTED") throw error;
     if (error instanceof CollaborationCliError) throw error;
     const message = String(error?.message || error || "Collaboration command failed.");
     const invalidInput = /(^Usage:|missing |must |required|invalid|unsupported|duplicate|enter a |add at least|not found)/i.test(message);

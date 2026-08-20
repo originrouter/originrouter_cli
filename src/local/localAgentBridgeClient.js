@@ -95,6 +95,10 @@ export class LocalAgentBridgeClient {
   }
 
   async update(payload) {
+    // Keep reconnect registration authoritative even when the daemon is
+    // temporarily unavailable. Claude can switch its native conversation via
+    // /clear or /resume while the bridge is disconnected.
+    this.sessionMetadata = { ...this.sessionMetadata, ...payload };
     if (this.closed || !(await this.connect())) return false;
     try {
       await request(
@@ -103,7 +107,6 @@ export class LocalAgentBridgeClient {
         `/agent/local/sessions/${encodeURIComponent(this.sessionId)}/update`,
         payload,
       );
-      this.sessionMetadata = { ...this.sessionMetadata, ...payload };
       return true;
     } catch {
       this.setEndpoint(null);

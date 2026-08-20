@@ -118,6 +118,53 @@ test("daemon preserves text and tool history while removing undefined fields", a
   });
 });
 
+test("daemon returns an empty tagged page when a transcript cannot be read", async () => {
+  const sent = [];
+  const registry = {
+    has: () => true,
+    history: () => {
+      throw new Error("transcript disappeared");
+    },
+    list: () => [
+      {
+        session_id: "session-1",
+        conversation_id: "claude:native-session-2",
+        native_session_id: "native-session-2",
+      },
+    ],
+    enqueueCommand: () => {},
+  };
+  const router = new ExternalAgentRelayRouter({
+    registry,
+    relayClient: {
+      send: async (type, payload) => sent.push({ type, payload }),
+    },
+  });
+
+  assert.equal(
+    await router.handle({
+      type: "agent.history.request",
+      sessionId: "session-1",
+      requestId: "history-failed",
+    }),
+    true,
+  );
+  assert.deepEqual(sent, [
+    {
+      type: "agent.history.page",
+      payload: {
+        sessionId: "session-1",
+        requestId: "history-failed",
+        messages: [],
+        nextCursor: null,
+        hasMore: false,
+        conversationId: "claude:native-session-2",
+        nativeSessionId: "native-session-2",
+      },
+    },
+  ]);
+});
+
 test("daemon routes App messages to the exact registered session", async () => {
   const { router, commands } = fixture();
   const message = {

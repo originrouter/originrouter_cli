@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 
-import { handleAgentWorkspaceCommand, parseAgentWorkspaceArgs } from "../src/commands/agentWorkspace.js";
+import {
+  buildWorkspaceAppScreen,
+  handleAgentWorkspaceCommand,
+  parseAgentWorkspaceArgs,
+  redrawPrompt,
+} from "../src/commands/agentWorkspace.js";
+import { buildAgentLaunchScreen } from "../src/local/agentLaunchScreen.js";
 import {
   buildLocalWorkspaceConfiguration,
   inferWorkspaceMode,
@@ -69,9 +76,10 @@ assert.equal(normalizeWorkspaceMode("plan"), "plan_build_verify");
 assert.equal(nextWorkspaceMode("auto").id, "solo");
 assert.equal(inferWorkspaceMode("explain the authentication flow"), "solo");
 assert.equal(inferWorkspaceMode("fix the authentication race and add tests"), "build_review");
-assert.equal(inferWorkspaceMode("check service status on server A"), "remote_ops");
+assert.equal(inferWorkspaceMode("check service status on server A"), "solo");
 assert.equal(workspaceRequiresPlanReview("deploy to production", "auto"), true);
-assert.equal(workspaceRequiresPlanReview("check service status on server A", "auto"), true);
+assert.equal(workspaceRequiresPlanReview("check service status on server A", "auto"), false);
+assert.equal(workspaceRequiresPlanReview("check service status on server A", "remote-ops"), true);
 
 const buildReview = buildLocalWorkspaceConfiguration({
   objective: "Fix login and add tests",
@@ -110,6 +118,140 @@ assert.equal(remote.participants.length, 2);
 assert.equal(remote.participants[1].device_id, "server-a");
 assert.equal(remote.auto_configuration.safe_to_skip_confirmation, false);
 
+const workspaceScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 80,
+  rows: 23,
+});
+assert.match(workspaceScreen, /╭─/);
+assert.match(workspaceScreen, /OriginRouter/);
+assert.match(workspaceScreen, /Agent Workspace/);
+assert.match(workspaceScreen, /Team      Auto/);
+assert.match(workspaceScreen, /Access    Guarded/);
+assert.doesNotMatch(workspaceScreen, /^OriginRouter\nWorkspace/m);
+
+const launchScreen = buildAgentLaunchScreen({
+  agent: "codex",
+  workspaceName: "originrouter-cli",
+  cwd: "~/Desktop/originrouter-cli",
+  detailLabel: "Detailed",
+  controlLabel: "local-only",
+  sessionLabel: "Codex native session",
+  columns: 80,
+});
+assert.match(launchScreen, /OriginRouter/);
+assert.doesNotMatch(launchScreen, /Agent Console/);
+assert.match(launchScreen, /OpenAI Codex/);
+assert.match(launchScreen, /Runtime/);
+assert.match(launchScreen, /Workspace/);
+assert.match(launchScreen, /Starting session/);
+
+const writes = [];
+const output = {
+  isTTY: true,
+  columns: 20,
+  write(chunk) {
+    writes.push(String(chunk));
+    return true;
+  },
+};
+let rows = redrawPrompt(output, "", "auto");
+rows = redrawPrompt(output, "我想分析一下我远程电脑的状态", "auto", rows);
+assert(rows > 1);
+rows = redrawPrompt(output, "我想分析一下我远程电脑的状态，包括机器状态和版本信息", "auto", rows);
+assert.match(writes.join(""), /\x1b\[1A/);
+assert.match(writes.join(""), /› 我想分析一下/);
+assert.match(writes.join(""), /Auto · Guarded ·/);
+assert.doesNotMatch(writes.join(""), /\[Auto\] >/);
+
+function fakeTerminal(columns = 80, rows = 24) {
+  const input = new EventEmitter();
+  input.isTTY = true;
+  input.setRawMode = () => {};
+  input.resume = () => {};
+  input.pause = () => {};
+  const terminalWrites = [];
+  const terminalOutput = new EventEmitter();
+  terminalOutput.isTTY = true;
+  terminalOutput.columns = columns;
+  terminalOutput.rows = rows;
+  terminalOutput.write = (chunk) => {
+    terminalWrites.push(String(chunk));
+    return true;
+  };
+  return { input, output: terminalOutput, writes: terminalWrites };
+}
+
+function emitText(input, text) {
+  for (const char of text) input.emit("keypress", char, { name: char });
+}
+
+const clearInputTerminal = fakeTerminal();
+const clearInputCalls = [];
+const clearInputRun = handleAgentWorkspaceCommand([], {
+  input: clearInputTerminal.input,
+  output: clearInputTerminal.output,
+  collaborationRunner: async (args) => clearInputCalls.push(args),
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(clearInputTerminal.input, "draft text");
+clearInputTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" });
+emitText(clearInputTerminal.input, "/exit");
+clearInputTerminal.input.emit("keypress", undefined, { name: "return" });
+await clearInputRun;
+assert.equal(clearInputCalls.length, 0);
+assert.match(clearInputTerminal.writes.join(""), /Input cleared/);
+
+const doubleExitTerminal = fakeTerminal();
+const doubleExitRun = handleAgentWorkspaceCommand([], {
+  input: doubleExitTerminal.input,
+  output: doubleExitTerminal.output,
+  collaborationRunner: async () => {
+    throw new Error("collaboration should not start");
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+doubleExitTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" });
+doubleExitTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" });
+await doubleExitRun;
+assert.match(doubleExitTerminal.writes.join(""), /Press Ctrl\+C again to exit/);
+
+const activeInterruptTerminal = fakeTerminal();
+const cancelledRuns = [];
+let activeRunnerStarted = false;
+const activeInterruptRun = handleAgentWorkspaceCommand([], {
+  input: activeInterruptTerminal.input,
+  output: activeInterruptTerminal.output,
+  collaborationRunner: async (_args, options = {}) => {
+    activeRunnerStarted = true;
+    options.onRunId?.("acr_test_interrupt");
+    setImmediate(() => process.emit("SIGINT"));
+    await new Promise((resolve, reject) => {
+      options.signal?.addEventListener("abort", () => {
+        const error = new Error("interrupted");
+        error.code = "ORIGINROUTER_INTERRUPTED";
+        reject(error);
+      }, { once: true });
+      setTimeout(resolve, 1000);
+    });
+  },
+  cancelCollaborationRun: async (runId) => {
+    cancelledRuns.push(runId);
+    setImmediate(() => {
+      emitText(activeInterruptTerminal.input, "/exit");
+      activeInterruptTerminal.input.emit("keypress", undefined, { name: "return" });
+    });
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(activeInterruptTerminal.input, "run something");
+activeInterruptTerminal.input.emit("keypress", undefined, { name: "return" });
+await activeInterruptRun;
+assert.equal(activeRunnerStarted, true);
+assert.deepEqual(cancelledRuns, ["acr_test_interrupt"]);
+assert.match(activeInterruptTerminal.writes.join(""), /Cancelling acr_test_interrupt/);
+
 const calls = [];
 await handleAgentWorkspaceCommand([
   "-c", "codex", "--mode", "solo", "explain", "this", "module",
@@ -126,6 +268,7 @@ const remoteCalls = [];
 await handleAgentWorkspaceCommand(["check", "service", "status", "on", "server", "A"], {
   collaborationRunner: async (args) => remoteCalls.push(args),
 });
-assert.equal(remoteCalls[0].includes("--yes"), false, "Auto-resolved Remote Ops must require review");
+assert.equal(remoteCalls[0].includes("--cloud-advice"), true, "Auto mode asks the advisory model to choose a team");
+assert.equal(remoteCalls[0].includes("--yes"), true, "Conservative local fallback remains a solo task");
 
 console.log("agent workspace tests passed");

@@ -56,3 +56,27 @@ test("local agent command polling never applies one command twice", async () => 
     globalThis.fetch = originalFetch;
   }
 });
+
+test("conversation metadata survives a daemon outage for reconnect", async () => {
+  const client = new LocalAgentBridgeClient({
+    stateDir: "/tmp/originrouter-local-bridge-conversation-test",
+    sessionId: "session-1",
+    onCommand: async () => {},
+  });
+  client.closed = true;
+
+  assert.equal(
+    await client.update({
+      conversationId: "claude:new-conversation",
+      nativeSessionId: "new-conversation",
+      transcriptPath: "/tmp/new-conversation.jsonl",
+    }),
+    false,
+  );
+  assert.equal(client.sessionMetadata.conversationId, "claude:new-conversation");
+  assert.equal(client.sessionMetadata.nativeSessionId, "new-conversation");
+  assert.equal(
+    client.sessionMetadata.transcriptPath,
+    "/tmp/new-conversation.jsonl",
+  );
+});

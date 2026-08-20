@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   inspectStoredLogin,
   storedLoginIsInvalid,
+  verifyStoredLogin,
 } from "../src/commands/auth.js";
 import {
   codingAuthPath,
@@ -79,6 +80,19 @@ test("terminal Surety rejection clears the stored login", () => withState(async 
   });
   assert.equal(result.state, "invalid");
   assert.equal(existsSync(codingAuthPath(stateDir)), false);
+}));
+
+test("diagnostic verification preserves an invalid local credential", () => withState(async (stateDir) => {
+  writeCodingAuth(stateDir, credential());
+  const result = await verifyStoredLogin({
+    stateDir,
+    fetchFn: async () => response(400, {
+      error: "invalid_grant",
+      error_description: "Refresh token is inactive",
+    }),
+  });
+  assert.equal(result.state, "invalid");
+  assert.equal(readCodingAuth(stateDir).refreshToken, "or_rt_existing");
 }));
 
 test("temporary Surety failure preserves the stored login", () => withState(async (stateDir) => {
