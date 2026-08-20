@@ -105,6 +105,47 @@ const ANSI = {
 
 const workspaceScreenCache = new WeakMap();
 
+// Coalesce background state changes into one terminal frame. Input-driven
+// changes can still request an immediate frame when the cursor must feel
+// synchronous, while event streams and timers share this short frame window.
+export function createWorkspaceFrameScheduler({
+  render,
+  schedule = setTimeout,
+  cancel = clearTimeout,
+  frameDelayMs = 16,
+} = {}) {
+  if (typeof render !== "function") throw new TypeError("workspace frame renderer requires render");
+  let pending = null;
+  let disposed = false;
+  const request = (force = false) => {
+    if (disposed) return;
+    if (force) {
+      if (pending !== null) {
+        cancel(pending);
+        pending = null;
+      }
+      render(true);
+      return;
+    }
+    if (pending !== null) return;
+    pending = schedule(() => {
+      pending = null;
+      if (!disposed) render(false);
+    }, Math.max(0, frameDelayMs));
+  };
+  return {
+    request,
+    flush() {
+      request(true);
+    },
+    dispose() {
+      disposed = true;
+      if (pending !== null) cancel(pending);
+      pending = null;
+    },
+  };
+}
+
 function colorEnabled() {
   return process.env.ORIGINROUTER_NO_COLOR == null && process.env.TERM !== "dumb";
 }
@@ -363,7 +404,8 @@ function buildRuntimeRows(runtime, columns, maxRows) {
   if (tasks.length) {
     push("");
     for (const task of tasks.slice(0, 6)) {
-      push(`${taskMarker(task.state)} ${task.title || task.task_key}  ${muted(task.participant_id || "unassigned")}`);
+      const taskState = String(task.state || "queued").replaceAll("_", " ");
+      push(`${taskMarker(task.state)} ${task.title || task.task_key}  ${muted(`${taskState} · ${task.participant_id || "unassigned"}`)}`);
     }
   }
 
@@ -378,7 +420,12 @@ function buildRuntimeRows(runtime, columns, maxRows) {
     const events = (runtime.events || []).filter((event) => event.visibility !== "diagnostic").slice(-4);
     if (events.length) {
       push("");
-      for (const event of events) push(`  ${event.summary || String(event.type || "activity").replaceAll(".", " ")}`, muted);
+      for (const event of events) {
+        const summary = event.summary || String(event.type || "activity").replaceAll(".", " ");
+        push(`  ${summary}`, muted);
+        const detail = String(event.detail || "").trim();
+        if (detail && detail !== summary) push(`    ${detail}`, muted);
+      }
     }
   }
   return lines.slice(0, Math.max(0, maxRows));
@@ -405,6 +452,20 @@ function composerStatus(columns) {
 }
 
 function runtimeComposer(runtime, columns) {
+  return composerLine(runtime.composerBuffer || "", runtime.composerCursor, columns);
+}
+
+function composerLine(value, cursor, columns) {
+  const chars = [...String(value || "")];
+  const boundedCursor = Math.max(0, Math.min(
+    Number.isInteger(cursor) ? cursor : chars.length,
+    chars.length,
+  ));
+  const cursorValue = `${chars.slice(0, boundedCursor).join("")}▌${chars.slice(boundedCursor).join("")}`;
+  return padDisplayRight(strong(fitDisplayText(`› ${cursorValue}`, Math.max(1, columns - 1))), columns);
+}
+
+function runtimePathComposer(runtime, columns) {
   let value = runtime.composerBuffer || "";
   if (runtime.phase === "needs_setup") {
     const selected = runtime.setupMode === "path"
@@ -425,9 +486,16 @@ function interactionComposer(runtime, columns) {
       "↑/↓ select · Enter confirm · type a path for another folder · Esc cancel",
     ];
   } else if (kind === "setup") {
+    const path = String(runtime.setupPath || runtime.setup?.default_path || "");
+    const pathChars = [...path];
+    const pathCursor = Math.max(0, Math.min(
+      Number.isInteger(runtime.setupCursor) ? runtime.setupCursor : pathChars.length,
+      pathChars.length,
+    ));
+    const pathWithCursor = `${pathChars.slice(0, pathCursor).join("")}▌${pathChars.slice(pathCursor).join("")}`;
     lines = [
       "? Authorize a remote workspace",
-      `› ${runtime.setupPath || runtime.setup?.default_path || ""}▌`,
+      `› ${pathWithCursor}`,
       "Enter authorize · Ctrl+U clear · ←/→ edit · Esc cancel",
     ];
   } else if (kind === "configuration") {
@@ -481,6 +549,9 @@ export function buildWorkspaceAppScreen({
   rows = 24,
   panel = null,
   runtime = null,
+  composerBuffer = null,
+  composerCursor = 0,
+  composerNotice = "",
 } = {}) {
   const terminalColumns = Math.max(40, Number(columns) || 80);
   const terminalRows = Math.max(14, Number(rows) || 24);
@@ -527,7 +598,16 @@ export function buildWorkspaceAppScreen({
   const separator = border("─".repeat(terminalColumns));
   const blankRows = Math.max(0, terminalRows - screenRows.length - reservedRows);
   const body = `${screenRows.join("\n")}\n${"\n".repeat(blankRows)}`;
-  if (!runtime) return `${body}${composerStatus(terminalColumns)}\n${separator}\n`;
+  if (!runtime && composerBuffer === null) return `${body}${composerStatus(terminalColumns)}\n${separator}\n`;
+  if (!runtime) {
+    return [
+      `${body}${muted(`  ${composerNotice || `${modeLabel} · shift+tab to cycle · /help for commands`}`)}`,
+      separator,
+      composerLine(composerBuffer, composerCursor, terminalColumns),
+      separator,
+      muted("  Enter submits · Ctrl+C clears · Ctrl+D exits · /help for commands"),
+    ].join("\n");
+  }
   const composer = runtime.interaction
     ? interactionComposer(runtime, terminalColumns)
     : runtimeComposer(runtime, terminalColumns);
@@ -548,6 +628,9 @@ function redrawWorkspaceApp(output, {
   mode,
   panel = null,
   runtime = null,
+  composerBuffer = null,
+  composerCursor = 0,
+  composerNotice = "",
   force = false,
 } = {}) {
   const screen = buildWorkspaceAppScreen({
@@ -555,23 +638,40 @@ function redrawWorkspaceApp(output, {
     mode,
     panel,
     runtime,
+    composerBuffer,
+    composerCursor,
+    composerNotice,
     columns: output.columns,
     rows: output.rows,
   });
   const nextLines = screen.replace(/\n$/, "").split("\n");
   const previous = workspaceScreenCache.get(output);
-  if (force || !previous || previous.columns !== output.columns || previous.rows !== output.rows) {
-    output.write("\x1b[2J\x1b[H");
-    output.write(screen);
-  } else {
-    const maxRows = Math.max(previous.lines.length, nextLines.length);
-    for (let index = 0; index < maxRows; index += 1) {
-      const next = nextLines[index] || "";
-      const old = previous.lines[index] || "";
-      if (next === old) continue;
-      output.write(`\x1b[${index + 1};1H\x1b[2K${next}`);
+  const writeFrame = (writer) => {
+    // DEC 2026 is supported by modern terminals and makes a frame appear
+    // atomically. Terminals that do not implement it safely ignore the mode.
+    output.write("\x1b[?2026h");
+    try {
+      writer();
+    } finally {
+      output.write("\x1b[?2026l");
     }
-    output.write(`\x1b[${Math.max(1, nextLines.length)};1H`);
+  };
+  if (force || !previous || previous.columns !== output.columns || previous.rows !== output.rows) {
+    writeFrame(() => {
+      output.write("\x1b[2J\x1b[H");
+      output.write(screen);
+    });
+  } else {
+    writeFrame(() => {
+      const maxRows = Math.max(previous.lines.length, nextLines.length);
+      for (let index = 0; index < maxRows; index += 1) {
+        const next = nextLines[index] || "";
+        const old = previous.lines[index] || "";
+        if (next === old) continue;
+        output.write(`\x1b[${index + 1};1H\x1b[2K${next}`);
+      }
+      output.write(`\x1b[${Math.max(1, nextLines.length)};1H`);
+    });
   }
   workspaceScreenCache.set(output, {
     columns: output.columns,
@@ -677,10 +777,21 @@ async function readWorkspaceLine({ input, output, mode, coordinator, panel, onMo
   input.setRawMode(true);
   input.resume();
   let buffer = "";
+  let cursor = 0;
   let notice = "";
   let exitArmed = false;
   let noticeTimer = null;
-  let renderedRows = redrawPrompt(output, buffer, mode, 0, { notice });
+  const renderInput = (force = false) => redrawWorkspaceApp(output, {
+    coordinator,
+    mode,
+    panel,
+    composerBuffer: buffer,
+    composerCursor: cursor,
+    composerNotice: notice,
+    force,
+  });
+  renderInput(true);
+  const inputFrameScheduler = createWorkspaceFrameScheduler({ render: renderInput });
   return new Promise((resolve, reject) => {
     const clearNoticeTimer = () => {
       if (!noticeTimer) return;
@@ -692,7 +803,7 @@ async function readWorkspaceLine({ input, output, mode, coordinator, panel, onMo
       noticeTimer = setTimeout(() => {
         notice = "";
         exitArmed = false;
-        renderedRows = redrawPrompt(output, buffer, mode, renderedRows, { notice });
+        renderInput(true);
       }, ms);
       noticeTimer.unref?.();
     };
@@ -705,24 +816,21 @@ async function readWorkspaceLine({ input, output, mode, coordinator, panel, onMo
       input.off("error", onError);
       output.off?.("resize", onResize);
       clearNoticeTimer();
+      inputFrameScheduler.dispose();
       input.setRawMode(false);
       input.pause();
     };
-    const redrawLine = () => {
-      redrawWorkspaceApp(output, { coordinator, mode, panel });
-      renderedRows = redrawPrompt(output, buffer, mode, 0, { notice });
-    };
     const onResize = () => {
-      redrawWorkspaceApp(output, { coordinator, mode, panel, force: true });
-      renderedRows = redrawPrompt(output, buffer, mode, 0, { notice });
+      inputFrameScheduler.request();
     };
     const onKeypress = (text, key = {}) => {
       if (key.ctrl && key.name === "c") {
         if (buffer) {
           buffer = "";
+          cursor = 0;
           exitArmed = false;
           notice = "Input cleared";
-          renderedRows = redrawPrompt(output, buffer, mode, renderedRows, { notice });
+          renderInput(true);
           clearNoticeLater(800);
           return;
         }
@@ -734,7 +842,7 @@ async function readWorkspaceLine({ input, output, mode, coordinator, panel, onMo
         }
         exitArmed = true;
         notice = "Press Ctrl+C again to exit";
-        renderedRows = redrawPrompt(output, buffer, mode, renderedRows, { notice });
+        renderInput(true);
         clearNoticeLater(500);
         return;
       }
@@ -755,15 +863,61 @@ async function readWorkspaceLine({ input, output, mode, coordinator, panel, onMo
         notice = "";
         exitArmed = false;
         mode = onModeChange().id;
-        redrawLine();
+        renderInput(true);
         return;
       }
       if (key.name === "backspace") {
         clearNoticeTimer();
         notice = "";
         exitArmed = false;
-        buffer = [...buffer].slice(0, -1).join("");
-        renderedRows = redrawPrompt(output, buffer, mode, renderedRows, { notice });
+        const chars = [...buffer];
+        if (cursor > 0) {
+          chars.splice(cursor - 1, 1);
+          cursor -= 1;
+          buffer = chars.join("");
+        }
+        renderInput();
+        return;
+      }
+      if (key.name === "delete") {
+        clearNoticeTimer();
+        notice = "";
+        exitArmed = false;
+        const chars = [...buffer];
+        if (cursor < chars.length) {
+          chars.splice(cursor, 1);
+          buffer = chars.join("");
+        }
+        renderInput();
+        return;
+      }
+      if (key.name === "left") {
+        cursor = Math.max(0, cursor - 1);
+        renderInput();
+        return;
+      }
+      if (key.name === "right") {
+        cursor = Math.min([...buffer].length, cursor + 1);
+        renderInput();
+        return;
+      }
+      if (key.name === "home" || (key.ctrl && key.name === "a")) {
+        cursor = 0;
+        renderInput();
+        return;
+      }
+      if (key.name === "end" || (key.ctrl && key.name === "e")) {
+        cursor = [...buffer].length;
+        renderInput();
+        return;
+      }
+      if (key.ctrl && key.name === "u") {
+        clearNoticeTimer();
+        notice = "";
+        exitArmed = false;
+        buffer = "";
+        cursor = 0;
+        renderInput();
         return;
       }
       if (key.name === "escape" || key.ctrl || key.meta) return;
@@ -771,8 +925,11 @@ async function readWorkspaceLine({ input, output, mode, coordinator, panel, onMo
         clearNoticeTimer();
         notice = "";
         exitArmed = false;
-        buffer += text;
-        renderedRows = redrawPrompt(output, buffer, mode, renderedRows, { notice });
+        const chars = [...buffer];
+        chars.splice(cursor, 0, ...text);
+        buffer = chars.join("");
+        cursor += [...text].length;
+        renderInput();
       }
     };
     input.on("keypress", onKeypress);
@@ -812,7 +969,8 @@ async function readRuntimeDecision({ input, runtime, render, kind }) {
   let buffer = kind === "setup" ? String(runtime.setupPath || "") : "";
   let cursor = [...buffer].length;
   runtime.setupPath = buffer;
-  render();
+  runtime.setupCursor = cursor;
+  render(true);
   return new Promise((resolve, reject) => {
     const cleanup = () => {
       input.off("keypress", onKeypress);
@@ -854,7 +1012,8 @@ async function readRuntimeDecision({ input, runtime, render, kind }) {
           buffer = text;
           cursor = [...buffer].length;
           runtime.setupPath = buffer;
-          render();
+          runtime.setupCursor = cursor;
+          render(true);
           return;
         }
         if (key.name === "up") {
@@ -871,7 +1030,7 @@ async function readRuntimeDecision({ input, runtime, render, kind }) {
         } else {
           runtime.setupMode = "workspace";
         }
-        render();
+        render(true);
         return;
       }
       if (kind !== "setup") return;
@@ -904,7 +1063,8 @@ async function readRuntimeDecision({ input, runtime, render, kind }) {
         return;
       }
       runtime.setupPath = buffer;
-      render();
+      runtime.setupCursor = cursor;
+      render(true);
     };
     input.on("keypress", onKeypress);
     input.once("error", onError);
@@ -977,31 +1137,30 @@ async function runWorkspaceObjective({
     configuration: null,
     setup: null,
     setupPath: "",
+    setupCursor: 0,
     setupSelection: 0,
     composerBuffer: "",
+    composerCursor: 0,
     queuedObjective: "",
     notice: "",
     interaction: false,
     interactionKind: "",
     error: null,
   };
-  const render = () => redrawWorkspaceApp(output, {
+  const render = (force = false) => redrawWorkspaceApp(output, {
     coordinator,
     mode,
     panel: runtimeHeaderPanel(runtime),
     runtime,
+    force,
   });
-  const onResize = () => redrawWorkspaceApp(output, {
-    coordinator,
-    mode,
-    panel: runtimeHeaderPanel(runtime),
-    runtime,
-    force: true,
-  });
+  const frameScheduler = createWorkspaceFrameScheduler({ render });
+  const scheduleRender = () => frameScheduler.request(false);
+  const onResize = () => scheduleRender();
   const timer = setInterval(() => {
     // Do not invalidate native terminal text selection while a setup/composer
     // interaction is active. State is redrawn on keypress and resize.
-    if (!runtime.interaction) render();
+    if (!runtime.interaction) scheduleRender();
   }, 1000);
   timer.unref?.();
   output.on?.("resize", onResize);
@@ -1021,7 +1180,7 @@ async function runWorkspaceObjective({
         runtime.error = error;
       });
     }
-    render();
+    render(true);
   };
   process.on("SIGINT", onActiveInterrupt);
   emitKeypressEvents(input);
@@ -1033,7 +1192,7 @@ async function runWorkspaceObjective({
     if (noticeTimer) clearTimeout(noticeTimer);
     noticeTimer = setTimeout(() => {
       runtime.notice = "";
-      render();
+      render(true);
     }, duration);
     noticeTimer.unref?.();
     render();
@@ -1049,11 +1208,51 @@ async function runWorkspaceObjective({
       if (!objectiveText) return;
       runtime.queuedObjective = objectiveText;
       runtime.composerBuffer = "";
+      runtime.composerCursor = 0;
       showNotice("Next objective queued");
       return;
     }
+    const chars = [...runtime.composerBuffer];
     if (key.name === "backspace") {
-      runtime.composerBuffer = [...runtime.composerBuffer].slice(0, -1).join("");
+      if (runtime.composerCursor > 0) {
+        chars.splice(runtime.composerCursor - 1, 1);
+        runtime.composerCursor -= 1;
+        runtime.composerBuffer = chars.join("");
+      }
+      render();
+      return;
+    }
+    if (key.name === "delete") {
+      if (runtime.composerCursor < chars.length) {
+        chars.splice(runtime.composerCursor, 1);
+        runtime.composerBuffer = chars.join("");
+      }
+      render();
+      return;
+    }
+    if (key.name === "left") {
+      runtime.composerCursor = Math.max(0, runtime.composerCursor - 1);
+      render();
+      return;
+    }
+    if (key.name === "right") {
+      runtime.composerCursor = Math.min(chars.length, runtime.composerCursor + 1);
+      render();
+      return;
+    }
+    if (key.name === "home" || (key.ctrl && key.name === "a")) {
+      runtime.composerCursor = 0;
+      render();
+      return;
+    }
+    if (key.name === "end" || (key.ctrl && key.name === "e")) {
+      runtime.composerCursor = chars.length;
+      render();
+      return;
+    }
+    if (key.ctrl && key.name === "u") {
+      runtime.composerBuffer = "";
+      runtime.composerCursor = 0;
       render();
       return;
     }
@@ -1063,7 +1262,9 @@ async function runWorkspaceObjective({
     }
     if (key.name === "escape" || key.ctrl || key.meta) return;
     if (text && !key.name?.startsWith("f")) {
-      runtime.composerBuffer += text;
+      chars.splice(runtime.composerCursor, 0, ...text);
+      runtime.composerBuffer = chars.join("");
+      runtime.composerCursor += [...text].length;
       render();
     }
   };
@@ -1095,7 +1296,7 @@ async function runWorkspaceObjective({
           signal: controller.signal,
           onRunId: (runId) => {
             runtime.runId = runId || runtime.runId;
-            render();
+            render(true);
           },
           onUpdate: (update) => {
             if (update.phase) runtime.phase = update.phase;
@@ -1106,7 +1307,7 @@ async function runWorkspaceObjective({
               for (const event of update.events) merged.set(event.sequence, event);
               runtime.events = [...merged.values()].sort((a, b) => Number(a.sequence) - Number(b.sequence)).slice(-20);
             }
-            render();
+            scheduleRender();
           },
           onConfigurationConfirmation: async (configuration) => {
             runtime.configuration = configuration;
@@ -1192,8 +1393,9 @@ async function runWorkspaceObjective({
     input.pause();
     output.off?.("resize", onResize);
     clearInterval(timer);
+    frameScheduler.dispose();
     await cancelPromise;
-    render();
+    render(true);
   }
 }
 
@@ -1234,7 +1436,7 @@ export async function handleAgentWorkspaceCommand(argv = [], {
         });
       pendingObjective = "";
       if (!line) {
-        redrawWorkspaceApp(output, { coordinator, mode, panel });
+        redrawWorkspaceApp(output, { coordinator, mode, panel, force: true });
         continue;
       }
       if (["/exit", "/quit", "exit", "quit"].includes(line.toLowerCase())) return;
@@ -1278,7 +1480,7 @@ export async function handleAgentWorkspaceCommand(argv = [], {
       });
       panel = completionPanel(runtime);
       pendingObjective = runtime.queuedObjective || "";
-      redrawWorkspaceApp(output, { coordinator, mode, panel });
+      redrawWorkspaceApp(output, { coordinator, mode, panel, force: true });
     }
   } finally {
     exitApp();

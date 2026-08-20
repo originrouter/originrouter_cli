@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 
 import {
   buildWorkspaceAppScreen,
+  createWorkspaceFrameScheduler,
   handleAgentWorkspaceCommand,
   parseAgentWorkspaceArgs,
   redrawPrompt,
@@ -166,6 +167,17 @@ assert.match(workspaceScreen, /Access    Guarded/);
 assert.match(workspaceScreen, /● guarded · \/access/);
 assert.doesNotMatch(workspaceScreen, /^OriginRouter\nWorkspace/m);
 
+const inputScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 80,
+  rows: 24,
+  composerBuffer: "draft objective",
+  composerCursor: 5,
+});
+assert.match(inputScreen, /› draf▌t objective/);
+assert.match(inputScreen, /Enter submits · Ctrl\+C clears/);
+
 const launchScreen = buildAgentLaunchScreen({
   agent: "codex",
   workspaceName: "originrouter-cli",
@@ -199,6 +211,25 @@ assert.match(writes.join(""), /\x1b\[1A/);
 assert.match(writes.join(""), /› 我想分析一下/);
 assert.match(writes.join(""), /Auto · shift\+tab to cycle/);
 assert.doesNotMatch(writes.join(""), /\[Auto\] >/);
+
+const scheduledFrames = [];
+const scheduledCallbacks = [];
+const frameScheduler = createWorkspaceFrameScheduler({
+  render: (force) => scheduledFrames.push(force),
+  schedule: (callback) => {
+    scheduledCallbacks.push(callback);
+    return callback;
+  },
+  cancel: () => {},
+});
+frameScheduler.request();
+frameScheduler.request();
+assert.equal(scheduledCallbacks.length, 1, "background updates coalesce into one frame");
+scheduledCallbacks.shift()();
+assert.deepEqual(scheduledFrames, [false]);
+frameScheduler.request(true);
+assert.deepEqual(scheduledFrames, [false, true]);
+frameScheduler.dispose();
 
 function fakeTerminal(columns = 80, rows = 24) {
   const input = new EventEmitter();

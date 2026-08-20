@@ -1785,7 +1785,10 @@ export async function runAgentWorkspaceCollaboration({
   onRunId = () => {},
   onConfigurationConfirmation = async () => "leave",
   onPlanConfirmation = async () => "leave",
-  interval = 750,
+  // Keep the interactive workspace responsive while still coalescing redraws
+  // in the TUI frame scheduler. The local API remains cursor-based, so this
+  // does not duplicate events.
+  interval = 300,
   requestFn = request,
   automaticCreatePayloadFn = automaticCreatePayload,
   workspaceSelections = {},
