@@ -61,6 +61,7 @@ const created = coordinator.create({
       runtime: "codex",
       device_id: "device-local",
       workspace_id: "workspace-1",
+      permission_profile: "guarded",
       responsibilities: ["research", "review_plan", "verify_result"],
     },
     worker: {
@@ -79,6 +80,7 @@ let run = store.getRun(created.run_id);
 assert.equal(run.state, "researching");
 assert.equal(launches.length, 1);
 assert.equal(launches[0].agentType, "codex");
+assert.equal(launches[0].permissionProfile, "manual", "managed child Runtime must always report approvals to OriginRouter");
 let leadSession = run.agents.lead.originrouter_session_id;
 registry.emit(leadSession, {
   type: "agent.interaction.requested",
@@ -92,6 +94,7 @@ await runtime.queue;
 let attention = store.getSnapshot(created.run_id).attention;
 assert.equal(attention.length, 1);
 assert.equal(attention[0].kind, "approval");
+assert.deepEqual(attention[0].actions, ["allow", "deny"]);
 await runtime.resolveAttention(created.run_id, attention[0].attention_id, {
   action: "allow",
   expected_revision: attention[0].revision,
@@ -100,8 +103,27 @@ assert.ok(registry.commands.some((item) => (
   item.sessionId === leadSession
   && item.command.type === "agent.interaction.resolve"
   && item.command.interactionId === "permission-1"
+  && item.command.action === "allow"
+  && item.command.response.remember_for_session === false
 )));
 assert.equal(store.getSnapshot(created.run_id).attention.length, 0);
+registry.emit(leadSession, {
+  type: "agent.interaction.requested",
+  eventId: "lead-safe-approval-request",
+  interactionId: "permission-safe-1",
+  kind: "permission",
+  title: "Bash needs permission",
+  tool: "Bash",
+  command: "uptime",
+});
+await runtime.queue;
+assert.equal(store.getSnapshot(created.run_id).attention.length, 0, "routine requests should be centrally auto-approved");
+assert.ok(registry.commands.some((item) => (
+  item.sessionId === leadSession
+  && item.command.interactionId === "permission-safe-1"
+  && item.command.action === "allow"
+  && item.command.decisionSource === "originrouter-session-supervisor"
+)));
 registry.emit(leadSession, { type: "agent.text", text: "Research brief", eventId: "lead-text-1" });
 registry.emit(leadSession, { type: "agent.task.complete", eventId: "lead-done-1" });
 await runtime.queue;

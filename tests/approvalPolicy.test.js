@@ -90,6 +90,31 @@ test("published schema contains the complete CLI atomic action registry", () => 
   }
 });
 
+test("protected defaults allow read-only machine diagnostics but ask for mutations", () => {
+  for (const command of [
+    "sw_vers",
+    "uptime",
+    "system_profiler SPSoftwareDataType",
+    "command -v originrouter",
+    "originrouter --version",
+    "brew list --versions originrouter-cli",
+    "launchctl list",
+  ]) {
+    const result = evaluateApprovalRequest(
+      permission("Bash", { command, cwd: "/tmp/project" }),
+      protectedApprovalPolicy(),
+      { workspace: "/tmp/project" },
+    );
+    assert.equal(result.effect, "allow", command);
+  }
+  const mutation = evaluateApprovalRequest(
+    permission("Bash", { command: "brew services restart originrouter", cwd: "/tmp/project" }),
+    protectedApprovalPolicy(),
+    { workspace: "/tmp/project" },
+  );
+  assert.equal(mutation.effect, "ask");
+});
+
 test("policy lint reports conflicts, shadowing, broad declarations, and impact", () => {
   const validation = validateApprovalPolicy({
     version: 2,

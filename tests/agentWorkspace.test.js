@@ -8,6 +8,7 @@ import {
   normalizeWorkspacePathInput,
   parseAgentWorkspaceArgs,
   redrawPrompt,
+  scrollRuntimeContent,
 } from "../src/commands/agentWorkspace.js";
 import { buildAgentLaunchScreen } from "../src/local/agentLaunchScreen.js";
 import {
@@ -125,6 +126,51 @@ assert.equal(remote.participants.length, 2);
 assert.equal(remote.participants[1].device_id, "server-a");
 assert.equal(remote.auto_configuration.safe_to_skip_confirmation, false);
 
+const secondRemoteCapabilities = {
+  ...remoteCapabilities,
+  device: { device_id: "server-b", default_workspace_path: "/srv/other" },
+  trusted_workspaces: [{
+    workspace_id: "workspace-remote-b",
+    canonical_path: "/srv/other",
+    repo_root: "/srv/other",
+  }],
+};
+const multipleRemoteDevices = [
+  ...devices,
+  {
+    deviceId: "server-b",
+    deviceName: "Server B",
+    local: false,
+    online: true,
+    trustStatus: "trusted",
+    capabilities: secondRemoteCapabilities,
+  },
+];
+assert.throws(
+  () => buildLocalWorkspaceConfiguration({
+    objective: "Inspect the remote computers",
+    mode: "remote-ops",
+    coordinator: "codex",
+    devices: multipleRemoteDevices,
+    currentDirectory: "/project",
+  }),
+  (error) => error.code === "AUTO_CONFIG_REMOTE_DEVICE_SELECTION_REQUIRED"
+    && error.setup?.devices?.length === 2,
+);
+const multiRemote = buildLocalWorkspaceConfiguration({
+  objective: "Inspect the remote computers",
+  mode: "remote-ops",
+  coordinator: "codex",
+  devices: multipleRemoteDevices,
+  currentDirectory: "/project",
+  deviceSelections: ["server-a", "server-b"],
+});
+assert.deepEqual(
+  multiRemote.participants.filter((participant) => !participant.planner).map((participant) => participant.device_id),
+  ["server-a", "server-b"],
+);
+assert.equal(multiRemote.participants.length, 3);
+
 assert.throws(
   () => buildLocalWorkspaceConfiguration({
     objective: "Inspect the remote computer",
@@ -170,7 +216,7 @@ assert.match(workspaceScreen, /OriginRouter/);
 assert.match(workspaceScreen, /Agent Workspace/);
 assert.match(workspaceScreen, /Team      Auto/);
 assert.match(workspaceScreen, /Access    Guarded/);
-assert.match(workspaceScreen, /● guarded · \/access/);
+assert.match(workspaceScreen, /● guarded · session approval/);
 assert.doesNotMatch(workspaceScreen, /^OriginRouter\nWorkspace/m);
 
 const inputScreen = buildWorkspaceAppScreen({
@@ -183,6 +229,37 @@ const inputScreen = buildWorkspaceAppScreen({
 });
 assert.match(inputScreen, /› draf▌t objective/);
 assert.match(inputScreen, /Enter submits · Ctrl\+C clears/);
+
+const wrappedInputScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 40,
+  rows: 24,
+  composerBuffer: "我想分析一下我远程电脑的状态，包括机器状态、是否安装originrouter-cli以及对应的版本信息",
+  composerCursor: 18,
+});
+assert.doesNotMatch(wrappedInputScreen, /originrouter-cli以及…/);
+assert.match(wrappedInputScreen, /我想分析一下我远程电脑的状态/);
+assert.match(wrappedInputScreen, /是否安装originrouter-cli/);
+assert.match(wrappedInputScreen, /▌/);
+assert.match(wrappedInputScreen, /Enter submits · Ctrl\+C clears/);
+
+const wrappedRuntimeInputScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 40,
+  rows: 24,
+  runtime: {
+    phase: "planning",
+    startedAt: Date.now(),
+    composerBuffer: "queue a complete follow-up objective without truncating editable text",
+    composerCursor: 30,
+    events: [],
+  },
+});
+assert.doesNotMatch(wrappedRuntimeInputScreen, /editable…/);
+assert.match(wrappedRuntimeInputScreen, /without truncating/);
+assert.match(wrappedRuntimeInputScreen, /editable text/);
 
 const launchScreen = buildAgentLaunchScreen({
   agent: "codex",
@@ -258,6 +335,65 @@ function fakeTerminal(columns = 80, rows = 24) {
 function emitText(input, text) {
   for (const char of text) input.emit("keypress", char, { name: char });
 }
+
+function emitPaste(input, text) {
+  input.emit("keypress", undefined, { name: "paste-start", sequence: "\x1b[200~" });
+  for (const char of text) {
+    if (char === "\n") input.emit("keypress", "\n", { name: "enter", sequence: "\n" });
+    else if (char === "\t") input.emit("keypress", "\t", { name: "tab", sequence: "\t" });
+    else input.emit("keypress", char, { name: char, sequence: char });
+  }
+  input.emit("keypress", undefined, { name: "paste-end", sequence: "\x1b[201~" });
+}
+
+const largePasteTerminal = fakeTerminal();
+const largePasteCalls = [];
+const largePasteText = `first line\n${"粘".repeat(1001)}\nlast line`;
+const largePasteRun = handleAgentWorkspaceCommand([], {
+  input: largePasteTerminal.input,
+  output: largePasteTerminal.output,
+  collaborationRunner: async (args) => {
+    largePasteCalls.push(args);
+    setTimeout(() => {
+      emitText(largePasteTerminal.input, "/exit");
+      largePasteTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 20);
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(largePasteTerminal.input, "inspect ");
+const largePasteWriteIndex = largePasteTerminal.writes.length;
+emitPaste(largePasteTerminal.input, largePasteText);
+emitText(largePasteTerminal.input, " carefully");
+const pasteFrame = largePasteTerminal.writes.slice(largePasteWriteIndex).join("");
+assert.match(pasteFrame, /\[Pasted Content 1022 chars\]/);
+assert.doesNotMatch(pasteFrame, /粘{20}/);
+largePasteTerminal.input.emit("keypress", undefined, { name: "return" });
+await largePasteRun;
+assert.equal(largePasteCalls[0][1], `inspect ${largePasteText} carefully`);
+assert.match(largePasteTerminal.writes.join(""), /\x1b\[\?2004h/);
+assert.match(largePasteTerminal.writes.join(""), /\x1b\[\?2004l/);
+
+const deletePasteTerminal = fakeTerminal();
+const deletePasteCalls = [];
+const deletePasteRun = handleAgentWorkspaceCommand([], {
+  input: deletePasteTerminal.input,
+  output: deletePasteTerminal.output,
+  collaborationRunner: async (args) => {
+    deletePasteCalls.push(args);
+    setTimeout(() => {
+      emitText(deletePasteTerminal.input, "/exit");
+      deletePasteTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 20);
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitPaste(deletePasteTerminal.input, "x".repeat(1001));
+deletePasteTerminal.input.emit("keypress", undefined, { name: "backspace" });
+emitText(deletePasteTerminal.input, "replacement objective");
+deletePasteTerminal.input.emit("keypress", undefined, { name: "return" });
+await deletePasteRun;
+assert.equal(deletePasteCalls[0][1], "replacement objective");
 
 const clearInputTerminal = fakeTerminal();
 const clearInputCalls = [];
@@ -433,6 +569,82 @@ assert.equal(
   "runtime and prompt transitions must stay inside the frame renderer",
 );
 
+const devicePickerTerminal = fakeTerminal(100, 30);
+const devicePickerCalls = [];
+const devicePickerRun = handleAgentWorkspaceCommand([], {
+  input: devicePickerTerminal.input,
+  output: devicePickerTerminal.output,
+  workspaceRunner: async (options) => {
+    devicePickerCalls.push([...options.deviceSelections]);
+    if (devicePickerCalls.length === 1) {
+      const error = new Error("Choose remote devices");
+      error.code = "AUTO_CONFIG_REMOTE_DEVICE_SELECTION_REQUIRED";
+      error.setup = {
+        kind: "device_selection",
+        devices: [
+          { device_id: "server-a", device_name: "Server A", online: true, runtimes: ["claude"], workspace_count: 1 },
+          { device_id: "server-b", device_name: "Server B", online: true, runtimes: ["codex", "claude"], workspace_count: 2 },
+        ],
+      };
+      setTimeout(() => {
+        devicePickerTerminal.input.emit("keypress", " ", { name: "space" });
+        devicePickerTerminal.input.emit("keypress", undefined, { name: "down" });
+        devicePickerTerminal.input.emit("keypress", " ", { name: "space" });
+        devicePickerTerminal.input.emit("keypress", undefined, { name: "return" });
+      }, 10);
+      throw error;
+    }
+    assert.deepEqual(options.deviceSelections, ["server-a", "server-b"]);
+    setTimeout(() => {
+      devicePickerTerminal.input.emit("keypress", undefined, { name: "return" });
+      setTimeout(() => {
+        emitText(devicePickerTerminal.input, "/exit");
+        devicePickerTerminal.input.emit("keypress", undefined, { name: "return" });
+      }, 15);
+    }, 10);
+    return { run: { state: "completed" }, tasks: [], final_report: { summary: "Done" } };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(devicePickerTerminal.input, "inspect remote computers");
+devicePickerTerminal.input.emit("keypress", undefined, { name: "return" });
+await devicePickerRun;
+assert.deepEqual(devicePickerCalls, [[], ["server-a", "server-b"]]);
+assert.match(devicePickerTerminal.writes.join(""), /Which remote devices should participate/);
+assert.match(devicePickerTerminal.writes.join(""), /2 selected/);
+
+const runtimePasteTerminal = fakeTerminal();
+const runtimePasteCalls = [];
+const runtimePasteText = "r".repeat(1001);
+const runtimePasteRun = handleAgentWorkspaceCommand([], {
+  input: runtimePasteTerminal.input,
+  output: runtimePasteTerminal.output,
+  collaborationRunner: async (args) => {
+    runtimePasteCalls.push(args);
+    if (runtimePasteCalls.length === 1) {
+      await new Promise((resolve) => {
+        setImmediate(() => {
+          emitPaste(runtimePasteTerminal.input, runtimePasteText);
+          runtimePasteTerminal.input.emit("keypress", undefined, { name: "return" });
+          setTimeout(resolve, 10);
+        });
+      });
+      return;
+    }
+    setTimeout(() => {
+      emitText(runtimePasteTerminal.input, "/exit");
+      runtimePasteTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 20);
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(runtimePasteTerminal.input, "first objective");
+runtimePasteTerminal.input.emit("keypress", undefined, { name: "return" });
+await runtimePasteRun;
+assert.equal(runtimePasteCalls.length, 2);
+assert.equal(runtimePasteCalls[1][1], runtimePasteText);
+assert.match(runtimePasteTerminal.writes.join(""), /\[Pasted Content 1001 chars\]/);
+
 const configurationDraftTerminal = fakeTerminal();
 let configurationDecision;
 const configurationDraftRun = handleAgentWorkspaceCommand([], {
@@ -461,6 +673,131 @@ configurationDraftTerminal.input.emit("keypress", undefined, { name: "return" })
 await configurationDraftRun;
 assert.equal(configurationDecision, "leave");
 assert.match(configurationDraftTerminal.writes.join(""), /› inspect remote machine▌/);
+
+const configurationScrollTerminal = fakeTerminal(80, 14);
+let configurationScrollDecision;
+const configurationScrollRun = handleAgentWorkspaceCommand([], {
+  input: configurationScrollTerminal.input,
+  output: configurationScrollTerminal.output,
+  workspaceRunner: async (options) => {
+    setImmediate(() => {
+      for (let page = 0; page < 5; page += 1) {
+        configurationScrollTerminal.input.emit("keypress", undefined, { sequence: "\x1b[6~" });
+      }
+      configurationScrollTerminal.input.emit("keypress", undefined, { name: "escape" });
+    });
+    configurationScrollDecision = await options.onConfigurationConfirmation({
+      resolved_workspace_mode: "remote_ops",
+      planning_source: "cloud_advice",
+      risk_tier: "yellow",
+      participants: [
+        { participant_id: "coordinator", display_name: "Coordinator", runtime: "codex", device_id: "local-device", workspace_id: "local-workspace", permission_profile: "guarded", planner: true, role_hint: "Coordinate the inspection and consolidate the report." },
+        { participant_id: "remote_operator", display_name: "Remote Operator", runtime: "claude", device_id: "remote-device-visible-after-scroll", workspace_id: "remote-workspace", permission_profile: "guarded", role_hint: "Inspect machine status and the installed CLI version without modifying the device." },
+      ],
+      auto_configuration: {
+        advice: {
+          reason: "The objective explicitly requires a remote read-only inspection. The remote operator must collect machine status, verify whether OriginRouter CLI is installed, and report its version while the coordinator reviews the evidence.",
+        },
+      },
+    });
+    setTimeout(() => {
+      configurationScrollTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" });
+      emitText(configurationScrollTerminal.input, "/exit");
+      configurationScrollTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 20);
+    return { run: { state: "configuration_pending" }, tasks: [] };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(configurationScrollTerminal.input, "inspect remote machine");
+configurationScrollTerminal.input.emit("keypress", undefined, { name: "return" });
+await configurationScrollRun;
+assert.equal(configurationScrollDecision, "leave");
+assert.match(
+  configurationScrollTerminal.writes.join(""),
+  /remote-device-visible-after-scroll/,
+  "macOS PageDown escape sequences scroll long configuration reviews",
+);
+
+const teamEditTerminal = fakeTerminal(90, 24);
+let editedConfiguration;
+let teamEditDecision;
+const teamEditRun = handleAgentWorkspaceCommand([], {
+  input: teamEditTerminal.input,
+  output: teamEditTerminal.output,
+  workspaceRunner: async (options) => {
+    const configuration = {
+      resolved_workspace_mode: "remote_ops",
+      coordinator_runtime: "codex",
+      planning_source: "cloud_advice",
+      risk_tier: "yellow",
+      participants: [{
+        participant_id: "coordinator",
+        display_name: "Coordinator",
+        runtime: "codex",
+        device_id: "local-device",
+        workspace_id: "local-workspace",
+        permission_profile: "guarded",
+        planner: true,
+      }],
+      auto_configuration: { coordinator: "codex", runtimes: ["codex"] },
+    };
+    Object.defineProperty(configuration, "_workspace_editor", {
+      enumerable: false,
+      value: {
+        devices: [{
+          device_id: "local-device",
+          device_name: "Local Mac",
+          runtimes: [{ id: "codex" }, { id: "claude" }],
+          resolved_routes: {
+            codex: { provider: "official", model: "review-model" },
+            claude: { provider: "official", model: "fast-model" },
+          },
+          providers: [{ name: "official", models: [{ id: "fast-model" }, { id: "review-model" }] }],
+        }],
+      },
+    });
+    setImmediate(() => {
+      teamEditTerminal.input.emit("keypress", "e", { name: "e" });
+      teamEditTerminal.input.emit("keypress", undefined, { name: "return" });
+      teamEditTerminal.input.emit("keypress", undefined, { name: "down" });
+      teamEditTerminal.input.emit("keypress", undefined, { name: "return" });
+      teamEditTerminal.input.emit("keypress", undefined, { name: "down" });
+      teamEditTerminal.input.emit("keypress", undefined, { name: "return" });
+      teamEditTerminal.input.emit("keypress", "p", { name: "p" });
+      teamEditTerminal.input.emit("keypress", undefined, { name: "down" });
+      teamEditTerminal.input.emit("keypress", undefined, { name: "return" });
+      teamEditTerminal.input.emit("keypress", "d", { name: "d" });
+      teamEditTerminal.input.emit("keypress", undefined, { name: "return" });
+    });
+    teamEditDecision = await options.onConfigurationConfirmation(configuration);
+    editedConfiguration = configuration;
+    setTimeout(() => teamEditTerminal.input.emit("keypress", undefined, { name: "return" }), 20);
+    setTimeout(() => {
+      emitText(teamEditTerminal.input, "/exit");
+      teamEditTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 45);
+    return { run: { state: "completed" }, tasks: [], final_report: { summary: "Done." } };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(teamEditTerminal.input, "inspect remote machine");
+teamEditTerminal.input.emit("keypress", undefined, { name: "return" });
+await teamEditRun;
+assert.equal(teamEditDecision, "confirm");
+assert.equal(editedConfiguration.participants[0].runtime, "claude");
+assert.equal(editedConfiguration.participants[0].provider, "official");
+assert.equal(editedConfiguration.participants[0].model, "fast-model");
+assert.equal(editedConfiguration.participants[0].permission_profile, "unrestricted");
+assert.equal(editedConfiguration.coordinator_runtime, "claude");
+assert.equal(editedConfiguration.auto_configuration.coordinator, "claude");
+assert.deepEqual(editedConfiguration.auto_configuration.runtimes, ["claude"]);
+assert.match(teamEditTerminal.writes.join(""), /Edit collaboration team/);
+assert.match(teamEditTerminal.writes.join(""), /Done editing · return to team review/);
+assert.match(teamEditTerminal.writes.join(""), /Review the updated team, then press Enter to continue/);
+assert.match(teamEditTerminal.writes.join(""), /Choose the Agent Runtime/);
+assert.match(teamEditTerminal.writes.join(""), /Choose the model route/);
+assert.match(teamEditTerminal.writes.join(""), /Choose this Agent's access policy/);
 
 const planRevisionTerminal = fakeTerminal();
 let planDecision;
@@ -502,6 +839,7 @@ const attentionReplyRun = handleAgentWorkspaceCommand([], {
   workspaceRunner: async (options) => {
     options.onRunId?.("acr_attention_reply");
     setImmediate(() => {
+      attentionReplyTerminal.input.emit("keypress", undefined, { name: "escape" });
       attentionReplyTerminal.input.emit("keypress", undefined, { name: "return" });
       emitText(attentionReplyTerminal.input, "only inspect version and service status");
       attentionReplyTerminal.input.emit("keypress", undefined, { name: "return" });
@@ -535,6 +873,232 @@ assert.deepEqual(attentionDecision, {
 });
 assert.match(attentionReplyTerminal.writes.join(""), /What should the remote Agent inspect/);
 assert.match(attentionReplyTerminal.writes.join(""), /Reply to the Agent/);
+assert.match(attentionReplyTerminal.writes.join(""), /still waiting for a decision/);
+
+const activeReturnTerminal = fakeTerminal();
+let followCalls = 0;
+const activeReturnRun = handleAgentWorkspaceCommand([], {
+  input: activeReturnTerminal.input,
+  output: activeReturnTerminal.output,
+  workspaceRunner: async (options) => {
+    options.onRunId?.("acr_active_return");
+    options.onUpdate?.({
+      type: "snapshot",
+      snapshot: {
+        run: { run_id: "acr_active_return", state: "running", phase: "execution" },
+        tasks: [{ task_key: "inspect", title: "Inspect remote machine", state: "running" }],
+      },
+      events: [],
+    });
+    return {
+      run: { run_id: "acr_active_return", state: "running", phase: "execution" },
+      tasks: [{ task_key: "inspect", title: "Inspect remote machine", state: "running" }],
+    };
+  },
+  followRunner: async (runId, options) => {
+    followCalls += 1;
+    assert.equal(runId, "acr_active_return");
+    const snapshot = {
+      run: { run_id: runId, state: "completed", phase: "completed" },
+      tasks: [{ task_key: "inspect", title: "Inspect remote machine", state: "completed" }],
+      final_report: { summary: "Recovered follow completed." },
+    };
+    options.onUpdate?.({ type: "snapshot", snapshot, events: [] });
+    return snapshot;
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(activeReturnTerminal.input, "inspect remote machine");
+activeReturnTerminal.input.emit("keypress", undefined, { name: "return" });
+setTimeout(() => activeReturnTerminal.input.emit("keypress", undefined, { name: "return" }), 20);
+setTimeout(() => {
+  emitText(activeReturnTerminal.input, "/exit");
+  activeReturnTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 45);
+await activeReturnRun;
+assert.equal(followCalls, 1, "an active snapshot is followed again instead of returning to the home screen");
+assert.match(activeReturnTerminal.writes.join(""), /restoring the live connection/);
+assert.match(activeReturnTerminal.writes.join(""), /Recovered follow completed/);
+
+const completedFollowupTerminal = fakeTerminal(100, 30);
+const completedFollowupCalls = [];
+const continuedTeamConfiguration = {
+  objective: "inspect remote machine",
+  resolved_workspace_mode: "remote_ops",
+  planning_source: "cloud_advice",
+  risk_tier: "yellow",
+  workflow_template_id: "remote_operations",
+  participants: [{
+    participant_id: "remote_operator",
+    display_name: "Remote Operator",
+    runtime: "claude",
+    device_id: "remote-device",
+    workspace_id: "remote-workspace",
+    permission_profile: "guarded",
+    provider: "originrouter-cloud",
+    model: "claude-model",
+    planner: true,
+  }],
+  preferences: {},
+  budget: { max_concurrency: 1 },
+  auto_configuration: {
+    resolved_workspace_mode: "remote_ops",
+    safe_to_skip_confirmation: false,
+  },
+};
+const completedFollowupRun = handleAgentWorkspaceCommand([], {
+  input: completedFollowupTerminal.input,
+  output: completedFollowupTerminal.output,
+  workspaceRunner: async (options) => {
+    completedFollowupCalls.push(options);
+    const index = completedFollowupCalls.length;
+    const runId = index === 1 ? "acr_completed_first" : "acr_completed_followup";
+    options.onRunId?.(runId);
+    options.onUpdate?.({ type: "configuration", payload: continuedTeamConfiguration });
+    return {
+      run: { run_id: runId, state: "completed" },
+      tasks: [{
+        task_key: "inspect",
+        title: "Inspect remote machine",
+        state: "completed",
+        result_summary: index === 1 ? "Full first result remains visible." : "Follow-up completed.",
+      }],
+      final_report: {
+        summary: index === 1 ? "Full first result remains visible." : "Follow-up completed.",
+        completed_tasks: [{ result: index === 1 ? "Detailed first result." : "Detailed follow-up result." }],
+      },
+    };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(completedFollowupTerminal.input, "inspect remote machine");
+completedFollowupTerminal.input.emit("keypress", undefined, { name: "return" });
+setTimeout(() => {
+  emitText(completedFollowupTerminal.input, "also check the service status");
+  completedFollowupTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 15);
+setTimeout(() => {
+  emitText(completedFollowupTerminal.input, "/exit");
+  completedFollowupTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 45);
+await completedFollowupRun;
+assert.equal(completedFollowupCalls.length, 2);
+assert.equal(completedFollowupCalls[1].continuedFromRunId, "acr_completed_first");
+assert.deepEqual(completedFollowupCalls[1].presetConfiguration, continuedTeamConfiguration);
+assert.notEqual(completedFollowupCalls[1].presetConfiguration, continuedTeamConfiguration);
+assert.match(completedFollowupTerminal.writes.join(""), /Full first result remains visible/);
+assert.match(completedFollowupTerminal.writes.join(""), /Enter continues with this team/);
+
+const reconnectResumeTerminal = fakeTerminal();
+let reconnectResumeCreates = 0;
+let reconnectResumeFollows = 0;
+const reconnectResumeRun = handleAgentWorkspaceCommand([], {
+  input: reconnectResumeTerminal.input,
+  output: reconnectResumeTerminal.output,
+  workspaceRunner: async (options) => {
+    reconnectResumeCreates += 1;
+    options.onRunId?.("acr_reconnect_resume");
+    options.onUpdate?.({
+      type: "snapshot",
+      snapshot: {
+        run: { run_id: "acr_reconnect_resume", state: "running" },
+        tasks: [{ task_key: "inspect", title: "Inspect remote machine", state: "running" }],
+      },
+      events: [{ sequence: 1, summary: "Remote inspection started" }],
+    });
+    const error = new Error("connection retries exhausted");
+    error.code = "COLLABORATION_FOLLOW_RECONNECT_EXHAUSTED";
+    throw error;
+  },
+  followRunner: async (runId, options) => {
+    reconnectResumeFollows += 1;
+    assert.equal(runId, "acr_reconnect_resume");
+    const snapshot = {
+      run: { run_id: runId, state: "completed" },
+      tasks: [{ task_key: "inspect", title: "Inspect remote machine", state: "completed" }],
+      final_report: { summary: "Reconnected to the preserved Run." },
+    };
+    options.onUpdate?.({ type: "snapshot", snapshot, events: [] });
+    return snapshot;
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(reconnectResumeTerminal.input, "inspect remote machine");
+reconnectResumeTerminal.input.emit("keypress", undefined, { name: "return" });
+setTimeout(() => reconnectResumeTerminal.input.emit("keypress", undefined, { name: "return" }), 15);
+setTimeout(() => reconnectResumeTerminal.input.emit("keypress", undefined, { name: "return" }), 35);
+setTimeout(() => {
+  emitText(reconnectResumeTerminal.input, "/exit");
+  reconnectResumeTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 60);
+await reconnectResumeRun;
+assert.equal(reconnectResumeCreates, 1, "manual recovery must not create a replacement Run");
+assert.equal(reconnectResumeFollows, 1);
+assert.match(reconnectResumeTerminal.writes.join(""), /Connection paused/);
+assert.match(reconnectResumeTerminal.writes.join(""), /Reconnected to the preserved Run/);
+
+const reconnectDetachTerminal = fakeTerminal();
+let reconnectDetachCreates = 0;
+let reconnectDetachFollows = 0;
+const reconnectDetachCancelled = [];
+const reconnectDetachRun = handleAgentWorkspaceCommand([], {
+  input: reconnectDetachTerminal.input,
+  output: reconnectDetachTerminal.output,
+  workspaceRunner: async (options) => {
+    reconnectDetachCreates += 1;
+    options.onRunId?.("acr_reconnect_detach");
+    const error = new Error("connection retries exhausted");
+    error.code = "COLLABORATION_FOLLOW_RECONNECT_EXHAUSTED";
+    throw error;
+  },
+  followRunner: async (runId) => {
+    reconnectDetachFollows += 1;
+    assert.equal(runId, "acr_reconnect_detach");
+    const error = new Error("connection retries exhausted again");
+    error.code = "COLLABORATION_FOLLOW_RECONNECT_EXHAUSTED";
+    throw error;
+  },
+  cancelCollaborationRun: async (runId) => reconnectDetachCancelled.push(runId),
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(reconnectDetachTerminal.input, "inspect remote machine");
+reconnectDetachTerminal.input.emit("keypress", undefined, { name: "return" });
+setTimeout(() => reconnectDetachTerminal.input.emit("keypress", undefined, { name: "return" }), 15);
+setTimeout(() => reconnectDetachTerminal.input.emit("keypress", "d", { name: "d" }), 35);
+setTimeout(() => {
+  emitText(reconnectDetachTerminal.input, "/exit");
+  reconnectDetachTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 60);
+await reconnectDetachRun;
+assert.equal(reconnectDetachCreates, 1, "repeated manual failures must not recreate the Run");
+assert.equal(reconnectDetachFollows, 1);
+assert.deepEqual(reconnectDetachCancelled, [], "detaching must not cancel the Run");
+assert.match(reconnectDetachTerminal.writes.join(""), /Collaboration continues in the service/);
+
+const reconnectInterruptTerminal = fakeTerminal();
+const reconnectInterruptCancelled = [];
+const reconnectInterruptRun = handleAgentWorkspaceCommand([], {
+  input: reconnectInterruptTerminal.input,
+  output: reconnectInterruptTerminal.output,
+  workspaceRunner: async (options) => {
+    options.onRunId?.("acr_reconnect_interrupt");
+    const error = new Error("connection retries exhausted");
+    error.code = "COLLABORATION_FOLLOW_RECONNECT_EXHAUSTED";
+    throw error;
+  },
+  cancelCollaborationRun: async (runId) => reconnectInterruptCancelled.push(runId),
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(reconnectInterruptTerminal.input, "inspect remote machine");
+reconnectInterruptTerminal.input.emit("keypress", undefined, { name: "return" });
+setTimeout(() => reconnectInterruptTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" }), 15);
+setTimeout(() => {
+  emitText(reconnectInterruptTerminal.input, "/exit");
+  reconnectInterruptTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 40);
+await reconnectInterruptRun;
+assert.deepEqual(reconnectInterruptCancelled, ["acr_reconnect_interrupt"]);
+assert.match(reconnectInterruptTerminal.writes.join(""), /Interrupting the collaboration/);
 
 const pausedTerminal = fakeTerminal();
 let pausedDecision;
@@ -616,6 +1180,28 @@ assert.match(runtimeScreen, /acr_runtime/);
 assert.match(runtimeScreen, /› queue another check/);
 assert.match(runtimeScreen, /Enter queues next objective/);
 assert.match(runtimeScreen.replace(/\x1b\[[0-9;]*m/g, ""), /\n› Inspect the remote computer/);
+const plainRuntimeScreen = runtimeScreen.replace(/\x1b\[[0-9;]*m/g, "");
+assert.match(plainRuntimeScreen, /\n⠋ Agents are working/);
+assert.match(plainRuntimeScreen, /\n  Remote Ops · 2 Agents · 2 devices/);
+assert.match(plainRuntimeScreen, /\n  Run acr_runtime/);
+assert.match(plainRuntimeScreen, /\n  ● Inspect remote status/);
+
+const scrollRuntime = {
+  contentLineCount: 30,
+  contentVisibleRows: 10,
+  autoFollow: true,
+  scrollOffset: 0,
+  unseenActivityCount: 0,
+};
+assert.equal(scrollRuntimeContent(scrollRuntime, -1, 6), true);
+assert.equal(scrollRuntime.autoFollow, false, "PageUp stops following the live tail");
+assert.equal(scrollRuntime.scrollOffset, 14);
+scrollRuntime.unseenActivityCount = 3;
+scrollRuntime.contentLineCount = 34;
+assert.equal(scrollRuntime.scrollOffset, 14, "new activity does not move a detached viewport");
+assert.equal(scrollRuntimeContent(scrollRuntime, 1, 20), true);
+assert.equal(scrollRuntime.autoFollow, true, "PageDown at the bottom resumes live following");
+assert.equal(scrollRuntime.unseenActivityCount, 0);
 
 const interactionScreen = buildWorkspaceAppScreen({
   coordinator: "codex",
@@ -660,6 +1246,34 @@ assert.match(emptyPathScreen, /› ▌/);
 assert.match(emptyPathScreen, /example: \/Users\/chengaoyan/);
 assert.doesNotMatch(emptyPathScreen, /Path  \/Users\/chengaoyan/);
 assert.doesNotMatch(interactionScreen, /queued objective is preserved/);
+
+const deviceSelectionScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 90,
+  rows: 28,
+  runtime: {
+    objective: "Inspect the remote computers",
+    phase: "needs_device",
+    mode: "auto",
+    interaction: true,
+    interactionKind: "device",
+    deviceSelection: 1,
+    deviceSelections: ["server-a"],
+    setup: {
+      kind: "device_selection",
+      devices: [
+        { device_id: "server-a", device_name: "Server A", online: true, runtimes: ["codex", "claude"], workspace_count: 2 },
+        { device_id: "server-b", device_name: "Server B", online: false, runtimes: ["claude"], workspace_count: 1 },
+      ],
+    },
+  },
+});
+assert.match(deviceSelectionScreen, /Choose remote devices/);
+assert.match(deviceSelectionScreen, /\[✓\] Server A/);
+assert.match(deviceSelectionScreen, /› \[ \] Server B/);
+assert.match(deviceSelectionScreen, /Space toggle/);
+assert.match(deviceSelectionScreen, /1 selected/);
 
 const pathSuggestionScreen = buildWorkspaceAppScreen({
   coordinator: "codex",
@@ -712,7 +1326,9 @@ const manyWorkspaceScreen = buildWorkspaceAppScreen({
 assert.match(manyWorkspaceScreen, /Workspace 8/);
 assert.match(manyWorkspaceScreen, /Workspace 10/);
 assert.doesNotMatch(manyWorkspaceScreen, /Workspace 1  \/Users\/chengaoyan\/project-1/);
-assert.match(manyWorkspaceScreen, /P\. Enter another folder path/);
+assert.match(manyWorkspaceScreen, /P\. Other folder · enter a path not listed above/);
+assert.match(manyWorkspaceScreen, /Choose a listed folder, or enter another folder path/);
+assert.match(manyWorkspaceScreen, /P or typing enters a folder not listed/);
 
 const reconnectingScreen = buildWorkspaceAppScreen({
   coordinator: "codex",
@@ -728,8 +1344,31 @@ const reconnectingScreen = buildWorkspaceAppScreen({
   },
 });
 assert.match(reconnectingScreen, /Reconnecting to the collaboration/);
-assert.match(reconnectingScreen, /Connection interrupted · retry 2\/30/);
+assert.match(reconnectingScreen, /Connection interrupted · retry 2\/5/);
 assert.match(reconnectingScreen, /retrying automatically/);
+
+const connectionPausedScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 90,
+  rows: 26,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "connection_paused",
+    runId: "acr_connection_paused",
+    connectionAttempts: 5,
+    interaction: true,
+    interactionKind: "reconnect",
+    snapshot: {
+      run: { run_id: "acr_connection_paused", state: "running" },
+      tasks: [{ task_key: "inspect", title: "Inspect remote machine", state: "running" }],
+    },
+  },
+});
+assert.match(connectionPausedScreen, /Connection paused/);
+assert.match(connectionPausedScreen, /OriginRouter service still owns this Run/);
+assert.match(connectionPausedScreen, /No new Run will be created/);
+assert.match(connectionPausedScreen, /Enter reconnect · D detach · Ctrl\+C interrupt Run/);
 
 const spinnerFrameA = buildWorkspaceAppScreen({
   coordinator: "codex",
@@ -766,6 +1405,7 @@ const configurationReviewScreen = buildWorkspaceAppScreen({
   runtime: {
     objective: "Inspect the remote computer",
     phase: "awaiting_configuration",
+    startedAt: Date.now() - 245_000,
     interaction: true,
     interactionKind: "configuration",
     configuration: {
@@ -784,6 +1424,14 @@ assert.match(configurationReviewScreen, /Proposed collaboration team/);
 assert.match(configurationReviewScreen, /A remote operator is required/);
 assert.match(configurationReviewScreen, /Remote Operator · Claude Code/);
 assert.match(configurationReviewScreen, /Esc return to objective/);
+assert.match(configurationReviewScreen, /● Review the proposed team/);
+assert.doesNotMatch(configurationReviewScreen, /Review the proposed team \(4m/);
+const plainConfigurationReview = configurationReviewScreen.replace(/\x1b\[[0-9;]*m/g, "");
+assert.match(plainConfigurationReview, /\nProposed collaboration team/);
+assert.match(plainConfigurationReview, /\n  A remote operator is required/);
+assert.match(plainConfigurationReview, /\n  ● Coordinator · Codex/);
+assert.match(plainConfigurationReview, /\n    local · local-workspace · Agent limit: Guarded/);
+assert.match(plainConfigurationReview, /Session approval Guarded/);
 assert.equal(configurationReviewScreen.split("\n").length <= 24, true, "interaction layout fits the terminal height");
 
 const planReviewScreen = buildWorkspaceAppScreen({
@@ -834,7 +1482,7 @@ const attentionScreen = buildWorkspaceAppScreen({
   },
 });
 assert.match(attentionScreen, /Allow a read-only command/);
-assert.match(attentionScreen, /› 2\. deny/);
+assert.match(attentionScreen, /› 2\. Deny/);
 assert.match(attentionScreen, /Agent needs your decision/);
 assert.equal(attentionScreen.split("\n").length <= 24, true, "attention layout fits the terminal height");
 

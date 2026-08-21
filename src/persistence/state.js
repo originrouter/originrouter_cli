@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { isIP } from "node:net";
 import { homedir, hostname, platform } from "node:os";
@@ -23,13 +23,26 @@ function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
+function atomicWriteJson(path, value, { mode = null } = {}) {
+  const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  try {
+    writeFileSync(temporary, JSON.stringify(value, null, 2), mode == null ? undefined : { mode });
+    if (mode != null) chmodSync(temporary, mode);
+    renameSync(temporary, path);
+    if (mode != null) chmodSync(path, mode);
+  } finally {
+    if (existsSync(temporary)) {
+      try { unlinkSync(temporary); } catch {}
+    }
+  }
+}
+
 function writeJson(path, value) {
-  writeFileSync(path, JSON.stringify(value, null, 2));
+  atomicWriteJson(path, value);
 }
 
 function writePrivateJson(path, value) {
-  writeFileSync(path, JSON.stringify(value, null, 2), { mode: 0o600 });
-  chmodSync(path, 0o600);
+  atomicWriteJson(path, value, { mode: 0o600 });
 }
 
 export function isStaleDeviceId(id) {

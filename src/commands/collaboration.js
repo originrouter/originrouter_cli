@@ -31,6 +31,8 @@ import {
 } from "../collaboration/workspaceModes.js";
 import { requestCollaborationAdvice } from "../collaboration/collaborationAdviceClient.js";
 
+export const MAX_COLLABORATION_RECONNECT_ATTEMPTS = 5;
+
 class CollaborationCliError extends Error {
   constructor(message, {
     exitCode = 1,
@@ -128,10 +130,11 @@ function throwIfAborted(signal) {
 }
 
 async function request(path, { method = "GET", body, signal } = {}) {
-  const api = localApi();
+  let api;
   let response;
   try {
     throwIfAborted(signal);
+    api = localApi();
     response = await fetch(`${api.baseUrl}${path}`, {
       method,
       signal,
@@ -143,6 +146,7 @@ async function request(path, { method = "GET", body, signal } = {}) {
     });
   } catch (error) {
     if (signal?.aborted) throw interruptedError();
+    if (error instanceof CollaborationCliError) throw error;
     throw new CollaborationCliError(
       "Could not connect to the local OriginRouter service.",
       {
@@ -154,7 +158,32 @@ async function request(path, { method = "GET", body, signal } = {}) {
       },
     );
   }
-  const payload = await response.json().catch(() => ({}));
+  let payload;
+  try {
+    const raw = await response.text();
+    if (!raw.trim()) {
+      if (response.ok) {
+        throw new Error("Local API returned an empty response body.");
+      }
+      payload = {};
+    } else {
+      payload = JSON.parse(raw);
+    }
+  } catch (error) {
+    if (!response.ok) payload = {};
+    else {
+      throw new CollaborationCliError(
+        "The local OriginRouter service returned an incomplete JSON response.",
+        {
+          exitCode: 10,
+          diagnosticCode: "LOCAL_API_INVALID_RESPONSE",
+          impact: "The response could not be consumed, but the Daemon-owned Run may still be active.",
+          action: "OriginRouter will reconnect automatically. Check `originrouter service status` if retries continue.",
+          cause: error,
+        },
+      );
+    }
+  }
   if (!response.ok || payload.ok === false) {
     const message = typeof payload.error === "string"
       ? payload.error
@@ -1217,6 +1246,47 @@ async function collectAutoConfigurationDevices({
   return devices.filter((device) => device.capabilities || device.cachedCapabilities);
 }
 
+function attachWorkspaceEditorMetadata(payload, devices) {
+  const editor = {
+    devices: devices.map((device) => {
+      const capabilities = device.capabilities || device.cachedCapabilities || {};
+      return {
+        device_id: device.deviceId,
+        device_name: device.deviceName || device.deviceId,
+        local: device.local === true,
+        runtimes: (capabilities.runtimes || [])
+          .filter((runtime) => runtime?.available && ["codex", "claude"].includes(runtime.id))
+          .map((runtime) => ({ id: runtime.id })),
+        resolved_routes: Object.fromEntries(
+          ["codex", "claude"].map((runtime) => {
+            const route = capabilities.resolved_routes?.[runtime]?.main;
+            return [runtime, route?.provider && route?.model
+              ? { provider: route.provider, model: route.model }
+              : null];
+          }),
+        ),
+        providers: (capabilities.providers || []).map((provider) => ({
+          name: provider.name,
+          models: (provider.models || []).map((model) => ({ id: model.id })),
+        })).filter((provider) => provider.name && provider.models.length),
+        permission_profiles: (capabilities.permission_profiles || [])
+          .map((profile) => ({
+            id: profile.id,
+            label: profile.label || profile.id,
+            description: profile.description || "",
+          }))
+          .filter((profile) => ["manual", "guarded", "ai_review", "unrestricted", "custom"].includes(profile.id)),
+      };
+    }),
+  };
+  Object.defineProperty(payload, "_workspace_editor", {
+    value: editor,
+    enumerable: false,
+    configurable: true,
+  });
+  return payload;
+}
+
 async function resolveAutoConfigurationAmbiguity(error, {
   prompt,
   objective,
@@ -1257,6 +1327,7 @@ export async function automaticCreatePayload({
   adviceFn = requestCollaborationAdvice,
   modelOptions = {},
   workspaceSelections = {},
+  deviceSelections = [],
 } = {}) {
   const devices = await collectAutoConfigurationDevices({
     requestFn,
@@ -1290,6 +1361,7 @@ export async function automaticCreatePayload({
       devices,
       currentDirectory,
       workspaceSelections,
+      deviceSelections,
     });
     if (workspaceMode === "auto") {
       configured.workspace_mode = "auto";
@@ -1325,15 +1397,15 @@ export async function automaticCreatePayload({
         throw error;
       }
     }
-    return configured;
+    return attachWorkspaceEditorMetadata(configured, devices);
   }
   try {
-    return await autoConfigureCollaboration({
+    return attachWorkspaceEditorMetadata(await autoConfigureCollaboration({
       objective,
       devices,
       ...(modelFn ? { modelFn } : {}),
       modelOptions: { stateDir: ensureStateDir(), ...modelOptions },
-    });
+    }), devices);
   } catch (error) {
     if (error?.code === "AUTO_CONFIG_CLOUD_QUESTION" && prompt) {
       const question = error.question;
@@ -1345,7 +1417,7 @@ export async function automaticCreatePayload({
           id: option.id,
         })),
       );
-      return autoConfigureCollaboration({
+      return attachWorkspaceEditorMetadata(await autoConfigureCollaboration({
         objective,
         devices,
         modelOptions: {
@@ -1353,15 +1425,20 @@ export async function automaticCreatePayload({
           ...modelOptions,
           answer: { [question.id]: selected.id },
         },
-      });
+      }), devices);
     }
-    return resolveAutoConfigurationAmbiguity(error, { prompt, objective, devices });
+    return attachWorkspaceEditorMetadata(
+      await resolveAutoConfigurationAmbiguity(error, { prompt, objective, devices }),
+      devices,
+    );
   }
 }
 
 export function autoConfigurationView(payload) {
   return {
     objective: payload.objective,
+    supervisor_permission_profile: payload.supervisor_permission_profile || "guarded",
+    supervisor_policy_id: payload.supervisor_policy_id || null,
     participants: payload.participants.map((participant) => ({
       participant_id: participant.participant_id,
       display_name: participant.display_name,
@@ -1370,6 +1447,7 @@ export function autoConfigurationView(payload) {
       workspace_id: participant.workspace_id,
       role_hint: participant.role_hint,
       permission_profile: participant.permission_profile,
+      approval_policy_id: participant.approval_policy_id || null,
       planner: participant.planner,
       waiting_for_device: participant.waiting_for_device === true,
       route: participant.provider
@@ -1721,8 +1799,8 @@ async function attachRun(runId, args = [], { signal } = {}) {
         if (connectionFailures === 1 && !json) {
           console.error(`Connection to the local OriginRouter service was interrupted: ${error.message}`);
         }
-        if (connectionFailures >= 30) {
-          throw new Error("Could not reconnect to the local OriginRouter service after 30 attempts. The collaboration may still be running.");
+        if (connectionFailures >= MAX_COLLABORATION_RECONNECT_ATTEMPTS) {
+          throw new Error(`Could not reconnect to the local OriginRouter service after ${MAX_COLLABORATION_RECONNECT_ATTEMPTS} attempts. The collaboration may still be running.`);
         }
       }
     }
@@ -1795,7 +1873,18 @@ export async function browseCollaborationWorkspaces(deviceId, path, {
 function isRetryableCollaborationReadError(error) {
   const code = String(error?.diagnosticCode || error?.code || "").toUpperCase();
   const message = String(error?.message || "").toUpperCase();
-  return /LOCAL_API_CONNECTION_FAILED|TIMEOUT|CONNECTION|RELAY|UNAVAILABLE|ECONN|ETIMEDOUT/.test(`${code} ${message}`);
+  return /LOCAL_API_CONNECTION_FAILED|LOCAL_API_INVALID_RESPONSE|UNEXPECTED END OF JSON|JSON PARSE|TIMEOUT|CONNECTION|RELAY|UNAVAILABLE|ECONN|ETIMEDOUT/.test(`${code} ${message}`);
+}
+
+function collaborationFollowReconnectExhaustedError(runId, cause) {
+  const error = new Error(
+    `Connection to Run ${runId} is paused after ${MAX_COLLABORATION_RECONNECT_ATTEMPTS} unsuccessful reconnect attempts.`,
+    { cause },
+  );
+  error.code = "COLLABORATION_FOLLOW_RECONNECT_EXHAUSTED";
+  error.diagnosticCode = "COLLABORATION_FOLLOW_RECONNECT_EXHAUSTED";
+  error.runId = runId;
+  return error;
 }
 
 export async function controlCollaborationRun(runId, action, { signal, body = {} } = {}) {
@@ -1836,9 +1925,17 @@ async function followAgentWorkspaceCollaboration({
         }
         return result;
       } catch (error) {
-        if (!isRetryableCollaborationReadError(error) || reconnectAttempts >= 30) throw error;
+        if (!isRetryableCollaborationReadError(error)) throw error;
+        if (reconnectAttempts >= MAX_COLLABORATION_RECONNECT_ATTEMPTS) {
+          throw collaborationFollowReconnectExhaustedError(run.run_id, error);
+        }
         reconnectAttempts += 1;
-        onUpdate({ type: "connection", phase: "reconnecting", connectionAttempts: reconnectAttempts, message: `Connection interrupted; retry ${reconnectAttempts}/30` });
+        onUpdate({
+          type: "connection",
+          phase: "reconnecting",
+          connectionAttempts: reconnectAttempts,
+          message: `Connection interrupted; retry ${reconnectAttempts}/${MAX_COLLABORATION_RECONNECT_ATTEMPTS}`,
+        });
         await abortableDelay(Math.min(5000, 500 + reconnectAttempts * 250), signal);
       }
     }
@@ -1943,6 +2040,29 @@ export async function retryAgentWorkspaceCollaboration(runId, {
   });
 }
 
+export async function followExistingAgentWorkspaceCollaboration(runId, {
+  signal,
+  onUpdate = () => {},
+  onPlanConfirmation = async () => "leave",
+  onAttention = async () => "leave",
+  onPaused = async () => "leave",
+  interval = 300,
+  requestFn = request,
+} = {}) {
+  if (!runId) throw new Error("A collaboration Run ID is required to follow an existing Run.");
+  return followAgentWorkspaceCollaboration({
+    run: { run_id: runId },
+    confirmation: "never",
+    signal,
+    onUpdate,
+    onPlanConfirmation,
+    onAttention,
+    onPaused,
+    interval,
+    requestFn,
+  });
+}
+
 export async function runAgentWorkspaceCollaboration({
   objective,
   workspaceMode = "auto",
@@ -1962,23 +2082,40 @@ export async function runAgentWorkspaceCollaboration({
   interval = 300,
   requestFn = request,
   automaticCreatePayloadFn = automaticCreatePayload,
+  presetConfiguration = null,
+  continuedFromRunId = "",
   workspaceSelections = {},
+  deviceSelections = [],
 } = {}) {
   throwIfAborted(signal);
   onUpdate({ type: "phase", phase: "configuring" });
-  const payload = await automaticCreatePayloadFn({
-    objective,
-    workspaceMode,
-    coordinator,
-    cloudAdvice,
-    requestFn,
-    workspaceSelections,
-  });
+  const payload = presetConfiguration
+    ? {
+        ...structuredClone(presetConfiguration),
+        objective,
+        planning_source: "continued_team",
+        auto_configuration: {
+          ...(structuredClone(presetConfiguration.auto_configuration || {})),
+          continued_from_run_id: continuedFromRunId || null,
+          safe_to_skip_confirmation: false,
+          requires_explicit_confirmation: true,
+        },
+      }
+    : await automaticCreatePayloadFn({
+        objective,
+        workspaceMode,
+        coordinator,
+        cloudAdvice,
+        requestFn,
+        workspaceSelections,
+        deviceSelections,
+      });
+  payload.supervisor_permission_profile = payload.supervisor_permission_profile || "guarded";
   throwIfAborted(signal);
   onUpdate({ type: "configuration", payload });
   const configurationSafe = payload.auto_configuration?.safe_to_skip_confirmation === true
     && payload.planning_source !== "local_fallback";
-  if (confirmation !== "always" && (confirmation === "never" || !configurationSafe)) {
+  if (!presetConfiguration && confirmation !== "always" && (confirmation === "never" || !configurationSafe)) {
     const decision = await onConfigurationConfirmation(payload);
     throwIfAborted(signal);
     if (decision !== "confirm") {

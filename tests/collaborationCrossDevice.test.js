@@ -163,7 +163,7 @@ const run = source.coordinator.create({
   objective: "Implement and verify cross-device export.",
   agents: {
     lead: { runtime: "codex", device_id: "device-a", workspace_id: "workspace-a", responsibilities: ["research", "review_plan", "verify_result"] },
-    worker: { runtime: "claude", device_id: "device-b", workspace_id: "workspace-b", responsibilities: ["propose_plan", "implement", "rework"] },
+    worker: { runtime: "claude", device_id: "device-b", workspace_id: workerStateDir, permission_profile: "guarded", responsibilities: ["propose_plan", "implement", "rework"] },
   },
 });
 
@@ -179,6 +179,7 @@ current = source.store.getRun(run.run_id);
 assert.equal(current.state, "planning");
 assert.equal(current.agents.worker.status, "dispatched");
 assert.equal(worker.launches.length, 1);
+assert.equal(worker.launches[0].permissionProfile, "manual", "remote child Runtime must not bypass the Session Supervisor");
 const dispatchEnvelope = envelopes.find((item) => item.target_device_id === "device-b");
 assert.ok(dispatchEnvelope, "remote dispatch must use an E2EE envelope");
 assert.equal(dispatchEnvelope.protocol, "e2ee-v2");
@@ -210,6 +211,24 @@ assert.ok(worker.registry.commands.some((item) => (
   && item.command.type === "agent.interaction.resolve"
   && item.command.interactionId === "remote-permission-1"
 )), "remote collaboration attention must resolve over the E2EE control path");
+worker.registry.emit(workerSession, {
+  type: "agent.interaction.requested",
+  eventId: "b-safe-approval",
+  interactionId: "remote-permission-safe-1",
+  kind: "permission",
+  title: "Bash needs permission",
+  tool: "Bash",
+  command: "uptime",
+  cwd: workerStateDir,
+});
+await worker.runtime.queue;
+assert.equal(source.store.getSnapshot(run.run_id).attention.length, 0);
+assert.ok(worker.registry.commands.some((item) => (
+  item.sessionId === workerSession
+  && item.command.interactionId === "remote-permission-safe-1"
+  && item.command.action === "allow"
+  && item.command.decisionSource === "originrouter-session-supervisor"
+)), "remote routine approval must be evaluated centrally and returned over E2EE");
 worker.registry.emit(workerSession, { type: "agent.text", text: "Remote plan", eventId: "b-plan" });
 worker.registry.emit(workerSession, { type: "agent.task.completed", eventId: "b-plan-done" });
 await worker.runtime.queue;

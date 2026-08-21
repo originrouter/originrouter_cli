@@ -44,7 +44,9 @@ import { ManagedAgentSupervisor } from "./managedAgentSupervisor.js";
 import { CollaborationStore } from "../collaboration/collaborationStore.js";
 import { PlanImplementVerifyCoordinator } from "../collaboration/planImplementVerifyCoordinator.js";
 import { CollaborationRuntime } from "../collaboration/collaborationRuntime.js";
+import { CollaborationApprovalSupervisor } from "../collaboration/collaborationApprovalSupervisor.js";
 import { buildCollaborationCapabilities } from "../collaboration/collaborationCapabilities.js";
+import { AiApprovalReviewer } from "../runtime/aiApprovalReviewer.js";
 import { ExternalAgentRelayRouter } from "./externalAgentRelayRouter.js";
 import { ensureRemoteCodingIdentity } from "../crypto/remoteCodingE2ee.js";
 import {
@@ -320,6 +322,10 @@ export async function startDaemon(args) {
     supervisor: managedAgentSupervisor,
     registry: externalAgentRegistry,
     catalog: agentCatalog,
+    approvalSupervisor: new CollaborationApprovalSupervisor({
+      stateDir,
+      aiReviewer: new AiApprovalReviewer({ stateDir }),
+    }),
     // Collaboration device messages carry prompts, results, usage details,
     // and cancellation state. Route them through the same E2EE transport as
     // Agent control; non-device control projections are passed through by the

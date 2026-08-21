@@ -12,6 +12,7 @@ const coordinator = new PlanImplementVerifyCoordinator({ store });
 
 const created = coordinator.create({
   objective: "Implement and verify a production-safe status view.",
+  supervisor_permission_profile: "ai_review",
   participants: [
     {
       participant_id: "planner",
@@ -20,6 +21,8 @@ const created = coordinator.create({
       device_id: "local",
       workspace_id: "/project",
       planner: true,
+      permission_profile: "guarded",
+      approval_policy_id: "protected",
     },
     {
       participant_id: "builder",
@@ -38,6 +41,9 @@ assert.equal(snapshot.run.legacy_state, "created");
 assert.equal(snapshot.last_sequence, 1);
 assert.equal(snapshot.tasks[0].state, "ready");
 assert.equal(snapshot.participants[0].participant_id, "planner");
+assert.equal(snapshot.run.supervisor_permission_profile, "ai_review");
+assert.equal(snapshot.participants[0].permission_profile, "guarded");
+assert.equal(snapshot.participants[0].approval_policy_id, "protected");
 assert.equal(snapshot.attention.length, 0);
 
 coordinator.start(created.run_id);
@@ -116,13 +122,24 @@ assert.equal(eventsAfter[0].schema_version, 2);
 
 store.recordExecutionEvent(created.run_id, {
   type: "task.progress",
+  summary: "Unix-second timestamp",
+  createdAt: 1_787_222_222,
+  idempotencyKey: "unix-second-timestamp-event",
+});
+const timestampedEvent = store.listExecutionEvents(created.run_id, {
+  afterSequence: beforeDuplicate + 1,
+})[0];
+assert.match(timestampedEvent.created_at, /^2026-/, "Unix seconds must not be stored as a 1970 millisecond timestamp");
+
+store.recordExecutionEvent(created.run_id, {
+  type: "task.progress",
   summary: "Provider replied with sk-v1-super-secret-value",
   detail: "authorization: Bearer or_at_super-secret-value",
   payload: { message: "password=hunter2" },
   idempotencyKey: "redacted-progress-event",
 });
 const redactedEvent = store.listExecutionEvents(created.run_id, {
-  afterSequence: beforeDuplicate + 1,
+  afterSequence: beforeDuplicate + 2,
 })[0];
 assert.ok(!redactedEvent.summary.includes("super-secret-value"));
 assert.ok(!redactedEvent.detail.includes("or_at_"));

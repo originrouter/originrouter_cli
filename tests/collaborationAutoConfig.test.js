@@ -7,10 +7,13 @@ import {
   requestAutoConfiguration,
   validateAndNormalizeAutoConfiguration,
 } from "../src/collaboration/collaborationAutoConfig.js";
+import { taskPrompt } from "../src/collaboration/adaptivePlan.js";
 import {
   automaticCreatePayload,
   autoConfigurationView,
   browseCollaborationWorkspaces,
+  followExistingAgentWorkspaceCollaboration,
+  MAX_COLLABORATION_RECONNECT_ATTEMPTS,
   retryAgentWorkspaceCollaboration,
   runAgentWorkspaceCollaboration,
   trustCollaborationWorkspace,
@@ -65,6 +68,29 @@ function capabilities({ workspaces, runtimes, budget = budgetPolicy() } = {}) {
     protocol_versions: { collaboration_snapshot: 2, collaboration_event: 2 },
   };
 }
+
+test("remote task prompts identify the assigned device as the inspection target", () => {
+  const prompt = taskPrompt({
+    run_id: "acr_remote_prompt",
+    objective: "Inspect the remote machine",
+    coordinator_device_id: "local-device",
+    agents: {
+      remote_operator: { device_id: "remote-device" },
+    },
+    tasks: [],
+  }, {
+    task_key: "inspect",
+    participant_id: "remote_operator",
+    kind: "read_only",
+    title: "Inspect machine status",
+    instructions: "Collect OS and CLI version information.",
+    deliverable: "A status report.",
+    depends_on: [],
+  });
+  assert.match(prompt, /already running on the selected target device/);
+  assert.match(prompt, /local shell, filesystem, OS, and workspace are the remote environment/);
+  assert.match(prompt, /do not search for SSH/);
+});
 
 function device(overrides = {}) {
   return {
@@ -256,6 +282,10 @@ test("automatic payload collection supports a mixed team without interactive pro
   });
   assert.equal(payload.participants.length, 2);
   assert.equal(payload.budget.max_concurrency, 2);
+  assert.equal(payload._workspace_editor.devices[0].device_name, "This device");
+  assert.deepEqual(payload._workspace_editor.devices[0].runtimes, [{ id: "claude" }, { id: "codex" }]);
+  assert.equal(payload._workspace_editor.devices[0].resolved_routes.codex.model, "review-model");
+  assert.equal(JSON.stringify(payload).includes("_workspace_editor"), false, "editor metadata stays local to the CLI");
 });
 
 test("Auto never silently downgrades an explicit remote objective to Solo when advice is unavailable", async () => {
@@ -298,6 +328,55 @@ test("workspace lifecycle does not create a Run before an unsafe configuration i
   });
   assert.equal(result.run.state, "configuration_pending");
   assert.equal(requests.length, 0);
+});
+
+test("workspace team edits are sent in the Run creation payload", async () => {
+  let createdBody = null;
+  const result = await runAgentWorkspaceCollaboration({
+    objective: "Inspect the remote computer",
+    confirmation: "safe",
+    automaticCreatePayloadFn: async () => ({
+      objective: "Inspect the remote computer",
+      workspace_mode: "auto",
+      resolved_workspace_mode: "remote_ops",
+      planning_source: "cloud_advice",
+      participants: [{
+        participant_id: "coordinator",
+        runtime: "codex",
+        device_id: "local",
+        workspace_id: "workspace-main",
+        permission_profile: "guarded",
+        planner: true,
+      }],
+      auto_configuration: { safe_to_skip_confirmation: false, coordinator: "codex", runtimes: ["codex"] },
+    }),
+    onConfigurationConfirmation: async (payload) => {
+      payload.participants[0].runtime = "claude";
+      payload.participants[0].provider = "official";
+      payload.participants[0].model = "fast-model";
+      payload.coordinator_runtime = "claude";
+      payload.auto_configuration.coordinator = "claude";
+      payload.auto_configuration.runtimes = ["claude"];
+      return "confirm";
+    },
+    requestFn: async (path, options = {}) => {
+      if (path === "/collaboration/local/runs") {
+        createdBody = options.body;
+        return { run: { run_id: "acr_edited", state: "created" } };
+      }
+      if (path.endsWith("/start")) return { run: { run_id: "acr_edited", state: "designing" } };
+      if (path.includes("/snapshot")) {
+        return { snapshot: { last_sequence: 0, run: { run_id: "acr_edited", state: "completed" }, tasks: [] } };
+      }
+      if (path.includes("/events?")) return { events: [] };
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+  assert.equal(result.run.state, "completed");
+  assert.equal(createdBody.participants[0].runtime, "claude");
+  assert.equal(createdBody.participants[0].provider, "official");
+  assert.equal(createdBody.participants[0].model, "fast-model");
+  assert.equal(createdBody.coordinator_runtime, "claude");
 });
 
 test("workspace lifecycle streams a snapshot and completes without terminal logging", async () => {
@@ -393,6 +472,153 @@ test("workspace lifecycle reconnects transient snapshot failures without recreat
   assert(updates.some((update) => update.type === "connection" && update.connectionAttempts === 0));
 });
 
+test("workspace lifecycle reconnects after a truncated JSON snapshot response", async () => {
+  let snapshotAttempts = 0;
+  const updates = [];
+  const result = await followExistingAgentWorkspaceCollaboration("acr_truncated_json", {
+    interval: 0,
+    onUpdate: (update) => updates.push(update),
+    requestFn: async (path) => {
+      if (path.includes("/snapshot")) {
+        snapshotAttempts += 1;
+        if (snapshotAttempts === 1) throw new SyntaxError("Unexpected end of JSON input");
+        return {
+          snapshot: {
+            last_sequence: 0,
+            run: { run_id: "acr_truncated_json", state: "completed" },
+            tasks: [],
+            final_report: { summary: "Recovered after truncated JSON." },
+          },
+        };
+      }
+      if (path.includes("/events?")) return { events: [] };
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+  assert.equal(result.run.state, "completed");
+  assert.equal(snapshotAttempts, 2);
+  assert(updates.some((update) => update.phase === "reconnecting"));
+  assert(updates.some((update) => update.type === "connection" && update.connectionAttempts === 0));
+});
+
+test("workspace follower pauses after five automatic reconnect attempts", async () => {
+  let reads = 0;
+  const reconnectUpdates = [];
+  await assert.rejects(
+    followExistingAgentWorkspaceCollaboration("acr_reconnect_exhausted", {
+      interval: 0,
+      onUpdate: (update) => reconnectUpdates.push(update),
+      requestFn: async () => {
+        reads += 1;
+        const error = new Error("local API connection failed");
+        error.code = "LOCAL_API_CONNECTION_FAILED";
+        throw error;
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, "COLLABORATION_FOLLOW_RECONNECT_EXHAUSTED");
+      assert.equal(error.runId, "acr_reconnect_exhausted");
+      return true;
+    },
+  );
+  const attempts = reconnectUpdates.filter((update) => update.phase === "reconnecting");
+  assert.equal(MAX_COLLABORATION_RECONNECT_ATTEMPTS, 5);
+  assert.equal(attempts.length, 5);
+  assert.deepEqual(attempts.map((update) => update.connectionAttempts), [1, 2, 3, 4, 5]);
+  assert.match(attempts.at(-1).message, /retry 5\/5/);
+  assert.equal(reads, 6, "the initial read is followed by exactly five retries");
+});
+
+test("workspace follow-up reuses the previous team but creates and reviews a new Run", async () => {
+  const createdBodies = [];
+  let automaticConfigurationCalls = 0;
+  let configurationReviewCalls = 0;
+  let planReviewCalls = 0;
+  let snapshotReads = 0;
+  const previousConfiguration = {
+    objective: "Inspect the remote machine",
+    workflow_template_id: "remote_ops",
+    planning_source: "cloud_advice",
+    risk_tier: "yellow",
+    participants: [{
+      participant_id: "remote_operator",
+      display_name: "Remote Operator",
+      runtime: "claude",
+      device_id: "remote-device",
+      workspace_id: "remote-workspace",
+      permission_profile: "guarded",
+      provider: "originrouter-cloud",
+      model: "claude-model",
+      planner: true,
+    }],
+    preferences: {},
+    budget: { max_concurrency: 1 },
+    auto_configuration: {
+      resolved_workspace_mode: "remote_ops",
+      safe_to_skip_confirmation: true,
+    },
+  };
+  const result = await runAgentWorkspaceCollaboration({
+    objective: "Also check the remote service status",
+    presetConfiguration: previousConfiguration,
+    continuedFromRunId: "acr_previous",
+    confirmation: "safe",
+    interval: 0,
+    automaticCreatePayloadFn: async () => {
+      automaticConfigurationCalls += 1;
+      throw new Error("automatic configuration must not run for a same-team follow-up");
+    },
+    onConfigurationConfirmation: async () => {
+      configurationReviewCalls += 1;
+      return "confirm";
+    },
+    onPlanConfirmation: async () => {
+      planReviewCalls += 1;
+      return "confirm";
+    },
+    requestFn: async (path, options = {}) => {
+      if (path === "/collaboration/local/runs") {
+        createdBodies.push(options.body);
+        return { run: { run_id: "acr_followup", state: "created" } };
+      }
+      if (path.endsWith("/start")) return { run: { run_id: "acr_followup", state: "designing" } };
+      if (path.endsWith("/confirm")) return { run: { run_id: "acr_followup", state: "running" } };
+      if (path.includes("/events?")) return { events: [] };
+      if (path.includes("/snapshot")) {
+        snapshotReads += 1;
+        if (snapshotReads === 1) {
+          return { snapshot: {
+            last_sequence: 0,
+            run: { run_id: "acr_followup", state: "awaiting_confirmation" },
+            plan: { title: "Follow-up plan", tasks: [] },
+            tasks: [],
+          } };
+        }
+        return { snapshot: {
+          last_sequence: 0,
+          run: { run_id: "acr_followup", state: "completed" },
+          tasks: [],
+          final_report: { summary: "Follow-up completed." },
+        } };
+      }
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+  assert.equal(result.run.state, "completed");
+  assert.equal(automaticConfigurationCalls, 0);
+  assert.equal(configurationReviewCalls, 0, "the explicitly continued team is not selected again");
+  assert.equal(planReviewCalls, 1, "the new objective still receives a new reviewable plan");
+  assert.equal(createdBodies.length, 1);
+  assert.equal(createdBodies[0].objective, "Also check the remote service status");
+  assert.equal(createdBodies[0].participants[0].device_id, "remote-device");
+  assert.equal(createdBodies[0].participants[0].runtime, "claude");
+  assert.equal(createdBodies[0].participants[0].provider, "originrouter-cloud");
+  assert.equal(createdBodies[0].participants[0].model, "claude-model");
+  assert.equal(createdBodies[0].auto_configuration.continued_from_run_id, "acr_previous");
+  assert.equal(createdBodies[0].planning_source, "continued_team");
+  assert.equal(previousConfiguration.objective, "Inspect the remote machine", "the previous Run configuration remains immutable");
+});
+
 test("plan review can request changes and waits for the replacement plan", async () => {
   const paths = [];
   let snapshotReads = 0;
@@ -449,6 +675,31 @@ test("a failed workspace Run can be retried and followed in place", async () => 
   });
   assert.equal(result.run.state, "completed");
   assert.equal(paths.filter((path) => path.endsWith("/retry")).length, 1);
+});
+
+test("an existing active workspace Run can be followed without recreating it", async () => {
+  const paths = [];
+  const result = await followExistingAgentWorkspaceCollaboration("acr_existing", {
+    interval: 0,
+    requestFn: async (path) => {
+      paths.push(path);
+      if (path.includes("/snapshot")) {
+        return {
+          snapshot: {
+            last_sequence: 0,
+            run: { run_id: "acr_existing", state: "completed" },
+            tasks: [],
+            final_report: { summary: "Existing Run completed." },
+          },
+        };
+      }
+      if (path.includes("/events?")) return { events: [] };
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+  assert.equal(result.run.state, "completed");
+  assert.equal(paths.some((path) => path === "/collaboration/local/runs"), false);
+  assert.equal(paths.some((path) => path.endsWith("/start")), false);
 });
 
 test("workspace lifecycle resolves an Agent attention request and continues", async () => {
@@ -587,7 +838,8 @@ test("JSON automation projection is stable and excludes capability secrets and p
     devices: [device()],
   });
   assert.deepEqual(Object.keys(autoConfigurationView(payload)), [
-    "objective", "participants", "workflow_template_id", "preferences",
+    "objective", "supervisor_permission_profile", "supervisor_policy_id",
+    "participants", "workflow_template_id", "preferences",
     "independent_review", "max_concurrency", "budget",
   ]);
   const projected = publicCapabilitySnapshot([device({

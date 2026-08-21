@@ -78,8 +78,14 @@ const OPAQUE_SCRIPT_EXECUTABLE = /^(?:ruby|perl|php|lua|r|rscript|pwsh|powershel
 const SQL_CLIENTS = new Set(["psql", "mysql", "mariadb", "sqlite3", "sqlcmd"]);
 const PACKAGE_MANAGERS = new Set(["npm", "npx", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "poetry", "cargo", "gem", "composer"]);
 const SAFE_PROCESS_COMMANDS = new Set([
-  "basename", "date", "dirname", "echo", "expr", "false", "id", "printf",
-  "pwd", "test", "true", "type", "uname", "which", "whoami",
+  "arch", "basename", "date", "dirname", "echo", "expr", "false", "hostname",
+  "id", "memory_pressure", "printf", "ps", "pwd", "sw_vers", "system_profiler",
+  "test", "true", "type", "uname", "uptime", "vm_stat", "which", "who", "whoami",
+]);
+const VERSION_QUERY_EXECUTABLES = new Set([
+  "brew", "bun", "cargo", "claude", "codex", "composer", "deno", "gem", "git",
+  "node", "nodejs", "npm", "npx", "originrouter", "pip", "pip3", "pnpm", "poetry",
+  "python", "python3", "ruby", "rustc", "uv", "yarn",
 ]);
 const COMMAND_WRAPPERS = new Set([
   "builtin", "command", "env", "exec", "nice", "nohup", "sudo", "doas", "time",
@@ -1210,13 +1216,18 @@ function semanticCommandAtoms(request, command, segment, context, depth = 0) {
   const args = tokens.slice(1);
   const positional = optionValues(args);
   let classified = SAFE_PROCESS_COMMANDS.has(executable);
+  const versionQuery = VERSION_QUERY_EXECUTABLES.has(executable)
+    && args.length > 0
+    && args.every((item) => ["--version", "-V", "-v", "version"].includes(item));
+  if (versionQuery) return atoms;
 
   if (COMMAND_WRAPPERS.has(executable)) {
     classified = true;
     if (["sudo", "doas"].includes(executable)) {
       atoms.push(baseAtom(request, "system.identity.manage", { command: atoms[0].command }));
     }
-    const nested = wrappedCommandTokens(executable, args);
+    const lookupOnly = executable === "command" && ["-v", "-V"].includes(args[0]);
+    const nested = lookupOnly ? [] : wrappedCommandTokens(executable, args);
     if (nested.length && depth < 8) {
       atoms.push(...semanticCommandAtoms(request, command, {
         tokens: nested,
@@ -1224,7 +1235,7 @@ function semanticCommandAtoms(request, command, segment, context, depth = 0) {
         dynamic: segment.dynamic,
         redirections: segment.redirections,
       }, context, depth + 1));
-    } else if (!nested.length) {
+    } else if (!nested.length && !lookupOnly) {
       atoms.push(baseAtom(request, "tool.unknown", {
         confidence: "low",
         command: atoms[0].command,
@@ -1380,6 +1391,25 @@ function semanticCommandAtoms(request, command, segment, context, depth = 0) {
         code: { language: "package-script", module: executable, script: "", sha256: "" },
         command: atoms[0].command,
       }));
+    }
+  }
+  if (executable === "brew") {
+    classified = true;
+    const verb = args.find((item) => !item.startsWith("-")) || "";
+    if (verb === "services") {
+      const serviceVerb = args.slice(args.indexOf(verb) + 1)
+        .find((item) => !item.startsWith("-")) || "list";
+      atoms.push(baseAtom(
+        request,
+        serviceVerb === "list" ? "system.service.read" : "system.service.manage",
+        { command: atoms[0].command },
+      ));
+    } else if (["install", "upgrade", "update", "tap"].includes(verb)) {
+      atoms.push(baseAtom(request, "package.install", { command: atoms[0].command }));
+    } else if (["uninstall", "remove", "rm", "untap"].includes(verb)) {
+      atoms.push(baseAtom(request, "package.remove", { command: atoms[0].command }));
+    } else {
+      atoms.push(baseAtom(request, "package.read", { command: atoms[0].command }));
     }
   }
   if (["systemctl", "service", "launchctl"].includes(executable)) {
@@ -1795,7 +1825,7 @@ export function protectedApprovalPolicy() {
       {
         id: "allow-routine-processes",
         effect: "allow",
-        actions: ["process.exec", "vcs.read", "package.read"],
+        actions: ["process.exec", "vcs.read", "package.read", "system.service.read", "infra.read"],
         when: { field: "command.cwd", op: "path_under", value: "${workspace}" },
       },
       {

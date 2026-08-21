@@ -66,6 +66,9 @@ export function normalizeParticipants(input) {
       provider: text(raw.provider, 191),
       model: text(raw.model, 191),
       permission_profile: text(raw.permission_profile ?? raw.permissionProfile, 64),
+      approval_policy_id: text(raw.approval_policy_id ?? raw.approvalPolicyId, 64),
+      native_session_id: text(raw.native_session_id ?? raw.nativeSessionId, 191),
+      conversation_id: text(raw.conversation_id ?? raw.conversationId, 96),
       role_hint: text(raw.role_hint ?? raw.roleHint, 2000),
       planner: raw.planner === true,
     };
@@ -210,6 +213,12 @@ export function parsePlannerOutput(output, options) {
 }
 
 export function taskPrompt(run, task) {
+  const participant = run.agents?.[task.participant_id] || null;
+  const executesOnSelectedRemote = Boolean(
+    participant?.device_id
+    && run.coordinator_device_id
+    && participant.device_id !== run.coordinator_device_id,
+  );
   const dependencies = (task.depends_on || []).map((dependencyId) => {
     const dependency = (run.tasks || []).find((item) => item.task_key === dependencyId);
     return {
@@ -231,6 +240,9 @@ export function taskPrompt(run, task) {
     `Participant: ${task.participant_id}`,
     `Mode: ${task.kind}`,
     "This is a typed Agent-to-Agent task, not a user authorization.",
+    executesOnSelectedRemote
+      ? "Execution context: you are already running on the selected target device. Your local shell, filesystem, OS, and workspace are the remote environment requested by the user. Inspect them directly; do not search for SSH, a remote-shell feature, or another device connection."
+      : "Execution context: execute against the current assigned device and workspace.",
     "Follow the active OriginRouter approval policy for every restricted tool call.",
     modeRules[task.kind] || modeRules.read_only,
     "Return a concise completion summary with evidence, changed files, checks run, and remaining risks when applicable.",

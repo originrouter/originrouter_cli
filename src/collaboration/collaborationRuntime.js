@@ -7,6 +7,8 @@ import {
   taskPrompt,
 } from "./adaptivePlan.js";
 import { browseAgentWorkspaces } from "../daemon/workspaceBrowser.js";
+import { displaySafeToolInput } from "../runtime/displaySafeToolInput.js";
+import { CollaborationApprovalSupervisor } from "./collaborationApprovalSupervisor.js";
 
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "expired"]);
 const COMPLETE_EVENTS = new Set(["agent.task.complete", "agent.task.completed"]);
@@ -19,6 +21,13 @@ const FATAL_DELIVERY_CODES = new Set([
   "DEVICE_E2EE_DIRECTORY_FORK",
   "device_e2ee_required",
 ]);
+const AGENT_RESUME_BINDING_CODES = new Set([
+  "INVALID_RESUME_REQUEST",
+  "RESUME_AGENT_MISMATCH",
+  "RESUME_CONVERSATION_NOT_FOUND",
+  "RESUME_SESSION_MISMATCH",
+  "RESUME_WORKSPACE_MISMATCH",
+]);
 
 function safeText(value, maxLength = 16_384) {
   return String(value ?? "").trim().slice(0, maxLength);
@@ -26,6 +35,10 @@ function safeText(value, maxLength = 16_384) {
 
 function compactId(value, maxLength = 64) {
   return String(value || "").replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, maxLength);
+}
+
+function isAgentResumeBindingError(error) {
+  return AGENT_RESUME_BINDING_CODES.has(safeText(error?.code, 96));
 }
 
 function expectedRole(run) {
@@ -97,6 +110,29 @@ function executionEventProjection(event = {}) {
       status: safeText(event.status, 32) || null,
       action: safeText(event.action, 64) || null,
       decision_source: safeText(event.decisionSource, 191) || null,
+      ...(type === "agent.interaction.requested" ? {
+        approval_request: {
+          ...displaySafeToolInput({
+          interactionId: safeText(event.interactionId || event.callId, 191),
+          kind: safeText(event.kind, 64) || "input",
+          title: safeText(event.title, 512),
+          prompt: safeText(event.prompt || event.message, 2048),
+          payload: {
+            tool: safeText(event.tool || event.toolName || event.tool_name, 128),
+            display_name: safeText(event.display_name || event.displayName, 256),
+            blocked_path: safeText(event.blocked_path || event.blockedPath, 4096),
+            tool_input: event.tool_input || event.toolInput || null,
+            command: event.command || null,
+            cwd: safeText(event.cwd, 4096),
+            file_changes: event.file_changes || event.fileChanges || null,
+            additional_permissions: event.additional_permissions || event.additionalPermissions || null,
+            network_approval_context: event.network_approval_context || event.networkApprovalContext || null,
+            default_approval_option: safeText(event.default_approval_option || event.defaultApprovalOption, 128),
+          },
+          }),
+          containsSecret: event.containsSecret === true,
+        },
+      } : {}),
     } : {},
     metadata: {
       ...(activity ? { activity } : {}),
@@ -114,7 +150,9 @@ function interactionAttentionKind(kind) {
 }
 
 function interactionAttentionActions(kind) {
-  return kind === "permission" ? ["allow", "deny"] : ["submit", "cancel"];
+  return kind === "permission"
+    ? ["allow", "deny"]
+    : ["submit", "cancel"];
 }
 
 function collaborationSnapshotSummary(snapshot) {
@@ -150,6 +188,7 @@ export class CollaborationRuntime {
     catalog = null,
     relayClient = null,
     capabilityProvider = null,
+    approvalSupervisor = null,
     deviceId = "local",
     registrationTimeoutMs = 15_000,
     pollIntervalMs = 100,
@@ -162,6 +201,7 @@ export class CollaborationRuntime {
     this.catalog = catalog;
     this.relayClient = relayClient;
     this.capabilityProvider = capabilityProvider;
+    this.approvalSupervisor = approvalSupervisor || new CollaborationApprovalSupervisor();
     this.deviceId = deviceId;
     this.registrationTimeoutMs = registrationTimeoutMs;
     this.pollIntervalMs = pollIntervalMs;
@@ -722,6 +762,122 @@ export class CollaborationRuntime {
     }
   }
 
+  blockForAgentRecovery(run, role, error) {
+    const agent = run.agents?.[role];
+    const taskId = agent?.current_task_id || null;
+    this.store.createAttention(run.run_id, {
+      taskId,
+      participantId: role,
+      kind: "agent_recovery",
+      title: `${agent?.display_name || role} could not resume its previous session`,
+      summary: "The saved Agent identity no longer matches the selected Runtime or workspace. OriginRouter will not silently replace it. Rebuild this member to continue with a fresh native Agent session, or cancel the collaboration.",
+      risk: "normal",
+      actions: ["rebuild", "cancel"],
+      payload: {
+        diagnostic_code: safeText(error?.code, 96) || "AGENT_RESUME_FAILED",
+        resume_state: run.state,
+      },
+      idempotencyKey: `agent-recovery:${role}:${agent?.native_session_id || "missing"}`,
+    });
+    this.store.updateAgent(run.run_id, role, { status: "blocked" });
+    this.store.transition(run.run_id, "blocked");
+    return this.store.getRun(run.run_id);
+  }
+
+  workspaceRoot(agent) {
+    return this.catalog?.getWorkspace?.(agent?.workspace_id, {
+      deviceId: agent?.device_id || "",
+    })?.canonical_path || agent?.workspace_id || process.cwd();
+  }
+
+  async deliverInteractionResolution(run, role, taskId, sessionId, interactionId, command, deliveryKey) {
+    const agent = run.agents?.[role];
+    const remote = agent && agent.device_id !== this.deviceId && agent.device_id !== "local";
+    if (!remote) {
+      this.registry.enqueueCommand(sessionId, command);
+      return;
+    }
+    await this.sendRemoteDurable("collaboration.remote.interaction.resolve", {
+      protocolVersion: "1",
+      sourceDeviceId: this.deviceId,
+      targetDeviceId: agent.device_id,
+      runId: run.run_id,
+      taskId,
+      role,
+      sessionId,
+      interactionId,
+      command,
+      deliveryId: compactId(deliveryKey, 96),
+    }, {
+      outboxId: `interaction:${compactId(deliveryKey, 160)}`,
+    });
+  }
+
+  async supervisePermissionRequest({ run, role, taskId, sessionId, request, createdAt }) {
+    const interactionId = safeText(request?.interactionId, 191);
+    const agent = run.agents?.[role];
+    if (!interactionId || !agent) return false;
+    const evidence = request?.payload || {};
+    if (![evidence.tool, evidence.command, evidence.tool_input, evidence.file_changes,
+      evidence.additional_permissions, evidence.network_approval_context, evidence.blocked_path]
+      .some((value) => value && (typeof value !== "object" || Object.keys(value).length > 0))) {
+      return false;
+    }
+    let decision;
+    try {
+      decision = await this.approvalSupervisor.evaluate({
+        request,
+        agent,
+        run,
+        workspaceRoot: this.workspaceRoot(agent),
+      });
+    } catch (error) {
+      decision = {
+        effect: "ask",
+        reason: safeText(error?.code || error?.message, 256) || "supervisor_evaluation_failed",
+        layers: [],
+      };
+    }
+    if (decision.effect === "ask") return false;
+    const command = {
+      type: "agent.interaction.resolve",
+      sessionId,
+      interactionId,
+      responseId: compactId(`supervisor-${run.run_id}-${interactionId}`, 191),
+      kind: "permission",
+      action: decision.action,
+      response: decision.response || { remember_for_session: false },
+      decisionSource: "originrouter-session-supervisor",
+    };
+    await this.deliverInteractionResolution(
+      run,
+      role,
+      taskId,
+      sessionId,
+      interactionId,
+      command,
+      `supervisor-${run.run_id}-${interactionId}`,
+    );
+    this.store.recordExecutionEvent(run.run_id, {
+      type: "agent.interaction.auto_resolved",
+      taskId,
+      participantId: role,
+      sessionId,
+      summary: decision.effect === "allow"
+        ? "OriginRouter approved the Agent request under the active Session policy."
+        : "OriginRouter denied the Agent request under the active Session policy.",
+      payload: {
+        interaction_id: interactionId,
+        action: decision.action,
+        reason: decision.reason,
+        policy_layers: decision.layers,
+      },
+      idempotencyKey: `supervisor-resolution:${sessionId}:${interactionId}`,
+      createdAt,
+    });
+    return true;
+  }
+
   async resolveAttention(runId, attentionId, input = {}) {
     const run = this.store.getRun(runId, { includeMessages: false });
     if (!run) throw new Error("collaboration run not found");
@@ -737,13 +893,58 @@ export class CollaborationRuntime {
     }
     const sessionId = safeText(item.payload?.session_id, 64);
     const interactionId = safeText(item.payload?.interaction_id, 191);
+    if (item.kind === "agent_recovery") {
+      if (action === "cancel") {
+        const resolved = this.store.resolveAttention(runId, attentionId, {
+          ...input,
+          resolution: action,
+        });
+        await this.cancel(runId);
+        return resolved;
+      }
+      const role = item.participant_id;
+      this.store.updateAgent(runId, role, {
+        status: "idle",
+        nativeSessionId: "",
+        originrouterSessionId: "",
+        conversationId: "",
+      });
+      const resolved = this.store.resolveAttention(runId, attentionId, {
+        ...input,
+        resolution: action,
+      });
+      const resumeState = safeText(item.payload?.resume_state, 64) || "executing";
+      this.store.transition(runId, resumeState);
+      if (run.template_id === ADAPTIVE_TEMPLATE_ID && item.task_id) {
+        const task = run.tasks.find((candidate) => candidate.task_id === item.task_id);
+        if (!task) throw new Error("Agent recovery task was not found");
+        this.store.updateAdaptiveTask(runId, task.task_key, { state: "active" });
+        const refreshed = this.store.getRun(runId);
+        await this.dispatch(
+          refreshed,
+          role,
+          task.task_key === "__planner__"
+            ? buildPlannerPrompt(refreshed, { recovery: true })
+            : taskPrompt(refreshed, task),
+          {
+            taskId: task.task_id,
+            taskKey: task.task_key,
+            phase: task.task_key === "__planner__" ? "plan_design" : task.kind,
+            retry: true,
+            resetAgentIdentity: true,
+          },
+        );
+      } else {
+        await this.dispatchForState(runId, { recovery: true, resetAgentIdentity: true });
+      }
+      return resolved;
+    }
     if (["approval", "input"].includes(item.kind)) {
       if (!sessionId || !interactionId) {
         const error = new Error("attention item is missing its Agent interaction binding");
         error.code = "COLLABORATION_ATTENTION_BINDING_MISSING";
         throw error;
       }
-      const agent = run.agents?.[item.participant_id];
       const command = {
         type: "agent.interaction.resolve",
         sessionId,
@@ -752,28 +953,21 @@ export class CollaborationRuntime {
           || compactId(`attention-${item.attention_id}-${item.revision}`, 191),
         kind: safeText(item.payload?.kind, 64) || null,
         action,
-        response: input.response && typeof input.response === "object" ? input.response : {},
+        response: {
+          ...(input.response && typeof input.response === "object" ? input.response : {}),
+          ...(item.kind === "approval" ? { remember_for_session: false } : {}),
+        },
         decisionSource: safeText(input.resolved_by ?? input.resolvedBy, 191) || "originrouter-user",
       };
-      const remote = agent && agent.device_id !== this.deviceId && agent.device_id !== "local";
-      if (remote) {
-        await this.sendRemoteDurable("collaboration.remote.interaction.resolve", {
-          protocolVersion: "1",
-          sourceDeviceId: this.deviceId,
-          targetDeviceId: agent.device_id,
-          runId: run.run_id,
-          taskId: item.task_id,
-          role: item.participant_id,
-          sessionId,
-          interactionId,
-          command,
-          deliveryId: compactId(`attention-${item.attention_id}-${item.revision}`, 96),
-        }, {
-          outboxId: `attention:${item.attention_id}:${item.revision}`,
-        });
-      } else {
-        this.registry.enqueueCommand(sessionId, command);
-      }
+      await this.deliverInteractionResolution(
+        run,
+        item.participant_id,
+        item.task_id,
+        sessionId,
+        interactionId,
+        command,
+        `attention-${item.attention_id}-${item.revision}`,
+      );
     }
     const resolved = this.store.resolveAttention(runId, attentionId, {
       ...input,
@@ -816,22 +1010,22 @@ export class CollaborationRuntime {
     }
   }
 
-  async dispatchForState(runId, { recovery = false } = {}) {
+  async dispatchForState(runId, { recovery = false, resetAgentIdentity = false } = {}) {
     const run = this.store.getRun(runId);
     if (!run || TERMINAL_STATES.has(run.state)) return run;
     void this.syncRun(runId);
     if (run.template_id === ADAPTIVE_TEMPLATE_ID) {
-      return this.dispatchAdaptive(run, { recovery });
+      return this.dispatchAdaptive(run, { recovery, resetAgentIdentity });
     }
     const role = expectedRole(run);
     if (!role) return run;
     const prompt = this.promptFor(run, role, { recovery });
     if (!prompt) return run;
-    await this.dispatch(run, role, prompt);
+    await this.dispatch(run, role, prompt, { resetAgentIdentity });
     return this.store.getRun(runId);
   }
 
-  async dispatchAdaptive(run, { recovery = false } = {}) {
+  async dispatchAdaptive(run, { recovery = false, resetAgentIdentity = false } = {}) {
     if (recovery) run = this.store.resetAdaptiveActiveTasks(run.run_id);
     if (run.state === "designing") {
       const role = run.planner_role;
@@ -848,6 +1042,7 @@ export class CollaborationRuntime {
           taskKey: "__planner__",
           phase: "plan_design",
           retry: recovery,
+          resetAgentIdentity,
         },
       );
       return this.store.getRun(run.run_id);
@@ -870,6 +1065,7 @@ export class CollaborationRuntime {
         taskKey: task.task_key,
         phase: task.kind,
         retry: recovery,
+        resetAgentIdentity,
       });
     }));
     return this.store.getRun(run.run_id);
@@ -921,6 +1117,7 @@ export class CollaborationRuntime {
     taskKey = null,
     phase = null,
     retry = false,
+    resetAgentIdentity = false,
   } = {}) {
     let agent = run.agents[role];
     if (!agent) throw new Error(`missing collaboration role: ${role}`);
@@ -970,7 +1167,10 @@ export class CollaborationRuntime {
         workspaceId: agent.workspace_id,
         provider: agent.provider,
         model: agent.model,
-        permissionProfile: agent.permission_profile || "manual",
+        permissionProfile: "manual",
+        nativeSessionId: agent.native_session_id || null,
+        conversationId: agent.conversation_id || null,
+        resetAgentIdentity,
         prompt,
       };
       let result;
@@ -979,6 +1179,10 @@ export class CollaborationRuntime {
           outboxId: `dispatch:${deliveryId}`,
         });
       } catch (error) {
+        if (agent.native_session_id && isAgentResumeBindingError(error)) {
+          this.blockForAgentRecovery(run, role, error);
+          return;
+        }
         if (!retryableDeliveryError(error)) throw error;
         this.store.updateAgent(run.run_id, role, { status: "waiting_device", currentTaskId: effectiveTaskId });
         return;
@@ -1002,23 +1206,32 @@ export class CollaborationRuntime {
     if (!active) {
       sessionId = compactId(`collab-${role}-${randomUUID()}`);
       const conversationId = agent.conversation_id || compactId(`collab-${run.run_id}-${role}`, 96);
-      const launch = await this.supervisor.start({
-        launchId: compactId(`launch-${run.run_id}-${role}-${randomUUID()}`, 96),
-        sessionId,
-        conversationId,
-        runId: run.run_id,
-        agentType: agent.runtime,
-        workspaceId: agent.workspace_id,
-        provider: agent.provider,
-        model: agent.model,
-        permissionProfile: agent.permission_profile || "manual",
-        ...(agent.native_session_id ? {
-          resumeConversationId: conversationId,
-          nativeSessionId: agent.native_session_id,
-        } : {}),
-        title: `${run.objective.slice(0, 120)} · ${agent.display_name || role}`,
-        startedBy: "collaboration-runtime",
-      });
+      let launch;
+      try {
+        launch = await this.supervisor.start({
+          launchId: compactId(`launch-${run.run_id}-${role}-${randomUUID()}`, 96),
+          sessionId,
+          conversationId,
+          runId: run.run_id,
+          agentType: agent.runtime,
+          workspaceId: agent.workspace_id,
+          provider: agent.provider,
+          model: agent.model,
+          permissionProfile: "manual",
+          ...(agent.native_session_id ? {
+            resumeConversationId: conversationId,
+            nativeSessionId: agent.native_session_id,
+          } : {}),
+          title: `${run.objective.slice(0, 120)} · ${agent.display_name || role}`,
+          startedBy: "collaboration-runtime",
+        });
+      } catch (error) {
+        if (agent.native_session_id && isAgentResumeBindingError(error)) {
+          this.blockForAgentRecovery(run, role, error);
+          return;
+        }
+        throw error;
+      }
       this.store.updateAgent(run.run_id, role, {
         status: "starting",
         originrouterSessionId: launch.sessionId,
@@ -1094,6 +1307,14 @@ export class CollaborationRuntime {
       const interactionId = safeText(event.interactionId || event.callId, 191);
       if (interactionId) {
         const kind = safeText(event.kind, 64) || "input";
+        if (kind === "permission" && await this.supervisePermissionRequest({
+          run: currentRun,
+          role: binding.role,
+          taskId: currentTaskId,
+          sessionId: notification.sessionId,
+          request: projectedEvent.payload.approval_request,
+          createdAt: event.createdAt,
+        })) return;
         const containsSecret = event.containsSecret === true;
         this.store.createAttention(binding.run_id, {
           taskId: currentTaskId,
@@ -1601,6 +1822,14 @@ export class CollaborationRuntime {
         const interactionId = safeText(payload.event?.payload?.interaction_id, 191);
         if (interactionId) {
           const kind = safeText(payload.event?.payload?.kind, 64) || "input";
+          if (kind === "permission" && await this.supervisePermissionRequest({
+            run,
+            role,
+            taskId: payload.taskId,
+            sessionId: safeText(payload.sessionId, 64),
+            request: payload.event?.payload?.approval_request,
+            createdAt: payload.createdAt,
+          })) return true;
           this.store.createAttention(run.run_id, {
             taskId: payload.taskId,
             participantId: role,
@@ -1742,10 +1971,15 @@ export class CollaborationRuntime {
         const run = this.store.getRun(payload.runId, { includeMessages: false });
         const role = safeText(payload.role, 32);
         if (!run || !this.acceptsFencing(run, role, payload)) return true;
-        await this.fail(payload.runId, Object.assign(
+        const error = Object.assign(
           new Error(safeText(payload.message, 2048) || "Remote collaboration Agent failed."),
           { code: safeText(payload.code, 96) },
-        ));
+        );
+        if (run.agents?.[role]?.native_session_id && isAgentResumeBindingError(error)) {
+          this.blockForAgentRecovery(run, role, error);
+        } else {
+          await this.fail(payload.runId, error);
+        }
       }
       return true;
     }
@@ -1772,6 +2006,9 @@ export class CollaborationRuntime {
       provider: payload.provider,
       model: payload.model,
       permissionProfile: payload.permissionProfile,
+      nativeSessionId: payload.nativeSessionId,
+      conversationId: payload.conversationId,
+      resetAgentIdentity: payload.resetAgentIdentity,
       deliveryId: payload.deliveryId,
       attempt: payload.attempt,
       fencingToken: payload.fencingToken,
@@ -1804,7 +2041,7 @@ export class CollaborationRuntime {
         workspaceId: assignment.workspace_id,
         provider: assignment.provider,
         model: assignment.model,
-        permissionProfile: assignment.permission_profile || "manual",
+        permissionProfile: "manual",
         ...(assignment.native_session_id ? {
           resumeConversationId: conversationId,
           nativeSessionId: assignment.native_session_id,

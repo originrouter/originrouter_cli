@@ -46,7 +46,11 @@ function safeText(value, maxLength = 4096) {
 }
 
 function iso(value = null) {
-  const date = value == null ? new Date() : new Date(value);
+  const numeric = typeof value === "number" ? value : null;
+  const normalized = numeric != null && Number.isFinite(numeric) && Math.abs(numeric) < 1e12
+    ? numeric * 1000
+    : value;
+  const date = normalized == null ? new Date() : new Date(normalized);
   return Number.isFinite(date.getTime()) ? date.toISOString() : new Date().toISOString();
 }
 
@@ -92,6 +96,9 @@ function normalizeRole(role, name) {
     provider: safeText(role.provider, 191),
     model: safeText(role.model, 191),
     permission_profile: safeText(role.permission_profile ?? role.permissionProfile, 64),
+    approval_policy_id: safeText(role.approval_policy_id ?? role.approvalPolicyId, 64),
+    native_session_id: safeText(role.native_session_id ?? role.nativeSessionId, 191),
+    conversation_id: safeText(role.conversation_id ?? role.conversationId, 96),
     responsibilities,
     display_name: safeText(role.display_name ?? role.displayName, 80) || name,
     role_hint: safeText(role.role_hint ?? role.roleHint, 2000),
@@ -108,6 +115,10 @@ function publicRun(row) {
     template_id: row.template_id,
     template_version: row.template_version,
     run_id: row.run_id,
+    workspace_session_id: row.workspace_session_id || null,
+    continued_from_run_id: row.continued_from_run_id || null,
+    supervisor_permission_profile: row.supervisor_permission_profile || "guarded",
+    supervisor_policy_id: row.supervisor_policy_id || null,
     conversation_id: row.conversation_id,
     objective: row.objective,
     preferences: row.preferences || "",
@@ -162,6 +173,10 @@ export class CollaborationStore {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS collaboration_runs (
         run_id TEXT PRIMARY KEY,
+        workspace_session_id TEXT NOT NULL DEFAULT '',
+        continued_from_run_id TEXT NOT NULL DEFAULT '',
+        supervisor_permission_profile TEXT NOT NULL DEFAULT 'guarded',
+        supervisor_policy_id TEXT NOT NULL DEFAULT '',
         conversation_id TEXT NOT NULL UNIQUE,
         template_id TEXT NOT NULL,
         template_version TEXT NOT NULL,
@@ -211,6 +226,7 @@ export class CollaborationStore {
         provider TEXT NOT NULL DEFAULT '',
         model TEXT NOT NULL DEFAULT '',
         permission_profile TEXT NOT NULL DEFAULT '',
+        approval_policy_id TEXT NOT NULL DEFAULT '',
         responsibilities_json TEXT NOT NULL,
         display_name TEXT NOT NULL DEFAULT '',
         role_hint TEXT NOT NULL DEFAULT '',
@@ -433,6 +449,10 @@ export class CollaborationStore {
         ON collaboration_attention_items(run_id, status, created_at ASC);
     `);
     this.ensureColumn("collaboration_runs", "schema_version", "INTEGER NOT NULL DEFAULT 2");
+    this.ensureColumn("collaboration_runs", "workspace_session_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_runs", "continued_from_run_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_runs", "supervisor_permission_profile", "TEXT NOT NULL DEFAULT 'guarded'");
+    this.ensureColumn("collaboration_runs", "supervisor_policy_id", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_runs", "revision", "INTEGER NOT NULL DEFAULT 1");
     this.ensureColumn("collaboration_runs", "phase", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_runs", "pause_reason", "TEXT NOT NULL DEFAULT ''");
@@ -443,6 +463,7 @@ export class CollaborationStore {
     this.ensureColumn("collaboration_runs", "last_event_sequence", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("collaboration_runs", "started_at", "TEXT");
     this.ensureColumn("collaboration_agents", "originrouter_session_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_agents", "approval_policy_id", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_agents", "conversation_id", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_runs", "account_budget_blocked", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("collaboration_runs", "resume_state", "TEXT NOT NULL DEFAULT ''");
@@ -457,6 +478,10 @@ export class CollaborationStore {
     this.ensureColumn("collaboration_runs", "planner_role", "TEXT NOT NULL DEFAULT 'lead'");
     this.ensureColumn("collaboration_runs", "plan_status", "TEXT NOT NULL DEFAULT 'confirmed'");
     this.ensureColumn("collaboration_runs", "plan_revision", "INTEGER NOT NULL DEFAULT 0");
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_collaboration_runs_workspace_session
+        ON collaboration_runs(workspace_session_id, created_at ASC, run_id ASC);
+    `);
     this.ensureColumn("collaboration_runs", "plan_revision_feedback", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_runs", "plan_json", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_runs", "archived_at", "TEXT");
@@ -559,6 +584,24 @@ export class CollaborationStore {
     const objective = safeText(input.objective, 16_000);
     if (!objective) throw new Error("objective is required");
     if (Array.isArray(input.participants)) return this.createAdaptiveRun(input, objective);
+    const continuedFromRunId = safeText(
+      input.continued_from_run_id
+        ?? input.continuedFromRunId
+        ?? input.auto_configuration?.continued_from_run_id,
+      195,
+    );
+    const continuedFromRun = continuedFromRunId
+      ? this.getRun(continuedFromRunId, { includeMessages: false })
+      : null;
+    if (continuedFromRunId && !continuedFromRun) throw new Error("continued collaboration Run was not found");
+    const workspaceSessionId = continuedFromRun?.workspace_session_id
+      || safeText(input.workspace_session_id ?? input.workspaceSessionId, 195)
+      || id("aws");
+    const supervisorPermissionProfile = continuedFromRun?.supervisor_permission_profile
+      || safeText(input.supervisor_permission_profile ?? input.session_permission_profile, 64)
+      || "guarded";
+    const supervisorPolicyId = continuedFromRun?.supervisor_policy_id
+      || safeText(input.supervisor_policy_id ?? input.session_policy_id, 64);
     const lead = normalizeRole(input.agents?.lead, "lead");
     const worker = normalizeRole(input.agents?.worker, "worker");
     const verifier = input.agents?.verifier ? normalizeRole(input.agents.verifier, "verifier") : null;
@@ -582,21 +625,25 @@ export class CollaborationStore {
     this.db.transaction(() => {
       this.db.prepare(`
         INSERT INTO collaboration_runs(
-          run_id, conversation_id, template_id, template_version, objective,
+          run_id, workspace_session_id, continued_from_run_id,
+          supervisor_permission_profile, supervisor_policy_id,
+          conversation_id, template_id, template_version, objective,
           state, gates_json, budget_json, usage_json, counters_json,
           account_budget_blocked, resume_state, coordinator_device_id,
           created_at, updated_at, finished_at
-        ) VALUES (?, ?, 'plan_implement_verify', '1', ?, 'created', ?, ?, ?, ?, 0, '', ?, ?, ?, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, 'plan_implement_verify', '1', ?, 'created', ?, ?, ?, ?, 0, '', ?, ?, ?, NULL)
       `).run(
-        runId, conversationId, objective, JSON.stringify(gates), JSON.stringify(budget),
+        runId, workspaceSessionId, continuedFromRunId,
+        supervisorPermissionProfile, supervisorPolicyId, conversationId,
+        objective, JSON.stringify(gates), JSON.stringify(budget),
         JSON.stringify({ sampled_tokens: 0, amount_micros: 0, currency: null, unpriced_events: 0 }),
         JSON.stringify({ plan_revisions: 0, rework_rounds: 0 }),
         safeText(input.coordinator_device_id ?? input.coordinatorDeviceId, 191),
         createdAt, createdAt,
       );
-      const insertAgent = this.db.prepare(`INSERT INTO collaboration_agents(agent_id, run_id, role, runtime, device_id, workspace_id, provider, model, permission_profile, responsibilities_json, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      const insertAgent = this.db.prepare(`INSERT INTO collaboration_agents(agent_id, run_id, role, runtime, device_id, workspace_id, provider, model, permission_profile, approval_policy_id, responsibilities_json, native_session_id, conversation_id, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
       for (const [index, role] of [lead, worker, verifier].filter(Boolean).entries()) {
-        insertAgent.run(role.agent_id, runId, role.role, role.runtime, role.device_id, role.workspace_id, role.provider, role.model, role.permission_profile, JSON.stringify(role.responsibilities), index, createdAt, createdAt);
+        insertAgent.run(role.agent_id, runId, role.role, role.runtime, role.device_id, role.workspace_id, role.provider, role.model, role.permission_profile, role.approval_policy_id, JSON.stringify(role.responsibilities), role.native_session_id, role.conversation_id, index, createdAt, createdAt);
       }
       this.db.prepare(`INSERT INTO collaboration_tasks(task_id, run_id, title, summary, state, phase, created_at, updated_at) VALUES (?, ?, ?, '', 'pending', 'research', ?, ?)`)
         .run(taskId, runId, safeText(input.title, 256) || objective.slice(0, 256), createdAt, createdAt);
@@ -612,6 +659,24 @@ export class CollaborationStore {
 
   createAdaptiveRun(input, objective) {
     const participants = normalizeParticipants(input.participants);
+    const continuedFromRunId = safeText(
+      input.continued_from_run_id
+        ?? input.continuedFromRunId
+        ?? input.auto_configuration?.continued_from_run_id,
+      195,
+    );
+    const continuedFromRun = continuedFromRunId
+      ? this.getRun(continuedFromRunId, { includeMessages: false })
+      : null;
+    if (continuedFromRunId && !continuedFromRun) throw new Error("continued collaboration Run was not found");
+    const workspaceSessionId = continuedFromRun?.workspace_session_id
+      || safeText(input.workspace_session_id ?? input.workspaceSessionId, 195)
+      || id("aws");
+    const supervisorPermissionProfile = continuedFromRun?.supervisor_permission_profile
+      || safeText(input.supervisor_permission_profile ?? input.session_permission_profile, 64)
+      || "guarded";
+    const supervisorPolicyId = continuedFromRun?.supervisor_policy_id
+      || safeText(input.supervisor_policy_id ?? input.session_policy_id, 64);
     const explicitPlanner = participants.find((item) => item.planner);
     const planner = explicitPlanner || participants[0];
     const runId = id("acr");
@@ -628,16 +693,20 @@ export class CollaborationStore {
     this.db.transaction(() => {
       this.db.prepare(`
         INSERT INTO collaboration_runs(
-          run_id, conversation_id, template_id, template_version, objective,
+          run_id, workspace_session_id, continued_from_run_id,
+          supervisor_permission_profile, supervisor_policy_id,
+          conversation_id, template_id, template_version, objective,
           preferences, coordination_prompt, workflow_template_id,
           workspace_mode, resolved_workspace_mode, coordinator_runtime,
           planning_source, risk_tier, planner_role,
           plan_status, plan_json, state, gates_json, budget_json, usage_json,
           counters_json, account_budget_blocked, resume_state, coordinator_device_id,
           created_at, updated_at, finished_at
-        ) VALUES (?, ?, ?, '2', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', '', 'created', '{}', ?, ?, '{}', 0, '', ?, ?, ?, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, '2', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', '', 'created', '{}', ?, ?, '{}', 0, '', ?, ?, ?, NULL)
       `).run(
-        runId, conversationId, ADAPTIVE_TEMPLATE_ID, objective,
+        runId, workspaceSessionId, continuedFromRunId,
+        supervisorPermissionProfile, supervisorPolicyId,
+        conversationId, ADAPTIVE_TEMPLATE_ID, objective,
         safeText(input.preferences, 16_000), safeText(input.coordination_prompt ?? input.coordinationPrompt, 16_000),
         safeText(input.workflow_template_id ?? input.workflowTemplateId, 64) || "adaptive",
         safeText(input.workspace_mode ?? input.workspaceMode, 32),
@@ -655,18 +724,20 @@ export class CollaborationStore {
       const insert = this.db.prepare(`
         INSERT INTO collaboration_agents(
           agent_id, run_id, role, runtime, device_id, workspace_id, provider, model,
-          permission_profile, responsibilities_json, display_name, role_hint, planner,
-          sort_order, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          permission_profile, approval_policy_id, responsibilities_json, display_name, role_hint, planner,
+          native_session_id, conversation_id, sort_order, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       for (const [index, participant] of participants.entries()) {
         insert.run(
           id("agent"), runId, participant.participant_id, participant.runtime,
           participant.device_id, participant.workspace_id, participant.provider,
-          participant.model, participant.permission_profile,
+          participant.model, participant.permission_profile, participant.approval_policy_id,
           JSON.stringify(participant.role_hint ? [participant.role_hint] : []),
           participant.display_name, participant.role_hint,
           participant.participant_id === planner.participant_id ? 1 : 0,
+          safeText(participant.native_session_id ?? participant.nativeSessionId, 191),
+          safeText(participant.conversation_id ?? participant.conversationId, 96),
           index,
           createdAt, createdAt,
         );
@@ -695,6 +766,7 @@ export class CollaborationStore {
       agent_id: row.agent_id, runtime: row.runtime, device_id: row.device_id,
       workspace_id: row.workspace_id || null, provider: row.provider || null,
       model: row.model || null, permission_profile: row.permission_profile || null,
+      approval_policy_id: row.approval_policy_id || null,
       responsibilities: parseJson(row.responsibilities_json, []), status: row.status,
       display_name: row.display_name || row.role,
       role_hint: row.role_hint || "",
@@ -736,6 +808,20 @@ export class CollaborationStore {
     return this.db.prepare(
       `SELECT * FROM collaboration_runs ${archived} ORDER BY updated_at DESC, run_id DESC LIMIT ?`,
     ).all(Math.max(1, Math.min(200, Number(limit) || 50))).map(publicRun);
+  }
+
+  listWorkspaceSession(sessionOrRunId) {
+    const key = safeText(sessionOrRunId, 195);
+    if (!key) return [];
+    const source = this.db.prepare(
+      "SELECT workspace_session_id FROM collaboration_runs WHERE run_id = ? OR workspace_session_id = ? LIMIT 1",
+    ).get(key, key);
+    if (!source?.workspace_session_id) return [];
+    return this.db.prepare(`
+      SELECT * FROM collaboration_runs
+      WHERE workspace_session_id = ?
+      ORDER BY created_at ASC, run_id ASC
+    `).all(source.workspace_session_id).map(publicRun);
   }
 
   listRunPage({
@@ -1287,7 +1373,7 @@ export class CollaborationStore {
         permission_profile, status, native_session_id, originrouter_session_id,
         conversation_id, attempt, fencing_token, lease_id, lease_expires_at,
         last_heartbeat_at, last_delivery_id, fencing_mode, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(assignment_id) DO UPDATE SET
         phase = excluded.phase,
         runtime = excluded.runtime,
@@ -1295,6 +1381,16 @@ export class CollaborationStore {
         provider = excluded.provider,
         model = excluded.model,
         permission_profile = excluded.permission_profile,
+        native_session_id = CASE
+          WHEN ? = 1 THEN ''
+          WHEN excluded.native_session_id <> '' THEN excluded.native_session_id
+          ELSE collaboration_remote_assignments.native_session_id
+        END,
+        conversation_id = CASE
+          WHEN ? = 1 THEN excluded.conversation_id
+          WHEN excluded.conversation_id <> '' THEN excluded.conversation_id
+          ELSE collaboration_remote_assignments.conversation_id
+        END,
         attempt = excluded.attempt,
         fencing_token = excluded.fencing_token,
         lease_id = excluded.lease_id,
@@ -1309,8 +1405,12 @@ export class CollaborationStore {
       sourceDeviceId, targetDeviceId, runtime, workspaceId,
       safeText(input.provider, 191), safeText(input.model, 191),
       safeText(input.permission_profile ?? input.permissionProfile, 64),
+      safeText(input.native_session_id ?? input.nativeSessionId, 191),
+      safeText(input.conversation_id ?? input.conversationId, 96),
       attempt, fencingToken, leaseId, leaseExpiresAt, now, deliveryId,
       hasFencing ? "strict" : "legacy", now, now,
+      input.reset_agent_identity === true || input.resetAgentIdentity === true ? 1 : 0,
+      input.reset_agent_identity === true || input.resetAgentIdentity === true ? 1 : 0,
     );
     return {
       assignment: this.getRemoteAssignment(assignmentId),
@@ -1965,6 +2065,8 @@ export class CollaborationStore {
     if (source.template_id === ADAPTIVE_TEMPLATE_ID) {
       created = this.createRun({
         objective: source.objective,
+        workspace_session_id: source.workspace_session_id,
+        continued_from_run_id: source.run_id,
         preferences: source.preferences,
         coordination_prompt: source.coordination_prompt,
         workflow_template_id: source.workflow_template_id,
@@ -1973,6 +2075,8 @@ export class CollaborationStore {
         coordinator_runtime: source.coordinator_runtime,
         planning_source: source.planning_source,
         risk_tier: source.risk_tier,
+        supervisor_permission_profile: source.supervisor_permission_profile,
+        supervisor_policy_id: source.supervisor_policy_id,
         coordinator_device_id: source.coordinator_device_id,
         participants: Object.entries(source.agents).map(([participantId, agent]) => ({
           participant_id: participantId,
@@ -1983,8 +2087,11 @@ export class CollaborationStore {
           provider: agent.provider,
           model: agent.model,
           permission_profile: agent.permission_profile,
+          approval_policy_id: agent.approval_policy_id,
           role_hint: agent.role_hint,
           planner: participantId === source.planner_role,
+          native_session_id: agent.native_session_id,
+          conversation_id: agent.conversation_id,
         })),
         budget: source.budget,
       });
@@ -1998,12 +2105,19 @@ export class CollaborationStore {
           provider: agent.provider,
           model: agent.model,
           permission_profile: agent.permission_profile,
+          approval_policy_id: agent.approval_policy_id,
           responsibilities: agent.responsibilities,
+          native_session_id: agent.native_session_id,
+          conversation_id: agent.conversation_id,
         } : null;
       };
       created = this.createRun({
         objective: source.objective,
+        workspace_session_id: source.workspace_session_id,
+        continued_from_run_id: source.run_id,
         coordinator_device_id: source.coordinator_device_id,
+        supervisor_permission_profile: source.supervisor_permission_profile,
+        supervisor_policy_id: source.supervisor_policy_id,
         title: source.tasks[0]?.title,
         agents: {
           lead: role("lead"),

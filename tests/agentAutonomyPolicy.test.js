@@ -32,10 +32,31 @@ test("guarded autonomy allows routine workspace work", () => {
     { profile: "guarded", workspaceRoot: "/tmp/project" },
   );
   assert.equal(edit.autoResolve, true);
+
+  for (const diagnostic of [
+    "sw_vers",
+    "uptime",
+    "system_profiler SPSoftwareDataType",
+    "command -v originrouter",
+    "originrouter --version",
+    "brew list --versions originrouter-cli",
+    "launchctl list",
+  ]) {
+    const result = evaluateAutonomyInteraction(
+      permission({ tool: "Bash", command: diagnostic, cwd: "/tmp/project" }),
+      { profile: "guarded", workspaceRoot: "/tmp/project" },
+    );
+    assert.equal(result.autoResolve, true, diagnostic);
+  }
 });
 
 test("guarded autonomy stops for destructive, elevated, and out-of-workspace work", () => {
-  for (const command of ["rm -rf build", "sudo systemctl restart app", "git push origin main"]) {
+  for (const command of [
+    "rm -rf build",
+    "sudo systemctl restart app",
+    "git push origin main",
+    "brew services restart originrouter",
+  ]) {
     const result = evaluateAutonomyInteraction(
       permission({ tool: "Bash", command, cwd: "/tmp/project" }),
       { profile: "guarded", workspaceRoot: "/tmp/project" },

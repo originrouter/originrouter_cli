@@ -167,14 +167,26 @@ function runtimeAvailable(device, runtime) {
   );
 }
 
-function chooseDevice(devices, runtime, { remote = false } = {}) {
-  const eligible = devices.filter((device) => (
-    !device.unavailableReason
+function eligibleDevice(device, runtime, { remote = false } = {}) {
+  return !device.unavailableReason
     && (device.local === true || device.trustStatus === "trusted")
-    && runtimeAvailable(device, runtime)
-  ));
+    && (!remote || device.local !== true)
+    && runtimeAvailable(device, runtime);
+}
+
+function chooseDevice(devices, runtime, { remote = false } = {}) {
+  const eligible = devices.filter((device) => eligibleDevice(device, runtime, { remote }));
   const preferred = eligible.find((device) => remote ? device.local !== true : device.local === true);
   return preferred || eligible[0] || null;
+}
+
+function remoteDeviceOptions(devices, runtime) {
+  const fallback = runtime === "codex" ? "claude" : "codex";
+  return devices.filter((device) => (
+    device.local !== true
+    && (eligibleDevice(device, runtime, { remote: true })
+      || eligibleDevice(device, fallback, { remote: true }))
+  ));
 }
 
 function chooseWorkspace(device, currentDirectory, preferredWorkspaceId = "") {
@@ -250,11 +262,17 @@ function roleDefinitions(mode, coordinator) {
 }
 
 function createParticipant(definition, devices, currentDirectory, usedIds, workspaceSelections = {}) {
-  let device = chooseDevice(devices, definition.runtime, { remote: definition.remote });
+  let device = definition.deviceId
+    ? devices.find((candidate) => candidate.deviceId === definition.deviceId
+      && eligibleDevice(candidate, definition.runtime, { remote: definition.remote }))
+    : chooseDevice(devices, definition.runtime, { remote: definition.remote });
   let runtime = definition.runtime;
   if (!device) {
     runtime = definition.runtime === "codex" ? "claude" : "codex";
-    device = chooseDevice(devices, runtime, { remote: definition.remote });
+    device = definition.deviceId
+      ? devices.find((candidate) => candidate.deviceId === definition.deviceId
+        && eligibleDevice(candidate, runtime, { remote: definition.remote }))
+      : chooseDevice(devices, runtime, { remote: definition.remote });
   }
   if (!device) {
     const location = definition.remote ? "trusted remote device" : "trusted device";
@@ -310,6 +328,7 @@ export function applyWorkspaceConfiguration(payload, {
   devices = [],
   currentDirectory = processCwd(),
   workspaceSelections = {},
+  deviceSelections = [],
 } = {}) {
   const selectedMode = workspaceModeDefinition(mode);
   const selectedCoordinator = normalizeCoordinator(coordinator);
@@ -340,8 +359,60 @@ export function applyWorkspaceConfiguration(payload, {
     return next;
   }
 
+  let definitions = roleDefinitions(selectedMode.id, selectedCoordinator);
+  if (selectedMode.id === "remote_ops") {
+    const remoteRuntime = selectedCoordinator === "codex" ? "claude" : "codex";
+    const eligibleRemotes = remoteDeviceOptions(devices, remoteRuntime);
+    if (!eligibleRemotes.length) {
+      throw new Error("No trusted remote device has an available Codex or Claude Code Runtime.");
+    }
+    const requestedIds = [...new Set((deviceSelections || []).map(clean).filter(Boolean))];
+    if (!requestedIds.length && eligibleRemotes.length > 1) {
+      const error = new Error("Choose one or more remote devices for this collaboration.");
+      error.code = "AUTO_CONFIG_REMOTE_DEVICE_SELECTION_REQUIRED";
+      error.setup = {
+        kind: "device_selection",
+        devices: eligibleRemotes.map((device) => {
+          const capabilities = capabilitiesFor(device) || {};
+          return {
+            device_id: device.deviceId,
+            device_name: device.deviceName || device.deviceId,
+            online: device.online !== false,
+            runtimes: (capabilities.runtimes || [])
+              .filter((candidate) => candidate.available && ["codex", "claude"].includes(candidate.id))
+              .map((candidate) => candidate.id),
+            workspace_count: (capabilities.trusted_workspaces || []).length,
+          };
+        }),
+      };
+      throw error;
+    }
+    const selectedRemotes = requestedIds.length
+      ? requestedIds.map((deviceId) => eligibleRemotes.find((device) => device.deviceId === deviceId))
+      : eligibleRemotes.slice(0, 1);
+    if (selectedRemotes.some((device) => !device)) {
+      throw Object.assign(new Error("A selected remote device is no longer trusted or Agent-capable."), {
+        code: "AUTO_CONFIG_REMOTE_DEVICE_UNAVAILABLE",
+      });
+    }
+    if (selectedRemotes.length > 15) {
+      throw Object.assign(new Error("A collaboration can use at most 15 remote devices."), {
+        code: "AUTO_CONFIG_TOO_MANY_REMOTE_DEVICES",
+      });
+    }
+    const coordinatorDefinition = definitions[0];
+    definitions = [
+      coordinatorDefinition,
+      ...selectedRemotes.map((device, index) => ({
+        ...definitions[1],
+        id: selectedRemotes.length === 1 ? "remote_operator" : `remote_operator_${index + 1}`,
+        name: selectedRemotes.length === 1 ? "Remote Operator" : `Remote Operator ${index + 1}`,
+        deviceId: device.deviceId,
+      })),
+    ];
+  }
   const usedIds = new Set();
-  const participants = roleDefinitions(selectedMode.id, selectedCoordinator)
+  const participants = definitions
     .map((definition) => createParticipant(
       definition,
       devices,
@@ -379,6 +450,7 @@ export function buildLocalWorkspaceConfiguration({
   devices = [],
   currentDirectory = processCwd(),
   workspaceSelections = {},
+  deviceSelections = [],
 } = {}) {
   const requestedMode = normalizeWorkspaceMode(mode);
   const resolvedMode = requestedMode === "auto" ? inferWorkspaceMode(objective) : requestedMode;
@@ -403,6 +475,7 @@ export function buildLocalWorkspaceConfiguration({
     devices,
     currentDirectory,
     workspaceSelections,
+    deviceSelections,
   });
   configured.auto_configuration.workspace_mode = requestedMode;
   configured.auto_configuration.resolved_workspace_mode = resolvedMode;
