@@ -529,7 +529,7 @@ test("workspace follower pauses after five automatic reconnect attempts", async 
   assert.equal(reads, 6, "the initial read is followed by exactly five retries");
 });
 
-test("workspace follow-up reuses the previous team but creates and reviews a new Run", async () => {
+test("workspace follow-up reuses the persisted Session Team and creates a direct new Run", async () => {
   const createdBodies = [];
   let automaticConfigurationCalls = 0;
   let configurationReviewCalls = 0;
@@ -566,7 +566,10 @@ test("workspace follow-up reuses the previous team but creates and reviews a new
     interval: 0,
     automaticCreatePayloadFn: async () => {
       automaticConfigurationCalls += 1;
-      throw new Error("automatic configuration must not run for a same-team follow-up");
+      return {
+        ...structuredClone(previousConfiguration),
+        objective: "Also check the remote service status",
+      };
     },
     onConfigurationConfirmation: async () => {
       configurationReviewCalls += 1;
@@ -581,19 +584,10 @@ test("workspace follow-up reuses the previous team but creates and reviews a new
         createdBodies.push(options.body);
         return { run: { run_id: "acr_followup", state: "created" } };
       }
-      if (path.endsWith("/start")) return { run: { run_id: "acr_followup", state: "designing" } };
-      if (path.endsWith("/confirm")) return { run: { run_id: "acr_followup", state: "running" } };
+      if (path.endsWith("/start")) return { run: { run_id: "acr_followup", state: "executing" } };
       if (path.includes("/events?")) return { events: [] };
       if (path.includes("/snapshot")) {
         snapshotReads += 1;
-        if (snapshotReads === 1) {
-          return { snapshot: {
-            last_sequence: 0,
-            run: { run_id: "acr_followup", state: "awaiting_confirmation" },
-            plan: { title: "Follow-up plan", tasks: [] },
-            tasks: [],
-          } };
-        }
         return { snapshot: {
           last_sequence: 0,
           run: { run_id: "acr_followup", state: "completed" },
@@ -605,9 +599,9 @@ test("workspace follow-up reuses the previous team but creates and reviews a new
     },
   });
   assert.equal(result.run.state, "completed");
-  assert.equal(automaticConfigurationCalls, 0);
+  assert.equal(automaticConfigurationCalls, 0, "a Session follow-up does not silently redesign its Team");
   assert.equal(configurationReviewCalls, 0, "the explicitly continued team is not selected again");
-  assert.equal(planReviewCalls, 1, "the new objective still receives a new reviewable plan");
+  assert.equal(planReviewCalls, 0, "the primary Agent handles the turn directly inside the existing Team");
   assert.equal(createdBodies.length, 1);
   assert.equal(createdBodies[0].objective, "Also check the remote service status");
   assert.equal(createdBodies[0].participants[0].device_id, "remote-device");
@@ -615,8 +609,73 @@ test("workspace follow-up reuses the previous team but creates and reviews a new
   assert.equal(createdBodies[0].participants[0].provider, "originrouter-cloud");
   assert.equal(createdBodies[0].participants[0].model, "claude-model");
   assert.equal(createdBodies[0].auto_configuration.continued_from_run_id, "acr_previous");
-  assert.equal(createdBodies[0].planning_source, "continued_team");
+  assert.equal(createdBodies[0].planning_source, "session_team");
+  assert.equal(createdBodies[0].session_continuation, true);
   assert.equal(previousConfiguration.objective, "Inspect the remote machine", "the previous Run configuration remains immutable");
+});
+
+test("a follow-up cannot change the Team through automatic reconfiguration", async () => {
+  const createdBodies = [];
+  let configurationReviews = 0;
+  const previousConfiguration = {
+    participants: [{
+      participant_id: "operator",
+      display_name: "Original Operator",
+      runtime: "claude",
+      device_id: "remote-a",
+      workspace_id: "workspace-a",
+      permission_profile: "guarded",
+      native_session_id: "native-original",
+      conversation_id: "conversation-original",
+      planner: true,
+    }],
+  };
+  let reads = 0;
+  await runAgentWorkspaceCollaboration({
+    objective: "Inspect the newly selected server",
+    presetConfiguration: previousConfiguration,
+    continuedFromRunId: "acr_previous",
+    confirmation: "safe",
+    interval: 0,
+    automaticCreatePayloadFn: async () => ({
+      objective: "Inspect the newly selected server",
+      participants: [{
+        participant_id: "operator",
+        display_name: "New Operator",
+        runtime: "claude",
+        device_id: "remote-b",
+        workspace_id: "workspace-b",
+        permission_profile: "guarded",
+        planner: true,
+      }],
+      auto_configuration: { safe_to_skip_confirmation: true },
+    }),
+    onConfigurationConfirmation: async () => {
+      configurationReviews += 1;
+      return "confirm";
+    },
+    onPlanConfirmation: async () => "confirm",
+    requestFn: async (path, options = {}) => {
+      if (path === "/collaboration/local/runs") {
+        createdBodies.push(options.body);
+        return { run: { run_id: "acr_reconfigured", state: "created" } };
+      }
+      if (path.endsWith("/start")) return { run: { run_id: "acr_reconfigured", state: "executing" } };
+      if (path.includes("/events?")) return { events: [] };
+      if (path.includes("/snapshot")) {
+        reads += 1;
+        return { snapshot: { last_sequence: 0, run: { run_id: "acr_reconfigured", state: "completed" }, tasks: [], final_report: { summary: "Done." } } };
+      }
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+  assert.equal(configurationReviews, 0);
+  assert.equal(createdBodies[0].planning_source, "session_team");
+  assert.equal(createdBodies[0].auto_configuration.session_team_changed, false);
+  assert.equal(createdBodies[0].participants[0].device_id, "remote-a");
+  assert.equal(createdBodies[0].participants[0].workspace_id, "workspace-a");
+  assert.equal(createdBodies[0].participants[0].native_session_id, "native-original");
+  assert.equal(createdBodies[0].participants[0].conversation_id, "conversation-original");
 });
 
 test("plan review can request changes and waits for the replacement plan", async () => {

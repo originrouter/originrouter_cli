@@ -4,6 +4,71 @@ Agent Workspace is the prompt-first terminal entry for managed Codex, Claude
 Code, and multi-Agent collaboration. It keeps the user in OriginRouter while
 the daemon owns the underlying managed Agent sessions and durable Run.
 
+## Workspace Session and Runs
+
+A Workspace Session is the durable conversation and team boundary. Each user
+objective creates a separate, finite Run inside that Session, so its plan,
+approvals, task graph, audit history, and final result stay independently
+inspectable. Completing a Run therefore does not end the workspace: enter the
+next objective to continue the Session. Use `/new` when you intentionally want
+a new Session with no inherited team or Agent context.
+
+The first objective after opening a new Workspace Session performs Team
+selection and plan review. OriginRouter persists that Session Team as revision
+1, including each member's runtime, trusted device, registered workspace,
+model route, permission boundary, role hint, and safe native conversation
+reference. Later objectives create new Runs but do not call automatic Team
+selection or build a new task DAG first. They go directly to the primary Agent,
+which may handle the turn itself or use the OriginRouter MCP gateway to list,
+ask, and delegate to the existing Team.
+
+The primary Agent cannot silently broaden the Session boundary. If a later
+objective needs another device, workspace, runtime, model route, or permission
+profile, it must call `request_team_change`. OriginRouter records an immutable
+proposed Team revision and shows the exact member/binding change for local user
+confirmation. Until confirmation, the old revision remains authoritative and
+the new participant cannot receive work. Confirmation updates the Session and
+current Run; unchanged members retain their native context while changed
+members start fresh. Rejection resumes within the existing boundary.
+
+`/resume <session-id>` restores the Workspace Session at its latest Run and
+latest confirmed Team revision. Run IDs are deliberately not accepted by this
+command: a Session is an ordered conversation, so an older Run cannot become a
+new continuation point or implicit branch. Use `/new` for an intentional new
+project, context, or trust boundary.
+
+When a Run completes, managed Agent wrappers are released. The daemon retains
+the safe native-session references required for a compatible later follow-up;
+it does not leave an idle process group running. Reopening Workspace and using
+`/resume <session-id>` restores the latest Session context before the next
+objective is submitted.
+
+## Multi-device transport and ownership
+
+The coordinating CLI is the owner of the Workspace Session Team record. It is
+stored in the coordinator's local collaboration database; the OriginRouter
+Server, App, and MySQL do not store Team membership or native Agent session
+references. MySQL may store only display-safe continuity identifiers used by
+the App: Workspace Session ID, previous Run ID, Team revision number, and the
+continuation flag. Server bridge, proxy URL, and direct IP/domain deployments
+all use the existing authenticated Relay configuration.
+
+Cross-device work follows one path:
+
+```text
+Coordinator CLI
+  -> authenticated E2EE Relay / Server bridge
+  -> target CLI
+  -> target machine's loopback-only managed supervisor
+```
+
+Remote dispatch, Agent results, MCP requests/responses, capability checks, and
+workspace trust requests are end-to-end encrypted between trusted devices.
+The server routes ciphertext and presence only. Attempt numbers, fencing
+tokens, leases, source/target device checks, registered-workspace checks, and
+the target CLI's local approval policy remain authoritative. No new
+cross-machine local API or unauthenticated direct coordinator port is opened.
+
 ## Entry points
 
 Open the workspace in the current directory:
@@ -97,7 +162,7 @@ policies remain authoritative regardless of plan confirmation.
 ```text
 /status               show workspace settings and the latest Run
 /runs [category]      list Runs; category is active, recent, or all
-/resume [run-id]      list recent Runs or restore and follow one
+/resume <session-id>  restore the Session at its latest ordered Run
 /attach <run-id>      follow a known Run without creating another Run
 /pause [run-id]       pause the latest or named Run
 /retry [run-id]       retry the latest or named Run
@@ -107,14 +172,22 @@ policies remain authoritative regardless of plan confirmation.
 /approval [profile]   show or change Session approval
 /coordinator <agent>  choose codex or claude for the next Run
 /team                 show the next team constraint
+/new                  start a fresh Workspace Session after a completed Run
 /help [command]       show available commands or one command's usage
 /exit                 exit Agent Workspace
 ```
 
-Typing `/` opens matching command suggestions. Commands that operate on a Run
-use the OriginRouter Run ID, not a Codex thread ID or a Claude conversation
-UUID. `/resume <run-id>` restores the Workspace view for that Run; when the
-Run is paused, Workspace asks for confirmation before it continues.
+Typing `/` opens matching command suggestions. Use Up/Down to select a
+candidate, Tab to insert it without executing it, and Esc to hide the list;
+Enter submits only the text already in the composer. Suggestions also complete
+mode names, approval policies, coordinator runtimes, Run categories, known Run
+IDs for Run controls, and known Session IDs for `/resume`. Commands that
+operate on a Run use the OriginRouter Run ID, not a Codex thread ID or a Claude
+conversation UUID. `/resume <session-id>` resolves the Session's latest Run;
+when that Run is paused, Workspace asks for confirmation before it continues.
+A completed latest Run remains available as the latest result and accepts a
+new objective in the same Session. Historical Runs remain inspectable but
+cannot be resumed as alternate conversation endpoints.
 
 Closing the foreground viewer does not cancel a daemon-owned Run. The advanced
 `originrouter collaboration` commands remain available for scripting, JSON

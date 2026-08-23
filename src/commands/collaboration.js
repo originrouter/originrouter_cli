@@ -1935,6 +1935,27 @@ export async function listAgentWorkspaceCollaborationRuns({
   };
 }
 
+export async function resolveAgentWorkspaceSession(sessionId, {
+  signal,
+  requestFn = request,
+} = {}) {
+  const normalized = String(sessionId || "").trim();
+  if (!/^aws_[a-z0-9]+$/i.test(normalized)) {
+    throw new Error("Use a Workspace Session ID such as aws_...; Run IDs cannot be resumed.");
+  }
+  const result = await requestFn(
+    `/collaboration/local/sessions/${encodeURIComponent(normalized)}`,
+    { signal },
+  );
+  const session = result?.session;
+  const snapshot = result?.latest_snapshot;
+  const latestRunId = String(session?.latest_run_id || snapshot?.run?.run_id || "").trim();
+  if (!latestRunId) {
+    throw new Error("The Workspace Session has no Run to restore.");
+  }
+  return { session, snapshot, latestRunId };
+}
+
 async function followAgentWorkspaceCollaboration({
   run,
   payload = {},
@@ -2129,16 +2150,22 @@ export async function runAgentWorkspaceCollaboration({
 } = {}) {
   throwIfAborted(signal);
   onUpdate({ type: "phase", phase: "configuring" });
-  const payload = presetConfiguration
+  // The first Run establishes the Session Team. Later turns reuse that exact
+  // versioned boundary and go straight to the primary Agent; team expansion
+  // is a separate, explicit confirmation flow initiated through MCP.
+  let payload = presetConfiguration
     ? {
         ...structuredClone(presetConfiguration),
         objective,
-        planning_source: "continued_team",
+        planning_source: "session_team",
+        session_continuation: true,
         auto_configuration: {
-          ...(structuredClone(presetConfiguration.auto_configuration || {})),
+          ...(presetConfiguration.auto_configuration || {}),
           continued_from_run_id: continuedFromRunId || null,
-          safe_to_skip_confirmation: false,
-          requires_explicit_confirmation: true,
+          session_continuation: true,
+          session_team_changed: false,
+          safe_to_skip_confirmation: true,
+          requires_explicit_confirmation: false,
         },
       }
     : await automaticCreatePayloadFn({
@@ -2164,7 +2191,10 @@ export async function runAgentWorkspaceCollaboration({
   onUpdate({ type: "configuration", payload });
   const configurationSafe = payload.auto_configuration?.safe_to_skip_confirmation === true
     && payload.planning_source !== "local_fallback";
-  if (!presetConfiguration && confirmation !== "always" && (confirmation === "never" || !configurationSafe)) {
+  const needsConfigurationReview = presetConfiguration
+    ? false
+    : confirmation === "never" || !configurationSafe;
+  if (confirmation !== "always" && needsConfigurationReview) {
     const decision = await onConfigurationConfirmation(payload);
     throwIfAborted(signal);
     if (decision !== "confirm") {
@@ -2189,7 +2219,11 @@ export async function runAgentWorkspaceCollaboration({
     { method: "POST", body: {}, signal },
   )).run;
   onRunId(run.run_id);
-  onUpdate({ type: "phase", phase: "planning", run });
+  onUpdate({
+    type: "phase",
+    phase: payload.session_continuation ? "executing" : "planning",
+    run,
+  });
   return followAgentWorkspaceCollaboration({
     run,
     payload,

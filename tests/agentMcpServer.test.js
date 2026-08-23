@@ -19,6 +19,7 @@ try {
     "delegate_task",
     "get_task_result",
     "list_participants",
+    "request_team_change",
   ]);
 } finally {
   await client.close();

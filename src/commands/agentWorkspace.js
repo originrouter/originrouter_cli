@@ -13,6 +13,7 @@ import {
   handleCollaborationCommand,
   listAgentWorkspaceCollaborationRuns,
   MAX_COLLABORATION_RECONNECT_ATTEMPTS,
+  resolveAgentWorkspaceSession,
   retryAgentWorkspaceCollaboration,
   runAgentWorkspaceCollaboration,
   trustCollaborationWorkspace,
@@ -27,9 +28,10 @@ import {
 import { projectCollaborationActivity } from "../collaboration/activityPresentation.js";
 import { listApprovalPolicies } from "../runtime/approvalPolicyStore.js";
 import {
+  completeWorkspaceCommandInput,
   findWorkspaceCommand,
   parseWorkspaceCommand,
-  workspaceCommandSuggestions,
+  workspaceInputSuggestions,
   workspaceCommandUsage,
 } from "./workspaceCommands.js";
 
@@ -116,7 +118,6 @@ const ANSI = {
 };
 
 const workspaceScreenCache = new WeakMap();
-const workspaceTerminalState = new WeakMap();
 const LARGE_PASTE_CHAR_THRESHOLD = 1000;
 const PASTE_TOKEN_CODE_POINT_START = 0xF0000;
 const TERMINAL_WORKSPACE_RUN_STATES = new Set(["completed", "failed", "cancelled", "expired"]);
@@ -209,7 +210,7 @@ function helpWorkspacePanel() {
     lines: [
       "/status - workspace settings and latest Run",
       "/runs [active|recent|all] - collaboration Runs",
-      "/resume [run-id] - restore and follow a Run",
+      "/resume <session-id> - restore the Session at its latest Run",
       "/pause, /retry, /cancel [run-id] - Run controls",
       "/agents [run-id] - assigned Agents and routes",
       "/mode, /approval, /team - next collaboration settings",
@@ -227,7 +228,7 @@ function commandHelpPanel(commandName = "") {
     lines: [
       command.description,
       command.name === "resume"
-        ? "Without an ID, lists recent Runs. A Run ID restores the OriginRouter Run, not a native Agent session."
+        ? "A Session ID restores only its latest ordered state. Run IDs are not accepted and cannot create a historical branch."
         : "Command arguments in brackets are optional.",
     ],
   };
@@ -256,6 +257,9 @@ function workspaceStatusPanel({ coordinator, mode, sessionApproval, lastRun = nu
     `Session approval: ${permissionLabel(sessionApproval.profile, sessionApproval.policyId)}`,
   ];
   if (lastRun?.run_id) {
+    if (lastRun.workspace_session_id) {
+      lines.push(`Session: ${lastRun.workspace_session_id}`);
+    }
     lines.push(`Latest Run: ${lastRun.run_id} · ${compactRunState(lastRun)}`);
     lines.push(runLabel(lastRun));
   } else {
@@ -268,15 +272,16 @@ function workspaceRunsPanel({ category, runs = [], total = 0 }) {
   if (!runs.length) {
     return {
       title: "Collaboration Runs",
-      lines: [`No ${category === "all" ? "" : `${category} `}Runs found.`, "Use /resume <run-id> to restore a known Run."],
+      lines: [`No ${category === "all" ? "" : `${category} `}Runs found.`, "Use /resume <session-id> to restore a Workspace Session."],
     };
   }
   const lines = runs.slice(0, 8).flatMap((run) => [
     `${run.run_id} · ${compactRunState(run)}`,
+    ...(run.workspace_session_id ? [`  Session ${run.workspace_session_id}`] : []),
     `  ${runLabel(run)}`,
   ]);
   if (total > runs.length) lines.push(`Showing ${runs.length} of ${total} Runs.`);
-  lines.push("Use /resume <run-id> to follow one.");
+  lines.push("Use /attach <run-id> to follow a Run, or /resume <session-id> to restore its Session.");
   return { title: `${category[0].toUpperCase()}${category.slice(1)} Runs`, lines };
 }
 
@@ -305,13 +310,17 @@ function workspaceCommandErrorPanel(message) {
   return { title: "Command unavailable", lines: [message, "Use /help to see available commands."] };
 }
 
-function workspaceCommandSuggestionsBlock(suggestions, columns) {
+function workspaceCommandSuggestionsBlock(suggestions, columns, selectedIndex = 0) {
   if (!suggestions?.length) return "";
   const width = Math.max(1, columns - 2);
-  return suggestions.map((command) => padDisplayRight(
-    muted(`  ${workspaceCommandUsage(command)} - ${command.description}`),
-    width,
-  )).join("\n");
+  const selected = Math.max(0, Math.min(suggestions.length - 1, Number(selectedIndex) || 0));
+  return suggestions.map((suggestion, index) => {
+    const label = suggestion.label || workspaceCommandUsage(suggestion.command || suggestion);
+    const description = suggestion.description || "";
+    const prefix = index === selected ? accent("› ") : muted("  ");
+    const row = `${prefix}${label}${description ? ` - ${description}` : ""}`;
+    return padDisplayRight(index === selected ? strong(row) : muted(row), width);
+  }).join("\n");
 }
 
 function approvalWorkspacePanel() {
@@ -582,6 +591,32 @@ function sessionPermissionOptions({ includePolicies = false } = {}) {
   return options;
 }
 
+function workspaceCommandCompletionContext({
+  approvalOptions = sessionPermissionOptions({ includePolicies: true }),
+  runIds = [],
+  sessionIds = [],
+} = {}) {
+  return {
+    modeOptions: WORKSPACE_MODES.map((mode) => ({
+      value: mode.id,
+      description: mode.description,
+    })),
+    approvalOptions: approvalOptions.map((option) => ({
+      value: option.id === "custom"
+        ? `custom:${option.policyId || "protected"}`
+        : option.id,
+      description: option.description,
+    })),
+    runIds,
+    sessionIds,
+  };
+}
+
+function commandSuggestionsForInput(buffer, context, { limit = 6, dismissed = false } = {}) {
+  if (dismissed) return [];
+  return workspaceInputSuggestions(buffer, { ...context, limit });
+}
+
 function permissionLabel(value, policyId = "") {
   if (value === "custom" && policyId && policyId !== "protected") return `Rules · ${policyId}`;
   return sessionPermissionOptions().find((option) => option.id === value)?.label || "Guarded";
@@ -661,6 +696,8 @@ function attentionActionLabel(action, attention = null) {
     submit: "Reply",
     cancel: "Cancel",
     rebuild: "Rebuild this Agent",
+    confirm_team_change: "Confirm Team change",
+    reject_team_change: "Keep current Team",
   }[action] || String(action || "").replaceAll("_", " ");
 }
 
@@ -769,6 +806,30 @@ function attentionRequestContext(attention, runtime) {
   const requestedProfile = evaluation.session_profile || currentProfile;
   const requestedPolicyId = evaluation.session_policy_id || "";
   const lines = [];
+  if (attention?.kind === "team_change") {
+    const before = attention.payload?.before || null;
+    const after = attention.payload?.after || null;
+    lines.push({
+      label: "Team revision",
+      value: `${attention.payload?.current_revision || "?"} → ${attention.payload?.proposed_revision || "?"}`,
+    });
+    lines.push({ label: "Operation", value: attention.payload?.operation || "change" });
+    lines.push({ label: "Participant", value: attention.payload?.participant_id || "unknown" });
+    if (before) {
+      lines.push({
+        label: "Current binding",
+        value: `${before.runtime} · ${before.device_id} · ${before.workspace_id || "default workspace"} · ${before.permission_profile || "guarded"}`,
+      });
+    }
+    if (after) {
+      lines.push({
+        label: "Proposed binding",
+        value: `${after.runtime} · ${after.device_id} · ${after.workspace_id || "default workspace"} · ${after.permission_profile || "guarded"}`,
+      });
+    }
+    if (attention.payload?.reason) lines.push({ label: "Reason", value: attention.payload.reason });
+    return lines;
+  }
   lines.push({ label: "Requested by", value: task ? `${participant} · ${task}` : participant });
   if (request.display_name || request.tool) {
     lines.push({ label: "Action", value: request.display_name || request.tool });
@@ -1001,6 +1062,8 @@ function buildRuntimeRows(runtime, columns, maxRows, { focusedInteraction = fals
       if (configured.planning_source === "cloud_advice") pushIndented("Auto decision: advisory model", 2, muted);
       if (configured.planning_source === "local_fallback") pushIndented("Auto decision: local fallback", 2, muted);
     }
+    const workspaceSessionId = runtime.snapshot?.run?.workspace_session_id;
+    if (workspaceSessionId) pushIndented(`Session ${workspaceSessionId}`, 2, muted);
     if (runtime.runId) pushIndented(`Run ${runtime.runId}`, 2, muted);
     if (runtime.sessionHistory?.length) {
       const previous = runtime.sessionHistory.at(-1);
@@ -1321,9 +1384,23 @@ function buildRuntimeRows(runtime, columns, maxRows, { focusedInteraction = fals
   const report = runtime.snapshot?.final_report;
   if (report?.summary && (!focusedInteraction || runtime.interactionKind === "completion")) {
     push("");
-    pushIndented(report.summary, 2, runtime.snapshot?.run?.state === "completed" ? strong : null);
-    for (const task of (report.completed_tasks || []).slice(0, 3)) {
-      if (task.result) pushIndented(task.result, 4, muted);
+    const completedTasks = (report.completed_tasks || []).filter((task) => task.result);
+    const completed = runtime.snapshot?.run?.state === "completed";
+    // The count is transport metadata; the Agent's delivered result is the
+    // user's primary outcome.  Keeping that outcome in the normal top-level
+    // hierarchy prevents it from looking like an activity log footnote.
+    if (completedTasks.length) {
+      push("Final result", strong);
+      for (const task of completedTasks.slice(0, 3)) {
+        if (completedTasks.length > 1 && task.title) pushIndented(`✓ ${task.title}`, 2, strong);
+        for (const row of wrapDisplayText(task.result, Math.max(1, width - 2))) {
+          pushIndented(row, 2, null);
+        }
+      }
+      pushIndented(report.summary, 2, muted);
+    } else {
+      push("Final result", strong);
+      pushIndented(report.summary, 2, completed ? strong : null);
     }
   }
   runtime.contentLineCount = lines.length;
@@ -1339,7 +1416,9 @@ function buildRuntimeRows(runtime, columns, maxRows, { focusedInteraction = fals
 
 function runtimeControls(runtime, columns) {
   const mode = workspaceModeDefinition(runtime.mode || "auto").label;
-  let text = runtime.notice || "Enter queues next objective · shift+tab approval · /approval chooses · ctrl+c interrupts";
+  // This footer has only 71 display columns in an 80-column terminal after
+  // the mode label. Keep the core completion and submission actions visible.
+  let text = runtime.notice || "drag selects text · Tab completes · Enter queues next objective";
   if (runtime.screenPaused) text = "screen frozen for copying · ctrl+t resumes updates";
   const selectedActivityId = runtime.activityParticipantIds?.[runtime.activitySelection || 0];
   const selectedActivityExpanded = selectedActivityId
@@ -1713,6 +1792,7 @@ export function buildWorkspaceAppScreen({
   composerPastes = [],
   composerNotice = "",
   commandSuggestions = [],
+  commandSuggestionSelection = 0,
   sessionApproval = null,
 } = {}) {
   const terminalColumns = Math.max(20, Number(columns) || 80);
@@ -1765,7 +1845,11 @@ export function buildWorkspaceAppScreen({
         bottomLine(frameWidth),
       ];
   const commandSuggestionsBlock = !runtime
-    ? workspaceCommandSuggestionsBlock(commandSuggestions, terminalColumns)
+    ? workspaceCommandSuggestionsBlock(
+      commandSuggestions,
+      terminalColumns,
+      commandSuggestionSelection,
+    )
     : "";
   const normalComposerBlock = !runtime && composerBuffer !== null
     ? [
@@ -1776,9 +1860,14 @@ export function buildWorkspaceAppScreen({
   const focusedInteraction = interactionUsesFocusedSurface(runtime, terminalColumns, terminalRows);
   const runtimeCommandSuggestionsBlock = runtime && !runtime.interaction
     ? workspaceCommandSuggestionsBlock(
-        workspaceCommandSuggestions(runtime.composerBuffer, { limit: 3 }),
-        terminalColumns,
-      )
+      commandSuggestionsForInput(
+        runtime.composerBuffer,
+        runtime.commandCompletionContext,
+        { limit: 3, dismissed: runtime.commandSuggestionsDismissed },
+      ),
+      terminalColumns,
+      runtime.commandSuggestionSelection,
+    )
     : "";
   const runtimeComposerBlock = runtime
     ? runtime.interaction
@@ -1813,7 +1902,7 @@ export function buildWorkspaceAppScreen({
       separator,
       normalComposerBlock,
       separator,
-      muted("  Enter submits · Ctrl+C clears · Ctrl+D exits · /help for commands"),
+      muted("  Tab completes · ↑/↓ select · Enter submits · Esc hides · Ctrl+C clears"),
     ].join("\n");
   }
   const composer = runtimeComposerBlock;
@@ -1839,10 +1928,10 @@ function redrawWorkspaceApp(output, {
   composerPastes = [],
   composerNotice = "",
   commandSuggestions = [],
+  commandSuggestionSelection = 0,
   sessionApproval = null,
   force = false,
 } = {}) {
-  setWorkspaceMouseCapture(output, Boolean(runtime && !runtime.screenPaused));
   const screen = buildWorkspaceAppScreen({
     coordinator,
     mode,
@@ -1853,6 +1942,7 @@ function redrawWorkspaceApp(output, {
     composerPastes,
     composerNotice,
     commandSuggestions,
+    commandSuggestionSelection,
     sessionApproval,
     columns: output.columns,
     rows: output.rows,
@@ -1897,28 +1987,20 @@ function supportsAppScreen(output) {
   return Boolean(output?.isTTY) && process.env.TERM !== "dumb";
 }
 
-function setWorkspaceMouseCapture(output, enabled) {
-  const terminalState = workspaceTerminalState.get(output);
-  if (!terminalState || terminalState.mouseCapture === enabled) return;
-  terminalState.mouseCapture = enabled;
-  output.write(enabled
-    ? "\x1b[?1000h\x1b[?1006h"
-    : "\x1b[?1000l\x1b[?1006l");
-}
-
 function enterWorkspaceApp(output) {
   if (!supportsAppScreen(output)) return () => {};
-  workspaceTerminalState.set(output, { mouseCapture: false });
+  // Do not enable terminal mouse reporting. It prevents native drag-to-select
+  // in terminal emulators, including macOS Terminal. Explicitly disable it in
+  // case a previous process left the mode enabled.
   // Disable autowrap while the app owns the screen. Writing a full-width row
   // into the bottom-right cell can otherwise scroll the alternate buffer and
   // expose the shell's scrollback above the app.
-  output.write("\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?25l\x1b[H\x1b[2J");
+  output.write("\x1b[?1000l\x1b[?1006l\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?25l\x1b[H\x1b[2J");
   let exited = false;
   const exit = () => {
     if (exited) return;
     exited = true;
     workspaceScreenCache.delete(output);
-    workspaceTerminalState.delete(output);
     output.write("\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l");
   };
   process.once("exit", exit);
@@ -2102,6 +2184,7 @@ async function readWorkspaceLine({
   sessionApproval,
   onSessionApprovalChange,
   initialBuffer = "",
+  completionContext = workspaceCommandCompletionContext(),
 }) {
   if (!input.isTTY || !output.isTTY || typeof input.setRawMode !== "function") {
     throw new Error("Interactive Agent Workspace requires a terminal. Pass an objective, for example: originrouter \"fix the failing test\"");
@@ -2117,6 +2200,15 @@ async function readWorkspaceLine({
   let notice = "";
   let exitArmed = false;
   let noticeTimer = null;
+  let commandSuggestionSelection = 0;
+  let commandSuggestionsDismissed = false;
+  const commandSuggestions = () => commandSuggestionsForInput(buffer, completionContext, {
+    dismissed: commandSuggestionsDismissed,
+  });
+  const resetCommandSuggestions = () => {
+    commandSuggestionSelection = 0;
+    commandSuggestionsDismissed = false;
+  };
   const renderInput = (force = false) => redrawWorkspaceApp(output, {
     coordinator,
     mode,
@@ -2125,7 +2217,8 @@ async function readWorkspaceLine({
     composerCursor: cursor,
     composerPastes: pendingPastes,
     composerNotice: notice,
-    commandSuggestions: workspaceCommandSuggestions(buffer),
+    commandSuggestions: commandSuggestions(),
+    commandSuggestionSelection,
     sessionApproval,
     force,
   });
@@ -2184,6 +2277,7 @@ async function readWorkspaceLine({
           clearNoticeTimer();
           notice = "";
           exitArmed = false;
+          resetCommandSuggestions();
           renderInput(true);
           return;
         }
@@ -2195,6 +2289,7 @@ async function readWorkspaceLine({
           buffer = "";
           cursor = 0;
           pendingPastes = [];
+          resetCommandSuggestions();
           exitArmed = false;
           notice = "Input cleared";
           renderInput(true);
@@ -2231,6 +2326,35 @@ async function readWorkspaceLine({
         clearNoticeLater(1200);
         return;
       }
+      const suggestions = commandSuggestions();
+      if (key.name === "escape" && suggestions.length) {
+        commandSuggestionsDismissed = true;
+        commandSuggestionSelection = 0;
+        renderInput();
+        return;
+      }
+      if (["up", "down"].includes(key.name) && suggestions.length) {
+        const offset = key.name === "up" ? -1 : 1;
+        commandSuggestionSelection = (
+          commandSuggestionSelection + offset + suggestions.length
+        ) % suggestions.length;
+        renderInput();
+        return;
+      }
+      if (key.name === "tab" && !commandSuggestionsDismissed && cursor === [...buffer].length) {
+        const completion = completeWorkspaceCommandInput(buffer, {
+          ...completionContext,
+          selection: commandSuggestionSelection,
+        });
+        if (completion) {
+          buffer = completion.value;
+          cursor = [...buffer].length;
+          pendingPastes = pruneComposerPastes(buffer, pendingPastes);
+          resetCommandSuggestions();
+          renderInput();
+        }
+        return;
+      }
       if (key.name === "backspace") {
         clearNoticeTimer();
         notice = "";
@@ -2241,6 +2365,7 @@ async function readWorkspaceLine({
           cursor -= 1;
           buffer = chars.join("");
           pendingPastes = pruneComposerPastes(buffer, pendingPastes);
+          resetCommandSuggestions();
         }
         renderInput();
         return;
@@ -2254,6 +2379,7 @@ async function readWorkspaceLine({
           chars.splice(cursor, 1);
           buffer = chars.join("");
           pendingPastes = pruneComposerPastes(buffer, pendingPastes);
+          resetCommandSuggestions();
         }
         renderInput();
         return;
@@ -2285,6 +2411,7 @@ async function readWorkspaceLine({
         buffer = "";
         cursor = 0;
         pendingPastes = [];
+        resetCommandSuggestions();
         renderInput();
         return;
       }
@@ -2299,6 +2426,7 @@ async function readWorkspaceLine({
         chars.splice(cursor, 0, ...text);
         buffer = chars.join("");
         cursor += [...text].length;
+        resetCommandSuggestions();
         renderInput();
       }
     };
@@ -3058,11 +3186,14 @@ function completionPanel(runtime) {
   }
   if (state === "completed") {
     return {
-      title: "Last collaboration completed",
+      title: "Latest Run completed · Workspace Session remains ready",
       lines: [
         report?.summary || "The collaboration completed.",
+        snapshot?.run?.workspace_session_id
+          ? `Session ${snapshot.run.workspace_session_id}`
+          : "",
         runtime.runId ? `Run ${runtime.runId}` : "",
-        "Enter another objective below.",
+        "Enter the next objective to continue this Team, or /new to start a fresh Session.",
       ].filter(Boolean),
     };
   }
@@ -3169,6 +3300,56 @@ function continuedTeamConfiguration(runtime) {
   return configuration;
 }
 
+// A collaboration Run is deliberately finite, but its Workspace Session is
+// not.  Reconstruct the reusable team charter from a persisted snapshot so a
+// terminal /resume can accept the next objective without treating it as an
+// unrelated, new team.  Native session bindings are included only as hints;
+// runAgentWorkspaceCollaboration keeps them only for an unchanged Agent
+// binding before it asks the current objective to be configured again.
+function teamConfigurationFromSnapshot(snapshot) {
+  const run = snapshot?.run || {};
+  const participants = Array.isArray(snapshot?.participants)
+    ? snapshot.participants
+    : Object.entries(run.agents || {}).map(([participantId, agent]) => ({
+        participant_id: participantId,
+        ...agent,
+      }));
+  if (!participants.length) return null;
+  return {
+    objective: run.objective || "",
+    workspace_mode: run.workspace_mode || "auto",
+    resolved_workspace_mode: run.resolved_workspace_mode || run.workspace_mode || "auto",
+    coordinator_runtime: run.coordinator_runtime || "codex",
+    planning_source: run.planning_source || "session_restored",
+    risk_tier: run.risk_tier || "green",
+    workflow_template_id: run.workflow_template_id || "adaptive",
+    preferences: run.preferences || "",
+    coordination_prompt: run.coordination_prompt || "",
+    budget: structuredClone(run.budget || {}),
+    supervisor_permission_profile: run.supervisor_permission_profile || "guarded",
+    ...(run.supervisor_policy_id ? { supervisor_policy_id: run.supervisor_policy_id } : {}),
+    participants: participants.map((participant) => ({
+      participant_id: participant.participant_id,
+      display_name: participant.display_name || participant.participant_id,
+      runtime: participant.runtime,
+      device_id: participant.device_id,
+      workspace_id: participant.workspace_id || "",
+      role_hint: participant.role_hint || "",
+      permission_profile: participant.permission_profile || "guarded",
+      ...(participant.provider ? { provider: participant.provider } : {}),
+      ...(participant.model ? { model: participant.model } : {}),
+      planner: participant.planner === true || participant.participant_id === run.planner_role,
+      ...(participant.native_session_id ? { native_session_id: participant.native_session_id } : {}),
+      ...(participant.conversation_id ? { conversation_id: participant.conversation_id } : {}),
+    })),
+    auto_configuration: {
+      resolved_workspace_mode: run.resolved_workspace_mode || run.workspace_mode || "auto",
+      session_restored: true,
+      safe_to_skip_confirmation: true,
+    },
+  };
+}
+
 async function runWorkspaceObjective({
   objective,
   existingRunId = "",
@@ -3266,10 +3447,18 @@ async function runWorkspaceObjective({
       profile: initialSessionApproval?.profile || "guarded",
       policyId: initialSessionApproval?.policyId || "",
     },
+    commandApprovalOptions: sessionPermissionOptions({ includePolicies: true }),
+    commandCompletionContext: null,
+    commandSuggestionSelection: 0,
+    commandSuggestionsDismissed: false,
     sessionPermissionOptions: [],
     approvalUpdatePending: false,
   };
   const render = (force = false) => {
+    runtime.commandCompletionContext = workspaceCommandCompletionContext({
+      approvalOptions: runtime.commandApprovalOptions,
+      runIds: [runtime.runId, runtime.snapshot?.run?.run_id, runtime.snapshot?.run?.id],
+    });
     runtime.terminalColumns = output.columns;
     runtime.terminalRows = output.rows;
     redrawWorkspaceApp(output, {
@@ -3409,6 +3598,15 @@ async function runWorkspaceObjective({
     }
     render(true);
   };
+  const activeCommandSuggestions = () => commandSuggestionsForInput(
+    runtime.composerBuffer,
+    runtime.commandCompletionContext,
+    { limit: 3, dismissed: runtime.commandSuggestionsDismissed },
+  );
+  const resetActiveCommandSuggestions = () => {
+    runtime.commandSuggestionSelection = 0;
+    runtime.commandSuggestionsDismissed = false;
+  };
   const onActiveKeypress = (text, key = {}) => {
     if (runtime.interaction) return;
     const mouse = consumeWorkspaceMouseKeypress(runtime, text, key);
@@ -3421,6 +3619,15 @@ async function runWorkspaceObjective({
     }
     if (key.ctrl && key.name === "o") {
       if (!toggleSelectedActivity(runtime)) runtime.notice = "No Agent activity is available yet";
+      render(true);
+      return;
+    }
+    const suggestions = activeCommandSuggestions();
+    if (["up", "down"].includes(key.name) && suggestions.length) {
+      const offset = key.name === "up" ? -1 : 1;
+      runtime.commandSuggestionSelection = (
+        runtime.commandSuggestionSelection + offset + suggestions.length
+      ) % suggestions.length;
       render(true);
       return;
     }
@@ -3453,6 +3660,7 @@ async function runWorkspaceObjective({
         runtime.composerPastes = inserted.pendingPastes;
         runtime.composerNextPasteId = inserted.nextPasteId;
         runtime.composerPasteBuffer = null;
+        resetActiveCommandSuggestions();
         render(true);
         return;
       }
@@ -3476,6 +3684,7 @@ async function runWorkspaceObjective({
         runtime.composerBuffer = "";
         runtime.composerCursor = 0;
         runtime.composerPastes = [];
+        resetActiveCommandSuggestions();
         showNotice("Input cleared");
         return;
       }
@@ -3496,6 +3705,31 @@ async function runWorkspaceObjective({
       void applySessionApproval(nextSessionPermission(current.profile, current.policyId));
       return;
     }
+    if (key.name === "escape" && suggestions.length) {
+      runtime.commandSuggestionsDismissed = true;
+      runtime.commandSuggestionSelection = 0;
+      render(true);
+      return;
+    }
+    if (key.name === "tab"
+      && !runtime.commandSuggestionsDismissed
+      && runtime.composerCursor === [...runtime.composerBuffer].length) {
+      const completion = completeWorkspaceCommandInput(runtime.composerBuffer, {
+        ...runtime.commandCompletionContext,
+        selection: runtime.commandSuggestionSelection,
+      });
+      if (completion) {
+        runtime.composerBuffer = completion.value;
+        runtime.composerCursor = [...runtime.composerBuffer].length;
+        runtime.composerPastes = pruneComposerPastes(
+          runtime.composerBuffer,
+          runtime.composerPastes,
+        );
+        resetActiveCommandSuggestions();
+        render(true);
+      }
+      return;
+    }
     if (key.name === "return" || key.name === "enter") {
       const objectiveText = expandComposerPastes(
         runtime.composerBuffer,
@@ -3511,6 +3745,7 @@ async function runWorkspaceObjective({
         runtime.composerBuffer = "";
         runtime.composerCursor = 0;
         runtime.composerPastes = [];
+        resetActiveCommandSuggestions();
         void openSessionApprovalPicker();
         return;
       }
@@ -3519,6 +3754,7 @@ async function runWorkspaceObjective({
         runtime.composerBuffer = "";
         runtime.composerCursor = 0;
         runtime.composerPastes = [];
+        resetActiveCommandSuggestions();
         if (!activeCommand.command) {
           showNotice(`Unknown command '/${activeCommand.rawName}' · use /help`, 2200);
           return;
@@ -3594,6 +3830,7 @@ async function runWorkspaceObjective({
         runtime.composerBuffer = "";
         runtime.composerCursor = 0;
         runtime.composerPastes = [];
+        resetActiveCommandSuggestions();
         if (!option) {
           showNotice("Unknown approval profile or policy · use /approval to choose", 2400);
           return;
@@ -3616,12 +3853,14 @@ async function runWorkspaceObjective({
           runtime.composerBuffer = "";
           runtime.composerCursor = 0;
           runtime.composerPastes = [];
+          resetActiveCommandSuggestions();
           showNotice(String(error.message || error).split("\n")[0], 2600);
           return;
         }
         runtime.composerBuffer = "";
         runtime.composerCursor = 0;
         runtime.composerPastes = [];
+        resetActiveCommandSuggestions();
         runtime.requestedMode = selected;
         showNotice(`Collaboration mode set to ${workspaceModeDefinition(selected).label} · use /new to apply`, 2600);
         return;
@@ -3631,6 +3870,7 @@ async function runWorkspaceObjective({
         runtime.composerBuffer = "";
         runtime.composerCursor = 0;
         runtime.composerPastes = [];
+        resetActiveCommandSuggestions();
         completedInputResolve?.("exit");
         return;
       }
@@ -3639,6 +3879,7 @@ async function runWorkspaceObjective({
         runtime.composerBuffer = "";
         runtime.composerCursor = 0;
         runtime.composerPastes = [];
+        resetActiveCommandSuggestions();
         completedInputResolve?.("new");
         return;
       }
@@ -3646,8 +3887,9 @@ async function runWorkspaceObjective({
       runtime.composerBuffer = "";
       runtime.composerCursor = 0;
       runtime.composerPastes = [];
+      resetActiveCommandSuggestions();
       if (runtime.snapshot?.run?.state === "completed") {
-        runtime.notice = "Follow-up accepted · continuing with the same team";
+        runtime.notice = "Follow-up accepted · evaluating the current team and devices";
         render(true);
         completedInputResolve?.("follow_up");
       } else {
@@ -3662,6 +3904,7 @@ async function runWorkspaceObjective({
         runtime.composerCursor -= 1;
         runtime.composerBuffer = chars.join("");
         runtime.composerPastes = pruneComposerPastes(runtime.composerBuffer, runtime.composerPastes);
+        resetActiveCommandSuggestions();
       }
       render();
       return;
@@ -3671,6 +3914,7 @@ async function runWorkspaceObjective({
         chars.splice(runtime.composerCursor, 1);
         runtime.composerBuffer = chars.join("");
         runtime.composerPastes = pruneComposerPastes(runtime.composerBuffer, runtime.composerPastes);
+        resetActiveCommandSuggestions();
       }
       render();
       return;
@@ -3699,6 +3943,7 @@ async function runWorkspaceObjective({
       runtime.composerBuffer = "";
       runtime.composerCursor = 0;
       runtime.composerPastes = [];
+      resetActiveCommandSuggestions();
       render();
       return;
     }
@@ -3709,6 +3954,7 @@ async function runWorkspaceObjective({
       chars.splice(runtime.composerCursor, 0, ...text);
       runtime.composerBuffer = chars.join("");
       runtime.composerCursor += [...text].length;
+      resetActiveCommandSuggestions();
       render();
     }
   };
@@ -3871,6 +4117,9 @@ async function runWorkspaceObjective({
           currentSnapshot = await followRunner(runtime.runId, followerOptions);
         }
         runtime.snapshot = currentSnapshot;
+        if (!runtime.configuration) {
+          runtime.configuration = teamConfigurationFromSnapshot(currentSnapshot);
+        }
         runtime.phase = currentSnapshot?.run?.state || "completed";
         if (runtime.phase === "completed" && !runtime.queuedObjective) {
           runtime.interaction = false;
@@ -4065,6 +4314,7 @@ export async function handleAgentWorkspaceCommand(argv = [], {
   cancelCollaborationRun = async (runId) => controlCollaborationRun(runId, "cancel"),
   controlCollaborationRunFn = controlCollaborationRun,
   listCollaborationRuns = listAgentWorkspaceCollaborationRuns,
+  resolveWorkspaceSession = resolveAgentWorkspaceSession,
   updateSessionApproval = async (runId, approval) => controlCollaborationRun(
     runId,
     "approval",
@@ -4108,6 +4358,18 @@ export async function handleAgentWorkspaceCommand(argv = [], {
           panel,
           sessionApproval,
           initialBuffer: draftObjective,
+          completionContext: workspaceCommandCompletionContext({
+            runIds: [
+              lastRun?.run_id,
+              lastRun?.runId,
+              ...sessionHistory.map((entry) => entry.runId),
+            ],
+            sessionIds: [
+              lastRun?.workspace_session_id,
+              lastRun?.workspaceSessionId,
+              ...sessionHistory.map((entry) => entry.sessionId),
+            ],
+          }),
           onSessionApprovalChange: (current) => {
             const next = nextSessionPermission(current.profile, current.policyId);
             sessionApproval = {
@@ -4163,14 +4425,15 @@ export async function handleAgentWorkspaceCommand(argv = [], {
             redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
             continue;
           }
-          if (command.name === "resume" && !argument) {
-            const page = await listCollaborationRuns({ category: "recent" });
-            if (page.runs[0]) lastRun = page.runs[0];
-            panel = workspaceRunsPanel(page);
-            redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
-            continue;
+          if (command.name === "resume") {
+            requireAtMostOneArgument();
+            if (!argument) throw new Error(`Usage: ${workspaceCommandUsage(command)}`);
+            const restored = await resolveWorkspaceSession(argument);
+            existingRunId = restored.latestRunId;
+            lastRun = restored.snapshot?.run || lastRun;
+            runObjective = `Restore Workspace Session ${argument}`;
           }
-          if (["resume", "attach"].includes(command.name)) {
+          if (command.name === "attach") {
             requireAtMostOneArgument();
             if (!argument) throw new Error(`Usage: ${workspaceCommandUsage(command)}`);
             existingRunId = argument;
@@ -4318,6 +4581,7 @@ export async function handleAgentWorkspaceCommand(argv = [], {
       if (runtime.snapshot?.run?.state === "completed" && runtime.runId) {
         sessionHistory.push({
           runId: runtime.runId,
+          sessionId: runtime.snapshot?.run?.workspace_session_id || "",
           objective: runtime.objective,
           summary: runtime.snapshot?.final_report?.summary || "Collaboration completed.",
         });
@@ -4325,7 +4589,11 @@ export async function handleAgentWorkspaceCommand(argv = [], {
       }
       pendingObjective = runtime.queuedObjective || "";
       draftObjective = pendingObjective ? "" : runtime.draftObjective || "";
-      if (pendingObjective && runtime.configuration) {
+      // A completed Run ends its task graph, not the Workspace Session. Keep
+      // its Team charter while the user is at the objective prompt so the
+      // next turn remains connected even if it is typed later rather than
+      // queued before the completion frame disappears.
+      if (runtime.snapshot?.run?.state === "completed" && runtime.configuration) {
         continuedConfiguration = continuedTeamConfiguration(runtime);
         continuedFromRunId = runtime.runId;
       } else {

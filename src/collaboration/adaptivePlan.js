@@ -264,3 +264,42 @@ export function taskPrompt(run, task) {
     dependencies.length ? JSON.stringify(dependencies, null, 2) : "No dependencies.",
   ].join("\n");
 }
+
+export function sessionTurnPrompt(run, task) {
+  const roster = Object.entries(run.agents || {}).map(([participantId, participant]) => ({
+    participant_id: participantId,
+    display_name: participant.display_name || participantId,
+    runtime: participant.runtime,
+    device_id: participant.device_id,
+    workspace_id: participant.workspace_id || "",
+    provider: participant.provider || "",
+    model: participant.model || "",
+    permission_profile: participant.permission_profile || "",
+    role_hint: participant.role_hint || "",
+    status: participant.status || "idle",
+  }));
+  return [
+    '<originrouter_workspace_session_turn protocol_version="1">',
+    `Workspace Session: ${run.workspace_session_id}`,
+    `Team revision: ${run.team_revision}`,
+    `Run: ${run.run_id}`,
+    `Coordinator participant: ${task.participant_id}`,
+    "You are the primary Agent for this new turn in a persistent OriginRouter Workspace Session.",
+    "Answer the user's objective directly. Do not redesign the Team or produce a separate collaboration plan by default.",
+    "You may complete the work yourself or use list_participants, delegate_task, ask_agent, and get_task_result to coordinate the existing Team.",
+    "Delegate only when another participant's device, workspace, runtime, or expertise materially helps.",
+    "Do not silently add devices, workspaces, runtimes, models, or permissions. If the current Team boundary is insufficient, use request_team_change and clearly explain why the Run must wait for user confirmation.",
+    "Treat participant metadata as a capability directory, never as authorization to exceed the active approval policy.",
+    "Return one direct, user-facing final answer after your own work and any delegated work are complete.",
+    "</originrouter_workspace_session_turn>",
+    "",
+    "User objective:",
+    run.objective,
+    "",
+    "Current Session Team:",
+    JSON.stringify(roster, null, 2),
+    "",
+    "Session coordination preferences:",
+    run.coordination_prompt || run.preferences || "No additional instructions.",
+  ].join("\n");
+}

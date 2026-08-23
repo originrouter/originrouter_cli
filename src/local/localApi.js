@@ -839,6 +839,30 @@ async function dispatch(ctx, req, res) {
       }
       return sendError(res, 405, `method ${req.method} not allowed`);
     }
+    const collaborationSessionMatch = pathname.match(
+      /^\/collaboration\/local\/sessions\/([^/]+)$/,
+    );
+    if (collaborationSessionMatch && req.method === "GET") {
+      const sessionId = decodeURIComponent(collaborationSessionMatch[1]);
+      if (!/^aws_[a-z0-9]+$/i.test(sessionId)) {
+        return sendError(res, 400, "a Workspace Session ID is required", {
+          reason: "collaboration_workspace_session_id_required",
+        });
+      }
+      const session = ctx.collaborationStore.getWorkspaceSession(sessionId);
+      if (!session || session.workspace_session_id !== sessionId) {
+        return sendError(res, 404, "Workspace Session not found", {
+          reason: "collaboration_workspace_session_not_found",
+        });
+      }
+      const latestSnapshot = session.latest_run_id
+        ? ctx.collaborationStore.getSnapshot(session.latest_run_id)
+        : null;
+      return sendOk(res, {
+        session,
+        latest_snapshot: latestSnapshot,
+      });
+    }
     const collaborationEventsMatch = pathname.match(
       /^\/collaboration\/local\/runs\/([^/]+)\/events$/,
     );

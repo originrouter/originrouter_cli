@@ -148,7 +148,33 @@ invisible OS prompt.
 
 Agent Workspace keeps the user in OriginRouter while the daemon runs managed
 Codex or Claude sessions in the background. Plans, tasks, approvals, budgets,
-messages, and results remain attached to one durable collaboration Run.
+messages, and results remain attached to durable collaboration Runs within one
+long-lived Workspace Session. A completed Run is a result, not the end of the
+conversation: type the next objective to continue the Session, or use `/new`
+to begin a fresh team and context.
+
+After reopening Workspace, use `/resume <session-id>`. Session history is
+strictly ordered: individual Run IDs remain available for inspection, retry,
+and audit, but cannot be used as historical continuation points.
+
+The first objective in a new Session selects the Team and creates its initial
+reviewable plan. Follow-up objectives reuse the persisted Team and go directly
+to its primary Agent, which can delegate through the Agent MCP gateway. A
+follow-up never silently adds a machine, directory, runtime, model, or wider
+permission. If the current boundary is insufficient, the primary Agent must
+request a versioned Team change; Workspace shows the exact change and waits for
+local confirmation before the new member can run. Unchanged Agents retain safe
+native conversation continuity across Runs.
+
+The Session Team is stored only in the coordinating CLI's local collaboration
+database. Cross-device dispatch and Agent MCP traffic continue through the
+existing authenticated E2EE Relay/Server bridge; the server routes ciphertext
+and presence but does not receive Team state or native Agent credentials. The
+App reads only display-safe Session continuity metadata (`workspace_session_id`,
+previous Run ID, Team revision number, and continuation flag) from the account
+projection. From the `originrouter_server` release, deploy
+`sql/024_collaboration_workspace_session_projection.sql` before the updated
+Server, then update every participating CLI and the App.
 
 Choose a collaboration mode with `--mode` or switch inside the interactive
 workspace with `/mode <name>` or Shift+Tab.

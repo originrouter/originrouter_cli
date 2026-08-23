@@ -109,6 +109,73 @@ function normalizeRole(role, name) {
   };
 }
 
+function normalizeSessionTeam(input = {}) {
+  const participants = normalizeParticipants(input.participants).map((participant) => ({
+    participant_id: participant.participant_id,
+    display_name: participant.display_name,
+    runtime: participant.runtime,
+    device_id: participant.device_id,
+    workspace_id: participant.workspace_id,
+    provider: participant.provider,
+    model: participant.model,
+    permission_profile: participant.permission_profile,
+    approval_policy_id: participant.approval_policy_id,
+    native_session_id: participant.native_session_id,
+    conversation_id: participant.conversation_id,
+    role_hint: participant.role_hint,
+    planner: participant.planner,
+  }));
+  const team = {
+    version: 1,
+    participants,
+    coordinator_runtime: safeText(input.coordinator_runtime ?? input.coordinatorRuntime, 16),
+    workspace_mode: safeText(input.workspace_mode ?? input.workspaceMode, 32),
+    resolved_workspace_mode: safeText(input.resolved_workspace_mode ?? input.resolvedWorkspaceMode, 32),
+    workflow_template_id: safeText(input.workflow_template_id ?? input.workflowTemplateId, 64) || "adaptive",
+    preferences: safeText(input.preferences, 16_000),
+    coordination_prompt: safeText(input.coordination_prompt ?? input.coordinationPrompt, 16_000),
+    supervisor_permission_profile: safeText(
+      input.supervisor_permission_profile ?? input.session_permission_profile,
+      64,
+    ) || "guarded",
+    supervisor_policy_id: safeText(input.supervisor_policy_id ?? input.session_policy_id, 64),
+    budget: {
+      token_limit: input.budget?.token_limit == null ? null : Math.max(1, Number(input.budget.token_limit)),
+      amount_limit_micros: input.budget?.amount_limit_micros == null
+        ? null
+        : Math.max(1, Number(input.budget.amount_limit_micros)),
+      currency: input.budget?.currency ? safeText(input.budget.currency, 3).toUpperCase() : null,
+      max_concurrency: Math.max(1, Math.min(16, Number(
+        input.budget?.max_concurrency ?? Math.min(4, participants.length),
+      ))),
+    },
+  };
+  if (!SUPERVISOR_PERMISSION_PROFILES.has(team.supervisor_permission_profile)) {
+    throw new Error(`unsupported Session approval profile '${team.supervisor_permission_profile}'`);
+  }
+  if (team.supervisor_permission_profile === "custom" && !team.supervisor_policy_id) {
+    throw new Error("Rules Session approval requires a policy ID");
+  }
+  if (team.supervisor_permission_profile !== "custom") team.supervisor_policy_id = "";
+  assertNoSecretFields(team);
+  return team;
+}
+
+function publicWorkspaceSession(row) {
+  if (!row) return null;
+  return {
+    workspace_session_id: row.workspace_session_id,
+    team_revision: Number(row.team_revision || 0),
+    team: parseJson(row.team_json, null),
+    coordinator_device_id: row.coordinator_device_id || null,
+    supervisor_permission_profile: row.supervisor_permission_profile || "guarded",
+    supervisor_policy_id: row.supervisor_policy_id || null,
+    latest_run_id: row.latest_run_id || null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
 function publicRun(row) {
   if (!row) return null;
   return {
@@ -120,6 +187,8 @@ function publicRun(row) {
     run_id: row.run_id,
     workspace_session_id: row.workspace_session_id || null,
     continued_from_run_id: row.continued_from_run_id || null,
+    team_revision: Number(row.team_revision || 0),
+    session_continuation: Boolean(row.session_continuation),
     supervisor_permission_profile: row.supervisor_permission_profile || "guarded",
     supervisor_policy_id: row.supervisor_policy_id || null,
     conversation_id: row.conversation_id,
@@ -178,6 +247,8 @@ export class CollaborationStore {
         run_id TEXT PRIMARY KEY,
         workspace_session_id TEXT NOT NULL DEFAULT '',
         continued_from_run_id TEXT NOT NULL DEFAULT '',
+        team_revision INTEGER NOT NULL DEFAULT 0,
+        session_continuation INTEGER NOT NULL DEFAULT 0,
         supervisor_permission_profile TEXT NOT NULL DEFAULT 'guarded',
         supervisor_policy_id TEXT NOT NULL DEFAULT '',
         conversation_id TEXT NOT NULL UNIQUE,
@@ -218,6 +289,29 @@ export class CollaborationStore {
         started_at TEXT,
         finished_at TEXT,
         archived_at TEXT
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS collaboration_workspace_sessions (
+        workspace_session_id TEXT PRIMARY KEY,
+        team_revision INTEGER NOT NULL DEFAULT 1,
+        team_json TEXT NOT NULL,
+        coordinator_device_id TEXT NOT NULL DEFAULT '',
+        supervisor_permission_profile TEXT NOT NULL DEFAULT 'guarded',
+        supervisor_policy_id TEXT NOT NULL DEFAULT '',
+        latest_run_id TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS collaboration_workspace_session_revisions (
+        workspace_session_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'confirmed',
+        team_json TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        source_run_id TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        confirmed_at TEXT,
+        rejected_at TEXT,
+        PRIMARY KEY(workspace_session_id, revision)
       ) STRICT;
       CREATE TABLE IF NOT EXISTS collaboration_agents (
         agent_id TEXT PRIMARY KEY,
@@ -450,10 +544,14 @@ export class CollaborationStore {
         ON collaboration_execution_events(run_id, participant_id, created_at ASC);
       CREATE INDEX IF NOT EXISTS idx_collaboration_attention_run
         ON collaboration_attention_items(run_id, status, created_at ASC);
+      CREATE INDEX IF NOT EXISTS idx_collaboration_workspace_session_revisions
+        ON collaboration_workspace_session_revisions(workspace_session_id, revision DESC);
     `);
     this.ensureColumn("collaboration_runs", "schema_version", "INTEGER NOT NULL DEFAULT 2");
     this.ensureColumn("collaboration_runs", "workspace_session_id", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_runs", "continued_from_run_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_runs", "team_revision", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("collaboration_runs", "session_continuation", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("collaboration_runs", "supervisor_permission_profile", "TEXT NOT NULL DEFAULT 'guarded'");
     this.ensureColumn("collaboration_runs", "supervisor_policy_id", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("collaboration_runs", "revision", "INTEGER NOT NULL DEFAULT 1");
@@ -661,7 +759,6 @@ export class CollaborationStore {
   }
 
   createAdaptiveRun(input, objective) {
-    const participants = normalizeParticipants(input.participants);
     const continuedFromRunId = safeText(
       input.continued_from_run_id
         ?? input.continuedFromRunId
@@ -675,28 +772,89 @@ export class CollaborationStore {
     const workspaceSessionId = continuedFromRun?.workspace_session_id
       || safeText(input.workspace_session_id ?? input.workspaceSessionId, 195)
       || id("aws");
-    const supervisorPermissionProfile = continuedFromRun?.supervisor_permission_profile
-      || safeText(input.supervisor_permission_profile ?? input.session_permission_profile, 64)
-      || "guarded";
-    const supervisorPolicyId = continuedFromRun?.supervisor_policy_id
-      || safeText(input.supervisor_policy_id ?? input.session_policy_id, 64);
+    const currentSession = this.getWorkspaceSession(workspaceSessionId);
+    const continuationRequested = Boolean(
+      continuedFromRun
+      || input.session_continuation === true
+      || input.sessionContinuation === true
+      || input.auto_configuration?.session_continuation === true,
+    );
+    if (currentSession && !continuationRequested) {
+      const error = new Error("an existing Workspace Session can only continue from its latest Run");
+      error.code = "COLLABORATION_SESSION_CONTINUATION_REQUIRED";
+      throw error;
+    }
+    if (!currentSession && continuationRequested) {
+      const error = new Error("the Workspace Session to continue was not found");
+      error.code = "COLLABORATION_WORKSPACE_SESSION_NOT_FOUND";
+      throw error;
+    }
+    const sessionContinuation = Boolean(
+      currentSession
+      && continuationRequested,
+    );
+    const requestedSupervisorProfile = safeText(
+      input.supervisor_permission_profile ?? input.session_permission_profile,
+      64,
+    );
+    const requestedSupervisorPolicyId = safeText(
+      input.supervisor_policy_id ?? input.session_policy_id,
+      64,
+    );
+    let selectedTeam = sessionContinuation
+      ? currentSession.team
+      : normalizeSessionTeam(input);
+    if (sessionContinuation && requestedSupervisorProfile) {
+      selectedTeam = {
+        ...selectedTeam,
+        supervisor_permission_profile: requestedSupervisorProfile,
+        supervisor_policy_id: requestedSupervisorProfile === "custom"
+          ? requestedSupervisorPolicyId
+          : "",
+      };
+    }
+    selectedTeam = normalizeSessionTeam(selectedTeam);
+    const participants = normalizeParticipants(selectedTeam.participants);
+    const effectiveContinuedFromRunId = sessionContinuation
+      ? (currentSession.latest_run_id || continuedFromRunId)
+      : continuedFromRunId;
+    const supervisorPermissionProfile = selectedTeam.supervisor_permission_profile || "guarded";
+    const supervisorPolicyId = selectedTeam.supervisor_policy_id || "";
     const explicitPlanner = participants.find((item) => item.planner);
     const planner = explicitPlanner || participants[0];
     const runId = id("acr");
     const conversationId = `collaboration:${randomUUID().replaceAll("-", "")}`;
-    const plannerTaskId = id("act");
+    const primaryTaskId = id("act");
     const createdAt = iso(this.now());
-    const budget = {
-      token_limit: input.budget?.token_limit == null ? null : Math.max(1, Number(input.budget.token_limit)),
-      amount_limit_micros: input.budget?.amount_limit_micros == null ? null : Math.max(1, Number(input.budget.amount_limit_micros)),
-      currency: input.budget?.currency ? safeText(input.budget.currency, 3).toUpperCase() : null,
-      max_concurrency: Math.max(1, Math.min(16, Number(input.budget?.max_concurrency ?? Math.min(4, participants.length)))),
-    };
+    const budget = selectedTeam.budget;
+    const teamRevision = Number(currentSession?.team_revision || 1);
     assertNoSecretFields(input);
+    if (!currentSession) {
+      this.ensureWorkspaceSessionTeam({
+        workspaceSessionId,
+        team: selectedTeam,
+        coordinatorDeviceId: safeText(input.coordinator_device_id ?? input.coordinatorDeviceId, 191),
+        createdAt,
+      });
+    } else if (
+      currentSession.supervisor_permission_profile !== supervisorPermissionProfile
+      || safeText(currentSession.supervisor_policy_id, 64) !== supervisorPolicyId
+    ) {
+      assertNoSecretFields(selectedTeam);
+      this.db.prepare(`
+        UPDATE collaboration_workspace_sessions
+        SET team_json = ?, supervisor_permission_profile = ?,
+            supervisor_policy_id = ?, updated_at = ?
+        WHERE workspace_session_id = ?
+      `).run(
+        JSON.stringify(selectedTeam), supervisorPermissionProfile,
+        supervisorPolicyId, createdAt, workspaceSessionId,
+      );
+    }
     this.db.transaction(() => {
       this.db.prepare(`
         INSERT INTO collaboration_runs(
-          run_id, workspace_session_id, continued_from_run_id,
+          run_id, workspace_session_id, continued_from_run_id, team_revision, session_continuation,
           supervisor_permission_profile, supervisor_policy_id,
           conversation_id, template_id, template_version, objective,
           preferences, coordination_prompt, workflow_template_id,
@@ -705,21 +863,21 @@ export class CollaborationStore {
           plan_status, plan_json, state, gates_json, budget_json, usage_json,
           counters_json, account_budget_blocked, resume_state, coordinator_device_id,
           created_at, updated_at, finished_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, '2', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', '', 'created', '{}', ?, ?, '{}', 0, '', ?, ?, ?, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '2', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 'created', '{}', ?, ?, '{}', 0, '', ?, ?, ?, NULL)
       `).run(
-        runId, workspaceSessionId, continuedFromRunId,
+        runId, workspaceSessionId, effectiveContinuedFromRunId, teamRevision, sessionContinuation ? 1 : 0,
         supervisorPermissionProfile, supervisorPolicyId,
         conversationId, ADAPTIVE_TEMPLATE_ID, objective,
-        safeText(input.preferences, 16_000), safeText(input.coordination_prompt ?? input.coordinationPrompt, 16_000),
-        safeText(input.workflow_template_id ?? input.workflowTemplateId, 64) || "adaptive",
-        safeText(input.workspace_mode ?? input.workspaceMode, 32),
-        safeText(input.resolved_workspace_mode ?? input.resolvedWorkspaceMode, 32),
-        safeText(input.coordinator_runtime ?? input.coordinatorRuntime, 16),
-        safeText(input.planning_source ?? input.planningSource, 32) || "local",
+        selectedTeam.preferences, selectedTeam.coordination_prompt,
+        selectedTeam.workflow_template_id,
+        selectedTeam.workspace_mode,
+        selectedTeam.resolved_workspace_mode,
+        selectedTeam.coordinator_runtime,
+        sessionContinuation ? "session_team" : (safeText(input.planning_source ?? input.planningSource, 32) || "local"),
         ["green", "yellow", "red"].includes(input.risk_tier ?? input.riskTier)
           ? (input.risk_tier ?? input.riskTier)
           : "green",
-        planner.participant_id, JSON.stringify(budget),
+        planner.participant_id, sessionContinuation ? "confirmed" : "draft", JSON.stringify(budget),
         JSON.stringify({ sampled_tokens: 0, amount_micros: 0, currency: null, unpriced_events: 0 }),
         safeText(input.coordinator_device_id ?? input.coordinatorDeviceId, 191),
         createdAt, createdAt,
@@ -749,9 +907,24 @@ export class CollaborationStore {
         INSERT INTO collaboration_tasks(
           task_id, run_id, title, summary, state, phase, task_key, participant_id,
           depends_on_json, instructions, kind, deliverable, created_at, updated_at
-        ) VALUES (?, ?, ?, '', 'pending', 'plan_design', '__planner__', ?, '[]', '', 'read_only', ?, ?, ?)
-      `).run(plannerTaskId, runId, "Design collaboration plan", planner.participant_id, "A structured plan for user review.", createdAt, createdAt);
+        ) VALUES (?, ?, ?, '', 'pending', ?, ?, ?, '[]', ?, ?, ?, ?, ?)
+      `).run(
+        primaryTaskId,
+        runId,
+        sessionContinuation ? "Handle Session turn" : "Design collaboration plan",
+        sessionContinuation ? "session_turn" : "plan_design",
+        sessionContinuation ? "__session_turn__" : "__planner__",
+        planner.participant_id,
+        sessionContinuation
+          ? "Handle the user's new objective using the existing Session Team. Delegate through the OriginRouter Agent gateway when another participant is useful."
+          : "",
+        sessionContinuation ? "workspace_write" : "read_only",
+        sessionContinuation ? "A direct final answer for this user turn." : "A structured plan for user review.",
+        createdAt,
+        createdAt,
+      );
     })();
+    this.setWorkspaceSessionLatestRun(workspaceSessionId, runId);
     this.recordExecutionEvent(runId, {
       type: "run.created",
       summary: "The collaboration was created.",
@@ -825,6 +998,421 @@ export class CollaborationStore {
       WHERE workspace_session_id = ?
       ORDER BY created_at ASC, run_id ASC
     `).all(source.workspace_session_id).map(publicRun);
+  }
+
+  workspaceSessionId(sessionOrRunId) {
+    const key = safeText(sessionOrRunId, 195);
+    if (!key) return "";
+    const source = this.db.prepare(`
+      SELECT workspace_session_id FROM collaboration_runs
+      WHERE run_id = ? OR workspace_session_id = ?
+      ORDER BY updated_at DESC LIMIT 1
+    `).get(key, key);
+    if (source?.workspace_session_id) return source.workspace_session_id;
+    return this.db.prepare(`
+      SELECT workspace_session_id FROM collaboration_workspace_sessions
+      WHERE workspace_session_id = ?
+    `).get(key)?.workspace_session_id || "";
+  }
+
+  getWorkspaceSession(sessionOrRunId) {
+    const workspaceSessionId = this.workspaceSessionId(sessionOrRunId)
+      || safeText(sessionOrRunId, 195);
+    if (!workspaceSessionId) return null;
+    let row = this.db.prepare(`
+      SELECT * FROM collaboration_workspace_sessions WHERE workspace_session_id = ?
+    `).get(workspaceSessionId);
+    if (row) return publicWorkspaceSession(row);
+
+    // Older databases already grouped Runs by workspace_session_id but did
+    // not persist the Session Team independently. Reconstruct it once from
+    // the latest Run so daemon restart and /resume gain the new semantics.
+    const latest = this.db.prepare(`
+      SELECT * FROM collaboration_runs
+      WHERE workspace_session_id = ?
+      ORDER BY updated_at DESC, run_id DESC LIMIT 1
+    `).get(workspaceSessionId);
+    if (!latest) return null;
+    const agents = this.db.prepare(`
+      SELECT * FROM collaboration_agents WHERE run_id = ?
+      ORDER BY sort_order, created_at, role
+    `).all(latest.run_id);
+    if (!agents.length) return null;
+    const team = normalizeSessionTeam({
+      participants: agents.map((agent) => ({
+        participant_id: agent.role,
+        display_name: agent.display_name || agent.role,
+        runtime: agent.runtime,
+        device_id: agent.device_id,
+        workspace_id: agent.workspace_id,
+        provider: agent.provider,
+        model: agent.model,
+        permission_profile: agent.permission_profile,
+        approval_policy_id: agent.approval_policy_id,
+        native_session_id: agent.native_session_id,
+        conversation_id: agent.conversation_id,
+        role_hint: agent.role_hint,
+        planner: Boolean(agent.planner),
+      })),
+      coordinator_runtime: latest.coordinator_runtime,
+      workspace_mode: latest.workspace_mode,
+      resolved_workspace_mode: latest.resolved_workspace_mode,
+      workflow_template_id: latest.workflow_template_id,
+      preferences: latest.preferences,
+      coordination_prompt: latest.coordination_prompt,
+      supervisor_permission_profile: latest.supervisor_permission_profile,
+      supervisor_policy_id: latest.supervisor_policy_id,
+      budget: parseJson(latest.budget_json, {}),
+    });
+    this.ensureWorkspaceSessionTeam({
+      workspaceSessionId,
+      team,
+      coordinatorDeviceId: latest.coordinator_device_id,
+      latestRunId: latest.run_id,
+      createdAt: latest.created_at,
+    });
+    row = this.db.prepare(`
+      SELECT * FROM collaboration_workspace_sessions WHERE workspace_session_id = ?
+    `).get(workspaceSessionId);
+    return publicWorkspaceSession(row);
+  }
+
+  currentSessionTeam(sessionOrRunId) {
+    return this.getWorkspaceSession(sessionOrRunId)?.team || null;
+  }
+
+  ensureWorkspaceSessionTeam({
+    workspaceSessionId,
+    team,
+    coordinatorDeviceId = "",
+    latestRunId = "",
+    createdAt = null,
+  } = {}) {
+    const sessionId = safeText(workspaceSessionId, 195);
+    if (!sessionId) throw new Error("workspace session id is required");
+    const normalized = normalizeSessionTeam(team);
+    const now = iso(createdAt ?? this.now());
+    const existing = this.db.prepare(`
+      SELECT * FROM collaboration_workspace_sessions WHERE workspace_session_id = ?
+    `).get(sessionId);
+    if (existing) return publicWorkspaceSession(existing);
+    this.db.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO collaboration_workspace_sessions(
+          workspace_session_id, team_revision, team_json, coordinator_device_id,
+          supervisor_permission_profile, supervisor_policy_id, latest_run_id,
+          created_at, updated_at
+        ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        sessionId,
+        JSON.stringify(normalized),
+        safeText(coordinatorDeviceId, 191),
+        normalized.supervisor_permission_profile,
+        normalized.supervisor_policy_id,
+        safeText(latestRunId, 195),
+        now,
+        now,
+      );
+      this.db.prepare(`
+        INSERT INTO collaboration_workspace_session_revisions(
+          workspace_session_id, revision, status, team_json, reason,
+          source_run_id, created_at, confirmed_at
+        ) VALUES (?, 1, 'confirmed', ?, 'Initial Session Team', ?, ?, ?)
+      `).run(sessionId, JSON.stringify(normalized), safeText(latestRunId, 195), now, now);
+    })();
+    return this.getWorkspaceSession(sessionId);
+  }
+
+  setWorkspaceSessionLatestRun(sessionOrRunId, runId) {
+    const sessionId = this.workspaceSessionId(sessionOrRunId) || safeText(sessionOrRunId, 195);
+    const updatedAt = iso(this.now());
+    this.db.prepare(`
+      UPDATE collaboration_workspace_sessions
+      SET latest_run_id = ?, updated_at = ? WHERE workspace_session_id = ?
+    `).run(safeText(runId, 195), updatedAt, sessionId);
+    return this.getWorkspaceSession(sessionId);
+  }
+
+  syncWorkspaceSessionAgent(runId, role) {
+    const run = this.getRun(runId, { includeMessages: false });
+    const session = run?.workspace_session_id ? this.getWorkspaceSession(run.workspace_session_id) : null;
+    const agent = run?.agents?.[role];
+    if (!session?.team || !agent) return session;
+    let changed = false;
+    const participants = session.team.participants.map((participant) => {
+      if (participant.participant_id !== role) return participant;
+      const next = {
+        ...participant,
+        native_session_id: agent.native_session_id || "",
+        conversation_id: agent.conversation_id || "",
+      };
+      changed = next.native_session_id !== participant.native_session_id
+        || next.conversation_id !== participant.conversation_id;
+      return next;
+    });
+    if (!changed) return session;
+    const team = { ...session.team, participants };
+    assertNoSecretFields(team);
+    const updatedAt = iso(this.now());
+    this.db.prepare(`
+      UPDATE collaboration_workspace_sessions
+      SET team_json = ?, updated_at = ? WHERE workspace_session_id = ?
+    `).run(JSON.stringify(team), updatedAt, session.workspace_session_id);
+    // Native conversation references are mutable operational bindings, not a
+    // Team boundary change, so they do not increment the Team revision.
+    return this.getWorkspaceSession(session.workspace_session_id);
+  }
+
+  proposeSessionTeamChange(sessionOrRunId, {
+    team,
+    reason = "",
+    sourceRunId = "",
+  } = {}) {
+    const session = this.getWorkspaceSession(sessionOrRunId);
+    if (!session) throw new Error("workspace session was not found");
+    const pending = this.db.prepare(`
+      SELECT * FROM collaboration_workspace_session_revisions
+      WHERE workspace_session_id = ? AND status = 'proposed'
+      ORDER BY revision DESC LIMIT 1
+    `).get(session.workspace_session_id);
+    if (pending) {
+      const error = new Error("a Session Team change is already awaiting confirmation");
+      error.code = "COLLABORATION_TEAM_CHANGE_PENDING";
+      throw error;
+    }
+    const normalized = normalizeSessionTeam(team);
+    const revision = session.team_revision + 1;
+    const createdAt = iso(this.now());
+    this.db.prepare(`
+      INSERT INTO collaboration_workspace_session_revisions(
+        workspace_session_id, revision, status, team_json, reason,
+        source_run_id, created_at, confirmed_at, rejected_at
+      ) VALUES (?, ?, 'proposed', ?, ?, ?, ?, NULL, NULL)
+    `).run(
+      session.workspace_session_id,
+      revision,
+      JSON.stringify(normalized),
+      safeText(reason, 2048),
+      safeText(sourceRunId, 195),
+      createdAt,
+    );
+    return {
+      workspace_session_id: session.workspace_session_id,
+      revision,
+      status: "proposed",
+      team: normalized,
+      reason: safeText(reason, 2048),
+      source_run_id: safeText(sourceRunId, 195) || null,
+      created_at: createdAt,
+    };
+  }
+
+  sessionTeamRevision(sessionOrRunId, revision) {
+    const sessionId = this.workspaceSessionId(sessionOrRunId) || safeText(sessionOrRunId, 195);
+    const row = this.db.prepare(`
+      SELECT * FROM collaboration_workspace_session_revisions
+      WHERE workspace_session_id = ? AND revision = ?
+    `).get(sessionId, Math.max(1, Number(revision) || 0));
+    if (!row) return null;
+    return {
+      workspace_session_id: row.workspace_session_id,
+      revision: Number(row.revision),
+      status: row.status,
+      team: parseJson(row.team_json, null),
+      reason: row.reason || "",
+      source_run_id: row.source_run_id || null,
+      created_at: row.created_at,
+      confirmed_at: row.confirmed_at || null,
+      rejected_at: row.rejected_at || null,
+    };
+  }
+
+  confirmSessionTeamChange(sessionOrRunId, revision) {
+    const session = this.getWorkspaceSession(sessionOrRunId);
+    const proposal = this.sessionTeamRevision(sessionOrRunId, revision);
+    if (!session || !proposal) throw new Error("Session Team change was not found");
+    if (proposal.status === "confirmed") return proposal;
+    if (proposal.status !== "proposed" || proposal.revision !== session.team_revision + 1) {
+      const error = new Error("Session Team change is stale; refresh and try again");
+      error.code = "COLLABORATION_TEAM_REVISION_CONFLICT";
+      throw error;
+    }
+    const currentById = new Map(session.team.participants.map((item) => [item.participant_id, item]));
+    const confirmedTeam = {
+      ...proposal.team,
+      participants: proposal.team.participants.map((participant) => {
+        const current = currentById.get(participant.participant_id);
+        const sameBoundary = current
+          && current.runtime === participant.runtime
+          && current.device_id === participant.device_id
+          && (current.workspace_id || "") === (participant.workspace_id || "")
+          && (current.provider || "") === (participant.provider || "")
+          && (current.model || "") === (participant.model || "")
+          && (current.permission_profile || "") === (participant.permission_profile || "")
+          && (current.approval_policy_id || "") === (participant.approval_policy_id || "");
+        return sameBoundary ? {
+          ...participant,
+          native_session_id: current.native_session_id || participant.native_session_id || "",
+          conversation_id: current.conversation_id || participant.conversation_id || "",
+        } : {
+          ...participant,
+          native_session_id: "",
+          conversation_id: "",
+        };
+      }),
+    };
+    assertNoSecretFields(confirmedTeam);
+    const confirmedAt = iso(this.now());
+    this.db.transaction(() => {
+      this.db.prepare(`
+        UPDATE collaboration_workspace_session_revisions
+        SET status = 'confirmed', team_json = ?, confirmed_at = ?
+        WHERE workspace_session_id = ? AND revision = ? AND status = 'proposed'
+      `).run(JSON.stringify(confirmedTeam), confirmedAt, session.workspace_session_id, proposal.revision);
+      this.db.prepare(`
+        UPDATE collaboration_workspace_sessions
+        SET team_revision = ?, team_json = ?,
+            supervisor_permission_profile = ?, supervisor_policy_id = ?, updated_at = ?
+        WHERE workspace_session_id = ? AND team_revision = ?
+      `).run(
+        proposal.revision,
+        JSON.stringify(confirmedTeam),
+        confirmedTeam.supervisor_permission_profile || "guarded",
+        confirmedTeam.supervisor_policy_id || "",
+        confirmedAt,
+        session.workspace_session_id,
+        session.team_revision,
+      );
+    })();
+    return this.sessionTeamRevision(session.workspace_session_id, proposal.revision);
+  }
+
+  rejectSessionTeamChange(sessionOrRunId, revision) {
+    const proposal = this.sessionTeamRevision(sessionOrRunId, revision);
+    if (!proposal) throw new Error("Session Team change was not found");
+    if (proposal.status === "rejected") return proposal;
+    if (proposal.status !== "proposed") {
+      const error = new Error("Session Team change is no longer pending");
+      error.code = "COLLABORATION_TEAM_REVISION_CONFLICT";
+      throw error;
+    }
+    const rejectedAt = iso(this.now());
+    this.db.prepare(`
+      UPDATE collaboration_workspace_session_revisions
+      SET status = 'rejected', rejected_at = ?
+      WHERE workspace_session_id = ? AND revision = ? AND status = 'proposed'
+    `).run(rejectedAt, proposal.workspace_session_id, proposal.revision);
+    return this.sessionTeamRevision(proposal.workspace_session_id, proposal.revision);
+  }
+
+  applySessionTeamToRun(runId, team, revision) {
+    const { run, normalized } = this.validateSessionTeamForRun(runId, team);
+    const nextIds = new Set(normalized.participants.map((item) => item.participant_id));
+    const updatedAt = iso(this.now());
+    this.db.transaction(() => {
+      const update = this.db.prepare(`
+        UPDATE collaboration_agents SET
+          runtime = ?, device_id = ?, workspace_id = ?, provider = ?, model = ?,
+          permission_profile = ?, approval_policy_id = ?, responsibilities_json = ?,
+          display_name = ?, role_hint = ?, planner = ?, sort_order = ?,
+          native_session_id = ?, conversation_id = ?, updated_at = ?
+        WHERE run_id = ? AND role = ?
+      `);
+      const insert = this.db.prepare(`
+        INSERT INTO collaboration_agents(
+          agent_id, run_id, role, runtime, device_id, workspace_id, provider, model,
+          permission_profile, approval_policy_id, responsibilities_json, display_name,
+          role_hint, planner, sort_order, native_session_id, conversation_id,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const [index, participant] of normalized.participants.entries()) {
+        const existing = run.agents[participant.participant_id];
+        const sameBoundary = existing
+          && existing.runtime === participant.runtime
+          && existing.device_id === participant.device_id
+          && (existing.workspace_id || "") === participant.workspace_id
+          && (existing.provider || "") === participant.provider
+          && (existing.model || "") === participant.model
+          && (existing.permission_profile || "") === participant.permission_profile
+          && (existing.approval_policy_id || "") === participant.approval_policy_id;
+        const nativeSessionId = sameBoundary
+          ? (existing.native_session_id || participant.native_session_id)
+          : "";
+        const conversationId = sameBoundary
+          ? (existing.conversation_id || participant.conversation_id)
+          : "";
+        if (existing) {
+          update.run(
+            participant.runtime, participant.device_id, participant.workspace_id,
+            participant.provider, participant.model, participant.permission_profile,
+            participant.approval_policy_id, JSON.stringify(participant.role_hint ? [participant.role_hint] : []),
+            participant.display_name, participant.role_hint, participant.planner ? 1 : 0,
+            index, nativeSessionId, conversationId, updatedAt, runId, participant.participant_id,
+          );
+        } else {
+          insert.run(
+            id("agent"), runId, participant.participant_id, participant.runtime,
+            participant.device_id, participant.workspace_id, participant.provider,
+            participant.model, participant.permission_profile, participant.approval_policy_id,
+            JSON.stringify(participant.role_hint ? [participant.role_hint] : []),
+            participant.display_name, participant.role_hint, participant.planner ? 1 : 0,
+            index, participant.native_session_id, participant.conversation_id,
+            updatedAt, updatedAt,
+          );
+        }
+      }
+      for (const role of Object.keys(run.agents)) {
+        if (!nextIds.has(role)) {
+          this.db.prepare("DELETE FROM collaboration_agents WHERE run_id = ? AND role = ?")
+            .run(runId, role);
+        }
+      }
+      const planner = normalized.participants.find((item) => item.planner)
+        || normalized.participants[0];
+      this.db.prepare(`
+        UPDATE collaboration_runs
+        SET team_revision = ?, planner_role = ?, supervisor_permission_profile = ?,
+            supervisor_policy_id = ?, budget_json = ?, updated_at = ?, revision = revision + 1
+        WHERE run_id = ?
+      `).run(
+        Math.max(1, Number(revision) || 1), planner.participant_id,
+        normalized.supervisor_permission_profile, normalized.supervisor_policy_id,
+        JSON.stringify(normalized.budget), updatedAt, runId,
+      );
+    })();
+    return this.getRun(runId);
+  }
+
+  validateSessionTeamForRun(runId, team) {
+    const run = this.getRun(runId, { includeMessages: false });
+    if (!run) throw new Error("collaboration run not found");
+    const normalized = normalizeSessionTeam(team);
+    const nextIds = new Set(normalized.participants.map((item) => item.participant_id));
+    for (const [role, agent] of Object.entries(run.agents)) {
+      if (!nextIds.has(role) && agent.current_task_id) {
+        const error = new Error(`cannot remove active Session participant '${role}'`);
+        error.code = "COLLABORATION_TEAM_MEMBER_ACTIVE";
+        throw error;
+      }
+    }
+    for (const participant of normalized.participants) {
+      const existing = run.agents[participant.participant_id];
+      const sameBoundary = existing
+        && existing.runtime === participant.runtime
+        && existing.device_id === participant.device_id
+        && (existing.workspace_id || "") === participant.workspace_id
+        && (existing.provider || "") === participant.provider
+        && (existing.model || "") === participant.model
+        && (existing.permission_profile || "") === participant.permission_profile
+        && (existing.approval_policy_id || "") === participant.approval_policy_id;
+      if (existing?.current_task_id && !sameBoundary) {
+        const error = new Error(`cannot change active Session participant '${participant.participant_id}'`);
+        error.code = "COLLABORATION_TEAM_MEMBER_ACTIVE";
+        throw error;
+      }
+    }
+    return { run, normalized };
   }
 
   listRunPage({
@@ -929,7 +1517,9 @@ export class CollaborationStore {
       role,
     );
     this.touchRun(runId, updatedAt);
-    return this.getRun(runId, { includeMessages: false }).agents[role];
+    const updated = this.getRun(runId, { includeMessages: false }).agents[role];
+    this.syncWorkspaceSessionAgent(runId, role);
+    return updated;
   }
 
   setAdaptivePlan(runId, plan) {
@@ -1890,6 +2480,21 @@ export class CollaborationStore {
           updated_at = ?, revision = revision + 1
       WHERE run_id = ?
     `).run(profile, policyId, updatedAt, safeText(runId, 195));
+    const session = run.workspace_session_id ? this.getWorkspaceSession(run.workspace_session_id) : null;
+    if (session?.team) {
+      const team = {
+        ...session.team,
+        supervisor_permission_profile: profile,
+        supervisor_policy_id: policyId,
+      };
+      assertNoSecretFields(team);
+      this.db.prepare(`
+        UPDATE collaboration_workspace_sessions
+        SET team_json = ?, supervisor_permission_profile = ?,
+            supervisor_policy_id = ?, updated_at = ?
+        WHERE workspace_session_id = ?
+      `).run(JSON.stringify(team), profile, policyId, updatedAt, session.workspace_session_id);
+    }
     this.recordExecutionEvent(runId, {
       type: "approval.session_policy_changed",
       category: "approval",

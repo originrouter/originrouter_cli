@@ -4,6 +4,7 @@ import {
   ADAPTIVE_TEMPLATE_ID,
   buildPlannerPrompt,
   parsePlannerOutput,
+  sessionTurnPrompt,
   taskPrompt,
 } from "./adaptivePlan.js";
 import { browseAgentWorkspaces } from "../daemon/workspaceBrowser.js";
@@ -361,7 +362,7 @@ export class CollaborationRuntime {
       throw error;
     }
     const normalizedAction = safeText(action, 32);
-    if (!["list", "delegate", "status"].includes(normalizedAction)) {
+    if (!["list", "delegate", "status", "team_change"].includes(normalizedAction)) {
       const error = new Error("Unsupported Agent MCP gateway action.");
       error.code = "COLLABORATION_MCP_ACTION_INVALID";
       throw error;
@@ -448,6 +449,8 @@ export class CollaborationRuntime {
     if (action === "list") {
       return {
         run_id: run.run_id,
+        workspace_session_id: run.workspace_session_id,
+        team_revision: run.team_revision,
         source_participant_id: sourceRole,
         participants: Object.entries(run.agents)
           .filter(([role]) => role !== sourceRole)
@@ -456,9 +459,129 @@ export class CollaborationRuntime {
             display_name: agent.display_name || role,
             runtime: agent.runtime,
             device_id: agent.device_id,
+            workspace_id: agent.workspace_id || "",
+            route_label: agent.provider && agent.model
+              ? `${agent.provider}/${agent.model}`
+              : (agent.model || agent.provider || "device-default"),
+            permission_profile: agent.permission_profile || "guarded",
+            approval_policy_id: agent.approval_policy_id || "",
             status: agent.status,
             role_hint: agent.role_hint || "",
+            capabilities: agent.responsibilities || [],
           })),
+      };
+    }
+    if (action === "team_change") {
+      const session = this.store.getWorkspaceSession(run.workspace_session_id);
+      if (!session?.team) {
+        const error = new Error("The Workspace Session Team is unavailable.");
+        error.code = "COLLABORATION_SESSION_TEAM_UNAVAILABLE";
+        throw error;
+      }
+      const operation = safeText(payload.operation, 16).toLowerCase();
+      const reason = safeText(payload.reason, 2048);
+      if (!reason) {
+        const error = new Error("A reason is required for a Session Team change.");
+        error.code = "COLLABORATION_TEAM_CHANGE_REASON_REQUIRED";
+        throw error;
+      }
+      const participants = session.team.participants.map((item) => ({ ...item }));
+      const participantInput = payload.participant && typeof payload.participant === "object"
+        ? payload.participant
+        : null;
+      const participantId = safeText(
+        participantInput?.participant_id ?? participantInput?.participantId
+          ?? payload.participant_id ?? payload.participantId,
+        32,
+      ).toLowerCase();
+      const currentIndex = participants.findIndex((item) => item.participant_id === participantId);
+      const currentAgent = run.agents?.[participantId];
+      if (operation === "add") {
+        if (!participantInput || !participantId || currentIndex >= 0) {
+          const error = new Error("An unused participant definition is required to add a Team member.");
+          error.code = "COLLABORATION_TEAM_CHANGE_PARTICIPANT_INVALID";
+          throw error;
+        }
+        participants.push({ ...participantInput, participant_id: participantId, planner: false });
+      } else if (operation === "replace") {
+        if (!participantInput || currentIndex < 0 || participantId === sourceRole || currentAgent?.current_task_id) {
+          const error = new Error("Choose an existing, inactive participant other than the requesting Agent.");
+          error.code = "COLLABORATION_TEAM_CHANGE_PARTICIPANT_INVALID";
+          throw error;
+        }
+        participants[currentIndex] = {
+          ...participantInput,
+          participant_id: participantId,
+          planner: participants[currentIndex].planner === true,
+        };
+      } else if (operation === "remove") {
+        if (currentIndex < 0 || participantId === sourceRole || participants.length <= 1
+            || currentAgent?.current_task_id || currentAgent?.planner) {
+          const error = new Error("Choose a removable participant other than the requesting Agent.");
+          error.code = "COLLABORATION_TEAM_CHANGE_PARTICIPANT_INVALID";
+          throw error;
+        }
+        participants.splice(currentIndex, 1);
+      } else {
+        const error = new Error("Team change operation must be add, replace, or remove.");
+        error.code = "COLLABORATION_TEAM_CHANGE_OPERATION_INVALID";
+        throw error;
+      }
+      const proposedDeviceId = safeText(
+        participants.find((item) => item.participant_id === participantId)?.device_id,
+        191,
+      );
+      if (operation !== "remove" && proposedDeviceId !== this.deviceId && proposedDeviceId !== "local") {
+        if (!this.relayClient?.currentPeer) {
+          const error = new Error("The proposed device cannot be verified against the trusted E2EE directory.");
+          error.code = "COLLABORATION_TEAM_DEVICE_UNVERIFIED";
+          throw error;
+        }
+        await this.relayClient.currentPeer(proposedDeviceId);
+      }
+      const nextTeam = { ...session.team, participants };
+      const proposal = this.store.proposeSessionTeamChange(run.workspace_session_id, {
+        team: nextTeam,
+        reason,
+        sourceRunId: run.run_id,
+      });
+      const before = session.team.participants.find((item) => item.participant_id === participantId) || null;
+      const after = proposal.team.participants.find((item) => item.participant_id === participantId) || null;
+      const attention = this.store.createAttention(run.run_id, {
+        taskId: sourceTaskId,
+        participantId: sourceRole,
+        kind: "team_change",
+        title: `Confirm Session Team revision ${proposal.revision}`,
+        summary: reason,
+        risk: "high",
+        actions: ["confirm_team_change", "reject_team_change"],
+        payload: {
+          workspace_session_id: run.workspace_session_id,
+          current_revision: session.team_revision,
+          proposed_revision: proposal.revision,
+          operation,
+          participant_id: participantId,
+          before,
+          after,
+          reason,
+        },
+        idempotencyKey: `team-change:${proposal.revision}`,
+      });
+      this.store.recordExecutionEvent(run.run_id, {
+        type: "team.change_requested",
+        taskId: sourceTaskId,
+        participantId: sourceRole,
+        severity: "warning",
+        summary: `Session Team revision ${proposal.revision} requires user confirmation.`,
+        detail: reason,
+        payload: { operation, participant_id: participantId, proposed_revision: proposal.revision },
+        idempotencyKey: `team-change-requested:${proposal.revision}`,
+      });
+      return {
+        status: "awaiting_user_confirmation",
+        attention_id: attention.attention_id,
+        proposed_revision: proposal.revision,
+        message: "The Team boundary was not changed. Stop this turn and wait for the user to confirm or reject the proposal.",
       };
     }
     if (action === "status") {
@@ -1013,6 +1136,14 @@ export class CollaborationRuntime {
       error.code = "COLLABORATION_ATTENTION_ACTION_INVALID";
       throw error;
     }
+    const expectedAttentionRevision = Number(
+      input.expected_revision ?? input.expectedRevision ?? item.revision,
+    );
+    if (expectedAttentionRevision !== Number(item.revision)) {
+      const error = new Error("collaboration attention item changed; refresh and try again");
+      error.code = "COLLABORATION_ATTENTION_REVISION_CONFLICT";
+      throw error;
+    }
     const approvalOption = action.startsWith("allow_option:")
       ? action.slice("allow_option:".length)
       : "";
@@ -1062,6 +1193,59 @@ export class CollaborationRuntime {
         );
       } else {
         await this.dispatchForState(runId, { recovery: true, resetAgentIdentity: true });
+      }
+      return resolved;
+    }
+    if (item.kind === "team_change") {
+      const revision = Number(item.payload?.proposed_revision || 0);
+      const sourceRole = item.participant_id || run.planner_role;
+      let proposal;
+      if (action === "confirm_team_change") {
+        const pending = this.store.sessionTeamRevision(run.workspace_session_id, revision);
+        if (!pending || pending.status !== "proposed") {
+          const error = new Error("Session Team change is stale; refresh and try again");
+          error.code = "COLLABORATION_TEAM_REVISION_CONFLICT";
+          throw error;
+        }
+        this.store.validateSessionTeamForRun(runId, pending.team);
+        proposal = this.store.confirmSessionTeamChange(run.workspace_session_id, revision);
+        this.store.applySessionTeamToRun(runId, proposal.team, proposal.revision);
+      } else {
+        proposal = this.store.rejectSessionTeamChange(run.workspace_session_id, revision);
+      }
+      const resolved = this.store.resolveAttention(runId, attentionId, {
+        ...input,
+        resolution: action,
+      });
+      this.store.recordExecutionEvent(runId, {
+        type: action === "confirm_team_change" ? "team.change_confirmed" : "team.change_rejected",
+        taskId: item.task_id,
+        participantId: sourceRole,
+        summary: action === "confirm_team_change"
+          ? `Session Team revision ${revision} was confirmed.`
+          : `Session Team revision ${revision} was rejected.`,
+        payload: { proposed_revision: revision, resolution: action },
+        idempotencyKey: `team-change-resolved:${revision}:${action}`,
+      });
+      let refreshed = this.store.getRun(runId);
+      const source = refreshed.agents?.[sourceRole];
+      const sourceTask = refreshed.tasks.find((task) => task.task_id === item.task_id);
+      if (refreshed.state === "blocked") {
+        refreshed = this.store.transition(runId, "executing");
+      }
+      if (!source?.current_task_id && sourceTask?.state === "completed") {
+        this.store.addAdaptiveTask(runId, {
+          taskKey: `team_change_resume_${revision}`,
+          participantId: sourceRole,
+          sourceParticipantId: "user",
+          title: action === "confirm_team_change" ? "Continue with updated Session Team" : "Continue without Team change",
+          instructions: action === "confirm_team_change"
+            ? `The user confirmed Session Team revision ${revision}. Re-check list_participants, continue the current objective within the updated boundary, and return the final answer.`
+            : `The user rejected Session Team revision ${revision}. Continue within the existing Team if possible; otherwise explain the remaining boundary clearly.`,
+          mode: "discussion",
+          deliverable: "The final answer for the current user objective.",
+        });
+        await this.dispatchForState(runId);
       }
       return resolved;
     }
@@ -1175,11 +1359,37 @@ export class CollaborationRuntime {
       return this.store.getRun(run.run_id);
     }
     if (run.state !== "executing") return run;
+    if (run.session_continuation) {
+      const sessionTask = run.tasks.find((task) => task.task_key === "__session_turn__");
+      const coordinator = run.agents?.[run.planner_role];
+      if (!sessionTask || !coordinator) throw new Error("Session coordinator is unavailable");
+      if (sessionTask.state !== "completed" && !coordinator.current_task_id) {
+        if (sessionTask.state !== "active") {
+          this.store.updateAdaptiveTask(run.run_id, sessionTask.task_key, { state: "active" });
+        }
+        const current = this.store.getRun(run.run_id);
+        await this.dispatch(current, run.planner_role, sessionTurnPrompt(current, sessionTask), {
+          taskId: sessionTask.task_id,
+          taskKey: sessionTask.task_key,
+          phase: "session_turn",
+          retry: recovery,
+          resetAgentIdentity,
+        });
+        return this.store.getRun(run.run_id);
+      }
+    }
     const tasks = this.store.runnableAdaptiveTasks(run.run_id);
     if (tasks.length === 0) {
       const current = this.store.getRun(run.run_id);
       const remaining = current.tasks.filter((task) => task.task_key !== "__planner__" && task.state !== "completed");
       if (remaining.length === 0) {
+        const teamChange = this.store.listAttention(run.run_id)
+          .find((item) => item.kind === "team_change");
+        if (teamChange) {
+          return this.store.transition(run.run_id, "blocked", {
+            taskPhase: "team_change_review",
+          });
+        }
         return this.store.transition(run.run_id, "completed");
       }
       return current;
@@ -2586,6 +2796,13 @@ export class CollaborationRuntime {
     const current = this.store.getRun(run.run_id);
     const remaining = current.tasks.filter((item) => item.task_key !== "__planner__" && item.state !== "completed");
     if (remaining.length === 0) {
+      const teamChange = this.store.listAttention(run.run_id)
+        .find((item) => item.kind === "team_change");
+      if (teamChange) {
+        this.store.transition(run.run_id, "blocked", { taskPhase: "team_change_review" });
+        void this.syncRun(run.run_id);
+        return;
+      }
       const completed = this.store.transition(run.run_id, "completed");
       this.stopLocalRunSessions(completed);
       void this.syncRun(run.run_id);
@@ -2641,6 +2858,10 @@ export class CollaborationRuntime {
       await this.relayClient.send("collaboration.run.project", {
         sourceDeviceId: this.deviceId,
         runId: run.run_id,
+        workspaceSessionId: run.workspace_session_id || "",
+        continuedFromRunId: run.continued_from_run_id || "",
+        teamRevision: Number(run.team_revision || 0),
+        sessionContinuation: run.session_continuation === true,
         templateId: run.template_id,
         workflowTemplateId: run.workflow_template_id,
         workspaceMode: run.workspace_mode,

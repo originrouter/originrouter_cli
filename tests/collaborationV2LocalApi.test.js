@@ -33,6 +33,22 @@ const base = `http://127.0.0.1:${handle.port}`;
 const headers = { Authorization: `Bearer ${token}` };
 
 try {
+  const sessionResponse = await fetch(
+    `${base}/collaboration/local/sessions/${encodeURIComponent(created.workspace_session_id)}`,
+    { headers },
+  );
+  assert.equal(sessionResponse.status, 200);
+  const sessionPayload = await sessionResponse.json();
+  assert.equal(sessionPayload.session.workspace_session_id, created.workspace_session_id);
+  assert.equal(sessionPayload.session.latest_run_id, created.run_id);
+  assert.equal(sessionPayload.latest_snapshot.run.run_id, created.run_id);
+
+  const runAsSessionResponse = await fetch(
+    `${base}/collaboration/local/sessions/${encodeURIComponent(created.run_id)}`,
+    { headers },
+  );
+  assert.equal(runAsSessionResponse.status, 400);
+
   const modeCreateResponse = await fetch(`${base}/collaboration/local/runs`, {
     method: "POST",
     headers: { ...headers, "Content-Type": "application/json" },

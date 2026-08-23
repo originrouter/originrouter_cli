@@ -1,5 +1,5 @@
 const ALLOWED = Object.freeze({
-  created: new Set(["designing", "researching", "cancelled"]),
+  created: new Set(["designing", "executing", "researching", "cancelled"]),
   designing: new Set(["awaiting_plan_confirmation", "waiting_input", "cancelled", "failed"]),
   awaiting_plan_confirmation: new Set(["executing", "cancelled", "failed"]),
   executing: new Set(["completed", "waiting_approval", "waiting_input", "waiting_device", "blocked", "cancelled", "failed"]),
@@ -36,6 +36,9 @@ export class PlanImplementVerifyCoordinator {
     const run = this.store.getRun(runId, { includeMessages: false });
     if (!run) throw new Error("collaboration run not found");
     if (run.template_id === "adaptive_collaboration") {
+      if (run.session_continuation) {
+        return this.move(runId, "executing", { taskState: "active", taskPhase: "session_turn" });
+      }
       return this.move(runId, "designing", { taskState: "active", taskPhase: "plan_design" });
     }
     return this.move(runId, "researching", { taskState: "active", taskPhase: "research" });

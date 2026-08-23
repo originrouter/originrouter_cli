@@ -146,8 +146,26 @@ originrouter remote setup --providers openai,anthropic \
 ## Agent Workspace
 
 Agent Workspace 让用户始终停留在 OriginRouter 中，由 daemon 在后台运行受管
-的 Codex 或 Claude 会话。计划、任务、审批、预算、消息与结果都会归属于同一个
-可持久化的协作 Run。
+的 Codex 或 Claude 会话。一个长期 Workspace Session 可以包含多个有限 Run；
+每次用户目标都有独立的任务、审批、预算、审计与最终结果，但完成一个 Run 不会
+结束整个对话。继续输入目标会留在当前 Session，`/new` 才会建立新的团队与上下文。
+
+重新打开 Workspace 后使用 `/resume <session-id>`。Session 历史严格按顺序推进；
+单个 Run ID 仍可用于查看、重试和审计，但不能作为历史分支的继续点。
+
+新 Session 的第一条目标负责选择 Team 并生成可审查计划。后续目标直接交给当前
+主 Agent，由它通过 Agent MCP gateway 自行决定是否调用现有成员，不会每次重新
+自动配置团队。如果需要新增机器、目录、runtime、模型或扩大权限，主 Agent 必须
+发起版本化 Team 变更；Workspace 会显示具体差异并等待本机用户确认，确认前新成员
+不能执行任务。未变化成员会跨 Run 保留安全的原生会话连续性。
+
+Session Team 只保存在协调端 CLI 的本地协作数据库中。跨设备派发与 Agent MCP
+通信继续使用现有已认证的 E2EE Relay/Server bridge；服务端只路由密文与在线状态，
+不保存 Team 或原生 Agent 凭据。为了让 App 能按 Session 展示与继续任务，账户投影
+只保存无敏感内容的连续性标识：`workspace_session_id`、前一 Run ID、Team revision
+编号与 continuation 标记。部署时先执行
+`originrouter_server/sql/024_collaboration_workspace_session_projection.sql`，
+再升级 Server、所有参与协作的 CLI，最后升级 App。
 
 可以通过 `--mode` 选择协作模式，也可以在交互式工作区中使用
 `/mode <名称>` 或 Shift+Tab 切换。

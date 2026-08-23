@@ -490,6 +490,10 @@ projectionRuntime.deviceId = "device-a";
 projectionRuntime.store = {
   getRun: () => ({
     run_id: "run-projection",
+    workspace_session_id: "workspace-session-projection",
+    continued_from_run_id: "run-projection-previous",
+    team_revision: 3,
+    session_continuation: true,
     template_id: "plan_implement_verify",
     workflow_template_id: "plan_implement_verify",
     workspace_mode: "shared",
@@ -505,6 +509,19 @@ projectionRuntime.store = {
     finished_at: null,
   }),
 };
+let projectionPayload = null;
+projectionRuntime.relayClient = {
+  async send(type, payload) {
+    assert.equal(type, "collaboration.run.project");
+    projectionPayload = payload;
+  },
+};
+assert.equal(await projectionRuntime.syncRun("run-projection"), true);
+assert.equal(projectionPayload.workspaceSessionId, "workspace-session-projection");
+assert.equal(projectionPayload.continuedFromRunId, "run-projection-previous");
+assert.equal(projectionPayload.teamRevision, 3);
+assert.equal(projectionPayload.sessionContinuation, true);
+
 projectionRuntime.relayClient = {
   async send() {
     const error = new Error("Unauthorized");

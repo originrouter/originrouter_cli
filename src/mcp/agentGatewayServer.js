@@ -83,6 +83,27 @@ export async function runAgentGatewayMcpServer(args = process.argv.slice(2)) {
     inputSchema: {},
   }, async () => toolResult(() => gatewayRequest(sessionId, "list")));
 
+  server.registerTool("request_team_change", {
+    description: "Request a versioned change to the persistent Workspace Session Team. This never changes devices, workspaces, runtimes, models, or permissions until the user explicitly confirms it in OriginRouter.",
+    inputSchema: {
+      operation: z.enum(["add", "replace", "remove"]),
+      reason: z.string().min(1).max(2_048),
+      participant_id: z.string().min(1).max(32).optional(),
+      participant: z.object({
+        participant_id: z.string().min(1).max(32),
+        display_name: z.string().max(80).optional(),
+        runtime: z.enum(["claude", "codex"]),
+        device_id: z.string().min(1).max(191),
+        workspace_id: z.string().max(191).optional(),
+        provider: z.string().max(191).optional(),
+        model: z.string().max(191).optional(),
+        permission_profile: z.string().max(64).optional(),
+        approval_policy_id: z.string().max(64).optional(),
+        role_hint: z.string().max(2_000).optional(),
+      }).optional(),
+    },
+  }, async (input) => toolResult(() => gatewayRequest(sessionId, "team_change", input)));
+
   server.registerTool("delegate_task", {
     description: "Delegate a typed child task to another Agent in this OriginRouter collaboration. Returns immediately with a task id; use get_task_result to check it.",
     inputSchema: {
