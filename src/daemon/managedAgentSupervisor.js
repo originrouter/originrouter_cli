@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureStateDir } from "../persistence/state.js";
 import {
@@ -9,6 +10,10 @@ import {
   aiReviewPolicyFromPayload,
   encodeAiReviewPolicyEnvironment,
 } from "../runtime/aiReviewPolicy.js";
+import {
+  assessRegisteredWorkspaceForUnattended,
+  requireRemoteWorkspacePathPreflight,
+} from "../runtime/unattendedWorkspaceReadiness.js";
 
 const AGENTS = new Set(["claude", "codex"]);
 const PERMISSION_PROFILES = new Set([
@@ -133,6 +138,19 @@ export class ManagedAgentSupervisor {
     if (!workspaceReference) {
       throw launchError("WORKSPACE_REQUIRED", "A trusted workspace is required.");
     }
+    // A raw path delivered from another device must be classified before any
+    // catalog lookup can resolve or stat it. A workspace id is safe to look up
+    // as metadata only and is checked below once its canonical path is known.
+    if (isAbsolute(workspaceReference)) {
+      try {
+        requireRemoteWorkspacePathPreflight(workspaceReference);
+      } catch (error) {
+        throw launchError(
+          error?.code || "WORKSPACE_UNATTENDED_UNAVAILABLE",
+          error?.message || "The workspace requires local authorization before remote use.",
+        );
+      }
+    }
     if (Boolean(resumeConversationId) !== Boolean(nativeSessionId)) {
       throw launchError(
         "INVALID_RESUME_REQUEST",
@@ -178,6 +196,22 @@ export class ManagedAgentSupervisor {
       throw launchError(
         "WORKSPACE_NOT_TRUSTED",
         "The requested workspace has not been trusted for remote Agent launches.",
+      );
+    }
+    // A detached collaboration cannot answer an OS privacy or credential
+    // dialog. Refuse before spawn so the remote controller gets a useful,
+    // recoverable error rather than a Run that appears to be frozen.
+    try {
+      const readiness = assessRegisteredWorkspaceForUnattended(workspace);
+      if (!readiness.remote_eligible) {
+        const error = new Error(`${readiness.summary} ${readiness.action}`);
+        error.code = readiness.code;
+        throw error;
+      }
+    } catch (error) {
+      throw launchError(
+        error?.code || "WORKSPACE_UNATTENDED_UNAVAILABLE",
+        error?.message || "The workspace is not available for unattended execution.",
       );
     }
     let resumeConversation = null;

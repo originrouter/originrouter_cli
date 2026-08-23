@@ -567,14 +567,24 @@ async function chooseWorkspace(
   preferredWorkspaceId = "",
   backStep = null,
 ) {
-  const workspaces = capabilities.trusted_workspaces || [];
+  const allWorkspaces = capabilities.trusted_workspaces || [];
+  const workspaces = allWorkspaces.filter(
+    (workspace) => workspace?.unattended_execution?.remote_eligible !== false,
+  );
+  const unavailableCount = allWorkspaces.length - workspaces.length;
   const options = [
     ...workspaces.map((workspace) => ({
       label: workspace.display_name || workspace.canonical_path,
       description: workspace.canonical_path,
       workspace,
     })),
-    { label: "Enter another folder path", custom: true },
+    {
+      label: "Enter another folder path",
+      description: unavailableCount
+        ? `${unavailableCount} trusted folder(s) are unavailable for unattended execution; choose a local development folder instead.`
+        : "The folder must be suitable for unattended execution on the selected device.",
+      custom: true,
+    },
   ];
   const preferredIndex = workspaces.findIndex((workspace) => (
     workspace.workspace_id === preferredWorkspaceId
@@ -597,6 +607,12 @@ async function chooseWorkspace(
     `/collaboration/devices/${encodeURIComponent(device.deviceId)}/workspaces/trust`,
     { method: "POST", body: { path } },
   );
+  const readiness = data.workspace?.unattended_execution;
+  if (readiness?.remote_eligible === false) {
+    const error = new Error(`${readiness.summary || "This workspace is unavailable for unattended execution."} ${readiness.action || ""}`.trim());
+    error.code = readiness.code || "WORKSPACE_UNATTENDED_UNAVAILABLE";
+    throw error;
+  }
   return data.workspace.workspace_id || data.workspace.canonical_path;
 }
 
@@ -1888,13 +1904,35 @@ function collaborationFollowReconnectExhaustedError(runId, cause) {
 }
 
 export async function controlCollaborationRun(runId, action, { signal, body = {} } = {}) {
-  if (!new Set(["start", "confirm", "pause", "resume", "cancel", "retry"]).has(action)) {
+  if (!new Set(["start", "confirm", "pause", "resume", "cancel", "retry", "approval"]).has(action)) {
     throw new Error(`Unsupported collaboration control '${action}'.`);
   }
   return (await request(
     `/collaboration/local/runs/${encodeURIComponent(runId)}/${action}`,
     { method: "POST", body, signal },
   )).run;
+}
+
+export async function listAgentWorkspaceCollaborationRuns({
+  category = "recent",
+  limit = 12,
+  requestFn = request,
+} = {}) {
+  const normalizedCategory = String(category || "recent").toLowerCase();
+  if (!["all", "attention", "active", "recent"].includes(normalizedCategory)) {
+    throw new Error("Run category must be all, attention, active, or recent.");
+  }
+  const query = new URLSearchParams({
+    category: normalizedCategory,
+    page: "1",
+    page_size: String(Math.max(1, Math.min(50, Number(limit) || 12))),
+  });
+  const page = await requestFn(`/collaboration/local/runs?${query}`);
+  return {
+    category: normalizedCategory,
+    runs: Array.isArray(page?.runs) ? page.runs : [],
+    total: Math.max(0, Number(page?.total) || 0),
+  };
 }
 
 async function followAgentWorkspaceCollaboration({
@@ -2084,6 +2122,8 @@ export async function runAgentWorkspaceCollaboration({
   automaticCreatePayloadFn = automaticCreatePayload,
   presetConfiguration = null,
   continuedFromRunId = "",
+  supervisorPermissionProfile = "",
+  supervisorPolicyId = "",
   workspaceSelections = {},
   deviceSelections = [],
 } = {}) {
@@ -2110,7 +2150,16 @@ export async function runAgentWorkspaceCollaboration({
         workspaceSelections,
         deviceSelections,
       });
-  payload.supervisor_permission_profile = payload.supervisor_permission_profile || "guarded";
+  payload.supervisor_permission_profile = supervisorPermissionProfile
+    || payload.supervisor_permission_profile
+    || "guarded";
+  if (payload.supervisor_permission_profile === "custom") {
+    payload.supervisor_policy_id = supervisorPolicyId
+      || payload.supervisor_policy_id
+      || "protected";
+  } else {
+    delete payload.supervisor_policy_id;
+  }
   throwIfAborted(signal);
   onUpdate({ type: "configuration", payload });
   const configurationSafe = payload.auto_configuration?.safe_to_skip_confirmation === true
@@ -2282,17 +2331,58 @@ async function resolveAttentionCommand(runId, attentionId, args) {
         : `The derived attention action '${action}' is not available from this CLI version.`,
     );
   }
+  const interactionKind = String(item.payload?.kind || item.kind || "input");
+  const needsText = ["input", "questions", "form"].includes(interactionKind);
   let reply = String(value(args, "text") || "").trim();
-  if (item.kind === "input" && action === "submit" && !reply && input.isTTY && output.isTTY) {
+  if (needsText && action === "submit" && !reply && input.isTTY && output.isTTY) {
     const prompt = createInterface({ input, output });
     try {
-      reply = await askRequired(prompt, "Reply to the Agent");
+      reply = await askRequired(
+        prompt,
+        interactionKind === "questions"
+          ? "Answers (JSON keyed by question ID)"
+          : interactionKind === "form"
+            ? "Form values (JSON)"
+            : "Reply to the Agent",
+      );
     } finally {
       prompt.close();
     }
   }
-  if (item.kind === "input" && action === "submit" && !reply) {
-    throw new Error("This input request requires --text <reply>.");
+  if (needsText && action === "submit" && !reply) {
+    throw new Error(interactionKind === "input"
+      ? "This input request requires --text <reply>."
+      : `This ${interactionKind} request requires --text with a JSON response.`);
+  }
+  let response = {};
+  if (reply) {
+    if (interactionKind === "questions") {
+      const questions = (item.payload?.request?.questions || []).filter((question) => !question.requires_local_entry);
+      if ((item.payload?.request?.questions || []).some((question) => question.requires_local_entry)) {
+        throw new Error("Sensitive question answers must be entered on the executing device.");
+      }
+      let answers;
+      if (questions.length === 1 && !reply.startsWith("{")) answers = { [questions[0]?.id]: [reply] };
+      else {
+        try { answers = JSON.parse(reply); } catch { throw new Error("Question answers must be valid JSON keyed by question ID."); }
+      }
+      if (!answers || typeof answers !== "object" || Array.isArray(answers)) {
+        throw new Error("Question answers must be a JSON object keyed by question ID.");
+      }
+      response = { answers };
+    } else if (interactionKind === "form") {
+      if ((item.payload?.request?.form_fields || []).some((field) => field.requires_local_entry)) {
+        throw new Error("Sensitive form values must be entered on the executing device.");
+      }
+      let values;
+      try { values = JSON.parse(reply); } catch { throw new Error("Form values must be valid JSON."); }
+      if (!values || typeof values !== "object" || Array.isArray(values)) throw new Error("Form values must be a JSON object.");
+      response = { values };
+    } else {
+      response = { text: reply };
+    }
+  } else if (interactionKind === "form") {
+    response = { values: {} };
   }
   await request(
     `/collaboration/local/runs/${encodeURIComponent(runId)}/attention/${encodeURIComponent(attentionId)}/resolve`,
@@ -2301,7 +2391,7 @@ async function resolveAttentionCommand(runId, attentionId, args) {
       body: {
         expected_revision: item.revision,
         action,
-        response: reply ? { text: reply } : {},
+        response,
       },
     },
   );

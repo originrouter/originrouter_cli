@@ -21,6 +21,10 @@ import { DEFAULT_PROXY_PORT, DEFAULT_REMOTE_SHARE_PROXY_PORT } from "../constant
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 import { handleRemoteCodingRequest } from "./remoteCodingServer.js";
 import { protectOriginrouterCodingEnv } from "../runtime/originrouterCodingAuthProxy.js";
+import {
+  assessRegisteredWorkspaceForUnattended,
+  requireRemoteWorkspacePathPreflight,
+} from "../runtime/unattendedWorkspaceReadiness.js";
 import { setAgentDetailDefault } from "../runtime/agentDetailProfile.js";
 import { buildAuditEvidenceBundle } from "../inquiry/auditEvidenceAdapter.js";
 import { AiAuditQueryPlanner } from "../runtime/aiAuditQueryPlanner.js";
@@ -811,12 +815,18 @@ export class SessionManager {
     if (payload.type === "agent.workspace.browse") {
       const requestId = String(payload.requestId || "").slice(0, 96);
       if (!requestId || !this.agentCatalog) return false;
-      browseAgentWorkspaces({
-        path: payload.path,
-        query: payload.query,
-        limit: payload.limit,
-        catalog: this.agentCatalog,
-        deviceId: this.deviceId,
+      Promise.resolve().then(() => {
+        // This request was delivered from another device. Do not even stat or
+        // read a known interactive location here: macOS TCC and mount
+        // credential prompts would be invisible to the remote controller.
+        requireRemoteWorkspacePathPreflight(payload.path);
+        return browseAgentWorkspaces({
+          path: payload.path,
+          query: payload.query,
+          limit: payload.limit,
+          catalog: this.agentCatalog,
+          deviceId: this.deviceId,
+        });
       }).then((page) => this.relayClient.send("agent.workspace.page", {
         requestId,
         ...page,
@@ -832,11 +842,17 @@ export class SessionManager {
     if (payload.type === "agent.workspace.trust") {
       const requestId = String(payload.requestId || "").slice(0, 96);
       if (!requestId || !this.agentCatalog) return false;
-      Promise.resolve().then(() => this.agentCatalog.trustWorkspace(payload.path, {
-        deviceId: this.deviceId,
-      })).then((workspace) => this.relayClient.send("agent.workspace.trust.result", {
+      Promise.resolve().then(() => {
+        requireRemoteWorkspacePathPreflight(payload.path);
+        return this.agentCatalog.trustWorkspace(payload.path, {
+          deviceId: this.deviceId,
+        });
+      }).then((workspace) => this.relayClient.send("agent.workspace.trust.result", {
         requestId,
-        workspace,
+        workspace: {
+          ...workspace,
+          unattended_execution: assessRegisteredWorkspaceForUnattended(workspace),
+        },
       })).catch((error) => this.relayClient.send("agent.workspace.trust.result", {
         requestId,
         error: error.message || "workspace trust failed",

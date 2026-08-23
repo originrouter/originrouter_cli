@@ -310,6 +310,15 @@ export class CodexAppServerClient {
     this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
   }
 
+  respondError(id, code, message) {
+    if (!this.child?.stdin?.writable) return;
+    this.child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      error: { code, message },
+    })}\n`);
+  }
+
   handleLine(line) {
     let message;
     try {
@@ -343,7 +352,7 @@ export class CodexAppServerClient {
     if (typeof message.id === "number" && message.method) {
       this.handleServerRequest(message.id, message.method, message.params || {}).catch((error) => {
         this.eventHandler?.({ type: "codex.approval.error", method: message.method, message: error.message });
-        this.respond(message.id, { decision: "decline" });
+        this.respondError(message.id, -32601, error.message || "Unsupported Codex server request");
       });
       return;
     }

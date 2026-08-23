@@ -109,6 +109,141 @@ assert.ok(registry.commands.some((item) => (
 assert.equal(store.getSnapshot(created.run_id).attention.length, 0);
 registry.emit(leadSession, {
   type: "agent.interaction.requested",
+  eventId: "lead-plan-confirmation",
+  interactionId: "confirm-1",
+  kind: "confirm",
+  title: "Implement this plan?",
+  prompt: "Review this action before continuing.",
+  payload: { plan: "Inspect the current configuration without changing the device." },
+});
+await runtime.queue;
+assert.equal(store.getSnapshot(created.run_id).attention.length, 0, "guarded policy continues a plan confirmation");
+assert.ok(registry.commands.some((item) => (
+  item.sessionId === leadSession
+  && item.command.interactionId === "confirm-1"
+  && item.command.kind === "confirm"
+  && item.command.action === "allow"
+  && item.command.response.policy_evaluated === true
+)));
+registry.emit(leadSession, {
+  type: "agent.interaction.requested",
+  eventId: "lead-questions-request",
+  interactionId: "questions-1",
+  kind: "questions",
+  title: "Choose a verification mode",
+  prompt: "Answer the questions to continue.",
+  payload: {
+    questions: [{
+      id: "mode",
+      header: "Mode",
+      question: "Which verification mode?",
+      options: [{ id: "fast", label: "Fast" }, { id: "full", label: "Full" }],
+    }],
+  },
+});
+await runtime.queue;
+attention = store.getSnapshot(created.run_id).attention;
+assert.equal(attention.length, 1);
+assert.equal(attention[0].kind, "questions");
+assert.equal(attention[0].payload.request.questions[0].id, "mode");
+assert.equal(attention[0].payload.request.questions[0].options[1].label, "Full");
+await runtime.resolveAttention(created.run_id, attention[0].attention_id, {
+  action: "submit",
+  response: { answers: { mode: ["full"] } },
+  expected_revision: attention[0].revision,
+});
+assert.ok(registry.commands.some((item) => (
+  item.command.interactionId === "questions-1"
+  && item.command.response.answers.mode[0] === "full"
+)));
+registry.emit(leadSession, {
+  type: "agent.interaction.requested",
+  eventId: "lead-form-request",
+  interactionId: "form-1",
+  kind: "form",
+  title: "MCP request",
+  prompt: "Choose an account.",
+  payload: {
+    schema: {
+      type: "object",
+      properties: { account: { type: "string", title: "Account" } },
+      required: ["account"],
+    },
+  },
+});
+await runtime.queue;
+attention = store.getSnapshot(created.run_id).attention;
+assert.equal(attention.length, 1);
+assert.equal(attention[0].kind, "form");
+assert.deepEqual(attention[0].payload.request.form_fields, [{
+  name: "account",
+  label: "Account",
+  description: "",
+  type: "string",
+  required: true,
+  requires_local_entry: false,
+  options: [],
+}]);
+await runtime.resolveAttention(created.run_id, attention[0].attention_id, {
+  action: "submit",
+  response: { values: { account: "primary" } },
+  expected_revision: attention[0].revision,
+});
+assert.ok(registry.commands.some((item) => (
+  item.command.interactionId === "form-1"
+  && item.command.response.values.account === "primary"
+)));
+registry.emit(leadSession, {
+  type: "agent.interaction.requested",
+  eventId: "lead-url-request",
+  interactionId: "url-1",
+  kind: "url",
+  title: "MCP authorization",
+  prompt: "Authorize the MCP server in your browser.",
+  payload: { url: "https://example.test/authorize" },
+});
+await runtime.queue;
+attention = store.getSnapshot(created.run_id).attention;
+assert.equal(attention.length, 1);
+assert.equal(attention[0].kind, "url");
+assert.equal(attention[0].payload.request.url, "https://example.test/authorize");
+await runtime.resolveAttention(created.run_id, attention[0].attention_id, {
+  action: "submit",
+  expected_revision: attention[0].revision,
+});
+assert.ok(registry.commands.some((item) => (
+  item.command.interactionId === "url-1"
+  && item.command.action === "submit"
+)));
+registry.emit(leadSession, {
+  type: "agent.interaction.requested",
+  eventId: "lead-risky-approval-request",
+  interactionId: "permission-risky-1",
+  kind: "permission",
+  title: "Bash needs permission",
+  prompt: "Remove the generated build directory before rebuilding.",
+  tool: "Bash",
+  command: "rm -rf ./build",
+  cwd: process.cwd(),
+});
+await runtime.queue;
+attention = store.getSnapshot(created.run_id).attention;
+assert.equal(attention.length, 1);
+assert.equal(attention[0].payload.request.tool, "Bash");
+assert.equal(attention[0].payload.request.command, "rm -rf ./build");
+assert.equal(attention[0].payload.request.cwd, process.cwd());
+assert.equal(attention[0].payload.supervisor_evaluation.effect, "ask");
+assert.equal(attention[0].payload.supervisor_evaluation.session_profile, "guarded");
+assert.deepEqual(
+  attention[0].payload.supervisor_evaluation.layers.map((layer) => layer.name),
+  ["agent", "session"],
+);
+await runtime.resolveAttention(created.run_id, attention[0].attention_id, {
+  action: "deny",
+  expected_revision: attention[0].revision,
+});
+registry.emit(leadSession, {
+  type: "agent.interaction.requested",
   eventId: "lead-safe-approval-request",
   interactionId: "permission-safe-1",
   kind: "permission",

@@ -43,6 +43,8 @@ test("collapsed activity groups operational events without exposing protocol pay
   assert.match(groups[0].summary, /6 explorations/);
   assert.match(groups[0].summary, /4 commands/);
   assert.match(groups[0].summary, /8 permissions handled/);
+  assert.ok(groups[0].details.length > 0, "collapsed groups retain key execution steps");
+  assert.match(groups[0].details[0], /Started rg/);
   assert.doesNotMatch(JSON.stringify(groups), /originrouter_collaboration|secret|protocol/);
 });
 
@@ -59,6 +61,23 @@ test("expanded activity humanizes structured details and deduplicates replayed e
   assert.match(groups[0].details.join("\n"), /status: ok/);
   assert.match(groups[0].details.join("\n"), /path: \/Users\/example\/project/);
   assert.doesNotMatch(groups[0].details.join("\n"), /ignored|\{\"status\"/);
+});
+
+test("one Agent can expand without expanding the other Agent groups", () => {
+  const events = [
+    event(1, "agent.tool_call.start", { participant_id: "coordinator", metadata: { tool: "Read" } }),
+    event(2, "agent.tool_call.end", { participant_id: "coordinator", metadata: { tool: "Read" } }),
+    event(3, "agent.tool_call.start", { participant_id: "remote_operator", metadata: { tool: "Bash" } }),
+    event(4, "agent.text", { participant_id: "remote_operator", detail: "Machine status collected" }),
+  ];
+  const groups = projectCollaborationActivity(events, {
+    expandedParticipantIds: ["remote_operator"],
+    participantLabels: { coordinator: "Coordinator", remote_operator: "Remote Operator" },
+  });
+  assert.equal(groups.length, 2);
+  assert.equal(groups[0].expanded, false);
+  assert.equal(groups[1].expanded, true);
+  assert.match(groups[1].details.join("\n"), /Machine status collected/);
 });
 
 test("warnings and failures remain visible even when they are not Agent activity", () => {

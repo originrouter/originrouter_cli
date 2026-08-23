@@ -46,6 +46,33 @@ assert.equal(snapshot.participants[0].permission_profile, "guarded");
 assert.equal(snapshot.participants[0].approval_policy_id, "protected");
 assert.equal(snapshot.attention.length, 0);
 
+const approvalRevision = snapshot.run.revision;
+store.updateSupervisorApproval(created.run_id, {
+  supervisor_permission_profile: "custom",
+  supervisor_policy_id: "protected",
+});
+snapshot = store.getSnapshot(created.run_id);
+assert.equal(snapshot.run.supervisor_permission_profile, "custom");
+assert.equal(snapshot.run.supervisor_policy_id, "protected");
+assert.ok(snapshot.run.revision > approvalRevision);
+assert.equal(
+  store.listExecutionEvents(created.run_id, { limit: 20 }).at(-1).type,
+  "approval.session_policy_changed",
+);
+assert.throws(
+  () => store.updateSupervisorApproval(created.run_id, {
+    supervisor_permission_profile: "custom",
+  }),
+  (error) => error.code === "COLLABORATION_SESSION_POLICY_REQUIRED",
+);
+
+store.updateSupervisorApproval(created.run_id, {
+  supervisor_permission_profile: "ai_review",
+});
+snapshot = store.getSnapshot(created.run_id);
+assert.equal(snapshot.run.supervisor_permission_profile, "ai_review");
+assert.equal(snapshot.run.supervisor_policy_id, null);
+
 coordinator.start(created.run_id);
 snapshot = store.getSnapshot(created.run_id);
 assert.equal(snapshot.run.state, "planning");

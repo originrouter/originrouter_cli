@@ -15,6 +15,7 @@ const INTERNAL_EVENT_TYPES = new Set([
 ]);
 
 const SIGNIFICANT_EVENT_TYPES = new Set([
+  "approval.session_policy_changed",
   "agent.task.aborted",
   "agent.task.failed",
   "budget.exhausted",
@@ -108,9 +109,28 @@ function eventDetailLine(event) {
   const type = clean(event?.type, 96);
   const detail = safeStructuredDetail(event);
   const tool = clean(event?.metadata?.tool || event?.metadata?.tool_name, 128);
-  if (type === "agent.tool_call.start") return tool ? `Started ${tool}` : "Started an Agent action";
-  if (type === "agent.tool_call.end") return tool ? `Finished ${tool}` : "Finished an Agent action";
-  if (type === "agent.interaction.requested") return sentence(event.summary || "Agent requested a decision");
+  const humanSummary = clean(event?.summary, 600);
+  const genericSummary = !humanSummary || humanSummary === type || humanSummary === type.replaceAll(".", " ");
+  if (type === "agent.tool_call.start") {
+    const action = tool ? `Started ${tool}` : "Started an Agent action";
+    return genericSummary ? action : `${action} · ${humanSummary}`;
+  }
+  if (type === "agent.tool_call.end") {
+    const action = tool ? `Finished ${tool}` : "Finished an Agent action";
+    return genericSummary ? action : `${action} · ${humanSummary}`;
+  }
+  if (type === "agent.task.started") return sentence(humanSummary || detail || "Started the assigned task");
+  if (["agent.task.complete", "agent.task.completed"].includes(type)) {
+    return sentence(humanSummary || detail || "Completed the assigned task");
+  }
+  if (type === "agent.interaction.requested") {
+    const request = event?.payload?.approval_request || {};
+    const requestTool = clean(request?.payload?.display_name || request?.payload?.tool, 128);
+    const requestPrompt = clean(request.prompt, 280);
+    if (requestTool && requestPrompt) return sentence(`${requestTool} needs a decision · ${requestPrompt}`);
+    if (requestTool) return sentence(`${requestTool} needs a decision`);
+    return sentence(genericSummary ? "Agent requested a decision" : humanSummary);
+  }
   if (type === "agent.interaction.result") {
     const action = clean(event?.payload?.action || event?.metadata?.status, 64);
     return action ? `Decision applied: ${action}` : "Agent decision applied";
@@ -123,6 +143,30 @@ function eventDetailLine(event) {
     : `Runtime state updated: ${type.slice("agent.".length).replaceAll(".", " ")}`;
   const summary = clean(event?.summary, 600) || type.replaceAll(".", " ");
   return detail && detail !== summary ? `${summary} · ${detail}` : summary;
+}
+
+function previewDetails(events) {
+  const meaningful = events
+    .filter((event) => event.visibility !== "diagnostic")
+    .filter((event) => !PERMISSION_RESOLUTION_TYPES.has(event.type))
+    .filter((event) => ![
+      "agent.adapter.status",
+      "agent.autonomy.status",
+      "agent.budget.status",
+      "agent.detail.status",
+      "agent.mode.status",
+      "agent.ready",
+      "agent.session_id",
+      "agent.usage",
+      "user.text",
+    ].includes(event.type))
+    .map(eventDetailLine)
+    .map((line) => clean(line, 360))
+    .filter(Boolean)
+    .filter((line, index, lines) => index === 0 || line !== lines[index - 1]);
+  if (meaningful.length <= 3) return meaningful;
+  return [meaningful[0], ...meaningful.slice(-2)]
+    .filter((line, index, lines) => lines.indexOf(line) === index);
 }
 
 function operationalEvent(event) {
@@ -179,16 +223,19 @@ function projectParticipantGroup(events, participantId, labels, expanded) {
         .map(eventDetailLine)
         .filter(Boolean)
         .filter((line, index, lines) => index === 0 || line !== lines[index - 1])
-        .slice(-12)
-    : [];
+        .slice(-16)
+    : previewDetails(events);
   return {
     key: `participant:${participantId || "agent"}`,
+    participantId,
     kind: "activity",
     marker: running ? "active" : "complete",
     title: `${participantLabel(participantId, labels)} ${running ? "is working" : "worked"}`,
     summary: parts.join(" · ") || "Runtime activity grouped",
     details,
     count: events.length,
+    expanded,
+    expandable: events.length > details.length || expanded,
   };
 }
 
@@ -208,9 +255,11 @@ function projectSignificantEvent(event, labels, expanded) {
 
 export function projectCollaborationActivity(events = [], {
   expanded = false,
+  expandedParticipantIds = [],
   participantLabels = {},
   maxGroups = 6,
 } = {}) {
+  const expandedParticipants = new Set(expandedParticipantIds || []);
   const unique = new Map();
   for (const [index, event] of (events || []).entries()) {
     if (!event) continue;
@@ -234,13 +283,23 @@ export function projectCollaborationActivity(events = [], {
     if (!participantEvents.has(participantId)) participantEvents.set(participantId, []);
     participantEvents.get(participantId).push(event);
   }
-  const groups = [
-    ...[...participantEvents.entries()].map(([participantId, items]) => (
-      projectParticipantGroup(items, participantId, participantLabels, expanded)
-    )),
-    ...significant.slice(expanded ? -8 : -3).map((event) => (
-      projectSignificantEvent(event, participantLabels, expanded)
-    )),
-  ];
-  return groups.slice(-Math.max(1, maxGroups));
+  const participantGroups = [...participantEvents.entries()].map(([participantId, items]) => (
+      projectParticipantGroup(
+        items,
+        participantId,
+        participantLabels,
+        expanded || expandedParticipants.has(participantId),
+      )
+    ));
+  const significantLimit = Math.max(
+    0,
+    Math.max(Number(maxGroups) || 0, participantGroups.length) - participantGroups.length,
+  );
+  const selectedSignificant = significantLimit > 0
+    ? significant.slice(-Math.min(expanded ? 8 : 3, significantLimit))
+    : [];
+  const significantGroups = selectedSignificant.map((event) => (
+    projectSignificantEvent(event, participantLabels, expanded)
+  ));
+  return [...participantGroups, ...significantGroups];
 }

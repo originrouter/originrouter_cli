@@ -789,6 +789,30 @@ async function captureSpawnEnv(env) {
   assert.equal((await threadPromise).thread.id, "thread-1");
 }
 
+// Unknown non-approval server requests must receive a JSON-RPC error, never
+// a permission-shaped `{ decision: "decline" }` payload.
+{
+  const { client, writes } = makeClient();
+  client.onServerRequest(async () => {
+    throw new Error("Unsupported Codex server request: item/tool/unknown");
+  });
+  feed(client, {
+    jsonrpc: "2.0",
+    id: 91,
+    method: "item/tool/unknown",
+    params: {},
+  });
+  await flush();
+  assert.deepEqual(writes.at(-1), {
+    jsonrpc: "2.0",
+    id: 91,
+    error: {
+      code: -32601,
+      message: "Unsupported Codex server request: item/tool/unknown",
+    },
+  });
+}
+
 // ---- 37. Stop-current-task uses Codex turn/interrupt ----
 
 {

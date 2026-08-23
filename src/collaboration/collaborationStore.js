@@ -32,6 +32,9 @@ const RUN_STATES = new Set([
   "waiting_approval", "waiting_input", "waiting_device", "budget_exhausted",
   "paused", "blocked", "failed", "cancelled", "expired",
 ]);
+const SUPERVISOR_PERMISSION_PROFILES = new Set([
+  "manual", "guarded", "ai_review", "custom", "unrestricted",
+]);
 const FORBIDDEN_KEYS = /token|secret|password|authorization|cookie|api[_-]?key|service[_-]?key|environment|env_dump/i;
 const SAFE_USAGE_KEYS = new Set([
   "token_limit", "token_budget", "sampled_tokens", "sampledTokens",
@@ -1853,6 +1856,56 @@ export class CollaborationStore {
         createdAt: updatedAt,
       });
     }
+    return this.getRun(runId);
+  }
+
+  updateSupervisorApproval(runId, input = {}) {
+    const run = this.getRun(runId, { includeMessages: false });
+    if (!run) throw new Error("collaboration run not found");
+    const profile = safeText(
+      input.supervisor_permission_profile ?? input.permission_profile ?? input.profile,
+      64,
+    );
+    if (!SUPERVISOR_PERMISSION_PROFILES.has(profile)) {
+      const error = new Error(`unsupported Session approval profile '${profile}'`);
+      error.code = "COLLABORATION_SESSION_APPROVAL_INVALID";
+      throw error;
+    }
+    const policyId = profile === "custom"
+      ? safeText(input.supervisor_policy_id ?? input.policy_id ?? input.policyId, 64)
+      : "";
+    if (profile === "custom" && !policyId) {
+      const error = new Error("Rules Session approval requires a policy ID");
+      error.code = "COLLABORATION_SESSION_POLICY_REQUIRED";
+      throw error;
+    }
+    if (
+      run.supervisor_permission_profile === profile
+      && safeText(run.supervisor_policy_id, 64) === policyId
+    ) return run;
+    const updatedAt = iso(this.now());
+    this.db.prepare(`
+      UPDATE collaboration_runs
+      SET supervisor_permission_profile = ?, supervisor_policy_id = ?,
+          updated_at = ?, revision = revision + 1
+      WHERE run_id = ?
+    `).run(profile, policyId, updatedAt, safeText(runId, 195));
+    this.recordExecutionEvent(runId, {
+      type: "approval.session_policy_changed",
+      category: "approval",
+      visibility: "summary",
+      summary: profile === "custom"
+        ? `Session approval changed to Rules (${policyId}).`
+        : `Session approval changed to ${profile}.`,
+      payload: {
+        previous_profile: run.supervisor_permission_profile || "guarded",
+        previous_policy_id: run.supervisor_policy_id || null,
+        profile,
+        policy_id: policyId || null,
+      },
+      idempotencyKey: `session-approval:${updatedAt}`,
+      createdAt: updatedAt,
+    });
     return this.getRun(runId);
   }
 

@@ -787,6 +787,26 @@ export async function runCodexAppServerSession(rawArgs) {
       };
     }
 
+    // Dynamic tools execute in the app-server client, not in the Codex
+    // runtime. Managed OriginRouter sessions do not expose arbitrary client
+    // tools, so return a typed failure instead of treating it as a user
+    // approval or leaking it into the collaboration reply channel.
+    if (method === "item/tool/call") {
+      return {
+        contentItems: [{
+          type: "inputText",
+          text: "OriginRouter does not expose client-side dynamic tools in managed sessions.",
+        }],
+        success: false,
+      };
+    }
+
+    // This request is opt-in upstream, but responding correctly makes a
+    // newer Codex app-server harmless if it is enabled by configuration.
+    if (method === "currentTime/read") {
+      return { currentTimeAt: Math.floor(Date.now() / 1000) };
+    }
+
     throw new Error(`Unsupported Codex server request: ${method}`);
   });
 

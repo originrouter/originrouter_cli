@@ -8,6 +8,12 @@ import {
 } from "./adaptivePlan.js";
 import { browseAgentWorkspaces } from "../daemon/workspaceBrowser.js";
 import { displaySafeToolInput } from "../runtime/displaySafeToolInput.js";
+import { readApprovalPolicy } from "../runtime/approvalPolicyStore.js";
+import {
+  assessRegisteredWorkspaceForUnattended,
+  requireRemoteWorkspacePathPreflight,
+} from "../runtime/unattendedWorkspaceReadiness.js";
+import { redactDisplayText, redactDisplayValue } from "../security/displayRedaction.js";
 import { CollaborationApprovalSupervisor } from "./collaborationApprovalSupervisor.js";
 
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "expired"]);
@@ -82,6 +88,9 @@ function retryableDeliveryError(error) {
 function executionEventProjection(event = {}) {
   const type = safeText(event.type, 96) || "agent.activity";
   const activity = safeText(event.activity, 64);
+  const interactionPayload = event.payload && typeof event.payload === "object"
+    ? event.payload
+    : {};
   const summary = safeText(
     event.summary
       || event.message
@@ -118,16 +127,21 @@ function executionEventProjection(event = {}) {
           title: safeText(event.title, 512),
           prompt: safeText(event.prompt || event.message, 2048),
           payload: {
-            tool: safeText(event.tool || event.toolName || event.tool_name, 128),
-            display_name: safeText(event.display_name || event.displayName, 256),
-            blocked_path: safeText(event.blocked_path || event.blockedPath, 4096),
-            tool_input: event.tool_input || event.toolInput || null,
-            command: event.command || null,
-            cwd: safeText(event.cwd, 4096),
-            file_changes: event.file_changes || event.fileChanges || null,
-            additional_permissions: event.additional_permissions || event.additionalPermissions || null,
-            network_approval_context: event.network_approval_context || event.networkApprovalContext || null,
-            default_approval_option: safeText(event.default_approval_option || event.defaultApprovalOption, 128),
+            tool: safeText(interactionPayload.tool || event.tool || event.toolName || event.tool_name, 128),
+            display_name: safeText(interactionPayload.display_name || event.display_name || event.displayName, 256),
+            blocked_path: safeText(interactionPayload.blocked_path || event.blocked_path || event.blockedPath, 4096),
+            tool_input: interactionPayload.tool_input || event.tool_input || event.toolInput || null,
+            command: interactionPayload.command || event.command || null,
+            cwd: safeText(interactionPayload.cwd || event.cwd, 4096),
+            file_changes: interactionPayload.file_changes || event.file_changes || event.fileChanges || null,
+            additional_permissions: interactionPayload.additional_permissions || event.additional_permissions || event.additionalPermissions || null,
+            network_approval_context: interactionPayload.network_approval_context || event.network_approval_context || event.networkApprovalContext || null,
+            default_approval_option: safeText(interactionPayload.default_approval_option || event.default_approval_option || event.defaultApprovalOption, 128),
+            questions: interactionQuestionsProjection(interactionPayload.questions),
+            form_fields: interactionFormFieldsProjection(interactionPayload.schema),
+            url: safeText(interactionPayload.url, 4096),
+            plan: safeText(interactionPayload.plan, 65_536),
+            approval_options: interactionApprovalOptionsProjection(interactionPayload.approval_options),
           },
           }),
           containsSecret: event.containsSecret === true,
@@ -145,14 +159,106 @@ function executionEventProjection(event = {}) {
   };
 }
 
-function interactionAttentionKind(kind) {
-  return kind === "permission" ? "approval" : "input";
+const SENSITIVE_INTERACTION_FIELD = /token|secret|password|passphrase|api[_-]?key|authorization|cookie|credential/i;
+
+function interactionQuestionsProjection(questions) {
+  if (!Array.isArray(questions)) return [];
+  return questions.slice(0, 8).map((question, index) => ({
+    id: safeText(question?.id, 128) || `q${index + 1}`,
+    header: safeText(question?.header, 128) || "Question",
+    question: redactDisplayText(question?.question, 2048),
+    multiple: question?.multiple === true,
+    allow_other: question?.allow_other !== false,
+    requires_local_entry: question?.secret === true,
+    options: Array.isArray(question?.options)
+      ? question.options.slice(0, 16).map((option, optionIndex) => ({
+          id: safeText(option?.id, 128) || `o${optionIndex + 1}`,
+          label: redactDisplayText(option?.label, 256),
+          description: redactDisplayText(option?.description, 1024),
+        }))
+      : [],
+  }));
 }
 
-function interactionAttentionActions(kind) {
-  return kind === "permission"
-    ? ["allow", "deny"]
-    : ["submit", "cancel"];
+function interactionFormFieldsProjection(schema) {
+  const properties = schema?.properties && typeof schema.properties === "object"
+    ? schema.properties
+    : {};
+  const required = new Set(Array.isArray(schema?.required) ? schema.required.map(String) : []);
+  return Object.entries(properties).slice(0, 32).map(([name, field]) => ({
+      name: safeText(name, 128),
+      label: safeText(field?.title, 256) || safeText(name, 128),
+      description: redactDisplayText(field?.description, 1024),
+      type: safeText(field?.type, 64) || "string",
+      required: required.has(name),
+      requires_local_entry: SENSITIVE_INTERACTION_FIELD.test(name) || field?.writeOnly || field?.format === "password",
+      options: Array.isArray(field?.enum)
+        ? field.enum.slice(0, 32).map((value) => redactDisplayText(value, 256))
+        : [],
+    }));
+}
+
+function interactionApprovalOptionsProjection(options) {
+  if (!Array.isArray(options)) return [];
+  return options.slice(0, 16).map((option, index) => ({
+    id: safeText(option?.id, 128) || `option-${index + 1}`,
+    label: redactDisplayText(option?.label, 256),
+  }));
+}
+
+function attentionRequestProjection(request = {}) {
+  const evidence = request?.payload && typeof request.payload === "object" ? request.payload : {};
+  const preview = (value, maxLength = 4096) => {
+    if (value == null || value === "") return null;
+    if (typeof value === "string") return redactDisplayText(value, maxLength) || null;
+    try {
+      return redactDisplayText(JSON.stringify(redactDisplayValue(value)), maxLength) || null;
+    } catch {
+      return "[details unavailable]";
+    }
+  };
+  return {
+    kind: safeText(request.kind, 64) || "input",
+    title: safeText(request.title, 512) || null,
+    prompt: redactDisplayText(request.prompt, 2048) || null,
+    tool: safeText(evidence.tool, 128) || null,
+    display_name: safeText(evidence.display_name, 256) || null,
+    blocked_path: safeText(evidence.blocked_path, 4096) || null,
+    command: preview(evidence.command),
+    cwd: safeText(evidence.cwd, 4096) || null,
+    tool_input_preview: preview(evidence.tool_input),
+    file_changes_preview: preview(evidence.file_changes),
+    additional_permissions_preview: preview(evidence.additional_permissions),
+    network_context_preview: preview(evidence.network_approval_context),
+    questions: interactionQuestionsProjection(evidence.questions),
+    form_fields: Array.isArray(evidence.form_fields) ? evidence.form_fields : [],
+    url: safeText(evidence.url, 4096) || null,
+    plan: redactDisplayText(evidence.plan, 65_536) || null,
+    approval_options: interactionApprovalOptionsProjection(evidence.approval_options),
+    contains_secret: request.containsSecret === true,
+  };
+}
+
+function interactionAttentionKind(kind) {
+  if (kind === "permission") return "approval";
+  if (["confirm", "questions", "form", "url"].includes(kind)) return kind;
+  return "input";
+}
+
+function interactionAttentionActions(kind, request = {}, containsSecret = false) {
+  if (containsSecret && ["questions", "form"].includes(kind)) return ["cancel"];
+  if (kind === "permission") {
+    const options = request?.payload?.approval_options || request?.approval_options || [];
+    if (Array.isArray(options) && options.length) {
+      return [
+        ...options.map((option) => `allow_option:${safeText(option?.id, 48)}`).filter((action) => action !== "allow_option:"),
+        "deny",
+      ];
+    }
+    return ["allow", "deny"];
+  }
+  if (kind === "confirm") return ["allow", "cancel"];
+  return ["submit", "cancel"];
 }
 
 function collaborationSnapshotSummary(snapshot) {
@@ -551,6 +657,24 @@ export class CollaborationRuntime {
     return run;
   }
 
+  async updateSupervisorApproval(runId, input = {}) {
+    const profile = safeText(
+      input.supervisor_permission_profile ?? input.permission_profile ?? input.profile,
+      64,
+    );
+    const policyId = safeText(
+      input.supervisor_policy_id ?? input.policy_id ?? input.policyId,
+      64,
+    );
+    if (profile === "custom") readApprovalPolicy(policyId, { stateDir: this.stateDir });
+    const run = this.store.updateSupervisorApproval(runId, {
+      supervisor_permission_profile: profile,
+      supervisor_policy_id: policyId,
+    });
+    void this.syncRun(runId);
+    return run;
+  }
+
   async pause(runId) {
     const before = this.store.getRun(runId, { includeMessages: false });
     const run = this.store.pauseRun(runId);
@@ -665,7 +789,11 @@ export class CollaborationRuntime {
     if (!targetDeviceId || !requestedPath) throw new Error("device id and workspace path are required");
     if (targetDeviceId === this.deviceId || targetDeviceId === "local") {
       if (!this.catalog) throw new Error("Agent workspace catalog unavailable");
-      return this.catalog.trustWorkspace(requestedPath, { deviceId: this.deviceId });
+      const workspace = this.catalog.trustWorkspace(requestedPath, { deviceId: this.deviceId });
+      return {
+        ...workspace,
+        unattended_execution: assessRegisteredWorkspaceForUnattended(workspace),
+      };
     }
     if (!this.relayClient) {
       const error = new Error("OriginRouter virtual network is unavailable");
@@ -813,16 +941,10 @@ export class CollaborationRuntime {
     });
   }
 
-  async supervisePermissionRequest({ run, role, taskId, sessionId, request, createdAt }) {
+  async superviseInteractionRequest({ run, role, taskId, sessionId, request, createdAt }) {
     const interactionId = safeText(request?.interactionId, 191);
     const agent = run.agents?.[role];
-    if (!interactionId || !agent) return false;
-    const evidence = request?.payload || {};
-    if (![evidence.tool, evidence.command, evidence.tool_input, evidence.file_changes,
-      evidence.additional_permissions, evidence.network_approval_context, evidence.blocked_path]
-      .some((value) => value && (typeof value !== "object" || Object.keys(value).length > 0))) {
-      return false;
-    }
+    if (!interactionId || !agent) return { handled: false, decision: null };
     let decision;
     try {
       decision = await this.approvalSupervisor.evaluate({
@@ -838,13 +960,13 @@ export class CollaborationRuntime {
         layers: [],
       };
     }
-    if (decision.effect === "ask") return false;
+    if (decision.effect === "ask") return { handled: false, decision };
     const command = {
       type: "agent.interaction.resolve",
       sessionId,
       interactionId,
       responseId: compactId(`supervisor-${run.run_id}-${interactionId}`, 191),
-      kind: "permission",
+      kind: safeText(request?.kind, 64) || "permission",
       action: decision.action,
       response: decision.response || { remember_for_session: false },
       decisionSource: "originrouter-session-supervisor",
@@ -864,7 +986,7 @@ export class CollaborationRuntime {
       participantId: role,
       sessionId,
       summary: decision.effect === "allow"
-        ? "OriginRouter approved the Agent request under the active Session policy."
+        ? "OriginRouter resolved the Agent request under the active Session policy."
         : "OriginRouter denied the Agent request under the active Session policy.",
       payload: {
         interaction_id: interactionId,
@@ -875,7 +997,7 @@ export class CollaborationRuntime {
       idempotencyKey: `supervisor-resolution:${sessionId}:${interactionId}`,
       createdAt,
     });
-    return true;
+    return { handled: true, decision };
   }
 
   async resolveAttention(runId, attentionId, input = {}) {
@@ -891,6 +1013,10 @@ export class CollaborationRuntime {
       error.code = "COLLABORATION_ATTENTION_ACTION_INVALID";
       throw error;
     }
+    const approvalOption = action.startsWith("allow_option:")
+      ? action.slice("allow_option:".length)
+      : "";
+    const wireAction = approvalOption ? "allow" : action;
     const sessionId = safeText(item.payload?.session_id, 64);
     const interactionId = safeText(item.payload?.interaction_id, 191);
     if (item.kind === "agent_recovery") {
@@ -939,7 +1065,7 @@ export class CollaborationRuntime {
       }
       return resolved;
     }
-    if (["approval", "input"].includes(item.kind)) {
+    if (["approval", "confirmation", "questions", "form", "url", "input"].includes(item.kind)) {
       if (!sessionId || !interactionId) {
         const error = new Error("attention item is missing its Agent interaction binding");
         error.code = "COLLABORATION_ATTENTION_BINDING_MISSING";
@@ -952,9 +1078,10 @@ export class CollaborationRuntime {
         responseId: safeText(input.response_id ?? input.responseId, 191)
           || compactId(`attention-${item.attention_id}-${item.revision}`, 191),
         kind: safeText(item.payload?.kind, 64) || null,
-        action,
+        action: wireAction,
         response: {
           ...(input.response && typeof input.response === "object" ? input.response : {}),
+          ...(approvalOption ? { approval_option: approvalOption } : {}),
           ...(item.kind === "approval" ? { remember_for_session: false } : {}),
         },
         decisionSource: safeText(input.resolved_by ?? input.resolvedBy, 191) || "originrouter-user",
@@ -979,9 +1106,9 @@ export class CollaborationRuntime {
       participantId: item.participant_id,
       sessionId,
       summary: item.kind === "approval"
-        ? `Agent permission ${action === "allow" ? "approved" : "denied"}.`
+        ? `Agent permission ${wireAction === "allow" ? "approved" : "denied"}.`
         : "Agent input was submitted.",
-      payload: { attention_id: item.attention_id, action },
+      payload: { attention_id: item.attention_id, action: wireAction, approval_option: approvalOption || null },
       idempotencyKey: `attention-resolved:${item.attention_id}:${item.revision}`,
     });
     return resolved;
@@ -1307,14 +1434,17 @@ export class CollaborationRuntime {
       const interactionId = safeText(event.interactionId || event.callId, 191);
       if (interactionId) {
         const kind = safeText(event.kind, 64) || "input";
-        if (kind === "permission" && await this.supervisePermissionRequest({
-          run: currentRun,
-          role: binding.role,
-          taskId: currentTaskId,
-          sessionId: notification.sessionId,
-          request: projectedEvent.payload.approval_request,
-          createdAt: event.createdAt,
-        })) return;
+        const supervision = ["permission", "confirm", "questions", "form", "url"].includes(kind)
+          ? await this.superviseInteractionRequest({
+              run: currentRun,
+              role: binding.role,
+              taskId: currentTaskId,
+              sessionId: notification.sessionId,
+              request: projectedEvent.payload.approval_request,
+              createdAt: event.createdAt,
+            })
+          : null;
+        if (supervision?.handled) return;
         const containsSecret = event.containsSecret === true;
         this.store.createAttention(binding.run_id, {
           taskId: currentTaskId,
@@ -1326,14 +1456,22 @@ export class CollaborationRuntime {
             ? "The Agent is waiting for a sensitive response. Open the request to continue."
             : safeText(event.prompt || event.message, 2048)
               || `The ${binding.role} Agent is waiting for ${kind.replaceAll("_", " ")}.`,
-          risk: kind === "permission" ? "normal" : "low",
-          actions: interactionAttentionActions(kind),
+          risk: ["permission", "confirm", "url"].includes(kind) ? "normal" : "low",
+          actions: interactionAttentionActions(kind, projectedEvent.payload.approval_request, containsSecret),
           payload: {
             interaction_id: interactionId,
             session_id: notification.sessionId,
             kind,
             source: safeText(event.source, 64) || null,
             contains_secret: containsSecret,
+            request: attentionRequestProjection(projectedEvent.payload.approval_request),
+            supervisor_evaluation: supervision?.decision ? {
+              effect: supervision.decision.effect,
+              reason: safeText(supervision.decision.reason, 256),
+              layers: supervision.decision.layers || [],
+              session_profile: currentRun.supervisor_permission_profile || "guarded",
+              session_policy_id: currentRun.supervisor_policy_id || null,
+            } : null,
           },
           expiresAt: event.expiresAt || null,
           idempotencyKey: `interaction:${notification.sessionId}:${interactionId}`,
@@ -1474,6 +1612,7 @@ export class CollaborationRuntime {
       return { run: await this.retry(runId, safeText(input.task_id ?? input.taskId, 195)) };
     }
     if (operation === "budget") return { run: await this.updateBudget(runId, input.budget || {}) };
+    if (operation === "approval") return { run: await this.updateSupervisorApproval(runId, input) };
     if (operation === "archive") return { run: this.store.archiveRun(runId, true) };
     if (operation === "delete") {
       return { deleted: this.store.deleteRun(runId), run_id: runId };
@@ -1494,6 +1633,10 @@ export class CollaborationRuntime {
       let page = null;
       let errorPayload = null;
       try {
+        // Workspace browse was requested over the device relay. Refuse known
+        // interactive locations before touching the filesystem so no target
+        // machine can be left behind an invisible OS authorization dialog.
+        requireRemoteWorkspacePathPreflight(payload.path);
         page = await browseAgentWorkspaces({
           path: payload.path,
           query: payload.query,
@@ -1611,6 +1754,7 @@ export class CollaborationRuntime {
       let errorPayload = null;
       try {
         if (!this.catalog) throw new Error("Agent workspace catalog unavailable");
+        requireRemoteWorkspacePathPreflight(payload.path);
         workspace = this.catalog.trustWorkspace(safeText(payload.path, 4096), {
           deviceId: this.deviceId,
         });
@@ -1822,14 +1966,17 @@ export class CollaborationRuntime {
         const interactionId = safeText(payload.event?.payload?.interaction_id, 191);
         if (interactionId) {
           const kind = safeText(payload.event?.payload?.kind, 64) || "input";
-          if (kind === "permission" && await this.supervisePermissionRequest({
-            run,
-            role,
-            taskId: payload.taskId,
-            sessionId: safeText(payload.sessionId, 64),
-            request: payload.event?.payload?.approval_request,
-            createdAt: payload.createdAt,
-          })) return true;
+          const supervision = ["permission", "confirm", "questions", "form", "url"].includes(kind)
+            ? await this.superviseInteractionRequest({
+                run,
+                role,
+                taskId: payload.taskId,
+                sessionId: safeText(payload.sessionId, 64),
+                request: payload.event?.payload?.approval_request,
+                createdAt: payload.createdAt,
+              })
+            : null;
+          if (supervision?.handled) return true;
           this.store.createAttention(run.run_id, {
             taskId: payload.taskId,
             participantId: role,
@@ -1838,14 +1985,22 @@ export class CollaborationRuntime {
             summary: payload.event?.payload?.contains_secret
               ? "The remote Agent is waiting for a sensitive response. Open the request to continue."
               : safeText(payload.event?.detail || payload.event?.summary, 2048),
-            risk: kind === "permission" ? "normal" : "low",
-            actions: interactionAttentionActions(kind),
+            risk: ["permission", "confirm", "url"].includes(kind) ? "normal" : "low",
+            actions: interactionAttentionActions(kind, payload.event?.payload?.approval_request, payload.event?.payload?.contains_secret === true),
             payload: {
               interaction_id: interactionId,
               session_id: safeText(payload.sessionId, 64),
               kind,
               source: safeText(payload.event?.payload?.source, 64) || null,
               contains_secret: payload.event?.payload?.contains_secret === true,
+              request: attentionRequestProjection(payload.event?.payload?.approval_request),
+              supervisor_evaluation: supervision?.decision ? {
+                effect: supervision.decision.effect,
+                reason: safeText(supervision.decision.reason, 256),
+                layers: supervision.decision.layers || [],
+                session_profile: run.supervisor_permission_profile || "guarded",
+                session_policy_id: run.supervisor_policy_id || null,
+              } : null,
             },
             expiresAt: payload.event?.payload?.expires_at || null,
             idempotencyKey: `interaction:${safeText(payload.sessionId, 64)}:${interactionId}`,

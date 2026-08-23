@@ -11,6 +11,7 @@ import {
   controlCollaborationRun,
   followExistingAgentWorkspaceCollaboration,
   handleCollaborationCommand,
+  listAgentWorkspaceCollaborationRuns,
   MAX_COLLABORATION_RECONNECT_ATTEMPTS,
   retryAgentWorkspaceCollaboration,
   runAgentWorkspaceCollaboration,
@@ -18,13 +19,19 @@ import {
 } from "./collaboration.js";
 import {
   WORKSPACE_MODES,
-  nextWorkspaceMode,
   normalizeCoordinator,
   normalizeWorkspaceMode,
   workspaceModeDefinition,
   workspaceModeSummary,
 } from "../collaboration/workspaceModes.js";
 import { projectCollaborationActivity } from "../collaboration/activityPresentation.js";
+import { listApprovalPolicies } from "../runtime/approvalPolicyStore.js";
+import {
+  findWorkspaceCommand,
+  parseWorkspaceCommand,
+  workspaceCommandSuggestions,
+  workspaceCommandUsage,
+} from "./workspaceCommands.js";
 
 const FORWARDED_FLAGS = new Set([
   "--detach",
@@ -109,6 +116,7 @@ const ANSI = {
 };
 
 const workspaceScreenCache = new WeakMap();
+const workspaceTerminalState = new WeakMap();
 const LARGE_PASTE_CHAR_THRESHOLD = 1000;
 const PASTE_TOKEN_CODE_POINT_START = 0xF0000;
 const TERMINAL_WORKSPACE_RUN_STATES = new Set(["completed", "failed", "cancelled", "expired"]);
@@ -189,7 +197,7 @@ function defaultWorkspacePanel() {
     lines: [
       "Describe the outcome you want.",
       "Chooses the Agent team.",
-      "Shift+Tab changes mode.",
+      "Shift+Tab changes Session approval.",
       "/help shows commands.",
     ],
   };
@@ -199,29 +207,129 @@ function helpWorkspacePanel() {
   return {
     title: "Commands",
     lines: [
-      "/mode [name] changes mode",
-      "/coordinator codex|claude",
-      "/team shows current team",
-      "/exit leaves OriginRouter",
-      "Shift+Tab cycles modes",
+      "/status - workspace settings and latest Run",
+      "/runs [active|recent|all] - collaboration Runs",
+      "/resume [run-id] - restore and follow a Run",
+      "/pause, /retry, /cancel [run-id] - Run controls",
+      "/agents [run-id] - assigned Agents and routes",
+      "/mode, /approval, /team - next collaboration settings",
+      "/coordinator codex|claude - preferred lead",
+      "/exit - leave OriginRouter",
     ],
   };
 }
 
-function modesWorkspacePanel() {
+function commandHelpPanel(commandName = "") {
+  const command = findWorkspaceCommand(commandName);
+  if (!command) return helpWorkspacePanel();
   return {
-    title: "Collaboration Modes",
-    lines: WORKSPACE_MODES.map((mode) => `${mode.label} - ${mode.description}`),
+    title: workspaceCommandUsage(command),
+    lines: [
+      command.description,
+      command.name === "resume"
+        ? "Without an ID, lists recent Runs. A Run ID restores the OriginRouter Run, not a native Agent session."
+        : "Command arguments in brackets are optional.",
+    ],
   };
 }
 
-function teamWorkspacePanel({ coordinator, mode }) {
+function compactRunState(run = {}) {
+  const tasks = Array.isArray(run.tasks) ? run.tasks.filter((task) => task.task_key !== "__planner__") : [];
+  const complete = tasks.filter((task) => task.state === "completed").length;
+  const attention = Array.isArray(run.attention)
+    ? run.attention.filter((item) => item.status === "pending").length
+    : 0;
+  const progress = tasks.length ? `${complete}/${tasks.length} tasks` : "no tasks yet";
+  return `${run.state || "unknown"} · ${progress}${attention ? ` · ${attention} needs attention` : ""}`;
+}
+
+function runLabel(run = {}) {
+  return String(run.objective || run.plan?.title || run.run_id || "Agent collaboration")
+    .replace(/\s+/g, " ")
+    .slice(0, 140);
+}
+
+function workspaceStatusPanel({ coordinator, mode, sessionApproval, lastRun = null }) {
+  const lines = [
+    `Mode: ${workspaceModeDefinition(mode).label}`,
+    `Coordinator: ${coordinatorLabel(coordinator)}`,
+    `Session approval: ${permissionLabel(sessionApproval.profile, sessionApproval.policyId)}`,
+  ];
+  if (lastRun?.run_id) {
+    lines.push(`Latest Run: ${lastRun.run_id} · ${compactRunState(lastRun)}`);
+    lines.push(runLabel(lastRun));
+  } else {
+    lines.push("Latest Run: none in this Workspace session");
+  }
+  return { title: "Workspace Status", lines };
+}
+
+function workspaceRunsPanel({ category, runs = [], total = 0 }) {
+  if (!runs.length) {
+    return {
+      title: "Collaboration Runs",
+      lines: [`No ${category === "all" ? "" : `${category} `}Runs found.`, "Use /resume <run-id> to restore a known Run."],
+    };
+  }
+  const lines = runs.slice(0, 8).flatMap((run) => [
+    `${run.run_id} · ${compactRunState(run)}`,
+    `  ${runLabel(run)}`,
+  ]);
+  if (total > runs.length) lines.push(`Showing ${runs.length} of ${total} Runs.`);
+  lines.push("Use /resume <run-id> to follow one.");
+  return { title: `${category[0].toUpperCase()}${category.slice(1)} Runs`, lines };
+}
+
+function workspaceAgentsPanel(run = {}) {
+  const agents = Array.isArray(run.participants)
+    ? run.participants
+    : Object.values(run.agents || {});
+  if (!agents.length) {
+    return {
+      title: "Run Agents",
+      lines: [run.run_id ? `Run ${run.run_id} has no Agent assignments yet.` : "Choose a Run with /agents <run-id> or /runs."],
+    };
+  }
+  const lines = [
+    `Run ${run.run_id || "current"} · ${compactRunState(run)}`,
+    ...agents.slice(0, 8).map((agent) => {
+      const identity = agent.display_name || agent.role || agent.participant_id || agent.agent_id || "Agent";
+      const route = agent.provider && agent.model ? `${agent.provider}/${agent.model}` : "device default route";
+      return `${identity} · ${agent.runtime || "unknown"} · ${route}`;
+    }),
+  ];
+  return { title: "Run Agents", lines };
+}
+
+function workspaceCommandErrorPanel(message) {
+  return { title: "Command unavailable", lines: [message, "Use /help to see available commands."] };
+}
+
+function workspaceCommandSuggestionsBlock(suggestions, columns) {
+  if (!suggestions?.length) return "";
+  const width = Math.max(1, columns - 2);
+  return suggestions.map((command) => padDisplayRight(
+    muted(`  ${workspaceCommandUsage(command)} - ${command.description}`),
+    width,
+  )).join("\n");
+}
+
+function approvalWorkspacePanel() {
+  return {
+    title: "Session Approval",
+    lines: sessionPermissionOptions({ includePolicies: true }).map((option) => (
+      `${option.label} - ${option.description}`
+    )),
+  };
+}
+
+function teamWorkspacePanel({ coordinator, mode, sessionApproval = { profile: "guarded", policyId: "" } }) {
   return {
     title: "Current Team",
     lines: [
       workspaceModeSummary(mode),
       `Coordinator: ${coordinatorLabel(coordinator)}`,
-      "Access: Guarded",
+      `Session approval: ${permissionLabel(sessionApproval.profile, sessionApproval.policyId)}`,
     ],
   };
 }
@@ -323,6 +431,32 @@ function reviewScrollDirection(text, key = {}, { arrows = false } = {}) {
   return 0;
 }
 
+export function consumeWorkspaceMouseKeypress(state, text, key = {}) {
+  const sequence = String(key.sequence || text || "");
+  let buffer = String(state?.mouseSequenceBuffer || "");
+  if (!buffer) {
+    if (!sequence.startsWith("\x1b[<")) return { handled: false, direction: 0 };
+    buffer = sequence;
+  } else {
+    buffer += sequence;
+  }
+  if (buffer.length > 64) {
+    state.mouseSequenceBuffer = "";
+    return { handled: true, direction: 0 };
+  }
+  if (!/[mM]$/.test(buffer)) {
+    state.mouseSequenceBuffer = buffer;
+    return { handled: true, direction: 0 };
+  }
+  state.mouseSequenceBuffer = "";
+  const match = /^\x1b\[<(\d+);\d+;\d+[mM]$/.exec(buffer);
+  const button = Number(match?.[1]);
+  return {
+    handled: true,
+    direction: button === 64 ? -1 : button === 65 ? 1 : 0,
+  };
+}
+
 export function scrollRuntimeContent(runtime, direction, pageSize = 6) {
   if (!direction) return false;
   const maxOffset = Math.max(
@@ -340,6 +474,34 @@ export function scrollRuntimeContent(runtime, direction, pageSize = 6) {
   runtime.scrollOffset = nextOffset;
   runtime.autoFollow = nextOffset >= maxOffset;
   if (runtime.autoFollow) runtime.unseenActivityCount = 0;
+  return true;
+}
+
+function moveActivitySelection(runtime, direction) {
+  const participants = runtime.activityParticipantIds || [];
+  if (!direction || participants.length < 2) return false;
+  const current = Math.max(0, Math.min(
+    participants.length - 1,
+    Number(runtime.activitySelection) || 0,
+  ));
+  runtime.activitySelection = (current + direction + participants.length) % participants.length;
+  return true;
+}
+
+function toggleSelectedActivity(runtime) {
+  const participants = runtime.activityParticipantIds || [];
+  const participantId = participants[Math.max(0, Math.min(
+    participants.length - 1,
+    Number(runtime.activitySelection) || 0,
+  ))];
+  if (!participantId) return false;
+  const expanded = new Set(runtime.expandedActivityParticipants || []);
+  if (expanded.has(participantId)) expanded.delete(participantId);
+  else expanded.add(participantId);
+  runtime.expandedActivityParticipants = [...expanded];
+  runtime.notice = expanded.has(participantId)
+    ? `${runtime.activityParticipantLabels?.[participantId] || participantId} details expanded`
+    : `${runtime.activityParticipantLabels?.[participantId] || participantId} details collapsed`;
   return true;
 }
 
@@ -399,18 +561,65 @@ function workspacePermissionOptions(configuration, participant) {
   ];
 }
 
-function sessionPermissionOptions() {
-  return [
+function sessionPermissionOptions({ includePolicies = false } = {}) {
+  const options = [
     { id: "manual", label: "Manual", description: "Ask before every child Agent permission." },
     { id: "guarded", label: "Guarded", description: "Approve routine work and ask for elevated or uncertain actions." },
     { id: "ai_review", label: "AI Review", description: "Use an independent reviewer and escalate high-risk or uncertain actions." },
     { id: "custom", label: "Rules", description: "Use the built-in protected rule policy.", policyId: "protected" },
     { id: "unrestricted", label: "Full", description: "Add no restriction beyond each Agent's own access limit." },
   ];
+  if (!includePolicies) return options;
+  for (const policy of listApprovalPolicies()) {
+    if (!policy?.id || policy.id === "protected" || policy.source === "invalid") continue;
+    options.splice(options.length - 1, 0, {
+      id: "custom",
+      policyId: policy.id,
+      label: `Rules · ${policy.name || policy.id}`,
+      description: policy.description || `Use approval policy ${policy.id}.`,
+    });
+  }
+  return options;
 }
 
-function permissionLabel(value) {
+function permissionLabel(value, policyId = "") {
+  if (value === "custom" && policyId && policyId !== "protected") return `Rules · ${policyId}`;
   return sessionPermissionOptions().find((option) => option.id === value)?.label || "Guarded";
+}
+
+function samePermissionOption(option, profile, policyId = "") {
+  return option.id === profile
+    && (option.id !== "custom" || (option.policyId || "protected") === (policyId || "protected"));
+}
+
+function nextSessionPermission(profile, policyId = "") {
+  const options = sessionPermissionOptions();
+  const current = options.findIndex((option) => samePermissionOption(option, profile, policyId));
+  return options[(current + 1 + options.length) % options.length];
+}
+
+function resolveSessionPermission(value) {
+  const requested = String(value || "").trim().toLowerCase();
+  if (!requested) return null;
+  const aliases = new Map([
+    ["ask", "manual"],
+    ["ai", "ai_review"],
+    ["review", "ai_review"],
+    ["rules", "custom:protected"],
+    ["protected", "custom:protected"],
+    ["full", "unrestricted"],
+  ]);
+  const normalized = aliases.get(requested) || requested;
+  const options = sessionPermissionOptions({ includePolicies: true });
+  if (normalized.startsWith("custom:") || normalized.startsWith("rules:")) {
+    const policyId = normalized.slice(normalized.indexOf(":") + 1);
+    return options.find((option) => option.id === "custom" && option.policyId === policyId) || null;
+  }
+  return options.find((option) => (
+    option.id === normalized
+    || option.policyId?.toLowerCase() === normalized
+    || option.label.toLowerCase() === normalized
+  )) || null;
 }
 
 function participantRouteLabel(configuration, participant) {
@@ -422,7 +631,30 @@ function runtimeDisplayName(runtime) {
   return runtime === "claude" ? "Claude Code" : "Codex";
 }
 
-function attentionActionLabel(action) {
+function attentionRequestKind(attention) {
+  return String(attention?.payload?.kind || attention?.payload?.request?.kind || attention?.kind || "input");
+}
+
+function attentionNeedsTypedResponse(attention) {
+  const request = attention?.payload?.request || {};
+  const kind = attentionRequestKind(attention);
+  if (kind === "questions") return (request.questions || []).some((question) => !question.requires_local_entry);
+  if (kind === "form") return (request.form_fields || []).some((field) => !field.requires_local_entry);
+  return kind === "input";
+}
+
+function attentionActionLabel(action, attention = null) {
+  const kind = attentionRequestKind(attention);
+  if (String(action).startsWith("allow_option:")) {
+    const id = String(action).slice("allow_option:".length);
+    const option = (attention?.payload?.request?.approval_options || [])
+      .find((candidate) => candidate.id === id);
+    return option?.label || "Allow with selected option";
+  }
+  if (action === "allow" && kind === "confirm") return "Continue";
+  if (action === "submit" && kind === "questions") return "Answer questions";
+  if (action === "submit" && kind === "form") return "Submit form";
+  if (action === "submit" && kind === "url") return "Continue after authorization";
   return {
     allow: "Allow once",
     deny: "Deny",
@@ -432,10 +664,264 @@ function attentionActionLabel(action) {
   }[action] || String(action || "").replaceAll("_", " ");
 }
 
+function attentionReplyPrompt(attention) {
+  const kind = attentionRequestKind(attention);
+  if (kind === "questions") {
+    const questions = (attention?.payload?.request?.questions || [])
+      .filter((question) => !question.requires_local_entry);
+    if (questions.length === 1) return "Enter an answer, or a JSON object keyed by question ID";
+    return "Enter a JSON object keyed by question ID";
+  }
+  if (kind === "form") return "Enter a JSON object containing the form fields";
+  return "Reply to the Agent";
+}
+
+function attentionResponseFromText(attention, text) {
+  const reply = String(text || "").trim();
+  const request = attention?.payload?.request || {};
+  const kind = attentionRequestKind(attention);
+  if (kind === "questions") {
+    const questions = (request.questions || []).filter((question) => !question.requires_local_entry);
+    if (!questions.length) return { answers: {} };
+    let values;
+    if (questions.length === 1 && !reply.startsWith("{")) {
+      values = { [questions[0].id]: reply };
+    } else {
+      try { values = JSON.parse(reply); } catch {
+        throw new Error("Enter valid JSON keyed by question ID");
+      }
+    }
+    if (!values || typeof values !== "object" || Array.isArray(values)) {
+      throw new Error("Answers must be a JSON object keyed by question ID");
+    }
+    const allowed = new Set(questions.map((question) => question.id));
+    const answers = {};
+    for (const [id, value] of Object.entries(values)) {
+      if (!allowed.has(id)) throw new Error(`Unknown question ID: ${id}`);
+      answers[id] = (Array.isArray(value) ? value : [value]).map(String);
+    }
+    return { answers };
+  }
+  if (kind === "form") {
+    let values;
+    try { values = JSON.parse(reply); } catch {
+      throw new Error("Enter valid JSON containing the form fields");
+    }
+    if (!values || typeof values !== "object" || Array.isArray(values)) {
+      throw new Error("Form values must be a JSON object");
+    }
+    const fields = (request.form_fields || []).filter((field) => !field.requires_local_entry);
+    const allowed = new Set(fields.map((field) => field.name));
+    for (const name of Object.keys(values)) {
+      if (!allowed.has(name)) throw new Error(`Unknown form field: ${name}`);
+    }
+    const missing = fields.find((field) => field.required && values[field.name] == null);
+    if (missing) throw new Error(`Enter a value for ${missing.label || missing.name}`);
+    return { values };
+  }
+  return { text: reply };
+}
+
+function attentionParticipantLabel(attention, runtime) {
+  const participantId = attention?.participant_id;
+  const participant = [
+    ...(runtime.configuration?.participants || []),
+    ...(runtime.snapshot?.participants || []),
+  ].find((item) => item.participant_id === participantId);
+  return participant?.display_name || participantId || "Agent";
+}
+
+function attentionTaskLabel(attention, runtime) {
+  const taskId = attention?.task_id;
+  const task = (runtime.snapshot?.tasks || []).find((item) => (
+    item.task_id === taskId || item.task_key === taskId || item.id === taskId
+  ));
+  return task?.title || task?.task_key || "";
+}
+
+function attentionReasonLabel(reason) {
+  return {
+    user_confirmation_required: "The active policy requires a person to decide this request.",
+    supervisor_evaluation_failed: "The automatic policy check could not complete safely.",
+  }[reason] || String(reason || "").replaceAll("_", " ");
+}
+
+function attentionPolicyLayerLabel(layer = {}) {
+  const owner = layer.name === "session" ? "Session approval" : "Agent access limit";
+  const effect = layer.effect === "ask" ? "asks you"
+    : layer.effect === "deny" ? "denies" : "allows";
+  return `${owner}: ${permissionLabel(layer.profile || "manual")} · ${effect}`;
+}
+
+function attentionRequestContext(attention, runtime) {
+  const request = attention?.payload?.request || {};
+  const evaluation = attention?.payload?.supervisor_evaluation || {};
+  const participant = attentionParticipantLabel(attention, runtime);
+  const task = attentionTaskLabel(attention, runtime);
+  const currentProfile = runtime.sessionApprovalOverride?.profile
+    || runtime.snapshot?.run?.supervisor_permission_profile
+    || runtime.configuration?.supervisor_permission_profile
+    || "guarded";
+  const currentPolicyId = runtime.sessionApprovalOverride?.policyId
+    || runtime.snapshot?.run?.supervisor_policy_id
+    || runtime.configuration?.supervisor_policy_id
+    || "";
+  const requestedProfile = evaluation.session_profile || currentProfile;
+  const requestedPolicyId = evaluation.session_policy_id || "";
+  const lines = [];
+  lines.push({ label: "Requested by", value: task ? `${participant} · ${task}` : participant });
+  if (request.display_name || request.tool) {
+    lines.push({ label: "Action", value: request.display_name || request.tool });
+  }
+  if (request.command) lines.push({ label: "Command", value: request.command, code: true });
+  if (request.cwd) lines.push({ label: "Working directory", value: request.cwd, code: true });
+  if (request.blocked_path) lines.push({ label: "Path", value: request.blocked_path, code: true });
+  if (request.file_changes_preview) lines.push({ label: "File changes", value: request.file_changes_preview });
+  if (request.additional_permissions_preview) {
+    lines.push({ label: "Additional access", value: request.additional_permissions_preview });
+  }
+  if (request.network_context_preview) lines.push({ label: "Network access", value: request.network_context_preview });
+  if (request.tool_input_preview && !request.command) {
+    lines.push({ label: "Input", value: request.tool_input_preview, code: true });
+  }
+  for (const question of request.questions || []) {
+    const options = (question.options || []).map((option) => option.label).filter(Boolean);
+    lines.push({
+      label: question.header || question.id || "Question",
+      value: question.requires_local_entry
+        ? "Sensitive answer required on the executing device"
+        : `${question.question || "Answer required"}${options.length ? ` (${options.join(" / ")})` : ""}`,
+    });
+  }
+  for (const field of request.form_fields || []) {
+    const options = (field.options || []).join(" / ");
+    lines.push({
+      label: field.label || field.name || "Field",
+      value: field.requires_local_entry
+        ? "Sensitive value required on the executing device"
+        : `${field.type || "string"}${field.required ? " · required" : ""}${options ? ` (${options})` : ""}${field.description ? ` · ${field.description}` : ""}`,
+    });
+  }
+  if (request.url) lines.push({ label: "Authorization URL", value: request.url, code: true });
+  if (request.plan) lines.push({ label: "Plan", value: request.plan });
+  if (attention?.kind === "approval" && attention?.title && attention.title !== request.prompt) {
+    lines.push({ label: "Request", value: attention.title });
+  }
+  const prompt = request.prompt || attention?.title || attention?.summary || "";
+  if (prompt) lines.push({ label: attention?.kind === "approval" ? "Reason" : "Request", value: prompt });
+  for (const layer of evaluation.layers || []) {
+    lines.push({ label: "Policy", value: attentionPolicyLayerLabel(layer) });
+  }
+  if (evaluation.reason) {
+    lines.push({ label: "Why you are seeing this", value: attentionReasonLabel(evaluation.reason) });
+  }
+  const requestedLabel = permissionLabel(requestedProfile, requestedPolicyId);
+  const currentLabel = permissionLabel(currentProfile, currentPolicyId);
+  lines.push({ label: "Session approval", value: currentLabel });
+  if (requestedLabel !== currentLabel) {
+    lines.push({
+      label: "Pending request",
+      value: `Evaluated under ${requestedLabel}. The new policy applies to later requests; this decision remains yours.`,
+    });
+  }
+  return lines.filter((item) => item.value);
+}
+
+function interactionResultSummary(runtime, kind, value) {
+  if (value == null || value === "leave") return "";
+  if (kind === "device" && Array.isArray(value)) {
+    const selected = (runtime.setup?.devices || [])
+      .filter((device) => value.includes(device.device_id))
+      .map((device) => device.device_name || device.device_id);
+    return selected.length
+      ? `Remote device${selected.length === 1 ? "" : "s"} selected · ${selected.join(", ")}`
+      : "Remote devices selected";
+  }
+  if (kind === "workspace") {
+    if (value === "__custom_workspace_path__") return "";
+    return `Workspace selected · ${value?.display_name || value?.canonical_path || "authorized workspace"}`;
+  }
+  if (kind === "setup" && typeof value === "string") return `Folder selected · ${value}`;
+  if (kind === "configuration" && value === "confirm") {
+    const configuration = runtime.configuration || {};
+    const resolved = configuration.resolved_workspace_mode
+      || configuration.auto_configuration?.resolved_workspace_mode
+      || configuration.workspace_mode
+      || "auto";
+    const participants = configuration.participants || [];
+    return `Team confirmed · ${workspaceModeDefinition(resolved).label} · ${participants.length} Agent${participants.length === 1 ? "" : "s"}`;
+  }
+  if (kind === "plan" && value === "confirm") {
+    const tasks = runtime.snapshot?.plan?.tasks || [];
+    return `Plan approved${tasks.length ? ` · ${tasks.length} step${tasks.length === 1 ? "" : "s"}` : ""}`;
+  }
+  if (kind === "plan_revision" && value?.action === "revise") return "Plan changes requested";
+  if (kind === "attention" && value?.action) {
+    return `Agent request answered · ${attentionActionLabel(value.action, runtime.attention)}`;
+  }
+  if (kind === "attention_reply" && value?.response) return "Agent response submitted";
+  if (kind === "paused" && value === "resume") return "Collaboration resumed";
+  if (kind === "reconnect" && value === "reconnect") return "Live connection resumed";
+  if (kind === "live_session_permission" && value?.profile) {
+    return `Session approval changed · ${permissionLabel(value.profile, value.policyId)}`;
+  }
+  if (kind === "live_workspace_mode" && typeof value === "string") {
+    return `Next collaboration mode · ${workspaceModeDefinition(value).label}`;
+  }
+  return "";
+}
+
+function recordInteractionResult(runtime, kind, value) {
+  const summary = interactionResultSummary(runtime, kind, value);
+  if (!summary) return;
+  runtime.interactionHistory = [
+    ...(runtime.interactionHistory || []),
+    { kind, summary, at: Date.now() },
+  ].slice(-12);
+}
+
+const FOCUSED_INTERACTION_KINDS = new Set([
+  "device",
+  "workspace",
+  "setup",
+  "configuration",
+  "team_edit",
+  "team_runtime",
+  "team_route",
+  "team_permission",
+  "team_session_permission",
+  "live_session_permission",
+  "live_workspace_mode",
+  "plan",
+  "plan_revision",
+  "completion",
+]);
+
+function interactionUsesFocusedSurface(runtime, columns = 80, rows = 24) {
+  if (!runtime?.interaction) return false;
+  if (FOCUSED_INTERACTION_KINDS.has(runtime.interactionKind)) return true;
+  if (!runtime.attention || !["attention", "attention_reply"].includes(runtime.interactionKind)) {
+    return false;
+  }
+  const width = Math.max(20, Number(columns) - 8);
+  const contextRows = attentionRequestContext(runtime.attention, runtime).reduce(
+    (total, item) => total + Math.max(1, wrapDisplayText(`${item.label}: ${item.value}`, width).length),
+    0,
+  );
+  const promptRows = contextRows + (runtime.attention.actions || []).length + 4;
+  const request = runtime.attention.payload?.request || {};
+  const hasLargeArtifact = String(request.file_changes_preview || "").length > 240
+    || String(request.tool_input_preview || "").length > 320
+    || String(request.command || "").length > Math.max(180, width * 2);
+  return hasLargeArtifact || promptRows > Math.max(10, Math.floor(Number(rows || 24) * 0.45));
+}
+
 function runtimePhase(runtime) {
   const snapshot = runtime.snapshot;
   const state = snapshot?.run?.state;
   const phase = snapshot?.run?.phase || runtime.phase;
+  if (runtime.interactionKind === "live_session_permission") return "Choose Session approval";
+  if (runtime.interactionKind === "live_workspace_mode") return "Choose collaboration mode";
   if (runtime.phase === "needs_setup") {
     return runtime.setup?.workspaces?.length ? "Choose a workspace" : "Workspace authorization required";
   }
@@ -475,7 +961,7 @@ function taskMarker(state) {
   return muted("○");
 }
 
-function buildRuntimeRows(runtime, columns, maxRows) {
+function buildRuntimeRows(runtime, columns, maxRows, { focusedInteraction = false } = {}) {
   const width = Math.max(20, columns - 4);
   const lines = [];
   const push = (value = "", style = null) => {
@@ -490,46 +976,51 @@ function buildRuntimeRows(runtime, columns, maxRows) {
       lines.push(style ? style(indented) : indented);
     }
   };
-  push("");
-  for (const [index, line] of wrapDisplayText(runtime.objective || "", width - 2).entries()) {
-    push(`${index === 0 ? "› " : "  "}${line}`, index === 0 ? strong : null);
-  }
-  push("");
-  const terminal = ["completed", "failed", "cancelled", "expired"].includes(runtime.snapshot?.run?.state);
-  const waitingForUser = runtime.interaction === true;
-  const spinner = waitingForUser
-    ? "●"
-    : terminal || ["needs_setup", "error"].includes(runtime.phase)
-    ? (runtime.snapshot?.run?.state === "completed" ? "✓" : "!")
-    : SPINNER_FRAMES[Number(runtime.animationFrame || 0) % SPINNER_FRAMES.length];
-  push(`${spinner} ${runtimePhase(runtime)}${runtime.startedAt && !waitingForUser ? ` (${elapsedText(runtime.startedAt)})` : ""}`, strong);
-
   const configured = runtime.configuration;
-  if (configured) {
-    const resolved = configured.resolved_workspace_mode
-      || configured.auto_configuration?.resolved_workspace_mode
-      || configured.workspace_mode;
-    const deviceCount = new Set((configured.participants || []).map((item) => item.device_id)).size;
-    pushIndented(`${workspaceModeDefinition(resolved || "auto").label} · ${(configured.participants || []).length} Agent${configured.participants?.length === 1 ? "" : "s"} · ${deviceCount} device${deviceCount === 1 ? "" : "s"}`, 2, muted);
-    if (configured.planning_source === "cloud_advice") pushIndented("Auto decision: advisory model", 2, muted);
-    if (configured.planning_source === "local_fallback") pushIndented("Auto decision: local fallback", 2, muted);
-  }
-  if (runtime.runId) pushIndented(`Run ${runtime.runId}`, 2, muted);
-  if (runtime.sessionHistory?.length) {
-    const previous = runtime.sessionHistory.at(-1);
-    pushIndented(
-      `Continued session · previous Run ${previous.runId || "completed"}: ${previous.summary || previous.objective}`,
-      2,
-      muted,
-    );
-    if (runtime.detailsExpanded && runtime.sessionHistory.length > 1) {
-      for (const item of runtime.sessionHistory.slice(-5, -1)) {
-        pushIndented(`Earlier · ${item.runId || "Run"} · ${item.summary || item.objective}`, 4, muted);
+  if (focusedInteraction) {
+    push("");
+    push(`● ${runtimePhase(runtime)}`, strong);
+    push("");
+  } else {
+    push("");
+    for (const [index, line] of wrapDisplayText(runtime.objective || "", width - 2).entries()) {
+      push(`${index === 0 ? "› " : "  "}${line}`, index === 0 ? strong : null);
+    }
+    push("");
+    const terminal = ["completed", "failed", "cancelled", "expired"].includes(runtime.snapshot?.run?.state);
+    const spinner = terminal || ["needs_setup", "error"].includes(runtime.phase)
+      ? (runtime.snapshot?.run?.state === "completed" ? "✓" : "!")
+      : SPINNER_FRAMES[Number(runtime.animationFrame || 0) % SPINNER_FRAMES.length];
+    push(`${spinner} ${runtimePhase(runtime)}${runtime.startedAt ? ` (${elapsedText(runtime.startedAt)})` : ""}`, strong);
+    if (configured) {
+      const resolved = configured.resolved_workspace_mode
+        || configured.auto_configuration?.resolved_workspace_mode
+        || configured.workspace_mode;
+      const deviceCount = new Set((configured.participants || []).map((item) => item.device_id)).size;
+      pushIndented(`${workspaceModeDefinition(resolved || "auto").label} · ${(configured.participants || []).length} Agent${configured.participants?.length === 1 ? "" : "s"} · ${deviceCount} device${deviceCount === 1 ? "" : "s"}`, 2, muted);
+      if (configured.planning_source === "cloud_advice") pushIndented("Auto decision: advisory model", 2, muted);
+      if (configured.planning_source === "local_fallback") pushIndented("Auto decision: local fallback", 2, muted);
+    }
+    if (runtime.runId) pushIndented(`Run ${runtime.runId}`, 2, muted);
+    if (runtime.sessionHistory?.length) {
+      const previous = runtime.sessionHistory.at(-1);
+      pushIndented(
+        `Continued session · previous Run ${previous.runId || "completed"}: ${previous.summary || previous.objective}`,
+        2,
+        muted,
+      );
+      if (runtime.detailsExpanded && runtime.sessionHistory.length > 1) {
+        for (const item of runtime.sessionHistory.slice(-5, -1)) {
+          pushIndented(`Earlier · ${item.runId || "Run"} · ${item.summary || item.objective}`, 4, muted);
+        }
       }
     }
-  }
-  if (runtime.connectionAttempts > 0) {
-    pushIndented(`Connection interrupted · retry ${runtime.connectionAttempts}/${MAX_COLLABORATION_RECONNECT_ATTEMPTS}`, 2, strong);
+    if (runtime.connectionAttempts > 0) {
+      pushIndented(`Connection interrupted · retry ${runtime.connectionAttempts}/${MAX_COLLABORATION_RECONNECT_ATTEMPTS}`, 2, strong);
+    }
+    for (const result of (runtime.interactionHistory || []).slice(-4)) {
+      pushIndented(`✓ ${result.summary}`, 2, muted);
+    }
   }
 
   if (runtime.phase === "needs_device" && runtime.setup) {
@@ -627,7 +1118,7 @@ function buildRuntimeRows(runtime, columns, maxRows) {
         pushIndented(`${device?.device_name || participant.device_id} · ${participantRouteLabel(configured, participant)} · Agent limit: ${permissionLabel(participant.permission_profile || "manual")}`, 6, muted);
       }
       push("");
-      pushIndented(`S. Session approval · ${permissionLabel(configured.supervisor_permission_profile || "guarded")}`, 2, strong);
+      pushIndented(`S. Session approval · ${permissionLabel(configured.supervisor_permission_profile || "guarded", configured.supervisor_policy_id)}`, 2, strong);
       pushIndented("P. Change access for the selected Agent", 2, strong);
       pushIndented("D. Done editing · return to team review", 2, strong);
     } else if (runtime.interactionKind === "team_runtime") {
@@ -666,7 +1157,7 @@ function buildRuntimeRows(runtime, columns, maxRows) {
         }
       }
     } else if (runtime.interactionKind === "team_session_permission") {
-      const options = sessionPermissionOptions();
+      const options = sessionPermissionOptions({ includePolicies: true });
       push("Session approval", strong);
       pushIndented("Applied after each Agent's own access limit.", 2, muted);
       push("");
@@ -678,7 +1169,7 @@ function buildRuntimeRows(runtime, columns, maxRows) {
       push("Proposed collaboration team", strong);
       const advice = configured.auto_configuration?.advice;
       if (advice?.reason) pushIndented(advice.reason, 2, muted);
-      pushIndented(`Risk ${configured.risk_tier || "green"} · ${configured.planning_source === "cloud_advice" ? "advisory model" : "local policy"} · Session approval ${permissionLabel(configured.supervisor_permission_profile || "guarded")}`, 2, muted);
+      pushIndented(`Risk ${configured.risk_tier || "green"} · ${configured.planning_source === "cloud_advice" ? "advisory model" : "local policy"} · Session approval ${permissionLabel(configured.supervisor_permission_profile || "guarded", configured.supervisor_policy_id)}`, 2, muted);
       for (const participant of participants) {
         const device = workspaceEditorDevice(configured, participant);
         pushIndented(`${participant.planner ? "●" : "○"} ${participant.display_name || participant.participant_id} · ${runtimeDisplayName(participant.runtime)}`, 2, strong);
@@ -687,23 +1178,41 @@ function buildRuntimeRows(runtime, columns, maxRows) {
         if (participant.role_hint) pushIndented(participant.role_hint, 4, muted);
       }
     }
-  } else if (runtime.interactionKind === "attention" && runtime.attention) {
+  } else if (runtime.interactionKind === "live_workspace_mode") {
+    const selected = Math.max(0, Math.min(
+      WORKSPACE_MODES.length - 1,
+      Number(runtime.workspaceModeSelection) || 0,
+    ));
     push("");
-    push(runtime.attention.title || "Agent needs your input", strong);
-    if (runtime.attention.summary) pushIndented(runtime.attention.summary, 2, muted);
-    if (runtime.attention.risk) pushIndented(`Risk: ${runtime.attention.risk}`, 2, muted);
+    push("Collaboration mode", strong);
+    pushIndented(runtime.runId
+      ? "The active Run keeps its current team. The selected mode applies after /new."
+      : "Choose how OriginRouter should form the Agent team for the next objective.", 2, muted);
     push("");
-    for (const [index, action] of (runtime.attention.actions || []).entries()) {
-      pushIndented(`${index === runtime.attentionSelection ? "›" : " "} ${index + 1}. ${attentionActionLabel(action)}`, 2);
+    for (const [index, option] of WORKSPACE_MODES.entries()) {
+      pushIndented(`${index === selected ? "›" : " "} ${option.label}`, 2, index === selected ? strong : null);
+      if (index === selected) pushIndented(option.description, 6, muted);
     }
-  } else if (runtime.interactionKind === "paused") {
+  } else if (runtime.interactionKind === "live_session_permission") {
+    const options = runtime.sessionPermissionOptions || sessionPermissionOptions({ includePolicies: true });
+    push("");
+    push("Session approval", strong);
+    pushIndented("Applies immediately to permission requests from every Agent in this Workspace Session.", 2, muted);
+    push("");
+    for (const [index, option] of options.entries()) {
+      pushIndented(`${index === runtime.teamSessionPermissionSelection ? "›" : " "} ${option.label}`, 2);
+      if (index === runtime.teamSessionPermissionSelection) pushIndented(option.description, 6, muted);
+    }
+    push("");
+    pushIndented("Rules templates are loaded from the OriginRouter approval policy library.", 2, muted);
+  } else if (runtime.interactionKind === "paused" && focusedInteraction) {
     push("");
     push("This collaboration is paused.", strong);
     pushIndented(runtime.snapshot?.run?.pause_reason || "The OriginRouter service is preserving the Run state.", 2, muted);
     if (runtime.snapshot?.run?.account_budget_blocked) {
       pushIndented("The account or device budget must be changed before this Run can resume.", 2, muted);
     }
-  } else if (runtime.interactionKind === "reconnect") {
+  } else if (runtime.interactionKind === "reconnect" && focusedInteraction) {
     push("");
     push("The live connection is paused.", strong);
     pushIndented("OriginRouter service still owns this Run; its task state and history are preserved.", 2, muted);
@@ -715,7 +1224,8 @@ function buildRuntimeRows(runtime, columns, maxRows) {
   }
 
   const plan = runtime.snapshot?.plan;
-  if (runtime.snapshot?.run?.state === "awaiting_confirmation" && plan) {
+  if (runtime.snapshot?.run?.state === "awaiting_confirmation" && plan
+    && (!focusedInteraction || ["plan", "plan_revision"].includes(runtime.interactionKind))) {
     push("");
     push(plan.title || "Proposed plan", strong);
     if (plan.summary) pushIndented(plan.summary, 2, muted);
@@ -727,7 +1237,7 @@ function buildRuntimeRows(runtime, columns, maxRows) {
   }
 
   const tasks = (runtime.snapshot?.tasks || []).filter((task) => task.task_key !== "__planner__");
-  if (tasks.length) {
+  if (!focusedInteraction && tasks.length) {
     push("");
     for (const task of tasks.slice(0, 6)) {
       const taskState = String(task.state || "queued").replaceAll("_", " ");
@@ -742,27 +1252,74 @@ function buildRuntimeRows(runtime, columns, maxRows) {
     participant.participant_id,
     participant.display_name || participant.participant_id,
   ]));
-  const activityGroups = projectCollaborationActivity(runtime.events, {
+  const activityGroups = focusedInteraction ? [] : projectCollaborationActivity(runtime.events, {
     expanded: runtime.detailsExpanded === true,
+    expandedParticipantIds: runtime.expandedActivityParticipants || [],
     participantLabels,
     maxGroups: runtime.detailsExpanded ? 8 : 4,
   });
+  const activityParticipants = activityGroups
+    .filter((group) => group.participantId)
+    .map((group) => group.participantId);
+  runtime.activityParticipantIds = activityParticipants;
+  runtime.activityParticipantLabels = participantLabels;
+  runtime.activitySelection = Math.max(0, Math.min(
+    Math.max(0, activityParticipants.length - 1),
+    Number(runtime.activitySelection) || 0,
+  ));
+  const selectedActivityParticipant = activityParticipants[runtime.activitySelection] || "";
   if (activityGroups.length) {
     push("");
-    push(runtime.detailsExpanded ? "Detailed transcript" : "Activity", strong);
+    push("Activity", strong);
     for (const group of activityGroups) {
       const marker = group.marker === "active" ? "●"
         : group.marker === "error" ? "×"
         : group.marker === "warning" ? "!" : "•";
-      pushIndented(`${marker} ${group.title}`, 2, group.marker === "active" ? strong : null);
+      const selected = group.participantId && group.participantId === selectedActivityParticipant;
+      pushIndented(`${selected ? "›" : " "} ${marker} ${group.title}`, 2, selected || group.marker === "active" ? strong : null);
       if (group.summary) pushIndented(group.summary, 4, muted);
-      for (const detail of group.details || []) pushIndented(`└ ${detail}`, 4, muted);
+      for (const task of tasks.filter((item) => item.participant_id === group.participantId).slice(0, 3)) {
+        const taskState = String(task.state || "queued").replaceAll("_", " ");
+        pushIndented(`Task · ${task.title || task.task_key} · ${taskState}`, 4, task.state === "active" ? strong : muted);
+      }
+      for (const [index, detail] of (group.details || []).entries()) {
+        const branch = index === group.details.length - 1 ? "└" : "├";
+        pushIndented(`${branch} ${detail}`, 4, muted);
+      }
     }
-    if (!runtime.detailsExpanded) pushIndented("Ctrl+O shows the detailed transcript.", 2, muted);
+    if (activityParticipants.length) {
+      const selectedGroup = activityGroups.find(
+        (group) => group.participantId === selectedActivityParticipant,
+      );
+      const action = selectedGroup?.expanded ? "collapses" : "expands";
+      const selectionHint = activityParticipants.length > 1 ? "↑/↓ selects an Agent · " : "";
+      pushIndented(`${selectionHint}Ctrl+O ${action} ${selectedGroup?.title?.replace(/ (?:is working|worked)$/, "") || "Agent"}.`, 2, muted);
+    }
+  }
+
+  if (focusedInteraction && ["attention", "attention_reply"].includes(runtime.interactionKind) && runtime.attention) {
+    push("");
+    const requestKind = attentionRequestKind(runtime.attention);
+    const permission = runtime.attention.kind === "approval";
+    const heading = requestKind === "confirm" ? "Continue execution"
+      : requestKind === "questions" ? "Agent questions"
+        : requestKind === "form" ? "Agent form"
+          : requestKind === "url" ? "External authorization"
+            : permission ? "Permission decision" : "Agent question";
+    push(heading, strong);
+    pushIndented(runtime.attention.title || (permission ? "Agent permission required" : "Agent needs your input"), 2, strong);
+    for (const item of attentionRequestContext(runtime.attention, runtime)) {
+      pushIndented(`${item.label}: ${item.value}`, 2, item.code ? strong : muted);
+    }
+    if (runtime.attention.risk) pushIndented(`Risk: ${runtime.attention.risk}`, 2, muted);
+    push("");
+    for (const [index, action] of (runtime.attention.actions || []).entries()) {
+      pushIndented(`${index === runtime.attentionSelection ? "›" : " "} ${index + 1}. ${attentionActionLabel(action, runtime.attention)}`, 2, index === runtime.attentionSelection ? strong : null);
+    }
   }
 
   const report = runtime.snapshot?.final_report;
-  if (report?.summary) {
+  if (report?.summary && (!focusedInteraction || runtime.interactionKind === "completion")) {
     push("");
     pushIndented(report.summary, 2, runtime.snapshot?.run?.state === "completed" ? strong : null);
     for (const task of (report.completed_tasks || []).slice(0, 3)) {
@@ -782,12 +1339,17 @@ function buildRuntimeRows(runtime, columns, maxRows) {
 
 function runtimeControls(runtime, columns) {
   const mode = workspaceModeDefinition(runtime.mode || "auto").label;
-  let text = runtime.notice || "Enter queues next objective · ctrl+c interrupts · ctrl+t freezes · PgUp/PgDn reviews";
+  let text = runtime.notice || "Enter queues next objective · shift+tab approval · /approval chooses · ctrl+c interrupts";
   if (runtime.screenPaused) text = "screen frozen for copying · ctrl+t resumes updates";
-  if (runtime.detailsExpanded) text = "verbose transcript · ctrl+o collapses · PgUp/PgDn scroll · Ctrl+End latest";
+  const selectedActivityId = runtime.activityParticipantIds?.[runtime.activitySelection || 0];
+  const selectedActivityExpanded = selectedActivityId
+    && (runtime.expandedActivityParticipants || []).includes(selectedActivityId);
+  if (selectedActivityId && !runtime.interaction) {
+    text = `${(runtime.activityParticipantIds || []).length > 1 ? "↑/↓ Agent · " : ""}ctrl+o ${selectedActivityExpanded ? "collapse" : "expand"} · PgUp/PgDn scroll`;
+  }
   if (runtime.autoFollow === false) {
     const unseen = Number(runtime.unseenActivityCount || 0);
-    text = `${unseen ? `${unseen} new event${unseen === 1 ? "" : "s"} · ` : ""}PgDn/Ctrl+End returns to latest · ctrl+o details`;
+    text = `${unseen ? `${unseen} new event${unseen === 1 ? "" : "s"} · ` : ""}PgDn/Ctrl+End latest · ctrl+o Agent details`;
   }
   if (runtime.queuedObjective) text = "next objective queued · ctrl+c interrupts · ← agents";
   if (runtime.phase === "needs_setup") text = runtime.setup?.workspaces?.length && runtime.setupMode !== "path"
@@ -808,21 +1370,33 @@ function runtimeControls(runtime, columns) {
   if (runtime.phase === "reconnecting") text = "connection interrupted · retrying automatically · ctrl+c cancels";
   if (runtime.phase === "connection_paused") text = "Enter reconnects · D detaches · ctrl+c interrupts Run";
   if (runtime.snapshot?.run?.state === "awaiting_confirmation") text = "↑/↓ reviews · Enter starts · E requests changes · Esc leaves pending";
-  if (["attention", "attention_reply"].includes(runtime.interactionKind)) text = "Agent is waiting for your response";
+  if (["attention", "attention_reply"].includes(runtime.interactionKind)) {
+    text = "Review the request above · shift+tab changes approval for later requests";
+  }
   if (runtime.snapshot?.run?.state === "completed") {
     text = "Enter continues with this team · /new starts fresh · /exit exits";
   } else if (["failed", "cancelled", "error"].includes(runtime.snapshot?.run?.state || runtime.phase)) {
     text = "reviewing the result";
+  }
+  if (runtime.interactionKind === "live_workspace_mode") {
+    text = runtime.runId
+      ? "↑/↓ selects · Enter saves for /new · Esc keeps current mode"
+      : "↑/↓ selects · Enter applies · Esc keeps current mode";
   }
   if (runtime.notice) text = runtime.notice;
   return padDisplayRight(muted(`  ${mode} · ${text}`), columns);
 }
 
 function composerStatus(columns, runtime = null) {
-  const profile = runtime?.snapshot?.run?.supervisor_permission_profile
+  const profile = runtime?.sessionApprovalOverride?.profile
+    || runtime?.snapshot?.run?.supervisor_permission_profile
     || runtime?.configuration?.supervisor_permission_profile
     || "guarded";
-  const status = `● ${permissionLabel(profile).toLowerCase()} · session approval`;
+  const policyId = runtime?.sessionApprovalOverride?.policyId
+    || runtime?.snapshot?.run?.supervisor_policy_id
+    || runtime?.configuration?.supervisor_policy_id
+    || "";
+  const status = `● ${permissionLabel(profile, policyId).toLowerCase()} · session approval`;
   return `${" ".repeat(Math.max(0, columns - promptDisplayWidth(status) - 2))}${accent(status)}  `;
 }
 
@@ -892,7 +1466,19 @@ function runtimePathComposer(runtime, columns) {
   return padDisplayRight(strong(fitDisplayText(prompt, Math.max(1, columns - 1))), columns);
 }
 
-function interactionComposer(runtime, columns) {
+function wrappedInteractionLines(lines, columns, maxLines = 16) {
+  const width = Math.max(1, columns - 1);
+  const rendered = [];
+  for (const line of lines) {
+    for (const row of wrapDisplayText(line, width).slice(0, 3)) {
+      rendered.push(padDisplayRight(strong(fitDisplayText(row, width)), columns));
+      if (rendered.length >= maxLines) return rendered.join("\n");
+    }
+  }
+  return rendered.join("\n");
+}
+
+function interactionComposer(runtime, columns, { focusedInteraction = false } = {}) {
   const kind = runtime.interactionKind;
   let lines;
   if (kind === "device") {
@@ -956,6 +1542,16 @@ function interactionComposer(runtime, columns) {
       "? Choose the Session approval policy",
       "↑/↓ select · Enter save Session approval · Esc back",
     ];
+  } else if (kind === "live_session_permission") {
+    lines = [
+      "? Change Session approval now?",
+      "↑/↓ select · Enter apply immediately · Esc keep current",
+    ];
+  } else if (kind === "live_workspace_mode") {
+    lines = [
+      runtime.runId ? "? Use this mode after /new?" : "? Use this collaboration mode?",
+      "↑/↓ select · Enter apply · Esc keep current",
+    ];
   } else if (kind === "plan") {
     lines = [
       "? Start this plan?",
@@ -979,24 +1575,82 @@ function interactionComposer(runtime, columns) {
         : "↑/↓ or PgUp/PgDn review · Enter return to objective prompt",
     ];
   } else if (kind === "attention") {
+    const permission = runtime.attention?.kind === "approval";
+    const requestKind = attentionRequestKind(runtime.attention);
+    const participant = attentionParticipantLabel(runtime.attention, runtime);
+    const attentionTitle = runtime.attention?.title
+      || (permission ? `Allow the request from ${participant}?`
+        : requestKind === "confirm" ? `Continue with ${participant}?`
+          : requestKind === "questions" ? `Answer questions from ${participant}?`
+            : requestKind === "form" ? `Complete the form for ${participant}?`
+              : requestKind === "url" ? `Continue authorization for ${participant}?`
+                : `Respond to ${participant}?`);
+    const attentionHeading = permission
+      ? `Allow the request from ${participant}? · ${attentionTitle}`
+      : requestKind === "confirm"
+        ? `Continue with ${participant}? · ${attentionTitle}`
+        : requestKind === "questions"
+          ? `Answer questions from ${participant}? · ${attentionTitle}`
+          : requestKind === "form"
+            ? `Complete the form for ${participant}? · ${attentionTitle}`
+            : requestKind === "url"
+              ? `Continue authorization for ${participant}? · ${attentionTitle}`
+              : `Respond to ${participant}? · ${attentionTitle}`;
+    if (!focusedInteraction) {
+      const context = attentionRequestContext(runtime.attention, runtime);
+      const actions = (runtime.attention?.actions || []).map((action, index) => (
+        `${index === runtime.attentionSelection ? "›" : " "} ${index + 1}. ${attentionActionLabel(action, runtime.attention)}`
+      ));
+      return wrappedInteractionLines([
+        `? ${attentionHeading}`,
+        ...context.map((item) => `${item.label}: ${item.value}`),
+        ...(runtime.attention?.risk ? [`Risk: ${runtime.attention.risk}`] : []),
+        ...actions,
+        permission
+          ? "↑/↓ select · Enter confirms · Shift+Tab changes later requests · D detach"
+          : "↑/↓ select · Enter continues · Shift+Tab changes later requests · D detach",
+      ], columns);
+    }
     lines = [
-      "? Agent needs your decision",
-      "↑/↓ select · Enter confirms · D detaches · Esc stays with Run",
+      `? ${attentionHeading}`,
+      permission
+        ? "↑/↓ select · Enter confirms · Shift+Tab changes approval for later requests"
+        : "↑/↓ select · Enter continues · Shift+Tab changes approval for later requests",
+      "D detaches · Esc stays with Run",
     ];
   } else if (kind === "attention_reply") {
+    const replyPrompt = attentionReplyPrompt(runtime.attention);
+    if (!focusedInteraction) {
+      const question = attentionRequestContext(runtime.attention, runtime)
+        .filter((item) => ["Requested by", "Request"].includes(item.label))
+        .map((item) => `${item.label}: ${item.value}`);
+      return [
+        wrappedInteractionLines([
+          `? ${replyPrompt}`,
+          ...question,
+        ], columns, 6),
+        composerLine(runtime.decisionBuffer || "", runtime.decisionCursor || 0, columns),
+        wrappedInteractionLines([
+          "Enter submits · Ctrl+U clears · Esc back to actions · Shift+Tab approval",
+        ], columns, 2),
+      ].join("\n");
+    }
     lines = [
-      "? Reply to the Agent",
+      `? ${replyPrompt}`,
       composerLine(runtime.decisionBuffer || "", runtime.decisionCursor || 0, columns),
-      "Enter sends reply · Ctrl+U clears · Esc back to actions",
+      "Enter submits · Ctrl+U clears · Esc back to actions · Shift+Tab approval",
     ];
   } else if (kind === "paused") {
     lines = [
       "? Resume this collaboration?",
+      runtime.snapshot?.run?.pause_reason || "The Run is preserved and can continue from its current state.",
       "Enter resume · Esc leave it paused",
     ];
   } else if (kind === "reconnect") {
     lines = [
       "? Reconnect to this Run?",
+      "OriginRouter service still owns this Run and its Agent bindings.",
+      "No new Run will be created.",
       "Enter reconnect · D detach · Ctrl+C interrupt Run",
     ];
   } else {
@@ -1017,6 +1671,8 @@ function interactionStatus(runtime, columns) {
     team_route: "choosing model route",
     team_permission: "choosing Agent access limit",
     team_session_permission: "choosing Session approval",
+    live_session_permission: "choosing Session approval",
+    live_workspace_mode: "choosing collaboration mode",
     plan: "reviewing plan",
     plan_revision: "requesting plan changes",
     completion: "reviewing result",
@@ -1056,6 +1712,8 @@ export function buildWorkspaceAppScreen({
   composerCursor = 0,
   composerPastes = [],
   composerNotice = "",
+  commandSuggestions = [],
+  sessionApproval = null,
 } = {}) {
   const terminalColumns = Math.max(20, Number(columns) || 80);
   const terminalRows = Math.max(8, Number(rows) || 24);
@@ -1077,7 +1735,7 @@ export function buildWorkspaceAppScreen({
     metricRow("Workspace", workspace, leftWidth),
     metricRow("Team", modeLabel, leftWidth),
     metricRow("Lead", lead, leftWidth),
-    metricRow("Access", "Guarded", leftWidth),
+    metricRow("Access", permissionLabel(sessionApproval?.profile || "guarded", sessionApproval?.policyId), leftWidth),
   ];
   const rightRows = [
     viewPanel.title,
@@ -1106,13 +1764,28 @@ export function buildWorkspaceAppScreen({
         ...detailRows,
         bottomLine(frameWidth),
       ];
+  const commandSuggestionsBlock = !runtime
+    ? workspaceCommandSuggestionsBlock(commandSuggestions, terminalColumns)
+    : "";
   const normalComposerBlock = !runtime && composerBuffer !== null
-    ? composerLine(composerBuffer, composerCursor, terminalColumns, composerPastes)
+    ? [
+        composerLine(composerBuffer, composerCursor, terminalColumns, composerPastes),
+        commandSuggestionsBlock,
+      ].filter(Boolean).join("\n")
+    : "";
+  const focusedInteraction = interactionUsesFocusedSurface(runtime, terminalColumns, terminalRows);
+  const runtimeCommandSuggestionsBlock = runtime && !runtime.interaction
+    ? workspaceCommandSuggestionsBlock(
+        workspaceCommandSuggestions(runtime.composerBuffer, { limit: 3 }),
+        terminalColumns,
+      )
     : "";
   const runtimeComposerBlock = runtime
     ? runtime.interaction
-      ? interactionComposer(runtime, terminalColumns)
-      : runtimeComposer(runtime, terminalColumns)
+      ? interactionComposer(runtime, terminalColumns, { focusedInteraction })
+      : [runtimeComposer(runtime, terminalColumns), runtimeCommandSuggestionsBlock]
+        .filter(Boolean)
+        .join("\n")
     : "";
   const reservedRows = runtime
     ? 4 + runtimeComposerBlock.split("\n").length
@@ -1120,16 +1793,23 @@ export function buildWorkspaceAppScreen({
       ? 4 + normalComposerBlock.split("\n").length
       : 5;
   const activityRows = runtime
-    ? buildRuntimeRows(runtime, terminalColumns, Math.max(0, terminalRows - headerRows.length - reservedRows))
+    ? buildRuntimeRows(
+        runtime,
+        terminalColumns,
+        Math.max(0, terminalRows - headerRows.length - reservedRows),
+        { focusedInteraction },
+      )
     : [];
   const screenRows = [...headerRows, ...activityRows];
   const separator = border("─".repeat(terminalColumns));
   const blankRows = Math.max(0, terminalRows - screenRows.length - reservedRows);
   const body = `${screenRows.join("\n")}\n${"\n".repeat(blankRows)}`;
-  if (!runtime && composerBuffer === null) return `${body}${composerStatus(terminalColumns)}\n${separator}\n`;
+  if (!runtime && composerBuffer === null) {
+    return `${body}${composerStatus(terminalColumns, { sessionApprovalOverride: sessionApproval })}\n${separator}\n`;
+  }
   if (!runtime) {
     return [
-      `${body}${muted(`  ${composerNotice || `${modeLabel} · shift+tab to cycle · /help for commands`}`)}`,
+      `${body}${muted(`  ${composerNotice || `${modeLabel} · shift+tab approval · /mode changes team · /help`}`)}`,
       separator,
       normalComposerBlock,
       separator,
@@ -1158,8 +1838,11 @@ function redrawWorkspaceApp(output, {
   composerCursor = 0,
   composerPastes = [],
   composerNotice = "",
+  commandSuggestions = [],
+  sessionApproval = null,
   force = false,
 } = {}) {
+  setWorkspaceMouseCapture(output, Boolean(runtime && !runtime.screenPaused));
   const screen = buildWorkspaceAppScreen({
     coordinator,
     mode,
@@ -1169,6 +1852,8 @@ function redrawWorkspaceApp(output, {
     composerCursor,
     composerPastes,
     composerNotice,
+    commandSuggestions,
+    sessionApproval,
     columns: output.columns,
     rows: output.rows,
   });
@@ -1212,15 +1897,29 @@ function supportsAppScreen(output) {
   return Boolean(output?.isTTY) && process.env.TERM !== "dumb";
 }
 
+function setWorkspaceMouseCapture(output, enabled) {
+  const terminalState = workspaceTerminalState.get(output);
+  if (!terminalState || terminalState.mouseCapture === enabled) return;
+  terminalState.mouseCapture = enabled;
+  output.write(enabled
+    ? "\x1b[?1000h\x1b[?1006h"
+    : "\x1b[?1000l\x1b[?1006l");
+}
+
 function enterWorkspaceApp(output) {
   if (!supportsAppScreen(output)) return () => {};
-  output.write("\x1b[?1049h\x1b[?2004h\x1b[?25l\x1b[H\x1b[2J");
+  workspaceTerminalState.set(output, { mouseCapture: false });
+  // Disable autowrap while the app owns the screen. Writing a full-width row
+  // into the bottom-right cell can otherwise scroll the alternate buffer and
+  // expose the shell's scrollback above the app.
+  output.write("\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?25l\x1b[H\x1b[2J");
   let exited = false;
   const exit = () => {
     if (exited) return;
     exited = true;
     workspaceScreenCache.delete(output);
-    output.write("\x1b[?2004l\x1b[?25h\x1b[?1049l");
+    workspaceTerminalState.delete(output);
+    output.write("\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l");
   };
   process.once("exit", exit);
   const onSigterm = () => {
@@ -1332,7 +2031,7 @@ function promptText(buffer) {
 
 function promptFooter(mode, notice = "") {
   if (notice) return accent(`  ${notice}`);
-  return muted(`  ${workspaceModeDefinition(mode).label} · shift+tab to cycle · /help for commands`);
+  return muted(`  ${workspaceModeDefinition(mode).label} · shift+tab approval · /mode changes team · /help`);
 }
 
 function isWideCodePoint(codePoint) {
@@ -1394,7 +2093,16 @@ export function redrawPrompt(output, buffer, mode, previousRows = 0, { notice = 
   return renderedRows;
 }
 
-async function readWorkspaceLine({ input, output, mode, coordinator, panel, onModeChange, initialBuffer = "" }) {
+async function readWorkspaceLine({
+  input,
+  output,
+  mode,
+  coordinator,
+  panel,
+  sessionApproval,
+  onSessionApprovalChange,
+  initialBuffer = "",
+}) {
   if (!input.isTTY || !output.isTTY || typeof input.setRawMode !== "function") {
     throw new Error("Interactive Agent Workspace requires a terminal. Pass an objective, for example: originrouter \"fix the failing test\"");
   }
@@ -1417,6 +2125,8 @@ async function readWorkspaceLine({ input, output, mode, coordinator, panel, onMo
     composerCursor: cursor,
     composerPastes: pendingPastes,
     composerNotice: notice,
+    commandSuggestions: workspaceCommandSuggestions(buffer),
+    sessionApproval,
     force,
   });
   renderInput(true);
@@ -1514,10 +2224,11 @@ async function readWorkspaceLine({ input, output, mode, coordinator, panel, onMo
       }
       if ((key.shift && key.name === "tab") || key.sequence === "\x1b[Z") {
         clearNoticeTimer();
-        notice = "";
+        sessionApproval = onSessionApprovalChange(sessionApproval);
+        notice = `Session approval: ${permissionLabel(sessionApproval.profile, sessionApproval.policyId)}`;
         exitArmed = false;
-        mode = onModeChange().id;
         renderInput(true);
+        clearNoticeLater(1200);
         return;
       }
       if (key.name === "backspace") {
@@ -1619,13 +2330,33 @@ function isInterrupted(error) {
     || error?.cause?.code === "ORIGINROUTER_INTERRUPTED";
 }
 
-async function readRuntimeDecision({ input, runtime, render, kind, browseWorkspaceFn = null }) {
+async function readRuntimeDecision({
+  input,
+  runtime,
+  render,
+  kind,
+  browseWorkspaceFn = null,
+  cycleSessionApproval = null,
+}) {
   emitKeypressEvents(input);
   input.setRawMode(true);
   input.resume();
   runtime.interaction = true;
   runtime.interactionKind = kind;
-  runtime.scrollOffset = 0;
+  const previousViewport = {
+    scrollOffset: Number(runtime.scrollOffset || 0),
+    autoFollow: runtime.autoFollow !== false,
+    unseenActivityCount: Number(runtime.unseenActivityCount || 0),
+  };
+  const focusedViewport = interactionUsesFocusedSurface(
+    runtime,
+    runtime.terminalColumns || 80,
+    runtime.terminalRows || 24,
+  );
+  if (focusedViewport) {
+    runtime.scrollOffset = 0;
+    runtime.autoFollow = true;
+  }
   let buffer = kind === "setup" ? String(runtime.setupPath || "") : "";
   let cursor = [...buffer].length;
   runtime.setupPath = buffer;
@@ -1685,8 +2416,14 @@ async function readRuntimeDecision({ input, runtime, render, kind, browseWorkspa
       input.off("error", onError);
       runtime.interaction = false;
       runtime.interactionKind = "";
+      if (focusedViewport) {
+        runtime.scrollOffset = previousViewport.scrollOffset;
+        runtime.autoFollow = previousViewport.autoFollow;
+        runtime.unseenActivityCount = previousViewport.unseenActivityCount;
+      }
     };
     const finish = (value) => {
+      recordInteractionResult(runtime, kind, value);
       cleanup();
       resolve(value);
     };
@@ -1695,9 +2432,24 @@ async function readRuntimeDecision({ input, runtime, render, kind, browseWorkspa
       reject(error);
     };
     const onKeypress = (text, key = {}) => {
+      const mouse = consumeWorkspaceMouseKeypress(runtime, text, key);
+      if (mouse.handled) {
+        if (mouse.direction) {
+          scrollRuntimeContent(runtime, mouse.direction, 3);
+          render(true);
+        }
+        return;
+      }
+      if (((key.shift && key.name === "tab") || key.sequence === "\x1b[Z")
+        && typeof cycleSessionApproval === "function") {
+        void Promise.resolve(cycleSessionApproval()).catch((error) => {
+          runtime.notice = `Session approval unchanged: ${String(error?.message || error).split("\n")[0]}`;
+          render(true);
+        });
+        return;
+      }
       if (key.ctrl && key.name === "o") {
-        runtime.detailsExpanded = !runtime.detailsExpanded;
-        runtime.notice = runtime.detailsExpanded ? "Detailed transcript shown" : "Execution details collapsed";
+        if (!toggleSelectedActivity(runtime)) runtime.notice = "No Agent activity is available yet";
         render(true);
         return;
       }
@@ -1725,6 +2477,10 @@ async function readRuntimeDecision({ input, runtime, render, kind, browseWorkspa
         return;
       }
       if (key.name === "escape" || (key.ctrl && key.name === "c")) {
+        if (["live_session_permission", "live_workspace_mode"].includes(kind)) {
+          finish(null);
+          return;
+        }
         if (kind === "attention" && key.name === "escape") {
           runtime.notice = "This Run is still waiting for a decision · press D to detach explicitly";
           render(true);
@@ -1831,10 +2587,14 @@ async function readRuntimeDecision({ input, runtime, render, kind, browseWorkspa
         return;
       }
       if (kind === "team_edit" && !key.ctrl && !key.meta && /^[sS]$/.test(text || "")) {
-        const options = sessionPermissionOptions();
+        const options = sessionPermissionOptions({ includePolicies: true });
         runtime.teamSessionPermissionSelection = Math.max(
           0,
-          options.findIndex((option) => option.id === (runtime.configuration?.supervisor_permission_profile || "guarded")),
+          options.findIndex((option) => samePermissionOption(
+            option,
+            runtime.configuration?.supervisor_permission_profile || "guarded",
+            runtime.configuration?.supervisor_policy_id,
+          )),
         );
         kind = "team_session_permission";
         runtime.interactionKind = "team_session_permission";
@@ -1936,7 +2696,7 @@ async function readRuntimeDecision({ input, runtime, render, kind, browseWorkspa
           runtime.interactionKind = "team_edit";
           render(true);
         } else if (kind === "team_session_permission") {
-          const options = sessionPermissionOptions();
+          const options = sessionPermissionOptions({ includePolicies: true });
           const profile = options[runtime.teamSessionPermissionSelection || 0];
           if (!profile) return;
           runtime.configuration.supervisor_permission_profile = profile.id;
@@ -1946,6 +2706,15 @@ async function readRuntimeDecision({ input, runtime, render, kind, browseWorkspa
           kind = "team_edit";
           runtime.interactionKind = "team_edit";
           render(true);
+        } else if (kind === "live_session_permission") {
+          const options = runtime.sessionPermissionOptions || sessionPermissionOptions({ includePolicies: true });
+          const profile = options[runtime.teamSessionPermissionSelection || 0];
+          finish(profile ? {
+            profile: profile.id,
+            policyId: profile.id === "custom" ? profile.policyId || "protected" : "",
+          } : null);
+        } else if (kind === "live_workspace_mode") {
+          finish(WORKSPACE_MODES[runtime.workspaceModeSelection || 0]?.id || null);
         } else {
           if (kind === "setup") {
             const path = normalizeWorkspacePathInput(buffer);
@@ -1967,7 +2736,7 @@ async function readRuntimeDecision({ input, runtime, render, kind, browseWorkspa
           } else if (kind === "attention") {
             const action = runtime.attention?.actions?.[runtime.attentionSelection || 0];
             if (!action) return;
-            if (runtime.attention?.kind === "input" && action === "submit") {
+            if (action === "submit" && attentionNeedsTypedResponse(runtime.attention)) {
               kind = "attention_reply";
               runtime.interactionKind = "attention_reply";
               runtime.decisionBuffer = "";
@@ -1975,15 +2744,20 @@ async function readRuntimeDecision({ input, runtime, render, kind, browseWorkspa
               render(true);
               return;
             }
-            finish({ action, response: {} });
+            finish({ action, response: attentionRequestKind(runtime.attention) === "form" ? { values: {} } : {} });
           } else if (kind === "attention_reply") {
             const reply = String(runtime.decisionBuffer || "").trim();
             if (!reply) {
-              runtime.notice = "Enter a reply before submitting";
+              runtime.notice = "Enter a response before submitting";
               render(true);
               return;
             }
-            finish({ action: "submit", response: { text: reply } });
+            try {
+              finish({ action: "submit", response: attentionResponseFromText(runtime.attention, reply) });
+            } catch (error) {
+              runtime.notice = String(error?.message || error);
+              render(true);
+            }
           } else if (kind === "completion") {
             finish("continue");
           } else if (kind === "paused") {
@@ -2032,7 +2806,7 @@ async function readRuntimeDecision({ input, runtime, render, kind, browseWorkspa
         }
         return;
       }
-      if (["team_edit", "team_runtime", "team_route", "team_permission", "team_session_permission"].includes(kind)) {
+      if (["team_edit", "team_runtime", "team_route", "team_permission", "team_session_permission", "live_session_permission", "live_workspace_mode"].includes(kind)) {
         let optionCount = 0;
         if (kind === "team_edit") {
           optionCount = runtime.configuration?.participants?.length || 0;
@@ -2048,7 +2822,11 @@ async function readRuntimeDecision({ input, runtime, render, kind, browseWorkspa
                 ).length
               : kind === "team_permission"
                 ? workspacePermissionOptions(runtime.configuration, participant).length
-                : sessionPermissionOptions().length;
+                : kind === "live_workspace_mode"
+                  ? WORKSPACE_MODES.length
+                : kind === "live_session_permission"
+                  ? (runtime.sessionPermissionOptions || sessionPermissionOptions({ includePolicies: true })).length
+                  : sessionPermissionOptions({ includePolicies: true }).length;
         }
         if (!optionCount) return;
         const selectionKey = kind === "team_edit"
@@ -2057,7 +2835,11 @@ async function readRuntimeDecision({ input, runtime, render, kind, browseWorkspa
             ? "teamRuntimeSelection"
             : kind === "team_route"
               ? "teamRouteSelection"
-              : kind === "team_permission" ? "teamPermissionSelection" : "teamSessionPermissionSelection";
+              : kind === "team_permission"
+                ? "teamPermissionSelection"
+                : kind === "live_workspace_mode"
+                  ? "workspaceModeSelection"
+                  : "teamSessionPermissionSelection";
         if (key.name === "up") {
           runtime[selectionKey] = (runtime[selectionKey] - 1 + optionCount) % optionCount;
         } else if (key.name === "down" || key.name === "tab") {
@@ -2314,6 +3096,61 @@ function completionPanel(runtime) {
   };
 }
 
+async function readWorkspaceModePicker({
+  input,
+  output,
+  coordinator,
+  mode,
+  sessionApproval,
+}) {
+  const runtime = {
+    phase: "configuring",
+    objective: "",
+    coordinator,
+    mode,
+    events: [],
+    sessionHistory: [],
+    runId: "",
+    snapshot: null,
+    configuration: null,
+    interaction: false,
+    interactionKind: "",
+    interactionHistory: [],
+    workspaceModeSelection: Math.max(0, WORKSPACE_MODES.findIndex((option) => option.id === mode)),
+    scrollOffset: 0,
+    autoFollow: true,
+    unseenActivityCount: 0,
+    contentLineCount: 0,
+    contentVisibleRows: 0,
+    sessionApprovalOverride: sessionApproval,
+    terminalColumns: output.columns,
+    terminalRows: output.rows,
+  };
+  const render = (force = false) => {
+    runtime.terminalColumns = output.columns;
+    runtime.terminalRows = output.rows;
+    redrawWorkspaceApp(output, {
+      coordinator,
+      mode,
+      panel: runtimeHeaderPanel(runtime),
+      runtime,
+      force,
+    });
+  };
+  const onResize = () => render(true);
+  output.on?.("resize", onResize);
+  try {
+    return await readRuntimeDecision({
+      input,
+      runtime,
+      render,
+      kind: "live_workspace_mode",
+    });
+  } finally {
+    output.off?.("resize", onResize);
+  }
+}
+
 function continuedTeamConfiguration(runtime) {
   if (!runtime.configuration) return null;
   const configuration = structuredClone(runtime.configuration);
@@ -2334,6 +3171,8 @@ function continuedTeamConfiguration(runtime) {
 
 async function runWorkspaceObjective({
   objective,
+  existingRunId = "",
+  retryRunId = "",
   continuedConfiguration = null,
   continuedFromRunId = "",
   sessionHistory = [],
@@ -2347,8 +3186,20 @@ async function runWorkspaceObjective({
   followRunner = followExistingAgentWorkspaceCollaboration,
   retryRunner = retryAgentWorkspaceCollaboration,
   cancelCollaborationRun,
+  controlRun = controlCollaborationRun,
   trustWorkspaceFn = trustCollaborationWorkspace,
   browseWorkspaceFn = browseCollaborationWorkspaces,
+  initialSessionApproval = { profile: "guarded", policyId: "" },
+  updateSessionApproval = async (runId, approval) => controlCollaborationRun(
+    runId,
+    "approval",
+    {
+      body: {
+        supervisor_permission_profile: approval.profile,
+        supervisor_policy_id: approval.policyId || null,
+      },
+    },
+  ),
 }) {
   const runtime = {
     phase: "configuring",
@@ -2358,7 +3209,7 @@ async function runWorkspaceObjective({
     startedAt: Date.now(),
     events: [],
     sessionHistory,
-    runId: "",
+    runId: String(existingRunId || retryRunId || ""),
     snapshot: null,
     configuration: continuedConfiguration,
     setup: null,
@@ -2382,9 +3233,14 @@ async function runWorkspaceObjective({
     notice: "",
     interaction: false,
     interactionKind: "",
+    interactionHistory: [],
     error: null,
     connectionAttempts: 0,
     detailsExpanded: false,
+    activitySelection: 0,
+    activityParticipantIds: [],
+    activityParticipantLabels: {},
+    expandedActivityParticipants: [],
     autoFollow: true,
     unseenActivityCount: 0,
     animationFrame: 0,
@@ -2394,6 +3250,7 @@ async function runWorkspaceObjective({
     decisionCursor: 0,
     draftObjective: "",
     screenPaused: false,
+    mouseSequenceBuffer: "",
     attention: null,
     attentionSelection: 0,
     detachRequested: false,
@@ -2402,15 +3259,27 @@ async function runWorkspaceObjective({
     teamRouteSelection: 0,
     teamPermissionSelection: 0,
     teamSessionPermissionSelection: 0,
+    workspaceModeSelection: Math.max(0, WORKSPACE_MODES.findIndex((option) => option.id === mode)),
+    requestedMode: "",
     teamEditDraft: null,
+    sessionApprovalOverride: {
+      profile: initialSessionApproval?.profile || "guarded",
+      policyId: initialSessionApproval?.policyId || "",
+    },
+    sessionPermissionOptions: [],
+    approvalUpdatePending: false,
   };
-  const render = (force = false) => redrawWorkspaceApp(output, {
-    coordinator,
-    mode,
-    panel: runtimeHeaderPanel(runtime),
-    runtime,
-    force,
-  });
+  const render = (force = false) => {
+    runtime.terminalColumns = output.columns;
+    runtime.terminalRows = output.rows;
+    redrawWorkspaceApp(output, {
+      coordinator,
+      mode,
+      panel: runtimeHeaderPanel(runtime),
+      runtime,
+      force,
+    });
+  };
   const frameScheduler = createWorkspaceFrameScheduler({ render });
   const scheduleRender = () => {
     if (!runtime.screenPaused) frameScheduler.request(false);
@@ -2466,11 +3335,97 @@ async function runWorkspaceObjective({
     noticeTimer.unref?.();
     render();
   };
+  const currentSessionApproval = () => ({
+    profile: runtime.sessionApprovalOverride.profile
+      || runtime.snapshot?.run?.supervisor_permission_profile
+      || runtime.configuration?.supervisor_permission_profile
+      || "guarded",
+    policyId: runtime.sessionApprovalOverride.policyId
+      || runtime.snapshot?.run?.supervisor_policy_id
+      || runtime.configuration?.supervisor_policy_id
+      || "",
+  });
+  const applySessionApproval = async (option) => {
+    if (!option || runtime.approvalUpdatePending) return;
+    const approval = {
+      profile: option.profile || option.id,
+      policyId: (option.profile || option.id) === "custom"
+        ? option.policyId || "protected"
+        : "",
+    };
+    runtime.approvalUpdatePending = true;
+    runtime.sessionApprovalOverride = approval;
+    if (runtime.configuration) {
+      runtime.configuration.supervisor_permission_profile = approval.profile;
+      if (approval.policyId) runtime.configuration.supervisor_policy_id = approval.policyId;
+      else delete runtime.configuration.supervisor_policy_id;
+    }
+    render(true);
+    try {
+      if (runtime.runId) {
+        const run = await updateSessionApproval(runtime.runId, approval);
+        if (runtime.snapshot?.run && run) runtime.snapshot.run = run;
+      }
+      runtime.notice = `Session approval set to ${permissionLabel(approval.profile, approval.policyId)}`;
+    } catch (error) {
+      runtime.notice = `Session approval unchanged: ${String(error?.message || error).split("\n")[0]}`;
+    } finally {
+      runtime.approvalUpdatePending = false;
+      render(true);
+    }
+  };
+  const openSessionApprovalPicker = async () => {
+    if (runtime.interaction || runtime.approvalUpdatePending) return;
+    const current = currentSessionApproval();
+    runtime.sessionPermissionOptions = sessionPermissionOptions({ includePolicies: true });
+    runtime.teamSessionPermissionSelection = Math.max(0, runtime.sessionPermissionOptions.findIndex(
+      (option) => samePermissionOption(option, current.profile, current.policyId),
+    ));
+    const selected = await readRuntimeDecision({
+      input,
+      runtime,
+      render,
+      kind: "live_session_permission",
+    });
+    runtime.sessionPermissionOptions = [];
+    if (selected) await applySessionApproval(selected);
+    else render(true);
+  };
+  const openWorkspaceModePicker = async () => {
+    if (runtime.interaction) return;
+    const currentMode = runtime.requestedMode || runtime.mode || "auto";
+    runtime.workspaceModeSelection = Math.max(0, WORKSPACE_MODES.findIndex(
+      (option) => option.id === currentMode,
+    ));
+    const selected = await readRuntimeDecision({
+      input,
+      runtime,
+      render,
+      kind: "live_workspace_mode",
+    });
+    if (selected) {
+      runtime.requestedMode = selected;
+      runtime.notice = `Collaboration mode set to ${workspaceModeDefinition(selected).label} · use /new to apply`;
+    }
+    render(true);
+  };
   const onActiveKeypress = (text, key = {}) => {
     if (runtime.interaction) return;
+    const mouse = consumeWorkspaceMouseKeypress(runtime, text, key);
+    if (mouse.handled) {
+      if (mouse.direction) {
+        scrollRuntimeContent(runtime, mouse.direction, 3);
+        render(true);
+      }
+      return;
+    }
     if (key.ctrl && key.name === "o") {
-      runtime.detailsExpanded = !runtime.detailsExpanded;
-      runtime.notice = runtime.detailsExpanded ? "Detailed transcript shown" : "Execution details collapsed";
+      if (!toggleSelectedActivity(runtime)) runtime.notice = "No Agent activity is available yet";
+      render(true);
+      return;
+    }
+    if (["up", "down"].includes(key.name) && moveActivitySelection(runtime, key.name === "up" ? -1 : 1)) {
+      runtime.notice = "";
       render(true);
       return;
     }
@@ -2536,6 +3491,11 @@ async function runWorkspaceObjective({
       completedInputResolve?.("exit");
       return;
     }
+    if ((key.shift && key.name === "tab") || key.sequence === "\x1b[Z") {
+      const current = currentSessionApproval();
+      void applySessionApproval(nextSessionPermission(current.profile, current.policyId));
+      return;
+    }
     if (key.name === "return" || key.name === "enter") {
       const objectiveText = expandComposerPastes(
         runtime.composerBuffer,
@@ -2545,6 +3505,125 @@ async function runWorkspaceObjective({
         if (runtime.snapshot?.run?.state === "completed") {
           showNotice("Type a follow-up to continue with this team · /new starts fresh");
         }
+        return;
+      }
+      if (objectiveText.toLowerCase() === "/approval") {
+        runtime.composerBuffer = "";
+        runtime.composerCursor = 0;
+        runtime.composerPastes = [];
+        void openSessionApprovalPicker();
+        return;
+      }
+      const activeCommand = parseWorkspaceCommand(objectiveText);
+      if (activeCommand) {
+        runtime.composerBuffer = "";
+        runtime.composerCursor = 0;
+        runtime.composerPastes = [];
+        if (!activeCommand.command) {
+          showNotice(`Unknown command '/${activeCommand.rawName}' · use /help`, 2200);
+          return;
+        }
+        const commandName = activeCommand.command.name;
+        if (["status", "agents", "pause", "cancel"].includes(commandName)
+          && activeCommand.args.length > 1) {
+          showNotice(`Usage: ${workspaceCommandUsage(activeCommand.command)}`, 2200);
+          return;
+        }
+        if (commandName === "status" && activeCommand.args.length) {
+          showNotice(`Usage: ${workspaceCommandUsage(activeCommand.command)}`, 2200);
+          return;
+        }
+        if (["agents", "pause", "cancel"].includes(commandName)
+          && activeCommand.argumentText
+          && activeCommand.argumentText !== runtime.runId) {
+          showNotice(`This live view controls Run ${runtime.runId || "preparing"}; use /runs after detaching to select another Run`, 3200);
+          return;
+        }
+        if (commandName === "status") {
+          showNotice(`Run ${runtime.runId || "preparing"} · ${compactRunState(runtime.snapshot?.run || { state: runtime.phase })}`, 3200);
+          return;
+        }
+        if (commandName === "agents") {
+          const participants = runtime.snapshot?.participants || runtime.configuration?.participants || [];
+          runtime.expandedActivityParticipants = participants
+            .map((participant) => participant.participant_id)
+            .filter(Boolean);
+          showNotice(participants.length ? `${participants.length} Agent details expanded` : "No Agent assignments are available yet", 2400);
+          return;
+        }
+        if (commandName === "pause") {
+          if (!runtime.runId) {
+            showNotice("A Run is not available to pause yet", 2200);
+            return;
+          }
+          showNotice("Pausing collaboration Run", 1800);
+          void Promise.resolve(controlRun(runtime.runId, "pause"))
+            .then((run) => {
+              runtime.snapshot = runtime.snapshot || { tasks: [] };
+              runtime.snapshot.run = run;
+              runtime.phase = run.state || "paused";
+              showNotice("Collaboration paused", 2200);
+            })
+            .catch((error) => showNotice(`Could not pause Run: ${String(error?.message || error).split("\n")[0]}`, 3200));
+          return;
+        }
+        if (commandName === "cancel") {
+          onActiveInterrupt();
+          return;
+        }
+        if (["runs", "resume", "attach", "retry"].includes(commandName)) {
+          showNotice(`/${commandName} is available from the Workspace prompt after detaching or completing this Run`, 3200);
+          return;
+        }
+        if (commandName === "help") {
+          showNotice("/status, /agents, /pause, /cancel, /mode, and /approval are available while following a Run", 3800);
+          return;
+        }
+        if (commandName === "team") {
+          const participants = runtime.snapshot?.participants || runtime.configuration?.participants || [];
+          showNotice(`${participants.length || "No"} Agent${participants.length === 1 ? "" : "s"} assigned · use /agents for details`, 2600);
+          return;
+        }
+        if (commandName === "coordinator") {
+          showNotice("Coordinator changes apply when starting the next collaboration", 2600);
+          return;
+        }
+      }
+      if (objectiveText.toLowerCase().startsWith("/approval ")) {
+        const option = resolveSessionPermission(objectiveText.slice(10));
+        runtime.composerBuffer = "";
+        runtime.composerCursor = 0;
+        runtime.composerPastes = [];
+        if (!option) {
+          showNotice("Unknown approval profile or policy · use /approval to choose", 2400);
+          return;
+        }
+        void applySessionApproval(option);
+        return;
+      }
+      if (objectiveText.toLowerCase() === "/mode") {
+        runtime.composerBuffer = "";
+        runtime.composerCursor = 0;
+        runtime.composerPastes = [];
+        void openWorkspaceModePicker();
+        return;
+      }
+      if (objectiveText.toLowerCase().startsWith("/mode ")) {
+        let selected;
+        try {
+          selected = normalizeWorkspaceMode(objectiveText.slice(6));
+        } catch (error) {
+          runtime.composerBuffer = "";
+          runtime.composerCursor = 0;
+          runtime.composerPastes = [];
+          showNotice(String(error.message || error).split("\n")[0], 2600);
+          return;
+        }
+        runtime.composerBuffer = "";
+        runtime.composerCursor = 0;
+        runtime.composerPastes = [];
+        runtime.requestedMode = selected;
+        showNotice(`Collaboration mode set to ${workspaceModeDefinition(selected).label} · use /new to apply`, 2600);
         return;
       }
       if (runtime.snapshot?.run?.state === "completed" && ["/exit", "/quit"].includes(objectiveText.toLowerCase())) {
@@ -2623,10 +3702,6 @@ async function runWorkspaceObjective({
       render();
       return;
     }
-    if ((key.shift && key.name === "tab") || key.sequence === "\x1b[Z") {
-      showNotice("Team mode is fixed for the current Run");
-      return;
-    }
     if (key.name === "escape" || key.ctrl || key.meta) return;
     if (text && !isFunctionKey(key)) {
       text = cleanInsertedText(text);
@@ -2642,7 +3717,15 @@ async function runWorkspaceObjective({
     if (update.phase) runtime.phase = update.phase;
     if (Number.isFinite(update.connectionAttempts)) runtime.connectionAttempts = update.connectionAttempts;
     if (typeof update.message === "string") runtime.notice = update.message;
-    if (update.payload) runtime.configuration = update.payload;
+    if (update.payload) {
+      runtime.configuration = update.payload;
+      const approval = runtime.sessionApprovalOverride;
+      if (approval?.profile) {
+        runtime.configuration.supervisor_permission_profile = approval.profile;
+        if (approval.policyId) runtime.configuration.supervisor_policy_id = approval.policyId;
+        else delete runtime.configuration.supervisor_policy_id;
+      }
+    }
     if (update.snapshot) {
       runtime.snapshot = update.snapshot;
       if (runtime.phase === "reconnecting" && runtime.connectionAttempts === 0) {
@@ -2680,7 +3763,16 @@ async function runWorkspaceObjective({
     runtime.phase = "blocked";
     runtime.composerBuffer = "";
     runtime.composerPastes = [];
-    const decision = await readRuntimeDecision({ input, runtime, render, kind: "attention" });
+    const decision = await readRuntimeDecision({
+      input,
+      runtime,
+      render,
+      kind: "attention",
+      cycleSessionApproval: () => {
+        const current = currentSessionApproval();
+        return applySessionApproval(nextSessionPermission(current.profile, current.policyId));
+      },
+    });
     runtime.attention = null;
     if (decision === "leave") runtime.detachRequested = true;
     return decision;
@@ -2694,7 +3786,8 @@ async function runWorkspaceObjective({
     if (decision === "leave") runtime.detachRequested = true;
     return decision;
   };
-  let followExistingRun = false;
+  let followExistingRun = Boolean(existingRunId);
+  let retryExistingRun = Boolean(retryRunId);
   try {
     while (true) {
       try {
@@ -2720,7 +3813,10 @@ async function runWorkspaceObjective({
           onPaused: reviewPause,
         };
         let snapshot;
-        if (followExistingRun) {
+        if (retryExistingRun) {
+          retryExistingRun = false;
+          snapshot = await retryRunner(runtime.runId, followerOptions);
+        } else if (followExistingRun) {
           followExistingRun = false;
           snapshot = await followRunner(runtime.runId, followerOptions);
         } else {
@@ -2731,6 +3827,8 @@ async function runWorkspaceObjective({
             cloudAdvice: mode === "auto" || forwarded.includes("--cloud-advice"),
             presetConfiguration: continuedConfiguration,
             continuedFromRunId,
+            supervisorPermissionProfile: runtime.sessionApprovalOverride.profile,
+            supervisorPolicyId: runtime.sessionApprovalOverride.policyId,
             workspaceSelections,
             deviceSelections: runtime.deviceSelections,
             confirmation,
@@ -2965,6 +4063,18 @@ export async function handleAgentWorkspaceCommand(argv = [], {
   followRunner = followExistingAgentWorkspaceCollaboration,
   retryRunner = retryAgentWorkspaceCollaboration,
   cancelCollaborationRun = async (runId) => controlCollaborationRun(runId, "cancel"),
+  controlCollaborationRunFn = controlCollaborationRun,
+  listCollaborationRuns = listAgentWorkspaceCollaborationRuns,
+  updateSessionApproval = async (runId, approval) => controlCollaborationRun(
+    runId,
+    "approval",
+    {
+      body: {
+        supervisor_permission_profile: approval.profile,
+        supervisor_policy_id: approval.policyId || null,
+      },
+    },
+  ),
   trustWorkspaceFn = trustCollaborationWorkspace,
   browseWorkspaceFn = browseCollaborationWorkspaces,
 } = {}) {
@@ -2978,15 +4088,17 @@ export async function handleAgentWorkspaceCommand(argv = [], {
   }
   let coordinator = parsed.coordinator;
   let mode = parsed.mode;
+  let sessionApproval = { profile: "guarded", policyId: "" };
   let panel = null;
   let pendingObjective = parsed.objective;
   let draftObjective = "";
   let continuedConfiguration = null;
   let continuedFromRunId = "";
   const sessionHistory = [];
+  let lastRun = null;
   const exitApp = enterWorkspaceApp(output);
   try {
-    redrawWorkspaceApp(output, { coordinator, mode, panel });
+    redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval });
     while (true) {
       const line = pendingObjective || await readWorkspaceLine({
           input,
@@ -2994,53 +4106,172 @@ export async function handleAgentWorkspaceCommand(argv = [], {
           mode,
           coordinator,
           panel,
+          sessionApproval,
           initialBuffer: draftObjective,
-          onModeChange: () => {
-            const next = nextWorkspaceMode(mode);
-            mode = next.id;
+          onSessionApprovalChange: (current) => {
+            const next = nextSessionPermission(current.profile, current.policyId);
+            sessionApproval = {
+              profile: next.id,
+              policyId: next.id === "custom" ? next.policyId || "protected" : "",
+            };
             panel = null;
-            return next;
+            return sessionApproval;
           },
         });
       pendingObjective = "";
       draftObjective = "";
       if (!line) {
-        redrawWorkspaceApp(output, { coordinator, mode, panel, force: true });
+        redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
         continue;
       }
       if (["/exit", "/quit", "exit", "quit"].includes(line.toLowerCase())) return;
-      if (line === "/help") {
-        panel = helpWorkspacePanel();
-        redrawWorkspaceApp(output, { coordinator, mode, panel });
+      const parsedCommand = parseWorkspaceCommand(line);
+      if (parsedCommand && !parsedCommand.command) {
+        panel = workspaceCommandErrorPanel(`Unknown command '/${parsedCommand.rawName}'.`);
+        redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
         continue;
       }
+      if (parsedCommand?.command?.name === "help") {
+        panel = commandHelpPanel(parsedCommand.args[0]);
+        redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval });
+        continue;
+      }
+      let existingRunId = "";
+      let retryRunId = "";
+      let runObjective = line;
+      const command = parsedCommand?.command;
+      if (command && ["status", "runs", "resume", "attach", "pause", "retry", "cancel", "agents"].includes(command.name)) {
+        const argument = parsedCommand.argumentText.trim();
+        const requireAtMostOneArgument = () => {
+          if (parsedCommand.args.length > 1) {
+            throw new Error(`Usage: ${workspaceCommandUsage(command)}`);
+          }
+        };
+        try {
+          if (command.name === "status") {
+            requireAtMostOneArgument();
+            panel = workspaceStatusPanel({ coordinator, mode, sessionApproval, lastRun });
+            redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
+            continue;
+          }
+          if (command.name === "runs") {
+            requireAtMostOneArgument();
+            const category = argument.toLowerCase() || "recent";
+            const page = await listCollaborationRuns({ category });
+            if (page.runs[0]) lastRun = page.runs[0];
+            panel = workspaceRunsPanel(page);
+            redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
+            continue;
+          }
+          if (command.name === "resume" && !argument) {
+            const page = await listCollaborationRuns({ category: "recent" });
+            if (page.runs[0]) lastRun = page.runs[0];
+            panel = workspaceRunsPanel(page);
+            redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
+            continue;
+          }
+          if (["resume", "attach"].includes(command.name)) {
+            requireAtMostOneArgument();
+            if (!argument) throw new Error(`Usage: ${workspaceCommandUsage(command)}`);
+            existingRunId = argument;
+            runObjective = `Follow collaboration Run ${existingRunId}`;
+          }
+          if (command.name === "retry") {
+            requireAtMostOneArgument();
+            retryRunId = argument || lastRun?.run_id || "";
+            if (!retryRunId) throw new Error("Choose a Run ID with /retry <run-id> or /runs.");
+            runObjective = `Retry collaboration Run ${retryRunId}`;
+          }
+          if (["pause", "cancel"].includes(command.name)) {
+            requireAtMostOneArgument();
+            const runId = argument || lastRun?.run_id || "";
+            if (!runId) throw new Error(`Choose a Run ID with /${command.name} <run-id> or /runs.`);
+            lastRun = await controlCollaborationRunFn(runId, command.name);
+            panel = {
+              title: command.name === "pause" ? "Collaboration paused" : "Collaboration cancelled",
+              lines: [`Run ${lastRun.run_id}`, compactRunState(lastRun), runLabel(lastRun)],
+            };
+            redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
+            continue;
+          }
+          if (command.name === "agents") {
+            requireAtMostOneArgument();
+            let run = argument && argument !== lastRun?.run_id ? null : lastRun;
+            if (!run) {
+              const page = await listCollaborationRuns({ category: "all", limit: 50 });
+              run = page.runs.find((candidate) => candidate.run_id === argument) || page.runs[0] || null;
+            }
+            if (!run) throw new Error("No Run is available. Start a collaboration or use /runs.");
+            lastRun = run;
+            panel = workspaceAgentsPanel(run);
+            redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
+            continue;
+          }
+        } catch (error) {
+          panel = workspaceCommandErrorPanel(String(error?.message || error).split("\n")[0]);
+          redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
+          continue;
+        }
+      }
       if (line === "/mode") {
-        panel = modesWorkspacePanel();
-        redrawWorkspaceApp(output, { coordinator, mode, panel });
+        const selected = await readWorkspaceModePicker({
+          input,
+          output,
+          coordinator,
+          mode,
+          sessionApproval,
+        });
+        if (selected) mode = selected;
+        panel = selected ? teamWorkspacePanel({ coordinator, mode, sessionApproval }) : null;
+        redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
         continue;
       }
       if (line.startsWith("/mode ")) {
         mode = normalizeWorkspaceMode(line.slice(6));
-        panel = teamWorkspacePanel({ coordinator, mode });
-        redrawWorkspaceApp(output, { coordinator, mode, panel });
+        panel = teamWorkspacePanel({ coordinator, mode, sessionApproval });
+        redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval });
+        continue;
+      }
+      if (line === "/approval") {
+        panel = approvalWorkspacePanel();
+        redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval });
+        continue;
+      }
+      if (line.startsWith("/approval ")) {
+        const option = resolveSessionPermission(line.slice(10));
+        if (!option) {
+          panel = {
+            title: "Unknown Session approval",
+            lines: ["Use /approval to list profiles and installed Rules policies."],
+          };
+        } else {
+          sessionApproval = {
+            profile: option.id,
+            policyId: option.id === "custom" ? option.policyId || "protected" : "",
+          };
+          panel = teamWorkspacePanel({ coordinator, mode, sessionApproval });
+        }
+        redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval });
         continue;
       }
       if (line === "/team") {
-        panel = teamWorkspacePanel({ coordinator, mode });
-        redrawWorkspaceApp(output, { coordinator, mode, panel });
+        panel = teamWorkspacePanel({ coordinator, mode, sessionApproval });
+        redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval });
         continue;
       }
       if (line.startsWith("/coordinator ")) {
         coordinator = normalizeCoordinator(line.slice(13));
-        panel = teamWorkspacePanel({ coordinator, mode });
-        redrawWorkspaceApp(output, { coordinator, mode, panel });
+        panel = teamWorkspacePanel({ coordinator, mode, sessionApproval });
+        redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval });
         continue;
       }
       panel = null;
       const runtime = await runWorkspaceObjective({
-        objective: line,
-        continuedConfiguration,
-        continuedFromRunId,
+        objective: runObjective,
+        existingRunId,
+        retryRunId,
+        continuedConfiguration: existingRunId || retryRunId ? null : continuedConfiguration,
+        continuedFromRunId: existingRunId || retryRunId ? "" : continuedFromRunId,
         sessionHistory,
         coordinator,
         mode,
@@ -3054,16 +4285,33 @@ export async function handleAgentWorkspaceCommand(argv = [], {
         cancelCollaborationRun,
         trustWorkspaceFn,
         browseWorkspaceFn,
+        initialSessionApproval: sessionApproval,
+        updateSessionApproval,
+        controlRun: controlCollaborationRunFn,
       });
+      sessionApproval = {
+        profile: runtime.snapshot?.run?.supervisor_permission_profile
+          || runtime.configuration?.supervisor_permission_profile
+          || runtime.sessionApprovalOverride?.profile
+          || sessionApproval.profile,
+        policyId: runtime.snapshot?.run?.supervisor_policy_id
+          || runtime.configuration?.supervisor_policy_id
+          || runtime.sessionApprovalOverride?.policyId
+          || "",
+      };
+      if (runtime.snapshot?.run || runtime.runId) {
+        lastRun = runtime.snapshot?.run || { run_id: runtime.runId, state: runtime.phase };
+      }
       if (runtime.exitRequested) return;
       if (runtime.returnToHome) {
+        if (runtime.requestedMode) mode = runtime.requestedMode;
         panel = completionPanel(runtime);
         pendingObjective = "";
         draftObjective = "";
         continuedConfiguration = null;
         continuedFromRunId = "";
         sessionHistory.splice(0, sessionHistory.length);
-        redrawWorkspaceApp(output, { coordinator, mode, panel, force: true });
+        redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
         continue;
       }
       panel = completionPanel(runtime);
@@ -3084,7 +4332,7 @@ export async function handleAgentWorkspaceCommand(argv = [], {
         continuedConfiguration = null;
         continuedFromRunId = "";
       }
-      redrawWorkspaceApp(output, { coordinator, mode, panel, force: true });
+      redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
     }
   } finally {
     exitApp();

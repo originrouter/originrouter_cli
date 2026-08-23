@@ -42,6 +42,7 @@ import {
   setRoute,
 } from "../config/routes.js";
 import { LITELLM_PROVIDERS } from "../proxy/litellmCatalog.js";
+import { assessRegisteredWorkspaceForUnattended } from "../runtime/unattendedWorkspaceReadiness.js";
 import { discoverProviderModels } from "../proxy/modelDiscovery.js";
 import { probeProviderModel } from "../proxy/modelProbe.js";
 import {
@@ -912,7 +913,7 @@ async function dispatch(ctx, req, res) {
       }
     }
     const collaborationMatch = pathname.match(
-      /^\/collaboration\/local\/runs\/([^/]+)(?:\/(start|confirm|replan|begin-planning|begin-implementation|pause|resume|retry|cancel|messages|budget))?$/,
+      /^\/collaboration\/local\/runs\/([^/]+)(?:\/(start|confirm|replan|begin-planning|begin-implementation|pause|resume|retry|cancel|messages|budget|approval))?$/,
     );
     if (collaborationMatch) {
       const runId = decodeURIComponent(collaborationMatch[1]);
@@ -985,6 +986,10 @@ async function dispatch(ctx, req, res) {
                   ? { run: ctx.collaborationRuntime
                       ? await ctx.collaborationRuntime.updateBudget(runId, body)
                       : ctx.collaborationStore.updateBudget(runId, body) }
+                  : action === "approval"
+                    ? { run: ctx.collaborationRuntime
+                        ? await ctx.collaborationRuntime.updateSupervisorApproval(runId, body)
+                        : ctx.collaborationStore.updateSupervisorApproval(runId, body) }
                   : ctx.collaborationCoordinator.receive(runId, body);
         return sendOk(res, result);
       } catch (error) {
@@ -1074,10 +1079,35 @@ async function dispatch(ctx, req, res) {
         const workspace = ctx.agentCatalog.trustWorkspace(body.path, {
           deviceId: ctx.deviceId,
         });
-        return sendOk(res, { workspace });
+        return sendOk(res, {
+          workspace: {
+            ...workspace,
+            unattended_execution: assessRegisteredWorkspaceForUnattended(workspace),
+          },
+        });
       } catch (error) {
         return sendError(res, 400, error.message || "workspace trust failed", {
           reason: error.code || "workspace_trust_failed",
+        });
+      }
+    }
+    if (req.method === "POST" && pathname === "/agent/catalog/workspaces/authorize") {
+      if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      try {
+        const workspace = ctx.agentCatalog.authorizeWorkspaceForUnattended(body.path, {
+          deviceId: ctx.deviceId,
+        });
+        return sendOk(res, {
+          workspace: {
+            ...workspace,
+            unattended_execution: assessRegisteredWorkspaceForUnattended(workspace),
+          },
+        });
+      } catch (error) {
+        return sendError(res, 400, error.message || "workspace authorization failed", {
+          reason: error.code || "workspace_authorization_failed",
         });
       }
     }

@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 
 import {
   buildWorkspaceAppScreen,
+  consumeWorkspaceMouseKeypress,
   createWorkspaceFrameScheduler,
   handleAgentWorkspaceCommand,
   normalizeWorkspacePathInput,
@@ -10,6 +11,13 @@ import {
   redrawPrompt,
   scrollRuntimeContent,
 } from "../src/commands/agentWorkspace.js";
+import {
+  findWorkspaceCommand,
+  parseWorkspaceCommand,
+  workspaceCommandSuggestions,
+  workspaceCommandUsage,
+} from "../src/commands/workspaceCommands.js";
+import { listAgentWorkspaceCollaborationRuns } from "../src/commands/collaboration.js";
 import { buildAgentLaunchScreen } from "../src/local/agentLaunchScreen.js";
 import {
   buildLocalWorkspaceConfiguration,
@@ -88,6 +96,40 @@ assert.equal(objectiveMentionsRemoteTarget("我想分析一下我远程电脑的
 assert.equal(objectiveMentionsRemoteTarget("explain this local module"), false);
 assert.equal(normalizeWorkspacePathInput('  "/Users/chengaoyan/Desktop/originrouter-cli"  '), "/Users/chengaoyan/Desktop/originrouter-cli");
 assert.equal(normalizeWorkspacePathInput(" '/Users/chengaoyan/project'\n"), "/Users/chengaoyan/project");
+assert.equal(findWorkspaceCommand("/resume")?.name, "resume");
+assert.equal(findWorkspaceCommand("run")?.name, "runs");
+assert.equal(workspaceCommandUsage(findWorkspaceCommand("agents")), "/agents [run-id]");
+assert.deepEqual(parseWorkspaceCommand("/resume acr_123"), {
+  rawName: "resume",
+  command: findWorkspaceCommand("resume"),
+  args: ["acr_123"],
+  argumentText: "acr_123",
+});
+assert.deepEqual(
+  workspaceCommandSuggestions("/res").map((command) => command.name),
+  ["resume"],
+);
+assert.equal(parseWorkspaceCommand("explain this module"), null);
+let runListPath = "";
+const activeRunPage = await listAgentWorkspaceCollaborationRuns({
+  category: "active",
+  limit: 7,
+  requestFn: async (path) => {
+    runListPath = path;
+    return { runs: [{ run_id: "acr_active" }], total: 1 };
+  },
+});
+assert.match(runListPath, /category=active/);
+assert.match(runListPath, /page_size=7/);
+assert.deepEqual(activeRunPage, {
+  category: "active",
+  runs: [{ run_id: "acr_active" }],
+  total: 1,
+});
+await assert.rejects(
+  () => listAgentWorkspaceCollaborationRuns({ category: "invalid" }),
+  /Run category must be all, attention, active, or recent/,
+);
 
 const buildReview = buildLocalWorkspaceConfiguration({
   objective: "Fix login and add tests",
@@ -292,7 +334,7 @@ assert(rows > 1);
 rows = redrawPrompt(output, "我想分析一下我远程电脑的状态，包括机器状态和版本信息", "auto", rows);
 assert.match(writes.join(""), /\x1b\[1A/);
 assert.match(writes.join(""), /› 我想分析一下/);
-assert.match(writes.join(""), /Auto · shift\+tab to cycle/);
+assert.match(writes.join(""), /Auto · shift\+tab approval · \/mode changes team/);
 assert.doesNotMatch(writes.join(""), /\[Auto\] >/);
 
 const scheduledFrames = [];
@@ -346,6 +388,112 @@ function emitPaste(input, text) {
   input.emit("keypress", undefined, { name: "paste-end", sequence: "\x1b[201~" });
 }
 
+const commandTerminal = fakeTerminal();
+const commandLists = [];
+const commandControls = [];
+const resumedRuns = [];
+const listedRun = {
+  run_id: "acr_workspace_command",
+  state: "running",
+  objective: "Inspect the release configuration",
+  tasks: [{ task_key: "inspect", state: "completed" }, { task_key: "verify", state: "running" }],
+  agents: {
+    coordinator: {
+      participant_id: "coordinator",
+      display_name: "Coordinator",
+      runtime: "codex",
+      provider: "openai",
+      model: "gpt-5-codex",
+    },
+  },
+};
+const commandRun = handleAgentWorkspaceCommand([], {
+  input: commandTerminal.input,
+  output: commandTerminal.output,
+  listCollaborationRuns: async (options) => {
+    commandLists.push(options);
+    return { category: options.category, runs: [listedRun], total: 1 };
+  },
+  controlCollaborationRunFn: async (runId, action) => {
+    commandControls.push({ runId, action });
+    return { ...listedRun, run_id: runId, state: action === "pause" ? "paused" : "cancelled" };
+  },
+  followRunner: async (runId) => {
+    resumedRuns.push(runId);
+    setTimeout(() => {
+      emitText(commandTerminal.input, "/exit");
+      commandTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 20);
+    return { run: { ...listedRun, run_id: runId, state: "completed" }, tasks: listedRun.tasks, final_report: { summary: "Inspection complete." } };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(commandTerminal.input, "/runs active");
+commandTerminal.input.emit("keypress", undefined, { name: "return" });
+await new Promise((resolve) => setImmediate(resolve));
+emitText(commandTerminal.input, "/agents acr_workspace_command");
+commandTerminal.input.emit("keypress", undefined, { name: "return" });
+await new Promise((resolve) => setImmediate(resolve));
+emitText(commandTerminal.input, "/pause acr_workspace_command");
+commandTerminal.input.emit("keypress", undefined, { name: "return" });
+await new Promise((resolve) => setImmediate(resolve));
+emitText(commandTerminal.input, "/resume acr_workspace_command");
+commandTerminal.input.emit("keypress", undefined, { name: "return" });
+await commandRun;
+assert.deepEqual(commandLists.map((call) => call.category), ["active"]);
+assert.deepEqual(commandControls, [{ runId: "acr_workspace_command", action: "pause" }]);
+assert.deepEqual(resumedRuns, ["acr_workspace_command"]);
+assert.match(commandTerminal.writes.join(""), /Active Runs/);
+assert.match(commandTerminal.writes.join(""), /Run Agents/);
+assert.match(commandTerminal.writes.join(""), /Collaboration paused/);
+
+const retryCommandTerminal = fakeTerminal();
+const retriedRuns = [];
+const retryCommandRun = handleAgentWorkspaceCommand([], {
+  input: retryCommandTerminal.input,
+  output: retryCommandTerminal.output,
+  retryRunner: async (runId) => {
+    retriedRuns.push(runId);
+    setTimeout(() => {
+      emitText(retryCommandTerminal.input, "/exit");
+      retryCommandTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 20);
+    return { run: { run_id: runId, state: "completed" }, tasks: [], final_report: { summary: "Retry complete." } };
+  },
+  followRunner: async () => {
+    throw new Error("/retry must use the retry lifecycle rather than attach");
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(retryCommandTerminal.input, "/retry acr_workspace_retry");
+retryCommandTerminal.input.emit("keypress", undefined, { name: "return" });
+await retryCommandRun;
+assert.deepEqual(retriedRuns, ["acr_workspace_retry"]);
+
+const homeModeTerminal = fakeTerminal();
+const homeModeRun = handleAgentWorkspaceCommand([], {
+  input: homeModeTerminal.input,
+  output: homeModeTerminal.output,
+  collaborationRunner: async () => {
+    throw new Error("mode selection must not create a collaboration Run");
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(homeModeTerminal.input, "/mode");
+homeModeTerminal.input.emit("keypress", undefined, { name: "return" });
+setTimeout(() => {
+  homeModeTerminal.input.emit("keypress", undefined, { name: "down" });
+  homeModeTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 10);
+setTimeout(() => {
+  emitText(homeModeTerminal.input, "/exit");
+  homeModeTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 25);
+await homeModeRun;
+assert.match(homeModeTerminal.writes.join(""), /Choose collaboration mode/);
+assert.match(homeModeTerminal.writes.join(""), /Choose how OriginRouter should form the Agent team/);
+assert.match(homeModeTerminal.writes.join(""), /Team\s+Solo/);
+
 const largePasteTerminal = fakeTerminal();
 const largePasteCalls = [];
 const largePasteText = `first line\n${"粘".repeat(1001)}\nlast line`;
@@ -373,6 +521,10 @@ await largePasteRun;
 assert.equal(largePasteCalls[0][1], `inspect ${largePasteText} carefully`);
 assert.match(largePasteTerminal.writes.join(""), /\x1b\[\?2004h/);
 assert.match(largePasteTerminal.writes.join(""), /\x1b\[\?2004l/);
+assert.match(largePasteTerminal.writes.join(""), /\x1b\[\?7l/);
+assert.match(largePasteTerminal.writes.join(""), /\x1b\[\?7h/);
+assert.match(largePasteTerminal.writes.join(""), /\x1b\[\?1000h\x1b\[\?1006h/);
+assert.match(largePasteTerminal.writes.join(""), /\x1b\[\?1000l\x1b\[\?1006l/);
 
 const deletePasteTerminal = fakeTerminal();
 const deletePasteCalls = [];
@@ -488,6 +640,65 @@ assert.equal(activeRunnerStarted, true);
 assert.deepEqual(cancelledRuns, ["acr_test_interrupt"]);
 assert.match(activeInterruptTerminal.writes.join(""), /Interrupting the collaboration/);
 assert.match(activeInterruptTerminal.writes.join(""), /acr_test_interrupt/);
+
+const liveApprovalTerminal = fakeTerminal();
+const liveApprovalUpdates = [];
+let liveApprovalResolve;
+const liveApprovalRun = handleAgentWorkspaceCommand([], {
+  input: liveApprovalTerminal.input,
+  output: liveApprovalTerminal.output,
+  collaborationRunner: async (_args, options = {}) => {
+    options.onRunId?.("acr_live_approval");
+    await new Promise((resolve, reject) => {
+      liveApprovalResolve = resolve;
+      options.signal?.addEventListener("abort", () => {
+        const error = new Error("interrupted");
+        error.code = "ORIGINROUTER_INTERRUPTED";
+        reject(error);
+      }, { once: true });
+    });
+  },
+  updateSessionApproval: async (runId, approval) => {
+    liveApprovalUpdates.push({ runId, ...approval });
+    return {
+      run_id: runId,
+      state: "running",
+      supervisor_permission_profile: approval.profile,
+      supervisor_policy_id: approval.policyId || null,
+    };
+  },
+  cancelCollaborationRun: async () => liveApprovalResolve?.(),
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(liveApprovalTerminal.input, "run with live approval");
+liveApprovalTerminal.input.emit("keypress", undefined, { name: "return" });
+await new Promise((resolve) => setImmediate(resolve));
+liveApprovalTerminal.input.emit("keypress", undefined, { shift: true, name: "tab", sequence: "\x1b[Z" });
+await new Promise((resolve) => setImmediate(resolve));
+assert.deepEqual(liveApprovalUpdates, [{
+  runId: "acr_live_approval",
+  profile: "ai_review",
+  policyId: "",
+}]);
+assert.match(liveApprovalTerminal.writes.join(""), /Session approval set to AI Review/);
+emitText(liveApprovalTerminal.input, "/approval");
+liveApprovalTerminal.input.emit("keypress", undefined, { name: "return" });
+await new Promise((resolve) => setImmediate(resolve));
+liveApprovalTerminal.input.emit("keypress", undefined, { name: "down" });
+liveApprovalTerminal.input.emit("keypress", undefined, { name: "return" });
+await new Promise((resolve) => setImmediate(resolve));
+assert.deepEqual(liveApprovalUpdates.at(-1), {
+  runId: "acr_live_approval",
+  profile: "custom",
+  policyId: "protected",
+});
+assert.match(liveApprovalTerminal.writes.join(""), /Change Session approval now/);
+liveApprovalTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" });
+setTimeout(() => {
+  emitText(liveApprovalTerminal.input, "/exit");
+  liveApprovalTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 20);
+await liveApprovalRun;
 
 const runtimeClearTerminal = fakeTerminal();
 const runtimeClearCancelled = [];
@@ -989,6 +1200,48 @@ assert.notEqual(completedFollowupCalls[1].presetConfiguration, continuedTeamConf
 assert.match(completedFollowupTerminal.writes.join(""), /Full first result remains visible/);
 assert.match(completedFollowupTerminal.writes.join(""), /Enter continues with this team/);
 
+const activeModeTerminal = fakeTerminal(100, 30);
+const activeModeRun = handleAgentWorkspaceCommand([], {
+  input: activeModeTerminal.input,
+  output: activeModeTerminal.output,
+  workspaceRunner: async (options) => {
+    options.onRunId?.("acr_mode_first");
+    options.onUpdate?.({ type: "configuration", payload: continuedTeamConfiguration });
+    return {
+      run: { run_id: "acr_mode_first", state: "completed" },
+      tasks: [],
+      final_report: { summary: "Mode test complete." },
+    };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(activeModeTerminal.input, "inspect remote machine");
+activeModeTerminal.input.emit("keypress", undefined, { name: "return" });
+setTimeout(() => {
+  emitText(activeModeTerminal.input, "/mode");
+  activeModeTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 15);
+setTimeout(() => {
+  activeModeTerminal.input.emit("keypress", undefined, { name: "down" });
+  activeModeTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 25);
+setTimeout(() => {
+  emitText(activeModeTerminal.input, "/new");
+  activeModeTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 38);
+setTimeout(() => {
+  emitText(activeModeTerminal.input, "/team");
+  activeModeTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 52);
+setTimeout(() => {
+  emitText(activeModeTerminal.input, "/exit");
+  activeModeTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 68);
+await activeModeRun;
+assert.match(activeModeTerminal.writes.join(""), /The active Run keeps its current team/);
+assert.match(activeModeTerminal.writes.join(""), /use \/new to apply/i);
+assert.match(activeModeTerminal.writes.join(""), /Team\s+Solo/);
+
 const reconnectResumeTerminal = fakeTerminal();
 let reconnectResumeCreates = 0;
 let reconnectResumeFollows = 0;
@@ -1202,6 +1455,33 @@ assert.equal(scrollRuntime.scrollOffset, 14, "new activity does not move a detac
 assert.equal(scrollRuntimeContent(scrollRuntime, 1, 20), true);
 assert.equal(scrollRuntime.autoFollow, true, "PageDown at the bottom resumes live following");
 assert.equal(scrollRuntime.unseenActivityCount, 0);
+
+const completeMouseState = { mouseSequenceBuffer: "" };
+assert.deepEqual(
+  consumeWorkspaceMouseKeypress(completeMouseState, undefined, { sequence: "\x1b[<64;10;5M" }),
+  { handled: true, direction: -1 },
+);
+assert.deepEqual(
+  consumeWorkspaceMouseKeypress(completeMouseState, undefined, { sequence: "\x1b[<65;10;5M" }),
+  { handled: true, direction: 1 },
+);
+assert.deepEqual(
+  consumeWorkspaceMouseKeypress(completeMouseState, "x", { sequence: "x" }),
+  { handled: false, direction: 0 },
+);
+
+const fragmentedMouseState = { mouseSequenceBuffer: "" };
+for (const sequence of ["\x1b[<", "6", "4", ";", "1", "0", ";", "5"]) {
+  assert.deepEqual(
+    consumeWorkspaceMouseKeypress(fragmentedMouseState, sequence, { sequence }),
+    { handled: true, direction: 0 },
+  );
+}
+assert.deepEqual(
+  consumeWorkspaceMouseKeypress(fragmentedMouseState, "M", { sequence: "M" }),
+  { handled: true, direction: -1 },
+  "readline-fragmented SGR mouse input is reconstructed before scrolling",
+);
 
 const interactionScreen = buildWorkspaceAppScreen({
   coordinator: "codex",
@@ -1473,18 +1753,145 @@ const attentionScreen = buildWorkspaceAppScreen({
     attentionSelection: 1,
     attention: {
       kind: "approval",
+      participant_id: "remote_operator",
+      task_id: "inspect-remote",
       title: "Allow a read-only command?",
       summary: "The remote operator wants to inspect system status.",
       risk: "low",
       actions: ["allow", "deny"],
+      payload: {
+        request: {
+          tool: "Bash",
+          display_name: "Run a shell command",
+          command: "system_profiler SPSoftwareDataType",
+          cwd: "/Users/chengaoyan/Desktop/originrouter-cli",
+          prompt: "Inspect the remote macOS version without changing files.",
+        },
+        supervisor_evaluation: {
+          effect: "ask",
+          reason: "user_confirmation_required",
+          session_profile: "guarded",
+          layers: [
+            { name: "agent", profile: "guarded", effect: "ask" },
+            { name: "session", profile: "guarded", effect: "ask" },
+          ],
+        },
+      },
     },
-    snapshot: { run: { state: "blocked" }, tasks: [] },
+    configuration: {
+      supervisor_permission_profile: "guarded",
+      participants: [{ participant_id: "remote_operator", display_name: "Remote Operator" }],
+    },
+    snapshot: {
+      run: { state: "blocked", supervisor_permission_profile: "guarded" },
+      tasks: [{ task_id: "inspect-remote", title: "Inspect the remote Mac" }],
+    },
   },
 });
 assert.match(attentionScreen, /Allow a read-only command/);
+assert.match(attentionScreen, /Requested by: Remote Operator · Inspect the remote Mac/);
+assert.match(attentionScreen, /Command: system_profiler SPSoftwareDataType/);
+assert.match(attentionScreen, /Session approval: Guarded/);
+assert.match(attentionScreen, /active policy requires a person to decide/);
 assert.match(attentionScreen, /› 2\. Deny/);
-assert.match(attentionScreen, /Agent needs your decision/);
+assert.match(attentionScreen, /Allow the request from Remote Operator/);
 assert.equal(attentionScreen.split("\n").length <= 24, true, "attention layout fits the terminal height");
+
+const confirmationScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 90,
+  rows: 24,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "blocked",
+    interaction: true,
+    interactionKind: "attention",
+    attention: {
+      kind: "confirmation",
+      participant_id: "remote_operator",
+      title: "Implement this plan?",
+      actions: ["allow", "cancel"],
+      payload: {
+        kind: "confirm",
+        request: {
+          kind: "confirm",
+          prompt: "Review this action before continuing.",
+          plan: "Inspect the CLI version and service status without changing the device.",
+        },
+      },
+    },
+    configuration: { participants: [{ participant_id: "remote_operator", display_name: "Remote Operator" }] },
+    snapshot: { run: { state: "blocked" }, tasks: [] },
+  },
+});
+assert.match(confirmationScreen, /Continue with Remote Operator/);
+assert.match(confirmationScreen, /1\. Continue/);
+assert.doesNotMatch(confirmationScreen, /Reply/);
+
+const questionsScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 90,
+  rows: 24,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "blocked",
+    interaction: true,
+    interactionKind: "attention",
+    attention: {
+      kind: "questions",
+      participant_id: "remote_operator",
+      title: "Choose a mode",
+      actions: ["submit", "cancel"],
+      payload: {
+        kind: "questions",
+        request: {
+          kind: "questions",
+          questions: [{ id: "mode", header: "Mode", question: "Which mode?", options: [{ id: "fast", label: "Fast" }, { id: "full", label: "Full" }] }],
+        },
+      },
+    },
+    configuration: { participants: [{ participant_id: "remote_operator", display_name: "Remote Operator" }] },
+    snapshot: { run: { state: "blocked" }, tasks: [] },
+  },
+});
+assert.match(questionsScreen, /Answer questions from Remote Operator/);
+assert.match(questionsScreen, /Mode: Which mode\? \(Fast \/ Full\)/);
+assert.match(questionsScreen, /Answer questions/);
+
+const activityRuntime = {
+  objective: "Inspect local and remote status",
+  phase: "executing",
+  activitySelection: 1,
+  expandedActivityParticipants: ["remote_operator"],
+  configuration: {
+    participants: [
+      { participant_id: "coordinator", display_name: "Coordinator" },
+      { participant_id: "remote_operator", display_name: "Remote Operator" },
+    ],
+  },
+  snapshot: { run: { state: "running" }, tasks: [] },
+  events: [
+    { event_id: "a1", sequence: 1, type: "agent.tool_call.start", participant_id: "coordinator", category: "agent", visibility: "detail", metadata: { tool: "Read" }, summary: "Inspect local package metadata" },
+    { event_id: "a2", sequence: 2, type: "agent.tool_call.end", participant_id: "coordinator", category: "agent", visibility: "detail", metadata: { tool: "Read" }, summary: "Local package metadata collected" },
+    { event_id: "a3", sequence: 3, type: "agent.tool_call.start", participant_id: "remote_operator", category: "agent", visibility: "detail", metadata: { tool: "Bash" }, summary: "Check remote machine status" },
+    { event_id: "a4", sequence: 4, type: "agent.text", participant_id: "remote_operator", category: "agent", visibility: "detail", metadata: {}, summary: "Remote status collected", detail: "macOS and CLI version data collected" },
+  ],
+};
+const activityScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 100,
+  rows: 34,
+  runtime: activityRuntime,
+});
+assert.match(activityScreen, /Coordinator worked/);
+assert.match(activityScreen, /Inspect local package metadata/);
+assert.match(activityScreen, /› ● Remote Operator is working/);
+assert.match(activityScreen, /macOS and CLI version data collected/);
+assert.match(activityScreen, /↑\/↓ selects an Agent · Ctrl\+O collapses Remote Operator/);
+assert.deepEqual(activityRuntime.activityParticipantIds, ["coordinator", "remote_operator"]);
 
 const narrowScreen = buildWorkspaceAppScreen({
   coordinator: "codex",

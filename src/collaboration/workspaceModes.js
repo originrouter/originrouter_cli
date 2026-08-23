@@ -191,7 +191,12 @@ function remoteDeviceOptions(devices, runtime) {
 
 function chooseWorkspace(device, currentDirectory, preferredWorkspaceId = "") {
   const capabilities = capabilitiesFor(device);
-  const workspaces = capabilities?.trusted_workspaces || [];
+  // A stale capability snapshot from an older client may lack this field.
+  // Let the launch-side guard make the final decision in that case; explicit
+  // blocks, however, must never be selected for a remote participant.
+  const workspaces = (capabilities?.trusted_workspaces || []).filter(
+    (workspace) => workspace?.unattended_execution?.remote_eligible !== false,
+  );
   const preferred = workspaces.find((workspace) => (
     workspace.workspace_id === preferredWorkspaceId
     || workspace.canonical_path === preferredWorkspaceId

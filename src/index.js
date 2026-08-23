@@ -47,6 +47,7 @@ import { RemoteCodingProxyManager } from "./proxy/remoteCodingProxyManager.js";
 import { runLocalAgentSession } from "./local/localAgentSession.js";
 import { readSessions } from "./persistence/sessionLog.js";
 import { AgentCatalog } from "./persistence/agentCatalog.js";
+import { assessRegisteredWorkspaceForUnattended } from "./runtime/unattendedWorkspaceReadiness.js";
 import { AgentBudgetStore } from "./agent/agentBudgetStore.js";
 import { readApiToken, rotateApiToken } from "./persistence/authToken.js";
 import {
@@ -195,6 +196,10 @@ Model routes:
   originrouter route cloud set <agent>.<slot> [--model <id>]
   originrouter route remote devices
   originrouter route remote set <agent>.<slot> [--device <id>] [--model <id>]
+  originrouter remote setup [--workspace <path>] [--providers <name[,name...]>] [--port <p>]
+  originrouter remote status
+  originrouter remote share status|start|stop|restart [--providers <name[,name...]>] [--port <p>]
+  originrouter remote workspace list|authorize <path>
   Aliases are fixed: originrouter-claude-model, originrouter-claude-fast-model, and gpt-5.4.
 
 LiteLLM proxy:
@@ -1438,6 +1443,125 @@ async function handleProxy(args) {
   throw new Error(`Unknown proxy action: ${action}`);
 }
 
+function remoteLocalApi() {
+  const stateDir = ensureStateDir();
+  const state = readDaemonState();
+  const token = readApiToken(stateDir);
+  if (!state?.localApiPort || !token) {
+    throw new Error("OriginRouter service is not running. Run `originrouter service start` first.");
+  }
+  const bind = state.localApiBindAddress || "127.0.0.1";
+  const host = bind === "0.0.0.0" || bind === "::" ? "127.0.0.1" : bind;
+  const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return { baseUrl: `http://${urlHost}:${state.localApiPort}`, token };
+}
+
+async function remoteLocalRequest(path, { method = "GET", body } = {}) {
+  const api = remoteLocalApi();
+  const response = await fetch(`${api.baseUrl}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${api.token}`,
+      ...(body == null ? {} : { "Content-Type": "application/json" }),
+    },
+    body: body == null ? undefined : JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.ok === false) {
+    const error = new Error(payload.error || `Local service request failed (${response.status})`);
+    error.code = payload.reason || "REMOTE_LOCAL_API_FAILED";
+    throw error;
+  }
+  return payload.data ?? payload;
+}
+
+function remoteProviderNames(value) {
+  return String(value || "").split(",").map((name) => name.trim()).filter(Boolean);
+}
+
+function printRemoteShareStatus(value) {
+  console.log(`Remote Share: ${value.enabled && value.state === "running" ? "on" : "off"}`);
+  console.log(`  port: ${value.port || "-"}`);
+  console.log(`  providers: ${(value.providers || []).join(", ") || "none"}`);
+  console.log(`  shared models: ${(value.catalog || []).length}`);
+  console.log(`  transport: ${value.e2eePolicy === "required" ? "trusted-device E2EE required" : "not configured"}`);
+}
+
+function printRemoteWorkspaces() {
+  const catalog = new AgentCatalog({ stateDir: ensureStateDir() });
+  try {
+    const workspaces = catalog.listWorkspaces();
+    if (workspaces.length === 0) {
+      console.log("No remote workspaces are registered.");
+      return;
+    }
+    for (const workspace of workspaces) {
+      const readiness = assessRegisteredWorkspaceForUnattended(workspace);
+      console.log(`${workspace.canonical_path} · ${readiness.status}`);
+      if (!readiness.remote_eligible) console.log(`  ${readiness.action}`);
+    }
+  } finally {
+    catalog.close();
+  }
+}
+
+async function authorizeRemoteWorkspace(path) {
+  if (!path) throw new Error("Usage: originrouter remote workspace authorize <path>");
+  const result = await remoteLocalRequest("/agent/catalog/workspaces/authorize", {
+    method: "POST",
+    body: { path },
+  });
+  console.log(`Remote workspace authorized: ${result.workspace.canonical_path}`);
+  console.log("The authorization was verified with the daemon's current runtime identity.");
+}
+
+async function handleRemoteCommand(args) {
+  const [section = "setup", action, ...rest] = args;
+  if (["--help", "-h", "help"].includes(section)) {
+    console.log("Usage: originrouter remote setup|status|share|workspace");
+    console.log("  remote setup [--workspace <path>] [--providers <name[,name...]>] [--port <p>]");
+    console.log("  remote share status|start|stop|restart [--providers <name[,name...]>] [--port <p>]");
+    console.log("  remote workspace list|authorize <path>");
+    return;
+  }
+  if (section === "workspace") {
+    if (!action || action === "list") return printRemoteWorkspaces();
+    if (action === "authorize") return authorizeRemoteWorkspace(rest[0]);
+    throw new Error("Usage: originrouter remote workspace list|authorize <path>");
+  }
+  if (section === "share") {
+    const operation = action || "status";
+    if (!new Set(["status", "start", "stop", "restart"]).has(operation)) {
+      throw new Error("Usage: originrouter remote share status|start|stop|restart [--providers <name[,name...]>] [--port <p>]");
+    }
+    if (operation === "status") return printRemoteShareStatus(await remoteLocalRequest("/remote-share/status"));
+    const options = parseOptionArgs(rest);
+    const body = {};
+    if (options["--providers"]) body.providers = remoteProviderNames(options["--providers"]);
+    if (options["--port"]) body.port = options["--port"];
+    return printRemoteShareStatus(await remoteLocalRequest(`/remote-share/${operation}`, { method: "POST", body }));
+  }
+  if (section === "status") {
+    await handleSecurityCommand(["status"]);
+    printRemoteShareStatus(await remoteLocalRequest("/remote-share/status"));
+    printRemoteWorkspaces();
+    return;
+  }
+  if (section !== "setup") throw new Error("Usage: originrouter remote setup|status|share|workspace");
+  const options = parseOptionArgs([action, ...rest].filter(Boolean));
+  await handleSecurityCommand(["status"]);
+  if (options["--providers"]) {
+    const body = { providers: remoteProviderNames(options["--providers"]) };
+    if (options["--port"]) body.port = options["--port"];
+    printRemoteShareStatus(await remoteLocalRequest("/remote-share/start", { method: "POST", body }));
+  } else {
+    printRemoteShareStatus(await remoteLocalRequest("/remote-share/status"));
+  }
+  if (options["--workspace"]) await authorizeRemoteWorkspace(options["--workspace"]);
+  else printRemoteWorkspaces();
+  console.log("Setup complete. Device trust, Remote Share, and workspace access remain independently scoped.");
+}
+
 async function handleCompatibility(args) {
   const [action = "status", ...rest] = args;
   const stateDir = ensureStateDir();
@@ -2114,6 +2238,11 @@ export async function main(argv) {
 
   if (command === "route") {
     await handleRoute(args);
+    return;
+  }
+
+  if (command === "remote") {
+    await handleRemoteCommand(args);
     return;
   }
 

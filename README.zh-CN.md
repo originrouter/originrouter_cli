@@ -108,6 +108,41 @@ originrouter -c claude --mode build-review \
 
 Agent Workspace 会自动使用当前目录，不需要额外输入项目路径。
 
+### 远程设置、Remote Share 与工作区授权
+
+`originrouter remote setup` 是在**实际运行 daemon 的目标电脑本机**执行的一次性
+onboarding 入口。它汇总远程能力的状态，但不会把任一项授权自动扩大到另一项：
+
+```bash
+# 查看设备信任、Remote Share 和已登记工作区
+originrouter remote status
+
+# 显式共享指定 LiteLLM Provider；只共享其 remote-enabled 模型
+originrouter remote share start --providers openai,anthropic
+
+# 在一次 setup 中启用共享并登记一个工作区
+originrouter remote setup --providers openai,anthropic \
+  --workspace ~/Desktop/client-a
+```
+
+远程功能分成三个相互独立的 scope：
+
+| Scope | 入口 | 授予的能力 |
+| --- | --- | --- |
+| 设备信任 | `originrouter login`，必要时在 App 批准设备 | 该设备可加入可信设备网络与 E2EE 通信。 |
+| Remote Share | `originrouter remote share start` | 仅把选定 Provider 的 remote-enabled 模型提供给其他可信设备路由；不会泄露 Provider 密钥，也不授予文件访问。 |
+| 工作区 | `originrouter remote workspace authorize <path>` | 仅允许远程 Agent 在该目录及其子目录工作；不共享模型或账户凭据。 |
+
+工作区可位于 Desktop、Documents、Downloads、iCloud/CloudStorage、OneDrive 或网络
+挂载等位置，但必须先在本机执行 `remote workspace authorize`。此步骤用 daemon 的
+当前运行身份做读写预检；若 macOS TCC、Windows 安全策略或挂载凭据需要确认，用户在
+此时一次性处理。随后远程启动只使用已登记且仍匹配该运行身份的目录；未登记或授权
+失效的目录会直接返回“需要本机授权”，不会在远程任务中等待系统弹窗。
+
+推荐仍将长期远程项目放在 `~/Developer` / `~/OriginRouterWorkspaces`（Windows 为
+`%USERPROFILE%\\Developer`），以减少系统隐私策略与云盘同步造成的维护成本。企业
+受管设备可通过 MDM、GPO 或系统配置预配相应的文件访问、Defender 和挂载权限。
+
 ## Agent Workspace
 
 Agent Workspace 让用户始终停留在 OriginRouter 中，由 daemon 在后台运行受管

@@ -11,8 +11,12 @@ import { basename, dirname, join, parse, relative, resolve, sep } from "node:pat
 import Database from "better-sqlite3";
 
 import { ensureStateDir } from "./state.js";
+import {
+  preflightUnattendedWorkspaceAuthorization,
+  requireUnattendedWorkspace,
+} from "../runtime/unattendedWorkspaceReadiness.js";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
 
@@ -188,6 +192,8 @@ export class AgentCatalog {
         canonical_path TEXT NOT NULL,
         repo_root TEXT NOT NULL DEFAULT '',
         trusted INTEGER NOT NULL DEFAULT 0,
+        unattended_authorized_at TEXT NOT NULL DEFAULT '',
+        unattended_authorization_subject TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(device_id, canonical_path)
@@ -271,6 +277,16 @@ export class AgentCatalog {
     );
     if (!conversationColumns.has("restored_at")) {
       this.db.exec("ALTER TABLE agent_conversations ADD COLUMN restored_at TEXT");
+    }
+    const workspaceColumns = new Set(
+      this.db.prepare("PRAGMA table_info(agent_workspaces)").all()
+        .map((column) => column.name),
+    );
+    if (!workspaceColumns.has("unattended_authorized_at")) {
+      this.db.exec("ALTER TABLE agent_workspaces ADD COLUMN unattended_authorized_at TEXT NOT NULL DEFAULT ''");
+    }
+    if (!workspaceColumns.has("unattended_authorization_subject")) {
+      this.db.exec("ALTER TABLE agent_workspaces ADD COLUMN unattended_authorization_subject TEXT NOT NULL DEFAULT ''");
     }
     this.db.prepare(`
       INSERT INTO catalog_meta(key, value) VALUES ('schema_version', ?)
@@ -876,7 +892,8 @@ export class AgentCatalog {
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     return this.db.prepare(`
       SELECT w.workspace_id, w.device_id, w.display_name, w.canonical_path,
-             w.repo_root, w.trusted, w.created_at, w.updated_at,
+             w.repo_root, w.trusted, w.unattended_authorized_at,
+             w.unattended_authorization_subject, w.created_at, w.updated_at,
              COUNT(c.conversation_id) AS conversation_count,
              MAX(c.last_activity_at) AS last_activity_at
       FROM agent_workspaces w
@@ -891,20 +908,33 @@ export class AgentCatalog {
   getWorkspace(reference, { deviceId = "" } = {}) {
     const value = safeText(reference, 4096);
     if (!value) return null;
-    const canonical = canonicalPath(value);
-    const clauses = ["(workspace_id = @reference OR canonical_path = @canonical)"];
-    const params = { reference: value, canonical };
+    const params = { reference: value };
+    let deviceClause = "";
     if (safeText(deviceId, 191)) {
-      clauses.push("device_id = @deviceId");
+      deviceClause = " AND device_id = @deviceId";
       params.deviceId = safeText(deviceId, 191);
     }
-    const row = this.db.prepare(`
+    // Workspace ids are opaque database identifiers. Resolve those first so a
+    // remote launch can run its preflight before it ever stats a protected
+    // directory simply to retrieve workspace metadata.
+    const byId = this.db.prepare(`
       SELECT workspace_id, device_id, display_name, canonical_path,
-             repo_root, trusted, created_at, updated_at
+             repo_root, trusted, unattended_authorized_at,
+             unattended_authorization_subject, created_at, updated_at
       FROM agent_workspaces
-      WHERE ${clauses.join(" AND ")}
+      WHERE workspace_id = @reference${deviceClause}
       LIMIT 1
     `).get(params);
+    if (byId) return { ...byId, trusted: Boolean(byId.trusted) };
+    const canonical = canonicalPath(value);
+    const row = this.db.prepare(`
+      SELECT workspace_id, device_id, display_name, canonical_path,
+             repo_root, trusted, unattended_authorized_at,
+             unattended_authorization_subject, created_at, updated_at
+      FROM agent_workspaces
+      WHERE canonical_path = @canonical${deviceClause}
+      LIMIT 1
+    `).get({ ...params, canonical });
     return row ? { ...row, trusted: Boolean(row.trusted) } : null;
   }
 
@@ -918,7 +948,8 @@ export class AgentCatalog {
     const normalizedDeviceId = safeText(deviceId, 191);
     const rows = this.db.prepare(`
       SELECT workspace_id, device_id, display_name, canonical_path,
-             repo_root, trusted, created_at, updated_at
+             repo_root, trusted, unattended_authorized_at,
+             unattended_authorization_subject, created_at, updated_at
       FROM agent_workspaces
       WHERE trusted = 1
         AND (@deviceId = '' OR device_id = @deviceId)
@@ -938,6 +969,8 @@ export class AgentCatalog {
       repo_root: repositoryRoot(canonical),
       trusted: true,
       inherited_from_workspace_id: ancestor.workspace_id,
+      unattended_authorized_at: ancestor.unattended_authorized_at,
+      unattended_authorization_subject: ancestor.unattended_authorization_subject,
       created_at: ancestor.created_at,
       updated_at: ancestor.updated_at,
     };
@@ -973,6 +1006,29 @@ export class AgentCatalog {
       now,
     );
     return this.getWorkspace(canonical, { deviceId: normalizedDeviceId });
+  }
+
+  authorizeWorkspaceForUnattended(path, { deviceId = "", subject = process.execPath } = {}) {
+    const workspace = this.trustWorkspace(path, { deviceId });
+    // Clear a previous grant before re-checking it. If the OS policy changed
+    // or the user dismisses the prompt, a stale record must never make a
+    // future remote launch appear eligible.
+    this.db.prepare(`
+      UPDATE agent_workspaces
+      SET unattended_authorized_at = '', unattended_authorization_subject = ''
+      WHERE workspace_id = ?
+    `).run(workspace.workspace_id);
+    // This method is intentionally invoked only by an explicit local command.
+    // On macOS it may cause the one-time TCC prompt while a user is present.
+    requireUnattendedWorkspace(workspace.canonical_path, { allowProtectedPaths: true });
+    preflightUnattendedWorkspaceAuthorization(workspace.canonical_path);
+    const authorizedAt = iso(this.now());
+    this.db.prepare(`
+      UPDATE agent_workspaces
+      SET unattended_authorized_at = ?, unattended_authorization_subject = ?, updated_at = ?
+      WHERE workspace_id = ?
+    `).run(authorizedAt, safeText(subject, 4096), authorizedAt, workspace.workspace_id);
+    return this.getWorkspace(workspace.workspace_id, { deviceId });
   }
 
   status() {

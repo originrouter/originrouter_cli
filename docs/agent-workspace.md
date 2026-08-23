@@ -95,16 +95,35 @@ policies remain authoritative regardless of plan confirmation.
 ## Interactive commands
 
 ```text
-/mode [name]          show or change collaboration mode
-/coordinator <agent> choose codex or claude
-/team                 show the active team constraint
-/help                 show workspace commands
+/status               show workspace settings and the latest Run
+/runs [category]      list Runs; category is active, recent, or all
+/resume [run-id]      list recent Runs or restore and follow one
+/attach <run-id>      follow a known Run without creating another Run
+/pause [run-id]       pause the latest or named Run
+/retry [run-id]       retry the latest or named Run
+/cancel [run-id]      cancel the latest or named Run
+/agents [run-id]      show assigned Agents and their selected routes
+/mode [name]          show or change collaboration mode for the next Run
+/approval [profile]   show or change Session approval
+/coordinator <agent>  choose codex or claude for the next Run
+/team                 show the next team constraint
+/help [command]       show available commands or one command's usage
 /exit                 exit Agent Workspace
 ```
 
-Closing the foreground viewer does not cancel a daemon-owned Run. Existing
-`collaboration attach`, `pause`, `resume`, `cancel`, and attention commands
-remain the advanced control surface.
+Typing `/` opens matching command suggestions. Commands that operate on a Run
+use the OriginRouter Run ID, not a Codex thread ID or a Claude conversation
+UUID. `/resume <run-id>` restores the Workspace view for that Run; when the
+Run is paused, Workspace asks for confirmation before it continues.
+
+Closing the foreground viewer does not cancel a daemon-owned Run. The advanced
+`originrouter collaboration` commands remain available for scripting, JSON
+output, exports, diagnostics, and task-level controls.
+
+`/model` and `/compact` are intentionally not Workspace commands yet. A
+collaboration Run can contain several managed Agent sessions, so changing a
+route or compacting context needs an explicit per-Agent or next-Run scope; the
+Workspace does not imply a cross-Agent live change it cannot guarantee.
 
 ## Parallel-write safety
 

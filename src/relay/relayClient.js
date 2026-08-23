@@ -197,6 +197,21 @@ export class RelayClient {
       this._ws = ws;
       ws.once("open", () => {
         markActivity();
+        // WebSocket close notifications are best-effort across mobile
+        // networks, reverse proxies, and worker restarts. Keep the server's
+        // connection-scoped presence lease alive explicitly instead of
+        // relying on a device-wide Redis flag.
+        const renewPresence = () => {
+          if (this._ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+          try {
+            ws.send(JSON.stringify({ type: "device.presence" }), (error) => {
+              if (error) ws.terminate();
+            });
+          } catch {
+            ws.terminate();
+          }
+        };
+        renewPresence();
         heartbeatTimer = setInterval(() => {
           if (this._ws !== ws || ws.readyState !== WebSocket.OPEN) {
             stopHeartbeat();
@@ -206,6 +221,7 @@ export class RelayClient {
             ws.terminate();
             return;
           }
+          renewPresence();
           try { ws.ping(); } catch { ws.terminate(); }
         }, this.heartbeatIntervalMs);
         heartbeatTimer.unref?.();

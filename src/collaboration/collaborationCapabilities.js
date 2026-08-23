@@ -5,6 +5,7 @@ import { enabledProviderModelEntries } from "../config/providerModels.js";
 import { listProviders } from "../config/providers.js";
 import { ROUTE_AGENTS, ROUTE_DEFS, getAgentRoutes } from "../config/routes.js";
 import { AGENT_AUTONOMY_PROFILES } from "../runtime/agentAutonomyPolicy.js";
+import { assessRegisteredWorkspaceForUnattended } from "../runtime/unattendedWorkspaceReadiness.js";
 
 function findExecutable(command, env = process.env) {
   const pathEntries = String(env.PATH || "")
@@ -84,6 +85,7 @@ export function buildCollaborationCapabilities({
           canonical_path: workspace.canonical_path,
           repo_root: workspace.repo_root || null,
           updated_at: workspace.updated_at,
+          unattended_execution: assessRegisteredWorkspaceForUnattended(workspace),
         }))
     : [];
   const runtimes = ["claude", "codex"].map((runtime) => {

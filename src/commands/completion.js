@@ -1,7 +1,7 @@
 import { readConfig } from "../persistence/state.js";
 
 const TOP_LEVEL = [
-  "status", "doctor", "sessions", "devices", "env", "agent", "history",
+  "status", "doctor", "sessions", "devices", "env", "agent", "history", "remote",
   "collaborate", "collaboration", "provider", "route", "proxy",
   "compatibility", "login", "logout", "auth", "security", "service", "services",
   "local", "completion", "help", "claude", "codex", "run",
@@ -35,6 +35,9 @@ const NESTED = {
   "local token": ["show", "rotate"],
   "route cloud": ["models", "set"],
   "route remote": ["devices", "set"],
+  remote: ["setup", "status", "share", "workspace"],
+  "remote share": ["status", "start", "stop", "restart"],
+  "remote workspace": ["list", "authorize"],
 };
 
 const OPTIONS = {

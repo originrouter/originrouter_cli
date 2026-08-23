@@ -127,6 +127,16 @@ function cleanCapabilitySnapshot(input = {}) {
           canonical_path: cleanText(workspace?.canonical_path, 4096),
           repo_root: cleanText(workspace?.repo_root, 4096) || null,
           updated_at: cleanText(workspace?.updated_at, 64) || null,
+          unattended_execution: workspace?.unattended_execution && typeof workspace.unattended_execution === "object"
+            ? {
+                status: cleanText(workspace.unattended_execution.status, 32) || "unknown",
+                remote_eligible: workspace.unattended_execution.remote_eligible === true,
+                platform: cleanText(workspace.unattended_execution.platform, 32) || null,
+                code: cleanText(workspace.unattended_execution.code, 96) || null,
+                summary: cleanText(workspace.unattended_execution.summary, 512) || null,
+                action: cleanText(workspace.unattended_execution.action, 512) || null,
+              }
+            : null,
         })).filter((workspace) => workspace.workspace_id && workspace.canonical_path)
       : [],
     permission_profiles: Array.isArray(input.permission_profiles)

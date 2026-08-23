@@ -15,11 +15,12 @@ import { RelayClient } from "../src/relay/relayClient.js";
 const PORT = 19100 + Math.floor(Math.random() * 1000);
 
 function makeCapture() {
-  const captured = { requests: [] };
+  const captured = { requests: [], wsMessages: [] };
   const wss = new WebSocketServer({ noServer: true });
   wss.on("connection", (ws) => {
+    ws.on("message", (raw) => captured.wsMessages.push(JSON.parse(String(raw))));
     ws.send(JSON.stringify({ type: "ping" }));
-    ws.close();
+    setTimeout(() => ws.close(), 30);
   });
   const server = http.createServer((req, res) => {
     let body = "";
@@ -135,6 +136,10 @@ try {
     const wsReq = captured.requests.find((r) => r.url.startsWith("/relay/v1/devices/d1/ws"));
     assert.ok(wsReq, "expected a WebSocket request to be captured");
     assert.equal(wsReq.headers.authorization, "Bearer or_at_ws");
+    assert.ok(
+      captured.wsMessages.some((payload) => payload.type === "device.presence"),
+      "expected an application-level Relay presence renewal",
+    );
     await connPromise;
     assert.ok(alive >= 1, "open/message activity should refresh connection liveness");
     server.close();

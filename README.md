@@ -110,6 +110,40 @@ originrouter -c claude --mode build-review \
 Agent Workspace uses the current directory automatically. You do not need to
 pass the project path.
 
+### Remote setup, Remote Share, and workspace authorization
+
+Run `originrouter remote setup` locally on the machine that runs the daemon.
+It is a one-time onboarding entry point that reports remote readiness without
+silently broadening any permission:
+
+```bash
+# Inspect device trust, Remote Share, and registered workspaces
+originrouter remote status
+
+# Share only selected remote-enabled LiteLLM Providers
+originrouter remote share start --providers openai,anthropic
+
+# Configure sharing and register a workspace in one local setup step
+originrouter remote setup --providers openai,anthropic \
+  --workspace ~/Desktop/client-a
+```
+
+Remote access has three independently scoped permissions:
+
+| Scope | Entry point | Granted capability |
+| --- | --- | --- |
+| Device trust | `originrouter login`, and App approval when required | Join the trusted-device network and use E2EE transport. |
+| Remote Share | `originrouter remote share start` | Route only selected remote-enabled Provider models to trusted devices; it never exposes Provider credentials or filesystem access. |
+| Workspace | `originrouter remote workspace authorize <path>` | Let remote Agents work only in that workspace and its children; it neither shares models nor account credentials. |
+
+Desktop, Documents, Downloads, iCloud/CloudStorage, OneDrive, and mounted
+locations remain supported. Before unattended remote use, register them locally
+with `remote workspace authorize`. The daemon performs the preflight under its
+own runtime identity, so any macOS TCC, Windows security, or mount credential
+interaction happens while a local user is present. A later remote Run uses only
+registered, still-valid workspaces and fails clearly rather than waiting on an
+invisible OS prompt.
+
 ## Agent Workspace
 
 Agent Workspace keeps the user in OriginRouter while the daemon runs managed
