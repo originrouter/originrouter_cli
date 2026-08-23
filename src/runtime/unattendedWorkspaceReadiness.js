@@ -58,6 +58,8 @@ function authorizationRequired({ platform, code, summary, action }) {
   };
 }
 
+const TARGET_AUTHORIZATION_ACTION = "Run `originrouter remote workspace authorize <path>` on the target device. Physical access is needed only if the operating system asks for interactive approval.";
+
 function macosReadiness(path, home) {
   const protectedRoots = [
     ["Desktop", "Desktop"],
@@ -72,7 +74,7 @@ function macosReadiness(path, home) {
         platform: "darwin",
         code: "MACOS_TCC_PROTECTED_WORKSPACE",
         summary: `This workspace is in ${label}, where macOS can show a TCC privacy prompt for node.`,
-        action: "Run `originrouter remote workspace authorize <path>` once on this Mac while a user can answer the macOS prompt, then remote launches may use this workspace.",
+        action: TARGET_AUTHORIZATION_ACTION,
       });
     }
   }
@@ -104,7 +106,7 @@ function windowsReadiness(path, home, env) {
         platform: "win32",
         code: "WINDOWS_PROTECTED_OR_SYNCED_WORKSPACE",
         summary: `This workspace is in ${label}, where Controlled Folder Access or cloud sync can block an unattended node process.`,
-        action: "Allow the OriginRouter Node runtime in the applicable Windows security policy, then run `originrouter remote workspace authorize <path>` locally.",
+        action: "Allow the OriginRouter Node runtime in the applicable Windows security policy, then run `originrouter remote workspace authorize <path>` on the target device. Physical access is needed only if Windows asks for interactive approval.",
       });
     }
   }
@@ -114,7 +116,7 @@ function windowsReadiness(path, home, env) {
       platform: "win32",
       code: "WINDOWS_NETWORK_WORKSPACE",
       summary: "This workspace is on a network share, which can require Windows credentials or become unavailable during a remote run.",
-      action: "Use a local workspace, or ensure the share has non-interactive credentials and authorize it locally before remote execution.",
+      action: "Use a stable workspace, or configure non-interactive share credentials and authorize it from the target device's management context before remote execution.",
     });
   }
   return null;
@@ -127,7 +129,7 @@ function linuxReadiness(path) {
         platform: "linux",
         code: "LINUX_INTERACTIVE_MOUNT_WORKSPACE",
         summary: "This workspace is on a desktop, removable, or network mount that can require credentials or disappear during an unattended run.",
-        action: "Use a stable local workspace, or ensure this mount has non-interactive credentials and authorize it locally before remote execution.",
+        action: "Use a stable workspace, or configure non-interactive mount credentials and authorize it from the target device's management context before remote execution.",
       });
     }
   }
@@ -199,9 +201,10 @@ export function requireUnattendedWorkspace(path, options = {}) {
 
 /**
  * Verify the exact filesystem operations a managed Agent needs. This is used
- * only by the explicit local authorization flow; it intentionally creates a
+ * only by the explicit target-side authorization flow; it intentionally creates a
  * short-lived private directory so Windows Controlled Folder Access, TCC, and
- * mount credential policies are exercised while someone can respond locally.
+ * mount credential policies are exercised before an unattended Run. A person
+ * needs to enter the target device only when the OS requests interaction.
  */
 export function preflightUnattendedWorkspaceAuthorization(path) {
   const workspacePath = String(path || "").trim();
@@ -215,7 +218,7 @@ export function preflightUnattendedWorkspaceAuthorization(path) {
   } catch (cause) {
     const error = new Error(
       "OriginRouter could not create and write a temporary preflight file in this workspace. "
-      + "Grant the daemon runtime access locally, then try authorization again.",
+      + "Grant the daemon runtime access on the target device, then try authorization again.",
     );
     error.code = "WORKSPACE_UNATTENDED_PREFLIGHT_FAILED";
     error.cause = cause;
@@ -236,7 +239,7 @@ export function preflightUnattendedWorkspaceAuthorization(path) {
  * Guard a filesystem request that arrived from another device. Unlike a local
  * authorization flow, this must not access the path at all when it is a
  * location known to surface an interactive OS or mount prompt. The explicit
- * local `remote workspace authorize` command is the only route that may
+ * target-side `remote workspace authorize` command is the only route that may
  * perform that preflight.
  */
 export function requireRemoteWorkspacePathPreflight(path, options = {}) {
@@ -251,7 +254,10 @@ export function requireRemoteWorkspacePathPreflight(path, options = {}) {
   });
   if (readiness.remote_eligible) return readiness;
   const error = new Error(`${readiness.summary} ${readiness.action}`);
-  error.code = readiness.code;
+  error.code = readiness.status === "requires_local_authorization"
+    ? "TARGET_WORKSPACE_AUTHORIZATION_REQUIRED"
+    : readiness.code;
+  error.platformCode = readiness.code;
   error.readiness = readiness;
   throw error;
 }

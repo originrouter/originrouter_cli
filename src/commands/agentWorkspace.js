@@ -900,7 +900,7 @@ function interactionResultSummary(runtime, kind, value) {
   }
   if (kind === "workspace") {
     if (value === "__custom_workspace_path__") return "";
-    return `Workspace selected · ${value?.display_name || value?.canonical_path || "authorized workspace"}`;
+    return `Workspace selected · ${value?.display_name || value?.canonical_path || "ready workspace"}`;
   }
   if (kind === "setup" && typeof value === "string") return `Folder selected · ${value}`;
   if (kind === "configuration" && value === "confirm") {
@@ -1105,7 +1105,15 @@ function buildRuntimeRows(runtime, columns, maxRows, { focusedInteraction = fals
       const checked = selectedIds.has(device.device_id) ? "[✓]" : "[ ]";
       const status = device.online ? "online" : "offline · cached capabilities";
       pushIndented(`${focused} ${checked} ${device.device_name || device.device_id}`, 2, strong);
-      pushIndented(`${status} · ${(device.runtimes || []).map(runtimeDisplayName).join(" + ") || "no Agent Runtime"} · ${device.workspace_count || 0} authorized workspace${device.workspace_count === 1 ? "" : "s"}`, 6, muted);
+      const readyCount = Number(device.ready_workspace_count ?? device.workspace_count) || 0;
+      const registeredCount = Number(device.registered_workspace_count ?? readyCount) || 0;
+      const actionRequiredCount = Number(device.workspace_action_required_count) || 0;
+      const workspaceStatus = [
+        `${readyCount} ready workspace${readyCount === 1 ? "" : "s"}`,
+        registeredCount !== readyCount ? `${registeredCount} registered` : "",
+        actionRequiredCount ? `${actionRequiredCount} need target authorization` : "",
+      ].filter(Boolean).join(" · ");
+      pushIndented(`${status} · ${(device.runtimes || []).map(runtimeDisplayName).join(" + ") || "no Agent Runtime"} · ${workspaceStatus}`, 6, muted);
     }
     if (start > 0 || start + maxVisible < devices.length) {
       pushIndented(`${selectedIndex + 1} of ${devices.length}`, 2, muted);
@@ -1117,7 +1125,7 @@ function buildRuntimeRows(runtime, columns, maxRows, { focusedInteraction = fals
     const deviceName = runtime.setup.device_name || runtime.setup.deviceName || "Remote device";
     push("");
     if (workspaces.length && runtime.setupMode !== "path") {
-      push(`${deviceName} has multiple authorized workspaces.`, strong);
+      push(`${deviceName} has multiple ready workspaces.`, strong);
       pushIndented("Choose a listed folder, or enter another folder path.", 2, muted);
       push("");
       const maxVisible = 6;
@@ -1141,9 +1149,9 @@ function buildRuntimeRows(runtime, columns, maxRows, { focusedInteraction = fals
     } else {
       push(runtime.setupMode === "path"
         ? `${deviceName} folder path`
-        : `${deviceName} is online and trusted, but no workspace is authorized.`, strong);
+        : `${deviceName} is online and trusted, but no workspace is ready for unattended use.`, strong);
       pushIndented(runtime.setup.remote
-        ? "Authorize a folder before a remote Agent can inspect this device."
+        ? "Request a normal folder here, or authorize a protected folder from the target device's management context."
         : "Authorize a folder before an Agent can work in this workspace.", 2, muted);
       if (runtime.setupMode === "path") {
         pushIndented(runtime.setupPath
@@ -1568,7 +1576,7 @@ function interactionComposer(runtime, columns, { focusedInteraction = false } = 
     ];
   } else if (kind === "workspace") {
     lines = [
-      "? Choose an authorized workspace",
+      "? Choose a ready workspace",
       "↑/↓ select · Enter confirm · P or typing enters a folder not listed",
       "Esc cancel",
     ];
@@ -1583,7 +1591,9 @@ function interactionComposer(runtime, columns, { focusedInteraction = false } = 
       ? `${pathChars.slice(0, pathCursor).join("")}▌${pathChars.slice(pathCursor).join("")}`
       : "▌";
     lines = [
-      "? Enter a folder path to authorize",
+      runtime.setup?.remote
+        ? "? Enter a folder path to request from the target device"
+        : "? Enter a folder path to authorize",
       path
         ? `› ${pathWithCursor}`
         : `› ${pathWithCursor}  ${muted(`example: ${runtime.setup?.default_path || "/path/to/workspace"}`)}`,

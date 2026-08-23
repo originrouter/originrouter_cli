@@ -44,10 +44,26 @@ access. Recheck immediately before the first publish because availability can ch
    shims (`originrouter.cmd` and `or.cmd`).
 4. Inspect the tarball allowlist. Tests, local state, `.env`, and development
    artifacts must not be present.
-5. Commit, create a signed tag such as `v0.1.0`, and publish a GitHub Release.
-6. The release event runs `.github/workflows/publish.yml`, tests again, and
-   publishes with npm provenance.
-7. Verify `npm view @originrouter/cli version dist.integrity` and install the
+5. Commit and push the release commit. Create a signed tag whose name exactly
+   matches `v` plus the package version. For version `0.2.1`, the tag must be
+   `v0.2.1`:
+
+   ```bash
+   git tag -s v0.2.1 -m "OriginRouter CLI v0.2.1"
+   git push origin main v0.2.1
+   ```
+
+6. Create a GitHub Release from that tag and click **Publish release**. Saving
+   a draft or only pushing the tag does not start npm publication.
+7. The published-release event runs `.github/workflows/publish.yml`, verifies
+   that the Release tag exactly matches `package.json`, runs the release checks
+   and full test suite again, and then publishes with npm provenance. If that
+   exact npm version already exists, the workflow safely skips `npm publish`.
+8. The npm Trusted Publisher must already be configured for repository
+   `originrouter/originrouter_cli`, workflow `publish.yml`, and the GitHub
+   environment `npm`. Without that one-time npm-side configuration, GitHub can
+   run the workflow but npm will reject the publish request.
+9. Verify `npm view @originrouter/cli version dist.integrity` and install the
    published version in a clean temporary directory.
 
 Never reuse a version. npm versions are immutable after publication. If a

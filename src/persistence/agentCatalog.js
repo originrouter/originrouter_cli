@@ -938,6 +938,23 @@ export class AgentCatalog {
     return row ? { ...row, trusted: Boolean(row.trusted) } : null;
   }
 
+  getRegisteredWorkspaceWithoutFilesystem(path, { deviceId = "" } = {}) {
+    const requested = safeText(path, 4096);
+    if (!requested) return null;
+    const canonical = resolve(requested);
+    const normalizedDeviceId = safeText(deviceId, 191);
+    const row = this.db.prepare(`
+      SELECT workspace_id, device_id, display_name, canonical_path,
+             repo_root, trusted, unattended_authorized_at,
+             unattended_authorization_subject, created_at, updated_at
+      FROM agent_workspaces
+      WHERE canonical_path = @canonical
+        AND (@deviceId = '' OR device_id = @deviceId)
+      LIMIT 1
+    `).get({ canonical, deviceId: normalizedDeviceId });
+    return row ? { ...row, trusted: Boolean(row.trusted) } : null;
+  }
+
   getTrustedWorkspaceForPath(path, { deviceId = "" } = {}) {
     let canonical;
     try {

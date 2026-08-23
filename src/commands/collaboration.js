@@ -10,6 +10,7 @@ import {
 import {
   cacheCollaborationCapabilities,
   getCachedCollaborationCapabilities,
+  updateCachedCollaborationWorkspace,
 } from "../collaboration/collaborationCapabilityCache.js";
 import {
   deleteCollaborationDraft,
@@ -1863,11 +1864,13 @@ function abortableDelay(ms, signal) {
 export async function trustCollaborationWorkspace(deviceId, path, {
   signal,
   requestFn = request,
+  updateCacheFn = updateCachedCollaborationWorkspace,
 } = {}) {
   const data = await requestFn(
     `/collaboration/devices/${encodeURIComponent(deviceId)}/workspaces/trust`,
     { method: "POST", body: { path }, signal },
   );
+  updateCacheFn?.(deviceId, data.workspace);
   return data.workspace;
 }
 

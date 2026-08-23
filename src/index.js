@@ -48,6 +48,7 @@ import { runLocalAgentSession } from "./local/localAgentSession.js";
 import { readSessions } from "./persistence/sessionLog.js";
 import { AgentCatalog } from "./persistence/agentCatalog.js";
 import { assessRegisteredWorkspaceForUnattended } from "./runtime/unattendedWorkspaceReadiness.js";
+import { updateCachedCollaborationWorkspace } from "./collaboration/collaborationCapabilityCache.js";
 import { AgentBudgetStore } from "./agent/agentBudgetStore.js";
 import { readApiToken, rotateApiToken } from "./persistence/authToken.js";
 import {
@@ -200,6 +201,7 @@ Model routes:
   originrouter remote status
   originrouter remote share status|start|stop|restart [--providers <name[,name...]>] [--port <p>]
   originrouter remote workspace list|authorize <path>
+  originrouter remote workspace request <path> --device <device-id>
   Aliases are fixed: originrouter-claude-model, originrouter-claude-fast-model, and gpt-5.4.
 
 LiteLLM proxy:
@@ -1506,13 +1508,60 @@ function printRemoteWorkspaces() {
 }
 
 async function authorizeRemoteWorkspace(path) {
+  if (process.env.ORIGINROUTER_MANAGED_AGENT === "1") {
+    const error = new Error("A managed Agent cannot authorize or expand remote workspace access. Run this command from a human-controlled target-device terminal, SSH session, screen-sharing session, or device-management tool.");
+    error.code = "REMOTE_WORKSPACE_SELF_AUTHORIZATION_FORBIDDEN";
+    throw error;
+  }
   if (!path) throw new Error("Usage: originrouter remote workspace authorize <path>");
   const result = await remoteLocalRequest("/agent/catalog/workspaces/authorize", {
     method: "POST",
     body: { path },
   });
   console.log(`Remote workspace authorized: ${result.workspace.canonical_path}`);
-  console.log("The authorization was verified with the daemon's current runtime identity.");
+  console.log("The target daemon verified unattended access with its current runtime identity.");
+  console.log("Physical access is needed only when the operating system requests interactive approval.");
+}
+
+function remoteWorkspaceRequestArgs(args) {
+  let deviceId = "";
+  let path = "";
+  for (let index = 0; index < args.length; index += 1) {
+    const item = String(args[index] || "");
+    if (item === "--device") {
+      deviceId = String(args[index + 1] || "").trim();
+      index += 1;
+    } else if (item.startsWith("--device=")) {
+      deviceId = item.slice("--device=".length).trim();
+    } else if (!path) {
+      path = item;
+    } else {
+      throw new Error(`Unexpected argument: ${item}`);
+    }
+  }
+  if (!deviceId || !path) {
+    throw new Error("Usage: originrouter remote workspace request <path> --device <device-id>");
+  }
+  return { deviceId, path };
+}
+
+async function requestRemoteWorkspace(args) {
+  if (process.env.ORIGINROUTER_MANAGED_AGENT === "1") {
+    const error = new Error("A managed Agent cannot request or expand remote workspace access. Run this command from a human-controlled OriginRouter control plane.");
+    error.code = "REMOTE_WORKSPACE_SELF_AUTHORIZATION_FORBIDDEN";
+    throw error;
+  }
+  const { deviceId, path } = remoteWorkspaceRequestArgs(args);
+  const result = await remoteLocalRequest(
+    `/collaboration/devices/${encodeURIComponent(deviceId)}/workspaces/trust`,
+    { method: "POST", body: { path } },
+  );
+  const workspace = result.workspace || {};
+  updateCachedCollaborationWorkspace(deviceId, workspace);
+  const readiness = workspace.unattended_execution || {};
+  console.log(`Remote workspace registered on target: ${workspace.canonical_path || path}`);
+  console.log(`Unattended status: ${readiness.status || "registered"}`);
+  if (readiness.action) console.log(readiness.action);
 }
 
 async function handleRemoteCommand(args) {
@@ -1522,12 +1571,14 @@ async function handleRemoteCommand(args) {
     console.log("  remote setup [--workspace <path>] [--providers <name[,name...]>] [--port <p>]");
     console.log("  remote share status|start|stop|restart [--providers <name[,name...]>] [--port <p>]");
     console.log("  remote workspace list|authorize <path>");
+    console.log("  remote workspace request <path> --device <device-id>");
     return;
   }
   if (section === "workspace") {
     if (!action || action === "list") return printRemoteWorkspaces();
     if (action === "authorize") return authorizeRemoteWorkspace(rest[0]);
-    throw new Error("Usage: originrouter remote workspace list|authorize <path>");
+    if (action === "request") return requestRemoteWorkspace(rest);
+    throw new Error("Usage: originrouter remote workspace list|authorize <path>|request <path> --device <device-id>");
   }
   if (section === "share") {
     const operation = action || "status";

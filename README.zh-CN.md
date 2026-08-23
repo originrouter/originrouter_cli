@@ -110,8 +110,9 @@ Agent Workspace 会自动使用当前目录，不需要额外输入项目路径�
 
 ### 远程设置、Remote Share 与工作区授权
 
-`originrouter remote setup` 是在**实际运行 daemon 的目标电脑本机**执行的一次性
-onboarding 入口。它汇总远程能力的状态，但不会把任一项授权自动扩大到另一项：
+`originrouter remote setup` 应在**目标设备的管理上下文**执行，例如目标设备终端、
+SSH、屏幕共享或设备管理工具；只有操作系统要求交互确认时，才需要进入目标设备的
+图形界面。它汇总远程能力的状态，但不会把任一项授权自动扩大到另一项：
 
 ```bash
 # 查看设备信任、Remote Share 和已登记工作区
@@ -133,11 +134,24 @@ originrouter remote setup --providers openai,anthropic \
 | Remote Share | `originrouter remote share start` | 仅把选定 Provider 的 remote-enabled 模型提供给其他可信设备路由；不会泄露 Provider 密钥，也不授予文件访问。 |
 | 工作区 | `originrouter remote workspace authorize <path>` | 仅允许远程 Agent 在该目录及其子目录工作；不共享模型或账户凭据。 |
 
+可信控制端可以请求目标设备登记普通目录，但远程 Agent 不能借此自行扩大权限：
+
+```bash
+originrouter remote workspace request /path/to/project --device <device-id>
+```
+
+目标 daemon 只会自动接受无需触发交互式系统权限或挂载凭据的目录。受保护目录会明确
+返回“需要目标设备授权”，随后从目标设备的管理上下文执行
+`remote workspace authorize`。这并不等于必须物理坐在目标设备前。OriginRouter 会
+显式标记受管 Agent 进程，并拒绝这些进程执行 request 或 authorize，防止 Agent 自行
+扩大工作区范围。
+
 工作区可位于 Desktop、Documents、Downloads、iCloud/CloudStorage、OneDrive 或网络
-挂载等位置，但必须先在本机执行 `remote workspace authorize`。此步骤用 daemon 的
-当前运行身份做读写预检；若 macOS TCC、Windows 安全策略或挂载凭据需要确认，用户在
-此时一次性处理。随后远程启动只使用已登记且仍匹配该运行身份的目录；未登记或授权
-失效的目录会直接返回“需要本机授权”，不会在远程任务中等待系统弹窗。
+挂载等位置，但必须先从目标设备的管理上下文执行 `remote workspace authorize`。
+此步骤用 daemon 的当前运行身份做读写预检；若 macOS TCC、Windows 安全策略或挂载
+凭据需要确认，才要求用户进入目标设备处理。随后远程启动只使用已登记且仍匹配该
+运行身份的目录；未登记或授权失效的目录会直接返回“需要目标设备授权”，不会在远程
+任务中等待系统弹窗。
 
 推荐仍将长期远程项目放在 `~/Developer` / `~/OriginRouterWorkspaces`（Windows 为
 `%USERPROFILE%\\Developer`），以减少系统隐私策略与云盘同步造成的维护成本。企业

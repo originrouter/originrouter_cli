@@ -88,11 +88,13 @@ export function publicCapabilitySnapshot(devices) {
       online: device.online !== false,
       trusted: device.trustStatus === "trusted" || device.local === true,
       runtimes: (capabilities?.runtimes || []).map(({ id, available }) => ({ id, available })),
-      trusted_workspaces: (capabilities?.trusted_workspaces || []).map((workspace) => ({
-        workspace_id: workspace.workspace_id,
-        display_name: workspace.display_name,
-        repo_name: cleanText(workspace.repo_root || workspace.canonical_path, 256).split(/[\\/]/).filter(Boolean).at(-1) || "workspace",
-      })),
+      trusted_workspaces: (capabilities?.trusted_workspaces || [])
+        .filter((workspace) => workspace?.unattended_execution?.remote_eligible !== false)
+        .map((workspace) => ({
+          workspace_id: workspace.workspace_id,
+          display_name: workspace.display_name,
+          repo_name: cleanText(workspace.repo_root || workspace.canonical_path, 256).split(/[\\/]/).filter(Boolean).at(-1) || "workspace",
+        })),
       providers: (capabilities?.providers || []).map((provider) => ({
         name: provider.name,
         models: (provider.models || []).map((model) => model.id),
@@ -218,6 +220,18 @@ export function validateAndNormalizeAutoConfiguration(rawOutput, { objective, de
       }
       if (!participant.workspace_id && workspaces.length === 1) participant.workspace_id = workspaces[0].workspace_id;
       else throw Object.assign(new Error(`The model referenced an unknown workspace '${participant.workspace_id}'.`), { code: "AUTO_CONFIG_UNKNOWN_WORKSPACE" });
+    }
+    const selectedWorkspace = workspaces.find((item) => item.workspace_id === participant.workspace_id);
+    if (selectedWorkspace?.unattended_execution?.remote_eligible === false) {
+      const error = new Error(
+        selectedWorkspace.unattended_execution.action
+          || `Workspace '${participant.workspace_id}' is registered but is not ready for unattended execution.`,
+      );
+      error.code = selectedWorkspace.unattended_execution.status === "requires_local_authorization"
+        ? "AUTO_CONFIG_WORKSPACE_TARGET_AUTHORIZATION_REQUIRED"
+        : "AUTO_CONFIG_WORKSPACE_UNAVAILABLE";
+      error.workspace = selectedWorkspace;
+      throw error;
     }
     const profiles = new Set((capabilities.permission_profiles || []).map((profile) => profile.id));
     if (!profiles.has(participant.permission_profile)) throw Object.assign(new Error(`Unknown permission profile '${participant.permission_profile}'.`), { code: "AUTO_CONFIG_UNKNOWN_PERMISSION" });

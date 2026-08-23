@@ -14,5 +14,6 @@ assert(getCompletionCandidates(["completion", "p"]).includes("powershell"));
 assert(getCompletionCandidates(["-"]).includes("--mode"));
 assert.deepEqual(getCompletionCandidates(["--coordinator", "c"]), ["claude", "codex"]);
 assert(getCompletionCandidates(["--mode", "p"]).includes("plan-build-verify"));
+assert(getCompletionCandidates(["remote", "workspace", "r"]).includes("request"));
 
 console.log("completion tests ok");

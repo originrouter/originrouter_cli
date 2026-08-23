@@ -3,6 +3,18 @@ import { access, readFile } from "node:fs/promises";
 
 const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 const constants = await readFile(new URL("../src/constants.js", import.meta.url), "utf8");
+const args = process.argv.slice(2);
+const tagIndex = args.indexOf("--tag");
+const releaseTag = tagIndex >= 0 ? args[tagIndex + 1]?.trim() : "";
+
+if (tagIndex >= 0) {
+  assert(releaseTag, "--tag requires a GitHub Release tag");
+  assert.equal(
+    releaseTag,
+    `v${pkg.version}`,
+    `GitHub Release tag must be v${pkg.version} for ${pkg.name}@${pkg.version}`,
+  );
+}
 
 assert.equal(pkg.private, undefined, "package.json must not set private=true");
 assert.equal(pkg.license, "Apache-2.0");
@@ -22,4 +34,6 @@ await access(new URL("../THIRD_PARTY_NOTICES.md", import.meta.url));
 await access(new URL("../README.md", import.meta.url));
 await access(new URL("../bin/originrouter.js", import.meta.url));
 
-console.log(`release metadata ok: ${pkg.name}@${pkg.version}`);
+console.log(
+  `release metadata ok: ${pkg.name}@${pkg.version}${releaseTag ? ` (${releaseTag})` : ""}`,
+);

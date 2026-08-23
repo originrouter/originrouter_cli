@@ -131,6 +131,8 @@ const trustedRemoteWorkspace = await source.runtime.trustWorkspaceOnDevice(
 );
 assert.equal(trustedRemoteWorkspace.device_id, "device-b");
 assert.equal(trustedRemoteWorkspace.trusted, true);
+assert.equal(trustedRemoteWorkspace.unattended_execution.remote_eligible, true);
+assert.equal(trustedRemoteWorkspace.unattended_execution.status, "ready");
 const appCreated = await worker.runtime.handleControlOperation("create", {
   request: {
     objective: "Exercise encrypted App collaboration control.",

@@ -63,7 +63,10 @@ Coordinator CLI
 ```
 
 Remote dispatch, Agent results, MCP requests/responses, capability checks, and
-workspace trust requests are end-to-end encrypted between trusted devices.
+workspace registration requests are end-to-end encrypted between trusted
+devices. A registration request cannot grant protected-folder access: only the
+target device's management context may run the unattended authorization
+preflight, and physical presence is needed only when the OS asks for it.
 The server routes ciphertext and presence only. Attempt numbers, fencing
 tokens, leases, source/target device checks, registered-workspace checks, and
 the target CLI's local approval policy remain authoritative. No new

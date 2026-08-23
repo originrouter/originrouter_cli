@@ -6,6 +6,7 @@ import { listProviders } from "../config/providers.js";
 import { ROUTE_AGENTS, ROUTE_DEFS, getAgentRoutes } from "../config/routes.js";
 import { AGENT_AUTONOMY_PROFILES } from "../runtime/agentAutonomyPolicy.js";
 import { assessRegisteredWorkspaceForUnattended } from "../runtime/unattendedWorkspaceReadiness.js";
+import { workspaceCapabilityCounts } from "./workspaceModes.js";
 
 function findExecutable(command, env = process.env) {
   const pathEntries = String(env.PATH || "")
@@ -97,6 +98,7 @@ export function buildCollaborationCapabilities({
       route_slots: [...(ROUTE_DEFS[runtime]?.slots || [])],
     };
   });
+  const workspaceSummary = workspaceCapabilityCounts({ trusted_workspaces: workspaces });
   return {
     schema_version: 1,
     captured_at: capturedAt,
@@ -117,6 +119,7 @@ export function buildCollaborationCapabilities({
     }))),
     resolved_routes: resolvedRoutes,
     trusted_workspaces: workspaces,
+    workspace_summary: workspaceSummary,
     permission_profiles: AGENT_AUTONOMY_PROFILES.map((profile) => ({ ...profile })),
     defaults: {
       permission_profile: "guarded",

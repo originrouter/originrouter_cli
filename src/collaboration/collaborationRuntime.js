@@ -1964,10 +1964,26 @@ export class CollaborationRuntime {
       let errorPayload = null;
       try {
         if (!this.catalog) throw new Error("Agent workspace catalog unavailable");
-        requireRemoteWorkspacePathPreflight(payload.path);
-        workspace = this.catalog.trustWorkspace(safeText(payload.path, 4096), {
-          deviceId: this.deviceId,
-        });
+        const requestedPath = safeText(payload.path, 4096);
+        const registered = this.catalog.getRegisteredWorkspaceWithoutFilesystem?.(
+          requestedPath,
+          { deviceId: this.deviceId },
+        );
+        const registeredReadiness = registered?.trusted
+          ? assessRegisteredWorkspaceForUnattended(registered, { checkAccess: false })
+          : null;
+        if (registeredReadiness?.remote_eligible) {
+          workspace = { ...registered, unattended_execution: registeredReadiness };
+        } else {
+          requireRemoteWorkspacePathPreflight(requestedPath);
+          const trusted = this.catalog.trustWorkspace(requestedPath, {
+            deviceId: this.deviceId,
+          });
+          workspace = {
+            ...trusted,
+            unattended_execution: assessRegisteredWorkspaceForUnattended(trusted),
+          };
+        }
       } catch (error) {
         errorPayload = {
           code: safeText(error?.code, 96) || "COLLABORATION_WORKSPACE_TRUST_FAILED",

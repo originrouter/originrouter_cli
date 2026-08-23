@@ -16,6 +16,12 @@ function capabilitiesFor(device) {
   return device.capabilities || device.cachedCapabilities || {};
 }
 
+function readyWorkspaceCount(device) {
+  return (capabilitiesFor(device).trusted_workspaces || []).filter((workspace) => (
+    workspace?.unattended_execution?.remote_eligible !== false
+  )).length;
+}
+
 export function collaborationCapabilitySummary(devices = []) {
   const eligible = devices.filter(
     (device) => device.local === true || device.trustStatus === "trusted",
@@ -32,7 +38,7 @@ export function collaborationCapabilitySummary(devices = []) {
     online_remote_count: remotes.filter((device) => device.online === true).length,
     remote_runtimes: unique(remotes.flatMap(runtimes)),
     trusted_workspace_count: eligible.reduce(
-      (count, device) => count + (capabilitiesFor(device).trusted_workspaces || []).length,
+      (count, device) => count + readyWorkspaceCount(device),
       0,
     ),
     configured_route_count: eligible.reduce((count, device) => {

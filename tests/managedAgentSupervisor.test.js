@@ -53,6 +53,7 @@ assert.equal(launched.pid, 4321);
 assert.equal(spawns.length, 1);
 assert.equal(spawns[0].command, "/usr/bin/node");
 assert.equal(spawns[0].options.cwd, workspace.canonical_path);
+assert.equal(spawns[0].options.env.ORIGINROUTER_MANAGED_AGENT, "1");
 assert.ok(spawns[0].args.includes("codex-app-server"));
 assert.ok(spawns[0].args.includes("--originrouter-conversation"));
 assert.ok(spawns[0].args.includes("--originrouter-workspace"));

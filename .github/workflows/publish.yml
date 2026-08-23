@@ -8,9 +8,14 @@ permissions:
   contents: read
   id-token: write
 
+concurrency:
+  group: npm-publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: npm
     steps:
       - uses: actions/checkout@v4
@@ -21,7 +26,8 @@ jobs:
           cache: npm
       - run: npm install --global npm@latest
       - run: npm ci
-      - run: npm run release:check
+      - name: Validate release tag and package metadata
+        run: npm run release:check -- --tag "${{ github.event.release.tag_name }}"
       - run: npm test
       - id: package
         run: node -e "const p=require('./package.json'); console.log('name='+p.name); console.log('version='+p.version)" >> "$GITHUB_OUTPUT"
@@ -32,5 +38,9 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-      - if: steps.registry.outputs.exists != 'true'
+      - name: Publish package with npm provenance
+        if: steps.registry.outputs.exists != 'true'
         run: npm publish --access public --provenance
+      - name: Report an idempotent existing release
+        if: steps.registry.outputs.exists == 'true'
+        run: echo "${{ steps.package.outputs.name }}@${{ steps.package.outputs.version }} is already published; skipping npm publish."

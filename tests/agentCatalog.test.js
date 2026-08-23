@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -229,6 +229,17 @@ assert.equal(
   "claude-wrapper-session",
 );
 assert.equal(switchedConversation.native_session_id, "native-after-clear");
+
+const registeredOnlyPath = mkdtempSync(join(stateDir, "registered-workspace-"));
+const registeredOnly = catalog.trustWorkspace(registeredOnlyPath, { deviceId: "server-2" });
+rmSync(registeredOnlyPath, { recursive: true, force: true });
+assert.equal(
+  catalog.getRegisteredWorkspaceWithoutFilesystem(registeredOnly.canonical_path, {
+    deviceId: "server-2",
+  }).workspace_id,
+  registeredOnly.workspace_id,
+  "a target may inspect an existing registration without touching a protected path",
+);
 
 catalog.close();
 

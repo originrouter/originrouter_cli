@@ -23,6 +23,8 @@ test("macOS protected folders require local authorization before a remote Run", 
   assert.equal(result.code, "MACOS_TCC_PROTECTED_WORKSPACE");
   assert.equal(result.status, "requires_local_authorization");
   assert.match(result.action, /remote workspace authorize/);
+  assert.match(result.action, /target device/);
+  assert.match(result.action, /only if the operating system asks/);
 });
 
 test("macOS local development folders remain eligible", () => {
@@ -117,7 +119,7 @@ test("a remote directory request rejects protected paths without touching the fi
     access() {
       throw new Error("must not access a protected remote path");
     },
-  }), { code: "MACOS_TCC_PROTECTED_WORKSPACE" });
+  }), { code: "TARGET_WORKSPACE_AUTHORIZATION_REQUIRED" });
   assert.equal(
     requireRemoteWorkspacePathPreflight("/Users/alice/Developer/project", {
       platformName: "darwin",

@@ -112,9 +112,11 @@ pass the project path.
 
 ### Remote setup, Remote Share, and workspace authorization
 
-Run `originrouter remote setup` locally on the machine that runs the daemon.
-It is a one-time onboarding entry point that reports remote readiness without
-silently broadening any permission:
+Run `originrouter remote setup` in the target device's management context (for
+example its terminal, SSH session, screen sharing session, or device-management
+tool). Physical presence is required only if the operating system asks for an
+interactive permission decision. It is a one-time onboarding entry point that
+reports remote readiness without silently broadening any permission:
 
 ```bash
 # Inspect device trust, Remote Share, and registered workspaces
@@ -136,11 +138,26 @@ Remote access has three independently scoped permissions:
 | Remote Share | `originrouter remote share start` | Route only selected remote-enabled Provider models to trusted devices; it never exposes Provider credentials or filesystem access. |
 | Workspace | `originrouter remote workspace authorize <path>` | Let remote Agents work only in that workspace and its children; it neither shares models nor account credentials. |
 
+A trusted controller can request registration of an ordinary folder without
+letting a remote Agent expand its own permissions:
+
+```bash
+originrouter remote workspace request /path/to/project --device <device-id>
+```
+
+The target daemon accepts the request only when it can safely validate the
+folder without triggering an interactive OS or mount prompt. Protected folders
+return a target-authorization-required error instead. Complete those with
+`remote workspace authorize` in the target device's management context.
+OriginRouter marks managed Agent processes explicitly and rejects both request
+and authorize commands from those processes, preventing workspace self-expansion.
+
 Desktop, Documents, Downloads, iCloud/CloudStorage, OneDrive, and mounted
-locations remain supported. Before unattended remote use, register them locally
-with `remote workspace authorize`. The daemon performs the preflight under its
-own runtime identity, so any macOS TCC, Windows security, or mount credential
-interaction happens while a local user is present. A later remote Run uses only
+locations remain supported. Before unattended remote use, authorize them from
+the target device's management context with `remote workspace authorize`. The
+daemon performs the preflight under its own runtime identity. If macOS TCC,
+Windows security, or mount credentials require interaction, the command asks
+for it on the target device; otherwise it completes silently. A later remote Run uses only
 registered, still-valid workspaces and fails clearly rather than waiting on an
 invisible OS prompt.
 

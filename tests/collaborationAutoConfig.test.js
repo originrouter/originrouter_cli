@@ -8,6 +8,7 @@ import {
   validateAndNormalizeAutoConfiguration,
 } from "../src/collaboration/collaborationAutoConfig.js";
 import { taskPrompt } from "../src/collaboration/adaptivePlan.js";
+import { workspaceCapabilityCounts } from "../src/collaboration/workspaceModes.js";
 import {
   automaticCreatePayload,
   autoConfigurationView,
@@ -126,6 +127,30 @@ function proposal(overrides = {}) {
     ...overrides,
   };
 }
+
+test("workspace counts distinguish registered folders from unattended-ready folders", () => {
+  assert.deepEqual(workspaceCapabilityCounts({
+    trusted_workspaces: [
+      { workspace_id: "ready" },
+      {
+        workspace_id: "needs-auth",
+        unattended_execution: {
+          status: "requires_local_authorization",
+          remote_eligible: false,
+        },
+      },
+      {
+        workspace_id: "blocked",
+        unattended_execution: { status: "blocked", remote_eligible: false },
+      },
+    ],
+  }), {
+    registered: 3,
+    ready: 1,
+    action_required: 1,
+    blocked: 1,
+  });
+});
 
 test("clear objective produces an automatic configuration with zero questions", async () => {
   let modelCalls = 0;
@@ -864,6 +889,7 @@ test("workspace lifecycle does not retry non-transient authorization errors", as
 test("workspace authorization uses the injected authenticated request client", async () => {
   let captured;
   const workspace = await trustCollaborationWorkspace("remote/device", " '/srv/project' ", {
+    updateCacheFn: () => {},
     requestFn: async (path, options) => {
       captured = { path, options };
       return { workspace: { workspace_id: "workspace-remote", canonical_path: options.body.path } };
@@ -873,6 +899,41 @@ test("workspace authorization uses the injected authenticated request client", a
   assert.equal(captured.options.method, "POST");
   assert.equal(captured.options.body.path, " '/srv/project' ");
   assert.equal(workspace.workspace_id, "workspace-remote");
+});
+
+test("automatic configuration rejects a registered workspace that needs target authorization", () => {
+  const protectedWorkspace = {
+    workspace_id: "workspace-protected",
+    display_name: "Protected",
+    canonical_path: "/Users/alice/Desktop/project",
+    unattended_execution: {
+      status: "requires_local_authorization",
+      remote_eligible: false,
+      action: "Authorize it on the target device.",
+    },
+  };
+  const remoteDevice = device({
+    deviceId: "remote-protected",
+    local: false,
+    capabilities: capabilities({ workspaces: [protectedWorkspace] }),
+  });
+  assert.throws(() => validateAndNormalizeAutoConfiguration(proposal({
+    participants: [{
+      participant_id: "coordinator",
+      display_name: "Coordinator",
+      runtime: "codex",
+      device_id: "remote-protected",
+      workspace_id: "workspace-protected",
+      permission_profile: "guarded",
+      provider: null,
+      model: null,
+      role_hint: "Inspect",
+    }],
+    planner: "coordinator",
+  }), {
+    objective: "Inspect the remote workspace",
+    devices: [remoteDevice],
+  }), { code: "AUTO_CONFIG_WORKSPACE_TARGET_AUTHORIZATION_REQUIRED" });
 });
 
 test("workspace browser encodes partial paths for remote completion", async () => {
@@ -941,8 +1002,26 @@ test("cloud auto-configuration uses the logged-in control service and no local m
 
 test("cloud capability projection contains no secrets or absolute workspace path", () => {
   const projected = publicCapabilitySnapshot([device({
-    capabilities: { ...capabilities(), api_key: "secret", environment: { TOKEN: "secret" } },
+    capabilities: {
+      ...capabilities({
+        workspaces: [
+          { workspace_id: "workspace-ready", canonical_path: "/private/project" },
+          {
+            workspace_id: "workspace-needs-target-auth",
+            canonical_path: "/Users/alice/Desktop/project",
+            unattended_execution: {
+              status: "requires_local_authorization",
+              remote_eligible: false,
+            },
+          },
+        ],
+      }),
+      api_key: "secret",
+      environment: { TOKEN: "secret" },
+    },
   })]);
   const encoded = JSON.stringify(projected);
   assert.doesNotMatch(encoded, /secret|api_key|TOKEN|\/private\/project/);
+  assert.match(encoded, /workspace-ready/);
+  assert.doesNotMatch(encoded, /workspace-needs-target-auth/);
 });

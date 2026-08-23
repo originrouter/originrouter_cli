@@ -161,6 +161,29 @@ function capabilitiesFor(device) {
   return device.capabilities || device.cachedCapabilities || null;
 }
 
+export function workspaceCapabilityCounts(capabilities = {}) {
+  const workspaces = Array.isArray(capabilities?.trusted_workspaces)
+    ? capabilities.trusted_workspaces
+    : [];
+  const ready = workspaces.filter((workspace) => (
+    workspace?.unattended_execution?.remote_eligible !== false
+  ));
+  const actionRequired = workspaces.filter((workspace) => (
+    workspace?.unattended_execution?.remote_eligible === false
+    && workspace?.unattended_execution?.status === "requires_local_authorization"
+  ));
+  const blocked = workspaces.filter((workspace) => (
+    workspace?.unattended_execution?.remote_eligible === false
+    && workspace?.unattended_execution?.status !== "requires_local_authorization"
+  ));
+  return {
+    registered: workspaces.length,
+    ready: ready.length,
+    action_required: actionRequired.length,
+    blocked: blocked.length,
+  };
+}
+
 function runtimeAvailable(device, runtime) {
   return capabilitiesFor(device)?.runtimes?.some(
     (candidate) => candidate.id === runtime && candidate.available,
@@ -298,11 +321,13 @@ function createParticipant(definition, devices, currentDirectory, usedIds, works
       device_name: device.deviceName || device.deviceId,
       default_path: capabilitiesFor(device)?.device?.default_workspace_path || "",
       remote: device.local !== true,
-      workspaces: (capabilitiesFor(device)?.trusted_workspaces || []).map((workspace) => ({
-        workspace_id: workspace.workspace_id || workspace.canonical_path,
-        display_name: workspace.display_name || workspace.canonical_path,
-        canonical_path: workspace.canonical_path,
-      })),
+      workspaces: (capabilitiesFor(device)?.trusted_workspaces || [])
+        .filter((workspace) => workspace?.unattended_execution?.remote_eligible !== false)
+        .map((workspace) => ({
+          workspace_id: workspace.workspace_id || workspace.canonical_path,
+          display_name: workspace.display_name || workspace.canonical_path,
+          canonical_path: workspace.canonical_path,
+        })),
     };
     throw error;
   }
@@ -386,7 +411,16 @@ export function applyWorkspaceConfiguration(payload, {
             runtimes: (capabilities.runtimes || [])
               .filter((candidate) => candidate.available && ["codex", "claude"].includes(candidate.id))
               .map((candidate) => candidate.id),
-            workspace_count: (capabilities.trusted_workspaces || []).length,
+            ...(() => {
+              const counts = workspaceCapabilityCounts(capabilities);
+              return {
+                workspace_count: counts.ready,
+                registered_workspace_count: counts.registered,
+                ready_workspace_count: counts.ready,
+                workspace_action_required_count: counts.action_required,
+                blocked_workspace_count: counts.blocked,
+              };
+            })(),
           };
         }),
       };

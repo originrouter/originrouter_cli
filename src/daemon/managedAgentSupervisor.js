@@ -287,6 +287,7 @@ export class ManagedAgentSupervisor {
       cwd: workspace.canonical_path,
       env: {
         ...process.env,
+        ORIGINROUTER_MANAGED_AGENT: "1",
         ...(aiReviewPolicy
           ? {
               ORIGINROUTER_AI_REVIEW_POLICY_B64:

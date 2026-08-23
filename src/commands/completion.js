@@ -37,7 +37,7 @@ const NESTED = {
   "route remote": ["devices", "set"],
   remote: ["setup", "status", "share", "workspace"],
   "remote share": ["status", "start", "stop", "restart"],
-  "remote workspace": ["list", "authorize"],
+  "remote workspace": ["list", "authorize", "request"],
 };
 
 const OPTIONS = {
@@ -48,6 +48,7 @@ const OPTIONS = {
   history: ["--agent", "--device", "--workspace", "--since", "--until", "--limit", "--archived", "--json"],
   provider: ["--type", "--engine", "--litellm-provider", "--base-url", "--api-key", "--auth-token", "--model", "--small-fast-model", "--agent", "--force"],
   route: ["--provider", "--model", "--main-model", "--small-model", "--device"],
+  remote: ["--device", "--workspace", "--providers", "--port"],
   proxy: ["--provider", "--port", "--version"],
   login: ["--no-browser"],
   collaboration: ["--objective", "--participant", "--role", "--route", "--permission", "--preference", "--template", "--coordination-prompt", "--concurrency", "--token-limit", "--amount-limit", "--currency", "--yes", "--detach", "--no-wait", "--timeout", "--review", "--json"],

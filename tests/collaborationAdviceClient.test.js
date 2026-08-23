@@ -32,7 +32,16 @@ const devices = [{
   trustStatus: "trusted",
   cachedCapabilities: {
     runtimes: [{ id: "claude", available: true }],
-    trusted_workspaces: [{ workspace_id: "workspace-remote" }],
+    trusted_workspaces: [
+      { workspace_id: "workspace-remote" },
+      {
+        workspace_id: "workspace-remote-needs-authorization",
+        unattended_execution: {
+          status: "requires_local_authorization",
+          remote_eligible: false,
+        },
+      },
+    ],
     resolved_routes: { claude: { main: { provider: "cloud", model: "model-b" }, small: null } },
   },
 }, {

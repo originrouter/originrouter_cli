@@ -139,6 +139,14 @@ function cleanCapabilitySnapshot(input = {}) {
             : null,
         })).filter((workspace) => workspace.workspace_id && workspace.canonical_path)
       : [],
+    workspace_summary: input.workspace_summary && typeof input.workspace_summary === "object"
+      ? {
+          registered: Math.max(0, Number(input.workspace_summary.registered) || 0),
+          ready: Math.max(0, Number(input.workspace_summary.ready) || 0),
+          action_required: Math.max(0, Number(input.workspace_summary.action_required) || 0),
+          blocked: Math.max(0, Number(input.workspace_summary.blocked) || 0),
+        }
+      : null,
     permission_profiles: Array.isArray(input.permission_profiles)
       ? input.permission_profiles.slice(0, 32).map((profile) => ({
           id: cleanText(profile?.id, 64),
@@ -214,4 +222,47 @@ export function getCachedCollaborationCapabilities(deviceId, {
   } catch {
     return null;
   }
+}
+
+export function updateCachedCollaborationWorkspace(deviceId, workspace, {
+  stateDir = ensureStateDir(),
+} = {}) {
+  const key = cleanText(deviceId, 191);
+  if (!key || !workspace || typeof workspace !== "object") return null;
+  const document = readDocument(stateDir);
+  const current = document.devices[key];
+  if (!current) return null;
+  const workspaceId = cleanText(workspace.workspace_id, 191);
+  const canonicalPath = cleanText(workspace.canonical_path, 4096);
+  if (!workspaceId || !canonicalPath) return null;
+  const existing = Array.isArray(current.trusted_workspaces)
+    ? current.trusted_workspaces
+    : [];
+  const trustedWorkspaces = [
+    ...existing.filter((candidate) => (
+      candidate?.workspace_id !== workspaceId
+      && candidate?.canonical_path !== canonicalPath
+    )),
+    workspace,
+  ];
+  const workspaceSummary = {
+    registered: trustedWorkspaces.length,
+    ready: trustedWorkspaces.filter((candidate) => (
+      candidate?.unattended_execution?.remote_eligible !== false
+    )).length,
+    action_required: trustedWorkspaces.filter((candidate) => (
+      candidate?.unattended_execution?.remote_eligible === false
+      && candidate?.unattended_execution?.status === "requires_local_authorization"
+    )).length,
+    blocked: trustedWorkspaces.filter((candidate) => (
+      candidate?.unattended_execution?.remote_eligible === false
+      && candidate?.unattended_execution?.status !== "requires_local_authorization"
+    )).length,
+  };
+  return cacheCollaborationCapabilities({
+    ...current,
+    captured_at: new Date().toISOString(),
+    trusted_workspaces: trustedWorkspaces,
+    workspace_summary: workspaceSummary,
+  }, { stateDir });
 }

@@ -5,7 +5,31 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ## Unreleased
 
+## 0.2.1 - 2026-08-23
+
+### Added
+
+- Added `originrouter remote workspace request <path> --device <device-id>` so
+  a trusted human-controlled CLI can request registration of an ordinary
+  target-device folder without granting managed Agents permission to expand
+  their own workspace boundary.
+
 ### Fixed
+
+- Distinguished registered workspaces from workspaces that are actually ready
+  for unattended execution across capability snapshots, automatic team
+  selection, cached capabilities, and Agent Workspace device summaries.
+- Protected macOS, Windows, and mounted workspaces now report that target-side
+  authorization is required without implying that physical presence is always
+  necessary. OS interaction is required only when the platform asks for it.
+- Remote workspace registration responses now include their unattended
+  readiness, update the control CLI's capability cache, and reuse an existing
+  authorized registration without probing the protected path first.
+- Cloud and local automatic configuration no longer select a workspace that is
+  registered but currently requires target authorization or is otherwise
+  unavailable for unattended execution.
+- Managed Agent processes are marked explicitly and cannot invoke workspace
+  request or authorization commands to expand filesystem access.
 
 - Fixed terminating a running Codex / Claude Code session from the App: the
   `session.stop` command previously only sent a single SIGHUP to the PTY leader
@@ -18,6 +42,9 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ### Changed
 
+- GitHub Release publishing now verifies that the release tag exactly matches
+  `v0.2.1` before running the npm publication, and reports an already-published
+  package as an idempotent skip.
 - Executors now share a single SIGTERM → SIGKILL escalation helper
   (`src/executors/processTreeKill.js`). The pipe executor also escalates to
   SIGKILL (signaling only its own pid, since a non-detached child is not a

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   cacheCollaborationCapabilities,
   getCachedCollaborationCapabilities,
+  updateCachedCollaborationWorkspace,
 } from "../src/collaboration/collaborationCapabilityCache.js";
 import { interactiveCreatePayload } from "../src/commands/collaboration.js";
 
@@ -68,6 +69,32 @@ assert.equal("executable" in cached.runtimes[0], false);
 assert.equal(
   statSync(join(stateDir, "collaboration-capabilities.json")).mode & 0o777,
   0o600,
+);
+updateCachedCollaborationWorkspace("device-remote", {
+  workspace_id: "workspace-new",
+  display_name: "New work",
+  canonical_path: "/srv/new",
+  unattended_execution: {
+    status: "ready",
+    remote_eligible: true,
+    platform: "linux",
+    code: null,
+    summary: "Ready",
+    action: null,
+  },
+}, { stateDir });
+const updatedCached = getCachedCollaborationCapabilities("device-remote", { stateDir });
+assert.equal(updatedCached.trusted_workspaces.length, 2);
+assert.deepEqual(updatedCached.workspace_summary, {
+  registered: 2,
+  ready: 2,
+  action_required: 0,
+  blocked: 0,
+});
+assert.equal(
+  updatedCached.trusted_workspaces.find((workspace) => workspace.workspace_id === "workspace-new")
+    .unattended_execution.remote_eligible,
+  true,
 );
 
 const localCapabilities = capabilitySnapshot("device-local", "This Mac");
