@@ -210,7 +210,8 @@ long-lived Workspace Session. A completed Run is a result, not the end of the
 conversation: type the next objective to continue the Session, or use `/new`
 to begin a fresh team and context.
 
-After reopening Workspace, use `/resume <session-id>`. Session history is
+After reopening Workspace, use `/resume` to choose a recent Session, or
+`/resume <session-id>` to restore a specific one. Session history is
 strictly ordered: individual Run IDs remain available for inspection, retry,
 and audit, but cannot be used as historical continuation points.
 

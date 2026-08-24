@@ -197,7 +197,8 @@ Agent Workspace 让用户始终停留在 OriginRouter 中，由 daemon 在后台
 每次用户目标都有独立的任务、审批、预算、审计与最终结果，但完成一个 Run 不会
 结束整个对话。继续输入目标会留在当前 Session，`/new` 才会建立新的团队与上下文。
 
-重新打开 Workspace 后使用 `/resume <session-id>`。Session 历史严格按顺序推进；
+重新打开 Workspace 后使用 `/resume` 选择最近 Session，或使用
+`/resume <session-id>` 恢复指定 Session。Session 历史严格按顺序推进；
 单个 Run ID 仍可用于查看、重试和审计，但不能作为历史分支的继续点。
 
 新 Session 的第一条目标负责选择 Team 并生成可审查计划。后续目标直接交给当前

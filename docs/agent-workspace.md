@@ -31,7 +31,7 @@ the new participant cannot receive work. Confirmation updates the Session and
 current Run; unchanged members retain their native context while changed
 members start fresh. Rejection resumes within the existing boundary.
 
-`/resume <session-id>` restores the Workspace Session at its latest Run and
+`/resume` opens a recent Workspace Session picker. `/resume <session-id>` restores the Workspace Session at its latest Run and
 latest confirmed Team revision. Run IDs are deliberately not accepted by this
 command: a Session is an ordered conversation, so an older Run cannot become a
 new continuation point or implicit branch. Use `/new` for an intentional new
@@ -40,7 +40,7 @@ project, context, or trust boundary.
 When a Run completes, managed Agent wrappers are released. The daemon retains
 the safe native-session references required for a compatible later follow-up;
 it does not leave an idle process group running. Reopening Workspace and using
-`/resume <session-id>` restores the latest Session context before the next
+`/resume` selects a recent Session, while `/resume <session-id>` restores the latest Session context before the next
 objective is submitted.
 
 ## Multi-device transport and ownership
@@ -166,7 +166,7 @@ policies remain authoritative regardless of plan confirmation.
 ```text
 /status               show workspace settings and the latest Run
 /runs [category]      list Runs; category is active, recent, or all
-/resume <session-id>  restore the Session at its latest ordered Run
+/resume [session-id]  choose or restore the Session at its latest ordered Run
 /attach <run-id>      follow a known Run without creating another Run
 /pause [run-id]       pause the latest or named Run
 /retry [run-id]       retry the latest or named Run
@@ -187,7 +187,7 @@ Enter submits only the text already in the composer. Suggestions also complete
 mode names, approval policies, coordinator runtimes, Run categories, known Run
 IDs for Run controls, and known Session IDs for `/resume`. Commands that
 operate on a Run use the OriginRouter Run ID, not a Codex thread ID or a Claude
-conversation UUID. `/resume <session-id>` resolves the Session's latest Run;
+conversation UUID. `/resume` opens recent Sessions, while `/resume <session-id>` resolves the Session's latest Run;
 when that Run is paused, Workspace asks for confirmation before it continues.
 A completed latest Run remains available as the latest result and accepts a
 new objective in the same Session. Historical Runs remain inspectable but

@@ -15,8 +15,8 @@ const COMMANDS = [
   },
   {
     name: "resume",
-    args: "<session-id>",
-    description: "restore a Workspace Session at its latest Run",
+    args: "[session-id]",
+    description: "choose or restore a Workspace Session at its latest Run",
   },
   {
     name: "attach",

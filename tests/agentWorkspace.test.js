@@ -507,6 +507,61 @@ assert.match(commandTerminal.writes.join(""), /Active Runs/);
 assert.match(commandTerminal.writes.join(""), /Run Agents/);
 assert.match(commandTerminal.writes.join(""), /Collaboration paused/);
 
+const resumePickerTerminal = fakeTerminal();
+const resumedPickerSessionIds = [];
+const resumedPickerRunIds = [];
+const resumePickerRun = handleAgentWorkspaceCommand([], {
+  input: resumePickerTerminal.input,
+  output: resumePickerTerminal.output,
+  listCollaborationRuns: async ({ category }) => {
+    assert.equal(category, "recent");
+    return {
+      category,
+      total: 2,
+      runs: [
+        {
+          run_id: "acr_picker_newer",
+          workspace_session_id: "aws_picker_newer",
+          state: "completed",
+          objective: "Inspect the newest Workspace Session",
+          tasks: [],
+        },
+        {
+          run_id: "acr_picker_older",
+          workspace_session_id: "aws_picker_older",
+          state: "completed",
+          objective: "Inspect the older Workspace Session",
+          tasks: [],
+        },
+      ],
+    };
+  },
+  resolveWorkspaceSession: async (sessionId) => {
+    resumedPickerSessionIds.push(sessionId);
+    return { latestRunId: sessionId === "aws_picker_older" ? "acr_picker_older" : "acr_picker_newer" };
+  },
+  followRunner: async (runId) => {
+    resumedPickerRunIds.push(runId);
+    setTimeout(() => {
+      emitText(resumePickerTerminal.input, "/exit");
+      resumePickerTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 20);
+    return { run: { run_id: runId, state: "completed" }, tasks: [], final_report: { summary: "Restored from picker." } };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(resumePickerTerminal.input, "/res");
+resumePickerTerminal.input.emit("keypress", undefined, { name: "tab" });
+resumePickerTerminal.input.emit("keypress", undefined, { name: "return" });
+await new Promise((resolve) => setImmediate(resolve));
+resumePickerTerminal.input.emit("keypress", undefined, { name: "down" });
+resumePickerTerminal.input.emit("keypress", undefined, { name: "return" });
+await resumePickerRun;
+assert.deepEqual(resumedPickerSessionIds, ["aws_picker_older"]);
+assert.deepEqual(resumedPickerRunIds, ["acr_picker_older"]);
+assert.match(resumePickerTerminal.writes.join(""), /Resume a Workspace Session/);
+assert.match(resumePickerTerminal.writes.join(""), /Choose a Workspace Session to restore/);
+
 const resumedSessionTerminal = fakeTerminal(100, 30);
 const resumedSessionStarts = [];
 const resumedSessionRun = handleAgentWorkspaceCommand([], {
@@ -816,10 +871,15 @@ setTimeout(() => {
 await liveApprovalRun;
 assert.equal(
   liveApprovalTerminal.writes.join("").includes("\x1b[?1000h"),
-  false,
-  "the live workspace must not enable mouse reporting, so terminal text remains selectable",
+  true,
+  "the live workspace enables mouse reporting so wheel scrolling stays inside the TUI",
 );
-assert.match(liveApprovalTerminal.writes.join(""), /drag selects text/);
+assert.equal(
+  liveApprovalTerminal.writes.join("").includes("\x1b[?1006h"),
+  true,
+  "the live workspace uses SGR mouse reporting for wheel events",
+);
+assert.match(liveApprovalTerminal.writes.join(""), /Shift\+drag selects text/);
 
 const runtimeClearTerminal = fakeTerminal();
 const runtimeClearCancelled = [];
@@ -1321,6 +1381,65 @@ assert.notEqual(completedFollowupCalls[1].presetConfiguration, continuedTeamConf
 assert.match(completedFollowupTerminal.writes.join(""), /Full first result remains visible/);
 assert.match(completedFollowupTerminal.writes.join(""), /Enter continues with this team/);
 
+const completedResumeTerminal = fakeTerminal(100, 30);
+const completedResumeSessionIds = [];
+const completedResumeRunIds = [];
+const completedResumeRun = handleAgentWorkspaceCommand([], {
+  input: completedResumeTerminal.input,
+  output: completedResumeTerminal.output,
+  workspaceRunner: async (options) => {
+    options.onRunId?.("acr_completed_resume_source");
+    return {
+      run: { run_id: "acr_completed_resume_source", state: "completed" },
+      tasks: [],
+      final_report: { summary: "The source Run completed." },
+    };
+  },
+  listCollaborationRuns: async ({ category }) => {
+    assert.equal(category, "recent");
+    return {
+      category,
+      total: 1,
+      runs: [{
+        run_id: "acr_completed_resume_target",
+        workspace_session_id: "aws_completed_resume_target",
+        state: "completed",
+        objective: "Restore this Workspace Session",
+        tasks: [],
+      }],
+    };
+  },
+  resolveWorkspaceSession: async (sessionId) => {
+    completedResumeSessionIds.push(sessionId);
+    return { latestRunId: "acr_completed_resume_target" };
+  },
+  followRunner: async (runId) => {
+    completedResumeRunIds.push(runId);
+    return {
+      run: { run_id: runId, state: "completed" },
+      tasks: [],
+      final_report: { summary: "The selected Run completed." },
+    };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(completedResumeTerminal.input, "complete the source Run");
+completedResumeTerminal.input.emit("keypress", undefined, { name: "return" });
+setTimeout(() => {
+  emitText(completedResumeTerminal.input, "/resume");
+  completedResumeTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 15);
+setTimeout(() => completedResumeTerminal.input.emit("keypress", undefined, { name: "return" }), 30);
+setTimeout(() => {
+  emitText(completedResumeTerminal.input, "/exit");
+  completedResumeTerminal.input.emit("keypress", undefined, { name: "return" });
+}, 50);
+await completedResumeRun;
+assert.deepEqual(completedResumeSessionIds, ["aws_completed_resume_target"]);
+assert.deepEqual(completedResumeRunIds, ["acr_completed_resume_target"]);
+assert.match(completedResumeTerminal.writes.join(""), /Choose a Workspace Session/);
+assert.doesNotMatch(completedResumeTerminal.writes.join(""), /\/resume is available from the Workspace prompt after detaching/);
+
 const activeModeTerminal = fakeTerminal(100, 30);
 const activeModeRun = handleAgentWorkspaceCommand([], {
   input: activeModeTerminal.input,
@@ -1553,7 +1672,7 @@ assert.match(runtimeScreen, /Inspect remote status/);
 assert.match(runtimeScreen, /acr_runtime/);
 assert.match(runtimeScreen, /› queue another check/);
 assert.match(runtimeScreen, /Enter queues next objective/);
-assert.match(runtimeScreen, /drag selects text/);
+assert.match(runtimeScreen, /Shift\+drag selects text/);
 assert.match(runtimeScreen.replace(/\x1b\[[0-9;]*m/g, ""), /\n› Inspect the remote computer/);
 const plainRuntimeScreen = runtimeScreen.replace(/\x1b\[[0-9;]*m/g, "");
 assert.match(plainRuntimeScreen, /\n⠋ Agents are working/);
@@ -1590,6 +1709,45 @@ assert.match(completedResultScreen, /All inspection commands completed cleanly/)
 assert.match(completedResultScreen, /✓ Inspect the remote machine/);
 assert.match(completedResultScreen, /Completed 2 of 2 collaboration tasks/);
 assert.doesNotMatch(completedResultScreen, /\x1b\[38;5;250m  All inspection commands completed cleanly/);
+
+const scrollingHeaderRuntime = {
+  objective: "Review the remote machine report before continuing ".repeat(12),
+  phase: "completed",
+  mode: "auto",
+  autoFollow: false,
+  scrollOffset: 0,
+  snapshot: {
+    run: { state: "completed" },
+    tasks: [],
+    final_report: {
+      summary: "Completed report summary.",
+      completed_tasks: [{
+        title: "Remote inspection",
+        result: "Inspection detail ".repeat(48),
+      }],
+    },
+  },
+  composerBuffer: "",
+};
+const firstScrollScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 80,
+  rows: 16,
+  runtime: scrollingHeaderRuntime,
+}).replace(/\x1b\[[0-9;]*m/g, "");
+assert.match(firstScrollScreen, /^╭─+ OriginRouter /, "a Run opens at the scrollable title card");
+assert.match(firstScrollScreen, /session approval/, "the status bar remains visible at the bottom");
+assert.equal(scrollRuntimeContent(scrollingHeaderRuntime, 1, 100), true);
+const laterScrollScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 80,
+  rows: 16,
+  runtime: scrollingHeaderRuntime,
+}).replace(/\x1b\[[0-9;]*m/g, "");
+assert.doesNotMatch(laterScrollScreen, /OriginRouter/, "the title card scrolls away with the document");
+assert.match(laterScrollScreen, /session approval/, "the status bar does not scroll away");
 
 const scrollRuntime = {
   contentLineCount: 30,

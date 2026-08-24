@@ -209,7 +209,7 @@ function helpWorkspacePanel() {
     lines: [
       "/status - workspace settings and latest Run",
       "/runs [active|recent|all] - collaboration Runs",
-      "/resume <session-id> - restore the Session at its latest Run",
+      "/resume [session-id] - choose or restore a Workspace Session",
       "/pause, /retry, /cancel [run-id] - Run controls",
       "/agents [run-id] - assigned Agents and routes",
       "/mode, /approval, /team - next collaboration settings",
@@ -227,7 +227,7 @@ function commandHelpPanel(commandName = "") {
     lines: [
       command.description,
       command.name === "resume"
-        ? "A Session ID restores only its latest ordered state. Run IDs are not accepted and cannot create a historical branch."
+        ? "Without an ID, choose a recent Workspace Session. A Session ID restores only its latest ordered state; Run IDs cannot create a historical branch."
         : "Command arguments in brackets are optional.",
     ],
   };
@@ -282,6 +282,15 @@ function workspaceRunsPanel({ category, runs = [], total = 0 }) {
   if (total > runs.length) lines.push(`Showing ${runs.length} of ${total} Runs.`);
   lines.push("Use /attach <run-id> to follow a Run, or /resume <session-id> to restore its Session.");
   return { title: `${category[0].toUpperCase()}${category.slice(1)} Runs`, lines };
+}
+
+function recentWorkspaceSessions(runs = []) {
+  const sessions = new Map();
+  for (const run of runs) {
+    const sessionId = String(run?.workspace_session_id || run?.workspaceSessionId || "").trim();
+    if (sessionId && !sessions.has(sessionId)) sessions.set(sessionId, run);
+  }
+  return [...sessions.entries()].map(([sessionId, run]) => ({ sessionId, run }));
 }
 
 function workspaceAgentsPanel(run = {}) {
@@ -952,6 +961,7 @@ const FOCUSED_INTERACTION_KINDS = new Set([
   "team_session_permission",
   "live_session_permission",
   "live_workspace_mode",
+  "session_resume",
   "plan",
   "plan_revision",
   "completion",
@@ -982,6 +992,7 @@ function runtimePhase(runtime) {
   const phase = snapshot?.run?.phase || runtime.phase;
   if (runtime.interactionKind === "live_session_permission") return "Choose Session approval";
   if (runtime.interactionKind === "live_workspace_mode") return "Choose collaboration mode";
+  if (runtime.interactionKind === "session_resume") return "Choose a Workspace Session";
   if (runtime.phase === "needs_setup") {
     return runtime.setup?.workspaces?.length ? "Choose a workspace" : "Workspace authorization required";
   }
@@ -1021,7 +1032,10 @@ function taskMarker(state) {
   return muted("○");
 }
 
-function buildRuntimeRows(runtime, columns, maxRows, { focusedInteraction = false } = {}) {
+function buildRuntimeRows(runtime, columns, maxRows, {
+  focusedInteraction = false,
+  prefixRows = [],
+} = {}) {
   const width = Math.max(20, columns - 4);
   const lines = [];
   const push = (value = "", style = null) => {
@@ -1280,6 +1294,25 @@ function buildRuntimeRows(runtime, columns, maxRows, { focusedInteraction = fals
     }
     push("");
     pushIndented("Rules templates are loaded from the OriginRouter approval policy library.", 2, muted);
+  } else if (runtime.interactionKind === "session_resume") {
+    const sessions = runtime.sessionResumeChoices || [];
+    const selected = Math.max(0, Math.min(sessions.length - 1, Number(runtime.sessionResumeSelection) || 0));
+    push("");
+    push("Resume a Workspace Session", strong);
+    pushIndented("Choose a recent session. Its latest Run and Team will be restored.", 2, muted);
+    push("");
+    if (!sessions.length) {
+      pushIndented("No saved Workspace Sessions are available yet.", 2, muted);
+    } else {
+      const start = Math.max(0, Math.min(Math.max(0, sessions.length - 6), selected - 2));
+      for (const [offset, choice] of sessions.slice(start, start + 6).entries()) {
+        const index = start + offset;
+        const run = choice.run || {};
+        pushIndented(`${index === selected ? "›" : " "} ${runLabel(run)}`, 2, index === selected ? strong : null);
+        pushIndented(`${choice.sessionId} · ${compactRunState(run)}`, 6, muted);
+      }
+      if (start > 0 || start + 6 < sessions.length) pushIndented(`${selected + 1} of ${sessions.length}`, 2, muted);
+    }
   } else if (runtime.interactionKind === "paused" && focusedInteraction) {
     push("");
     push("This collaboration is paused.", strong);
@@ -1415,22 +1448,26 @@ function buildRuntimeRows(runtime, columns, maxRows, { focusedInteraction = fals
       pushIndented(report.summary, 2, completed ? strong : null);
     }
   }
-  runtime.contentLineCount = lines.length;
+  // The title card belongs to the document, rather than to the permanent
+  // chrome. This lets a new Run open at its natural first screen, while the
+  // composer and its status remain anchored at the bottom of the terminal.
+  const documentRows = [...prefixRows, ...lines];
+  runtime.contentLineCount = documentRows.length;
   const visibleRows = Math.max(0, maxRows);
   runtime.contentVisibleRows = visibleRows;
-  const maxStart = Math.max(0, lines.length - visibleRows);
+  const maxStart = Math.max(0, documentRows.length - visibleRows);
   const start = runtime.autoFollow === false
     ? Math.max(0, Math.min(maxStart, Number(runtime.scrollOffset) || 0))
     : maxStart;
   runtime.scrollOffset = start;
-  return lines.slice(start, start + visibleRows);
+  return documentRows.slice(start, start + visibleRows);
 }
 
 function runtimeControls(runtime, columns) {
   const mode = workspaceModeDefinition(runtime.mode || "auto").label;
   // This footer has only 71 display columns in an 80-column terminal after
   // the mode label. Keep the core completion and submission actions visible.
-  let text = runtime.notice || "drag selects text · Tab completes · Enter queues next objective";
+  let text = runtime.notice || "Shift+drag selects text · Tab completes · Enter queues next objective";
   if (runtime.screenPaused) text = "screen frozen for copying · ctrl+t resumes updates";
   const selectedActivityId = runtime.activityParticipantIds?.[runtime.activitySelection || 0];
   const selectedActivityExpanded = selectedActivityId
@@ -1645,6 +1682,11 @@ function interactionComposer(runtime, columns, { focusedInteraction = false } = 
       runtime.runId ? "? Use this mode after /new?" : "? Use this collaboration mode?",
       "↑/↓ select · Enter apply · Esc keep current",
     ];
+  } else if (kind === "session_resume") {
+    lines = [
+      "? Choose a Workspace Session to restore",
+      "↑/↓ select · Enter restore · Esc return to the Workspace prompt",
+    ];
   } else if (kind === "plan") {
     lines = [
       "? Start this plan?",
@@ -1766,6 +1808,7 @@ function interactionStatus(runtime, columns) {
     team_session_permission: "choosing Session approval",
     live_session_permission: "choosing Session approval",
     live_workspace_mode: "choosing collaboration mode",
+    session_resume: "choosing a Workspace Session",
     plan: "reviewing plan",
     plan_revision: "requesting plan changes",
     completion: "reviewing result",
@@ -1895,15 +1938,15 @@ export function buildWorkspaceAppScreen({
     : normalComposerBlock
       ? 4 + normalComposerBlock.split("\n").length
       : 5;
-  const activityRows = runtime
+  const contentRows = runtime
     ? buildRuntimeRows(
         runtime,
         terminalColumns,
-        Math.max(0, terminalRows - headerRows.length - reservedRows),
-        { focusedInteraction },
+        Math.max(0, terminalRows - reservedRows),
+        { focusedInteraction, prefixRows: headerRows },
       )
     : [];
-  const screenRows = [...headerRows, ...activityRows];
+  const screenRows = runtime ? contentRows : headerRows;
   const separator = border("─".repeat(terminalColumns));
   const blankRows = Math.max(0, terminalRows - screenRows.length - reservedRows);
   const body = `${screenRows.join("\n")}\n${"\n".repeat(blankRows)}`;
@@ -2003,13 +2046,14 @@ function supportsAppScreen(output) {
 
 function enterWorkspaceApp(output) {
   if (!supportsAppScreen(output)) return () => {};
-  // Do not enable terminal mouse reporting. It prevents native drag-to-select
-  // in terminal emulators, including macOS Terminal. Explicitly disable it in
-  // case a previous process left the mode enabled.
+  // Receive SGR wheel events so scrolling stays inside the rendered document,
+  // rather than exposing the terminal's alternate-screen history. Terminals
+  // conventionally reserve Shift+drag for native text selection while mouse
+  // tracking is active.
   // Disable autowrap while the app owns the screen. Writing a full-width row
   // into the bottom-right cell can otherwise scroll the alternate buffer and
   // expose the shell's scrollback above the app.
-  output.write("\x1b[?1000l\x1b[?1006l\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?25l\x1b[H\x1b[2J");
+  output.write("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?7l\x1b[?2004h\x1b[?25l\x1b[H\x1b[2J");
   let exited = false;
   const exit = () => {
     if (exited) return;
@@ -2216,6 +2260,7 @@ async function readWorkspaceLine({
   let noticeTimer = null;
   let commandSuggestionSelection = 0;
   let commandSuggestionsDismissed = false;
+  const mouseState = { mouseSequenceBuffer: "" };
   const commandSuggestions = () => commandSuggestionsForInput(buffer, completionContext, {
     dismissed: commandSuggestionsDismissed,
   });
@@ -2270,6 +2315,10 @@ async function readWorkspaceLine({
       inputFrameScheduler.request();
     };
     const onKeypress = (text, key = {}) => {
+      // Mouse tracking is enabled for the Workspace as a whole. The home
+      // composer has no document to scroll, but it must still consume wheel
+      // reports so those escape sequences never become typed input.
+      if (consumeWorkspaceMouseKeypress(mouseState, text, key).handled) return;
       if (key.name === "paste-start") {
         pasteBuffer = "";
         return;
@@ -2614,7 +2663,7 @@ async function readRuntimeDecision({
         return;
       }
       if (key.name === "escape" || (key.ctrl && key.name === "c")) {
-        if (["live_session_permission", "live_workspace_mode"].includes(kind)) {
+        if (["live_session_permission", "live_workspace_mode", "session_resume"].includes(kind)) {
           finish(null);
           return;
         }
@@ -2852,6 +2901,8 @@ async function readRuntimeDecision({
           } : null);
         } else if (kind === "live_workspace_mode") {
           finish(WORKSPACE_MODES[runtime.workspaceModeSelection || 0]?.id || null);
+        } else if (kind === "session_resume") {
+          finish((runtime.sessionResumeChoices || [])[runtime.sessionResumeSelection || 0] || null);
         } else {
           if (kind === "setup") {
             const path = normalizeWorkspacePathInput(buffer);
@@ -2943,13 +2994,15 @@ async function readRuntimeDecision({
         }
         return;
       }
-      if (["team_edit", "team_runtime", "team_route", "team_permission", "team_session_permission", "live_session_permission", "live_workspace_mode"].includes(kind)) {
+      if (["team_edit", "team_runtime", "team_route", "team_permission", "team_session_permission", "live_session_permission", "live_workspace_mode", "session_resume"].includes(kind)) {
         let optionCount = 0;
         if (kind === "team_edit") {
           optionCount = runtime.configuration?.participants?.length || 0;
         } else {
           const participant = runtime.configuration?.participants?.[runtime.teamEditSelection || 0];
-          optionCount = kind === "team_runtime"
+          optionCount = kind === "session_resume"
+            ? (runtime.sessionResumeChoices || []).length
+            : kind === "team_runtime"
             ? workspaceRuntimeOptions(runtime.configuration, participant).length
             : kind === "team_route"
               ? workspaceRouteOptions(
@@ -2966,7 +3019,9 @@ async function readRuntimeDecision({
                   : sessionPermissionOptions({ includePolicies: true }).length;
         }
         if (!optionCount) return;
-        const selectionKey = kind === "team_edit"
+        const selectionKey = kind === "session_resume"
+          ? "sessionResumeSelection"
+          : kind === "team_edit"
           ? "teamEditSelection"
           : kind === "team_runtime"
             ? "teamRuntimeSelection"
@@ -3291,6 +3346,63 @@ async function readWorkspaceModePicker({
   }
 }
 
+async function readWorkspaceSessionPicker({
+  input,
+  output,
+  coordinator,
+  mode,
+  sessionApproval,
+  sessions = [],
+}) {
+  const runtime = {
+    phase: "configuring",
+    objective: "",
+    coordinator,
+    mode,
+    events: [],
+    sessionHistory: [],
+    runId: "",
+    snapshot: null,
+    configuration: null,
+    interaction: false,
+    interactionKind: "",
+    interactionHistory: [],
+    sessionResumeChoices: sessions,
+    sessionResumeSelection: 0,
+    scrollOffset: 0,
+    autoFollow: true,
+    unseenActivityCount: 0,
+    contentLineCount: 0,
+    contentVisibleRows: 0,
+    sessionApprovalOverride: sessionApproval,
+    terminalColumns: output.columns,
+    terminalRows: output.rows,
+  };
+  const render = (force = false) => {
+    runtime.terminalColumns = output.columns;
+    runtime.terminalRows = output.rows;
+    redrawWorkspaceApp(output, {
+      coordinator,
+      mode,
+      panel: runtimeHeaderPanel(runtime),
+      runtime,
+      force,
+    });
+  };
+  const onResize = () => render(true);
+  output.on?.("resize", onResize);
+  try {
+    return await readRuntimeDecision({
+      input,
+      runtime,
+      render,
+      kind: "session_resume",
+    });
+  } finally {
+    output.off?.("resize", onResize);
+  }
+}
+
 function continuedTeamConfiguration(runtime) {
   if (!runtime.configuration) return null;
   const configuration = structuredClone(runtime.configuration);
@@ -3431,7 +3543,9 @@ async function runWorkspaceObjective({
     activityParticipantIds: [],
     activityParticipantLabels: {},
     expandedActivityParticipants: [],
-    autoFollow: true,
+    // A Run opens at the title card. PageDown/Ctrl+End or the mouse wheel can
+    // resume following the live tail once the user has reviewed that context.
+    autoFollow: false,
     unseenActivityCount: 0,
     animationFrame: 0,
     scrollOffset: 0,
@@ -3814,6 +3928,13 @@ async function runWorkspaceObjective({
         }
         if (commandName === "cancel") {
           onActiveInterrupt();
+          return;
+        }
+        if (commandName === "resume" && runtime.snapshot?.run?.state === "completed") {
+          runtime.returnToHome = true;
+          runtime.returnToHomeCommand = objectiveText;
+          runtime.notice = "Opening recent Workspace Sessions";
+          completedInputResolve?.("resume");
           return;
         }
         if (["runs", "resume", "attach", "retry"].includes(commandName)) {
@@ -4435,11 +4556,30 @@ export async function handleAgentWorkspaceCommand(argv = [], {
           }
           if (command.name === "resume") {
             requireAtMostOneArgument();
-            if (!argument) throw new Error(`Usage: ${workspaceCommandUsage(command)}`);
-            const restored = await resolveWorkspaceSession(argument);
+            let sessionId = argument;
+            if (!sessionId) {
+              const page = await listCollaborationRuns({ category: "recent", limit: 50 });
+              const selected = await readWorkspaceSessionPicker({
+                input,
+                output,
+                coordinator,
+                mode,
+                sessionApproval,
+                sessions: recentWorkspaceSessions(page.runs),
+              });
+              if (!selected?.sessionId) {
+                panel = page.runs.length
+                  ? workspaceCommandErrorPanel("No Workspace Session was selected.")
+                  : workspaceCommandErrorPanel("No saved Workspace Sessions are available yet.");
+                redrawWorkspaceApp(output, { coordinator, mode, panel, sessionApproval, force: true });
+                continue;
+              }
+              sessionId = selected.sessionId;
+            }
+            const restored = await resolveWorkspaceSession(sessionId);
             existingRunId = restored.latestRunId;
             lastRun = restored.snapshot?.run || lastRun;
-            runObjective = `Restore Workspace Session ${argument}`;
+            runObjective = `Restore Workspace Session ${sessionId}`;
           }
           if (command.name === "attach") {
             requireAtMostOneArgument();
@@ -4577,7 +4717,7 @@ export async function handleAgentWorkspaceCommand(argv = [], {
       if (runtime.returnToHome) {
         if (runtime.requestedMode) mode = runtime.requestedMode;
         panel = completionPanel(runtime);
-        pendingObjective = "";
+        pendingObjective = runtime.returnToHomeCommand || "";
         draftObjective = "";
         continuedConfiguration = null;
         continuedFromRunId = "";
