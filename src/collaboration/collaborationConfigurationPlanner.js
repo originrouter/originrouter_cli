@@ -257,7 +257,15 @@ export class CollaborationConfigurationPlanner {
     let usable = devices;
     try { if (!usable?.length) usable = await this.liveDevices(session); } catch { /* retain primary error */ }
     try {
-      const proposal = buildLocalWorkspaceConfiguration({ objective: session.objective, mode: "auto", coordinator: session.coordinator_runtime, devices: usable || [], currentDirectory: process.cwd() });
+      let proposal;
+      try {
+        proposal = buildLocalWorkspaceConfiguration({ objective: session.objective, mode: "auto", coordinator: session.coordinator_runtime, devices: usable || [], currentDirectory: process.cwd() });
+      } catch (autoError) {
+        // Auto classifications such as review panels may need devices that are
+        // currently unavailable. A fallback must remain non-blocking, so use a
+        // least-privilege Solo proposal before reporting failure.
+        proposal = buildLocalWorkspaceConfiguration({ objective: session.objective, mode: "solo", coordinator: session.coordinator_runtime, devices: usable || [], currentDirectory: process.cwd() });
+      }
       this.store.updateConfigurationSession(configurationId, {
         state: "fallback_ready", proposal: { ...proposal, planning_source: "local_fallback" }, planning_source: "local_fallback",
         fallback_reason: text(error?.code, 512) || "configuration_server_planner_failed",

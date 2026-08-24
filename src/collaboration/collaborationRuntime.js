@@ -332,6 +332,7 @@ export class CollaborationRuntime {
       coordinator: this.coordinator,
       capabilitiesForDevice: (deviceId) => this.capabilitiesForDevice(deviceId),
       deviceId: this.deviceId,
+      stateDir: this.store.stateDir,
     });
   }
 

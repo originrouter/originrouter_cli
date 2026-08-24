@@ -230,6 +230,7 @@ function publicRun(row) {
 
 export class CollaborationStore {
   constructor({ stateDir = ensureStateDir(), dbPath = null, now = () => new Date() } = {}) {
+    this.stateDir = stateDir;
     this.dbPath = dbPath || join(stateDir, "collaboration.sqlite3");
     this.now = now;
     this.db = new Database(this.dbPath);
