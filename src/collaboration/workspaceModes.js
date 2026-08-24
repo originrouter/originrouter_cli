@@ -106,6 +106,7 @@ export function workspaceModeDefinition(value = "auto") {
 
 export function inferWorkspaceMode(objective) {
   const text = clean(objective).toLowerCase();
+  if (objectiveMentionsRemoteTarget(text)) return "remote_ops";
   if (/\b(?:debate|compare approaches|trade-?offs?|architecture decision|rfc)\b|方案对比|技术选型|架构决策|辩论/.test(text)) {
     return "review_panel";
   }

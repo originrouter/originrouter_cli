@@ -4,7 +4,6 @@ import test from "node:test";
 import {
   autoConfigureCollaboration,
   publicCapabilitySnapshot,
-  requestAutoConfiguration,
   validateAndNormalizeAutoConfiguration,
 } from "../src/collaboration/collaborationAutoConfig.js";
 import { taskPrompt } from "../src/collaboration/adaptivePlan.js";
@@ -199,32 +198,23 @@ test("multiple matching workspaces cause one actionable ambiguity", () => {
   );
 });
 
-test("automatic setup asks exactly one workspace question and then validates again", async () => {
+test("deterministic fallback derives a local configuration when server planning is unavailable", async () => {
   const workspaces = [
     { workspace_id: "one", display_name: "One", canonical_path: "/one" },
     { workspace_id: "two", display_name: "Two", canonical_path: "/two" },
   ];
-  const questions = [];
-  const prompt = {
-    async question(text) {
-      questions.push(text);
-      return "2";
-    },
-  };
   const local = capabilities({ workspaces });
   const result = await automaticCreatePayload({
     objective: "Fix tests",
-    prompt,
     requestFn: async () => ({ capabilities: local }),
     loadDeviceDirectoryFn: async () => [],
     cacheCapabilitiesFn: (value) => value,
     getCachedCapabilitiesFn: () => null,
-    modelFn: async () => JSON.stringify(proposal({
-      participants: [{ ...proposal().participants[0], workspace_id: "" }],
-    })),
+    currentDirectory: "/not-a-trusted-workspace",
   });
-  assert.equal(questions.length, 1);
-  assert.equal(result.participants[0].workspace_id, "two");
+  assert.equal(result.workspace_mode, "auto");
+  assert.equal(result.planning_source, "local");
+  assert.equal(result.participants.length, 2);
 });
 
 test("a fabricated device is rejected", () => {
@@ -313,22 +303,17 @@ test("automatic payload collection supports a mixed team without interactive pro
   assert.equal(JSON.stringify(payload).includes("_workspace_editor"), false, "editor metadata stays local to the CLI");
 });
 
-test("Auto never silently downgrades an explicit remote objective to Solo when advice is unavailable", async () => {
+test("Auto never silently downgrades an explicit remote objective to Solo", async () => {
   await assert.rejects(
     automaticCreatePayload({
       objective: "Inspect my remote computer status",
       workspaceMode: "auto",
-      cloudAdvice: true,
       requestFn: async () => ({ capabilities: capabilities() }),
       loadDeviceDirectoryFn: async () => [],
       cacheCapabilitiesFn: (value) => value,
       getCachedCapabilitiesFn: () => null,
-      adviceFn: async () => {
-        throw Object.assign(new Error("advice offline"), { code: "COLLABORATION_ADVICE_UNAVAILABLE" });
-      },
     }),
-    (error) => error.code === "AUTO_CONFIG_REMOTE_ADVICE_REQUIRED"
-      && /Remote Ops/.test(error.message),
+    (error) => /trusted remote device/.test(error.message),
   );
 });
 
@@ -966,38 +951,6 @@ test("JSON automation projection is stable and excludes capability secrets and p
     capabilities: { ...capabilities(), api_key: "secret", environment: { TOKEN: "secret" } },
   })]);
   assert.doesNotMatch(JSON.stringify(projected), /secret|api_key|TOKEN|\/private\/project/);
-});
-
-test("cloud auto-configuration uses the logged-in control service and no local model route", async () => {
-  let captured;
-  const result = await requestAutoConfiguration({
-    objective: "Fix tests",
-    devices: [device()],
-  }, {
-    stateDir: "/state",
-    ensureFreshAccessTokenFn: async ({ resource }) => {
-      assert.equal(resource, "originrouter.control");
-      return { accessTokens: { control: { token: "or_at_control" } } };
-    },
-    selectControlBaseUrlFn: async () => "https://control.example/",
-    fetchFn: async (url, options) => {
-      captured = { url, options };
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return { code: 0, data: { status: "configured", ...proposal() } };
-        },
-      };
-    },
-  });
-  assert.equal(captured.url, "https://control.example/cli/v1/collaboration/auto-configurations");
-  assert.equal(captured.options.headers.Authorization, "Bearer or_at_control");
-  const body = JSON.parse(captured.options.body);
-  assert.deepEqual(Object.keys(body), ["protocol_version", "objective", "capability_snapshot"]);
-  assert.equal(body.objective, "Fix tests");
-  assert.equal(result.planner, "planner");
-  assert.equal(JSON.stringify(body).includes("originrouter-claude-fast-model"), false);
 });
 
 test("cloud capability projection contains no secrets or absolute workspace path", () => {

@@ -54,6 +54,8 @@ import {
 import { readApiToken } from "../persistence/authToken.js";
 import { getStateDir, readConfig, readProxyState, writeConfig } from "../persistence/state.js";
 import { DEFAULT_RELAY_URL, DEFAULT_REMOTE_SHARE_PROXY_PORT } from "../constants.js";
+import { cachedUpdateStatus } from "../update/checker.js";
+import { detectInstallContext } from "../update/installContext.js";
 import {
   AGENT_AUTONOMY_SCOPES,
   normalizeAutonomyScopes,
@@ -85,13 +87,7 @@ import { CollaborationStore } from "../collaboration/collaborationStore.js";
 import { PlanImplementVerifyCoordinator } from "../collaboration/planImplementVerifyCoordinator.js";
 import { browseAgentWorkspaces } from "../daemon/workspaceBrowser.js";
 import { buildCollaborationCapabilities } from "../collaboration/collaborationCapabilities.js";
-import {
-  classifyWorkspaceRisk,
-  inferWorkspaceMode,
-  normalizeCoordinator,
-  normalizeWorkspaceMode,
-  workspaceModeDefinition,
-} from "../collaboration/workspaceModes.js";
+import { normalizeCollaborationCreateRequest } from "../collaboration/createRunRequest.js";
 
 // Exported so CLI subcommands (e.g. `local api set-host`) can apply
 // the same gating as the runtime auth layer. Keep the set in lock-
@@ -703,6 +699,13 @@ async function dispatch(ctx, req, res) {
     if (req.method === "GET" && pathname === "/proxy/status") {
       return sendOk(res, await ctx.getProxyStatus());
     }
+    if (req.method === "GET" && pathname === "/updates/status") {
+      return sendOk(res, cachedUpdateStatus({
+        stateDir: ctx.stateDir || getStateDir(),
+        config: readConfig(),
+        installContext: detectInstallContext(),
+      }));
+    }
     if (req.method === "POST" && (pathname === "/proxy/start" || pathname === "/proxy/stop" || pathname === "/proxy/restart")) {
       const action = pathname.slice("/proxy/".length); // start | stop | restart
       const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
@@ -795,46 +798,56 @@ async function dispatch(ctx, req, res) {
         const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
         if (body.__error) return sendError(res, 400, body.__error);
         try {
-          const requestedMode = normalizeWorkspaceMode(body.workspace_mode || "auto");
-          const suppliedResolvedMode = normalizeWorkspaceMode(body.resolved_workspace_mode || "auto");
-          const resolvedMode = requestedMode === "auto"
-            ? (suppliedResolvedMode === "auto" ? inferWorkspaceMode(body.objective) : suppliedResolvedMode)
-            : requestedMode;
-          const planner = Array.isArray(body.participants)
-            ? body.participants.find((participant) => participant?.planner === true) || body.participants[0]
-            : null;
-          const coordinatorRuntime = normalizeCoordinator(
-            body.coordinator_runtime || planner?.runtime || "codex",
-          );
-          const riskTier = classifyWorkspaceRisk(body.objective, resolvedMode);
-          const coordinatorDeviceId =
-            ctx.collaborationRuntime?.deviceId || body.coordinator_device_id || "local";
-          if (resolvedMode === "remote_ops" && !body.participants?.some(
-            (participant) => String(participant?.device_id || participant?.deviceId || "")
-              !== String(coordinatorDeviceId),
-          )) {
-            const error = new Error("Remote Ops requires a participant on a different trusted device.");
-            error.code = "COLLABORATION_REMOTE_PARTICIPANT_REQUIRED";
-            throw error;
-          }
           return sendOk(res, {
-            run: ctx.collaborationCoordinator.create({
-              ...body,
-              workspace_mode: requestedMode,
-              resolved_workspace_mode: resolvedMode,
-              coordinator_runtime: coordinatorRuntime,
-              planning_source: String(body.planning_source || "").trim()
-                || (requestedMode === "auto" ? "local" : "manual"),
-              risk_tier: riskTier,
-              workflow_template_id:
-                body.workflow_template_id || workspaceModeDefinition(resolvedMode).templateId,
-              coordinator_device_id: coordinatorDeviceId,
-            }),
+            run: ctx.collaborationRuntime
+              ? (await ctx.collaborationRuntime.handleControlOperation("create", { request: body })).run
+              : ctx.collaborationCoordinator.create(normalizeCollaborationCreateRequest(body, {
+                coordinatorDeviceId: body.coordinator_device_id || "local",
+              })),
           });
         } catch (error) {
           return sendError(res, 400, error.message || "invalid collaboration run", {
             reason: error.code || "invalid_collaboration_run",
           });
+        }
+      }
+      return sendError(res, 405, `method ${req.method} not allowed`);
+    }
+    const configurationMatch = pathname.match(
+      /^\/collaboration\/local\/configurations(?:\/([^/]+)(?:\/(answer|accept|cancel))?)?$/,
+    );
+    if (configurationMatch) {
+      if (!ctx.collaborationRuntime) return sendError(res, 503, "collaboration runtime unavailable");
+      const configurationId = configurationMatch[1] ? decodeURIComponent(configurationMatch[1]) : "";
+      const action = configurationMatch[2] || "";
+      if (!configurationId && req.method === "POST") {
+        const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+        if (body.__error) return sendError(res, 400, body.__error);
+        try {
+          const result = await ctx.collaborationRuntime.handleControlOperation("configuration_create", { request: body });
+          return sendOk(res, result);
+        } catch (error) {
+          return sendError(res, 400, error.message || "collaboration configuration failed", { reason: error.code || "configuration_failed" });
+        }
+      }
+      if (configurationId && !action && req.method === "GET") {
+        try {
+          return sendOk(res, await ctx.collaborationRuntime.handleControlOperation("configuration_get", { configuration_id: configurationId }));
+        } catch (error) {
+          return sendError(res, 404, error.message || "configuration not found", { reason: error.code || "configuration_not_found" });
+        }
+      }
+      if (configurationId && action && req.method === "POST") {
+        const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+        if (body.__error) return sendError(res, 400, body.__error);
+        const operation = `configuration_${action}`;
+        try {
+          return sendOk(res, await ctx.collaborationRuntime.handleControlOperation(operation, {
+            configuration_id: configurationId,
+            answers: body.answers || {},
+          }));
+        } catch (error) {
+          return sendError(res, 409, error.message || "configuration action failed", { reason: error.code || "configuration_action_failed" });
         }
       }
       return sendError(res, 405, `method ${req.method} not allowed`);
@@ -1483,6 +1496,11 @@ async function handleLocalStatus(ctx) {
       availableProfiles: AGENT_DETAIL_PROFILES,
     },
     compatibility: ctx.sessionManager?.compatibilityStatus?.(),
+    updates: cachedUpdateStatus({
+      stateDir: ctx.stateDir || getStateDir(),
+      config: readConfig(),
+      installContext: detectInstallContext(),
+    }),
   };
 }
 

@@ -16,6 +16,8 @@ import {
 } from "../runtime/unattendedWorkspaceReadiness.js";
 import { redactDisplayText, redactDisplayValue } from "../security/displayRedaction.js";
 import { CollaborationApprovalSupervisor } from "./collaborationApprovalSupervisor.js";
+import { CollaborationConfigurationPlanner } from "./collaborationConfigurationPlanner.js";
+import { normalizeCollaborationCreateRequest } from "./createRunRequest.js";
 
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "expired"]);
 const COMPLETE_EVENTS = new Set(["agent.task.complete", "agent.task.completed"]);
@@ -325,6 +327,12 @@ export class CollaborationRuntime {
     this.workspaceTrustRequests = new Map();
     this.workspaceBrowseRequests = new Map();
     this.unsubscribe = registry?.subscribe?.((notification) => this.enqueue(notification)) || (() => {});
+    this.configurationPlanner = new CollaborationConfigurationPlanner({
+      store: this.store,
+      coordinator: this.coordinator,
+      capabilitiesForDevice: (deviceId) => this.capabilitiesForDevice(deviceId),
+      deviceId: this.deviceId,
+    });
   }
 
   mcpBinding(sessionId) {
@@ -1782,11 +1790,31 @@ export class CollaborationRuntime {
     }
     if (operation === "create") {
       return {
-        run: this.coordinator.create({
-          ...(input.request || {}),
-          coordinator_device_id: this.deviceId,
-        }),
+        run: this.coordinator.create(normalizeCollaborationCreateRequest(
+          input.request || {},
+          { coordinatorDeviceId: this.deviceId },
+        )),
       };
+    }
+    if (operation === "configuration_create") {
+      return { configuration: await this.configurationPlanner.create(input.request || input) };
+    }
+    if (operation === "configuration_get") {
+      return { configuration: await this.configurationPlanner.get(input.configuration_id ?? input.configurationId) };
+    }
+    if (operation === "configuration_answer") {
+      return {
+        configuration: await this.configurationPlanner.answer(
+          input.configuration_id ?? input.configurationId,
+          input.answers || {},
+        ),
+      };
+    }
+    if (operation === "configuration_accept") {
+      return this.configurationPlanner.accept(input.configuration_id ?? input.configurationId);
+    }
+    if (operation === "configuration_cancel") {
+      return { configuration: await this.configurationPlanner.cancel(input.configuration_id ?? input.configurationId) };
     }
     if (!runId) throw new Error("collaboration run_id is required");
     if (operation === "snapshot") {

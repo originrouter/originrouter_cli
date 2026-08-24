@@ -251,8 +251,8 @@ export function writeDaemonState(state) {
   });
 }
 
-export function readDaemonState() {
-  return readJson(join(ensureStateDir(), "daemon.state.json")) || null;
+export function readDaemonState(stateDir = ensureStateDir()) {
+  return readJson(join(stateDir, "daemon.state.json")) || null;
 }
 
 export function readLocalApiConfig() {

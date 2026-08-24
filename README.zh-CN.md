@@ -78,6 +78,39 @@ originrouter --help
 or --help
 ```
 
+### CLI 更新
+
+OriginRouter 会在 Agent Workspace 启动时后台检查 npm 的 `latest` 版本。
+检查结果缓存 20 小时，启动过程不会等待 npm Registry。缓存中已经发现新版时，
+交互启动会提供“立即更新”“本次跳过”和“跳过直到下一个版本”。
+
+```bash
+originrouter update status
+originrouter update check
+originrouter update
+```
+
+默认模式为 `prompt`。自动更新需要用户主动开启，并且只会在安装方式受支持、
+全局包目录可写、没有运行中的 Agent Session 或协作任务时执行：
+
+```bash
+originrouter config set updates.mode prompt
+originrouter config set updates.mode auto
+originrouter config set updates.mode off
+```
+
+OriginRouter 可以识别 npm、pnpm 和 Bun 的全局安装。更新程序不会调用 `sudo`，
+不会覆盖源码仓库或链接的开发安装；检查或安装失败时会继续使用当前版本。
+受管后台服务会在空闲更新成功后自动重启，手动启动的 daemon 需要手动重启。
+
+版本检查最多等待 5 秒且不会阻塞启动。安装前的 daemon 活动检查最多等待 3 秒；
+如果无法确认 daemon 已空闲，更新会按安全原则延后。安装程序最多运行 5 分钟，
+超时后会终止整个安装进程树，确认退出后才释放更新锁。安装成功还会重新读取实际
+安装的包版本进行校验；`originrouter update status` 会显示结构化失败原因以及是否
+需要重启。启动阶段更新失败会继续进入 Agent Workspace；显式执行
+`originrouter update` 失败则返回非零退出码。任何更新路径都不会请求提权，也不会
+静默改用 `sudo` 重试。
+
 ## 快速开始
 
 在实际运行 Agent 的机器上执行一次：
@@ -200,12 +233,11 @@ Session Team 只保存在协调端 CLI 的本地协作数据库中。跨设备�
 originrouter -c codex "<目标>"
 originrouter -c claude "<目标>"
 originrouter --mode plan-build-verify "<目标>"
-originrouter --cloud-advice "比较几种安全的上线方案"
 ```
 
-`--cloud-advice` 是可选功能，只会把目标和经过类型约束的 display-safe 能力摘要
-发送给 OriginRouter AI Server，不包含设备 ID、工作区路径、Provider 和模型名称、
-凭据或环境变量。用户手动选择的模式始终拥有最高优先级。
+目标 CLI 会将白名单能力快照交给服务端专用的协作配置 API，由服务端进行有上限的多轮团队规划。
+目标 CLI 只执行被请求的只读探针，并在当前机器上完成最终实时安全校验；用户确认后仍由它创建并执行 Run。
+App 是可视化控制面；服务端不会访问工作区，也不能创建 Run。
 
 交互命令、确认策略、后台 Run 和并行写入安全规则参见
 [Agent Workspace 指南](docs/agent-workspace.md)。
@@ -276,7 +308,7 @@ originrouter completion powershell | Out-String | Invoke-Expression
 
 | 领域 | 命令 |
 | --- | --- |
-| Agent Workspace | `originrouter`、`-c`、`--mode`、`--cloud-advice` |
+| Agent Workspace | `originrouter`、`-c`、`--mode` |
 | Agent | `claude`、`codex`、`agent setup`、`agent detail`、`agent budget` |
 | 协作 | `collaborate`、`collaboration` |
 | 模型 | `provider`、`route`、`proxy`、`compatibility` |

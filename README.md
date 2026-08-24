@@ -79,6 +79,46 @@ originrouter --help
 or --help
 ```
 
+### CLI updates
+
+OriginRouter checks the npm `latest` release in the background when Agent
+Workspace starts. The check is cached for 20 hours, so startup never waits for
+the registry. When a newer version is already cached, an interactive launch
+offers **Update now**, **Skip**, and **Skip until next version**.
+
+```bash
+originrouter update status
+originrouter update check
+originrouter update
+```
+
+The default mode is `prompt`. Automatic updates are opt-in and run only when
+the installation method is supported, the global package directory is
+writable, and no Agent session or collaboration run is active:
+
+```bash
+originrouter config set updates.mode prompt
+originrouter config set updates.mode auto
+originrouter config set updates.mode off
+```
+
+OriginRouter recognizes global npm, pnpm, and Bun installations. It never
+invokes `sudo`, never overwrites a source checkout or linked development
+install, and continues with the installed version if an update check or
+installation fails. A managed background service is restarted after a
+successful idle update; a manually started daemon must be restarted manually.
+
+Update checks time out after 5 seconds and never block startup. Before an
+install, daemon activity detection is bounded to 3 seconds and fails closed:
+if OriginRouter cannot prove the daemon is idle, the update is deferred. An
+installer may run for at most 5 minutes; on timeout OriginRouter terminates the
+whole installer process tree before releasing its update lock. Successful
+installs are verified by reading the installed package version, and
+`originrouter update status` reports structured failure details and whether a
+restart is required. A startup update failure returns to Agent Workspace;
+the explicit `originrouter update` command instead exits non-zero. No update
+path requests elevation or silently retries with `sudo`.
+
 ## Quick start
 
 Run these commands once on the machine that will execute your Agents:
@@ -212,13 +252,14 @@ Useful options:
 originrouter -c codex "<objective>"
 originrouter -c claude "<objective>"
 originrouter --mode plan-build-verify "<objective>"
-originrouter --cloud-advice "Compare safe rollout strategies"
 ```
 
-`--cloud-advice` is optional. It sends the objective and a typed, display-safe
-capability summary to the OriginRouter AI Server. It excludes device IDs,
-workspace paths, provider and model names, credentials, and environment values.
-Manual mode selection remains authoritative.
+The target CLI sends an allowlisted capability snapshot to the server-owned
+Collaboration Configuration API, which performs bounded multi-turn team
+planning. The target CLI executes only requested read-only probes, performs the
+final live safety validation, then creates and executes the Run itself after
+confirmation. The App is a visual control surface; the Server never accesses a
+workspace or creates a Run.
 
 Read the [Agent Workspace guide](docs/agent-workspace.md) for interactive
 commands, confirmation policy, detached runs, and parallel-write safety.
@@ -293,7 +334,7 @@ originrouter completion powershell | Out-String | Invoke-Expression
 
 | Area | Commands |
 | --- | --- |
-| Agent Workspace | `originrouter`, `-c`, `--mode`, `--cloud-advice` |
+| Agent Workspace | `originrouter`, `-c`, `--mode` |
 | Agents | `claude`, `codex`, `agent setup`, `agent detail`, `agent budget` |
 | Collaboration | `collaborate`, `collaboration` |
 | Models | `provider`, `route`, `proxy`, `compatibility` |

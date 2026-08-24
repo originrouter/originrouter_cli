@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, platform, userInfo } from "node:os";
-import { join, posix as posixPath, resolve, win32 as win32Path } from "node:path";
+import { dirname, join, posix as posixPath, resolve, win32 as win32Path } from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { readApiToken } from "../persistence/authToken.js";
@@ -253,6 +253,11 @@ function servicePaths(currentPlatform = platform()) {
   return { ...logs, configPath: null };
 }
 
+export function isServiceInstalled(currentPlatform = platform()) {
+  const paths = servicePaths(currentPlatform);
+  return Boolean(paths.configPath && existsSync(paths.configPath));
+}
+
 function serviceConfigForPlatform(currentPlatform = platform()) {
   const paths = servicePaths(currentPlatform);
   const common = {
@@ -391,6 +396,14 @@ async function startService({ dryRun = false } = {}) {
   throw new Error(`Unsupported platform for service management: ${currentPlatform}`);
 }
 
+export async function restartService({ dryRun = false } = {}) {
+  try { stopService({ dryRun }); } catch {}
+  if (platform() === "darwin" && !dryRun) {
+    await waitForLaunchdUnloaded();
+  }
+  await startService({ dryRun });
+}
+
 export async function waitForLaunchdUnloaded({
   timeoutMs = 5_000,
   isLoaded = () => {
@@ -517,14 +530,7 @@ export async function handleServiceCommand(args) {
     return;
   }
   if (action === "restart") {
-    try { stopService({ dryRun }); } catch {}
-    // launchctl bootout returns before the job is always fully removed from
-    // the per-user domain. Starting immediately can make bootstrap fail while
-    // kickstart then reports that the service does not exist.
-    if (platform() === "darwin" && !dryRun) {
-      await waitForLaunchdUnloaded();
-    }
-    await startService({ dryRun });
+    await restartService({ dryRun });
     return;
   }
   if (action === "status") {

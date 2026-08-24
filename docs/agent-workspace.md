@@ -121,23 +121,24 @@ sessions and are not the default Agent Workspace runtime.
 
 ## Auto mode
 
-Auto mode selects the smallest useful collaboration shape without sending the
-objective to the OriginRouter control server. Device capability discovery is
-performed first, then deterministic local classification selects an initial
-mode. The read-only Planner still creates and validates the actual task DAG.
-
-Cloud-assisted planning is opt-in:
+Auto mode uses the server-owned Collaboration Configuration API to plan the
+smallest useful team. The selected target CLI first collects an allowlisted
+capability snapshot, then the Server may ask bounded follow-up questions or
+request one of three read-only facts. The target CLI performs those probes,
+revalidates the final team against its current capabilities, and is the only
+component that can create a Run after the user confirms it.
 
 ```sh
-originrouter --cloud-advice "Compare safe rollout strategies"
+originrouter collaboration create "Compare safe rollout strategies"
 ```
 
-Only the objective and a typed capability summary containing runtime names and
-counts are sent to the AI Server. Device IDs, workspace paths, route provider
-names, model names, credentials, and environment values are excluded. The AI
-response is advisory: a manually selected mode remains fixed, deterministic
-risk may be raised but never lowered, and any error or unavailable recommendation
-falls back to local planning.
+Only the objective and typed, allowlisted planning facts are sent to the API:
+trusted device IDs, runtime availability, opaque workspace IDs and display-safe
+repository names, approved permission profiles, routes, and budgets. Workspace
+paths, credentials, environment values, filesystem access, commands, and Run
+authority are never sent or granted. If the API/model is unavailable, malformed,
+or rejected by live CLI validation, the CLI presents a visibly labelled
+deterministic local fallback rather than blocking or silently creating a Run.
 
 Current classifications include:
 

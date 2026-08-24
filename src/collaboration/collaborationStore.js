@@ -530,6 +530,31 @@ export class CollaborationStore {
         FOREIGN KEY(run_id) REFERENCES collaboration_runs(run_id) ON DELETE CASCADE,
         UNIQUE(run_id, idempotency_key)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS collaboration_configuration_sessions (
+        configuration_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        objective TEXT NOT NULL,
+        coordinator_device_id TEXT NOT NULL,
+        coordinator_runtime TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        capability_snapshot_json TEXT NOT NULL,
+        server_configuration_id TEXT NOT NULL DEFAULT '',
+        server_revision INTEGER NOT NULL DEFAULT 0,
+        tool_requests_json TEXT NOT NULL DEFAULT '[]',
+        server_proposal_json TEXT NOT NULL DEFAULT '{}',
+        planning_source TEXT NOT NULL DEFAULT 'server_model',
+        conversation_id TEXT NOT NULL DEFAULT '',
+        native_session_id TEXT NOT NULL DEFAULT '',
+        agent_session_id TEXT NOT NULL DEFAULT '',
+        turn_count INTEGER NOT NULL DEFAULT 0,
+        questions_json TEXT NOT NULL DEFAULT '[]',
+        proposal_json TEXT NOT NULL DEFAULT '{}',
+        fallback_reason TEXT NOT NULL DEFAULT '',
+        model_error TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL DEFAULT ''
+      ) STRICT;
       CREATE INDEX IF NOT EXISTS idx_collaboration_runs_updated ON collaboration_runs(updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_collaboration_runs_updated_stable
         ON collaboration_runs(updated_at DESC, run_id DESC);
@@ -546,6 +571,8 @@ export class CollaborationStore {
         ON collaboration_attention_items(run_id, status, created_at ASC);
       CREATE INDEX IF NOT EXISTS idx_collaboration_workspace_session_revisions
         ON collaboration_workspace_session_revisions(workspace_session_id, revision DESC);
+      CREATE INDEX IF NOT EXISTS idx_collaboration_configuration_updated
+        ON collaboration_configuration_sessions(updated_at DESC);
     `);
     this.ensureColumn("collaboration_runs", "schema_version", "INTEGER NOT NULL DEFAULT 2");
     this.ensureColumn("collaboration_runs", "workspace_session_id", "TEXT NOT NULL DEFAULT ''");
@@ -579,6 +606,11 @@ export class CollaborationStore {
     this.ensureColumn("collaboration_runs", "planner_role", "TEXT NOT NULL DEFAULT 'lead'");
     this.ensureColumn("collaboration_runs", "plan_status", "TEXT NOT NULL DEFAULT 'confirmed'");
     this.ensureColumn("collaboration_runs", "plan_revision", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("collaboration_configuration_sessions", "server_configuration_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("collaboration_configuration_sessions", "server_revision", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("collaboration_configuration_sessions", "tool_requests_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("collaboration_configuration_sessions", "server_proposal_json", "TEXT NOT NULL DEFAULT '{}'");
+    this.ensureColumn("collaboration_configuration_sessions", "planning_source", "TEXT NOT NULL DEFAULT 'server_model'");
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_collaboration_runs_workspace_session
         ON collaboration_runs(workspace_session_id, created_at ASC, run_id ASC);
@@ -679,6 +711,121 @@ export class CollaborationStore {
       WHERE run_id = ?
     `).run(updatedAt, safeText(runId, 195));
     return updatedAt;
+  }
+
+  publicConfigurationSession(row) {
+    if (!row) return null;
+    return {
+      configuration_id: row.configuration_id,
+      state: row.state,
+      objective: row.objective,
+      coordinator_device_id: row.coordinator_device_id,
+      coordinator_runtime: row.coordinator_runtime,
+      request: parseJson(row.request_json, {}),
+      capability_snapshot: parseJson(row.capability_snapshot_json, { devices: [] }),
+      server_configuration_id: row.server_configuration_id || null,
+      server_revision: Number(row.server_revision || 0),
+      tool_requests: parseJson(row.tool_requests_json, []),
+      server_proposal: parseJson(row.server_proposal_json, {}),
+      conversation_id: row.conversation_id || null,
+      native_session_id: row.native_session_id || null,
+      agent_session_id: row.agent_session_id || null,
+      turn_count: Number(row.turn_count || 0),
+      questions: parseJson(row.questions_json, []),
+      proposal: parseJson(row.proposal_json, null),
+      planning_source: row.planning_source || (row.state === "fallback_ready" ? "local_fallback" : "server_model"),
+      fallback_reason: row.fallback_reason || null,
+      model_error: row.model_error || null,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      expires_at: row.expires_at || null,
+    };
+  }
+
+  createConfigurationSession(input = {}) {
+    const objective = safeText(input.objective, 16_000);
+    if (!objective) throw new Error("configuration objective is required");
+    const configurationId = safeText(input.configuration_id, 195) || id("ccs");
+    const createdAt = iso(this.now());
+    const expiresAt = iso(Date.now() + Math.max(60_000, Number(input.ttl_ms) || 30 * 60_000));
+    this.db.prepare(`
+      INSERT INTO collaboration_configuration_sessions (
+        configuration_id, state, objective, coordinator_device_id, coordinator_runtime,
+        request_json, capability_snapshot_json, server_configuration_id, server_revision,
+        tool_requests_json, server_proposal_json, planning_source, conversation_id, native_session_id,
+        agent_session_id, turn_count, questions_json, proposal_json, fallback_reason,
+        model_error, created_at, updated_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      configurationId,
+      safeText(input.state, 32) || "planning",
+      objective,
+      safeText(input.coordinator_device_id, 191),
+      safeText(input.coordinator_runtime, 32) || "codex",
+      JSON.stringify(input.request || {}),
+      JSON.stringify(input.capability_snapshot || { devices: [] }),
+      safeText(input.server_configuration_id, 195),
+      Math.max(0, Number(input.server_revision) || 0),
+      JSON.stringify(input.tool_requests || []),
+      JSON.stringify(input.server_proposal || {}),
+      safeText(input.planning_source, 32) || "server_model",
+      safeText(input.conversation_id, 96),
+      safeText(input.native_session_id, 191),
+      safeText(input.agent_session_id, 64),
+      Math.max(0, Number(input.turn_count) || 0),
+      JSON.stringify(input.questions || []),
+      JSON.stringify(input.proposal || {}),
+      safeText(input.fallback_reason, 512),
+      safeText(input.model_error, 4096),
+      createdAt,
+      createdAt,
+      expiresAt,
+    );
+    return this.getConfigurationSession(configurationId);
+  }
+
+  getConfigurationSession(configurationId) {
+    const row = this.db.prepare(`
+      SELECT * FROM collaboration_configuration_sessions WHERE configuration_id = ?
+    `).get(safeText(configurationId, 195));
+    if (!row) return null;
+    if (["planning", "awaiting_input"].includes(row.state)
+        && row.expires_at && Date.parse(row.expires_at) < Date.now()) {
+      this.db.prepare(`UPDATE collaboration_configuration_sessions
+        SET state = 'failed', model_error = 'configuration_session_expired', updated_at = ?
+        WHERE configuration_id = ?`).run(iso(this.now()), row.configuration_id);
+      return this.getConfigurationSession(row.configuration_id);
+    }
+    return this.publicConfigurationSession(row);
+  }
+
+  updateConfigurationSession(configurationId, patch = {}) {
+    const current = this.getConfigurationSession(configurationId);
+    if (!current) throw new Error("collaboration configuration session not found");
+    const fields = [];
+    const values = [];
+    const set = (column, value) => { fields.push(`${column} = ?`); values.push(value); };
+    if (patch.state != null) set("state", safeText(patch.state, 32));
+    if (patch.request != null) set("request_json", JSON.stringify(patch.request));
+    if (patch.capability_snapshot != null) set("capability_snapshot_json", JSON.stringify(patch.capability_snapshot));
+    if (patch.server_configuration_id != null) set("server_configuration_id", safeText(patch.server_configuration_id, 195));
+    if (patch.server_revision != null) set("server_revision", Math.max(0, Number(patch.server_revision) || 0));
+    if (patch.tool_requests != null) set("tool_requests_json", JSON.stringify(patch.tool_requests));
+    if (patch.server_proposal != null) set("server_proposal_json", JSON.stringify(patch.server_proposal));
+    if (patch.planning_source != null) set("planning_source", safeText(patch.planning_source, 32));
+    if (patch.conversation_id != null) set("conversation_id", safeText(patch.conversation_id, 96));
+    if (patch.native_session_id != null) set("native_session_id", safeText(patch.native_session_id, 191));
+    if (patch.agent_session_id != null) set("agent_session_id", safeText(patch.agent_session_id, 64));
+    if (patch.turn_count != null) set("turn_count", Math.max(0, Number(patch.turn_count) || 0));
+    if (patch.questions != null) set("questions_json", JSON.stringify(patch.questions));
+    if (patch.proposal != null) set("proposal_json", JSON.stringify(patch.proposal));
+    if (patch.fallback_reason != null) set("fallback_reason", safeText(patch.fallback_reason, 512));
+    if (patch.model_error != null) set("model_error", safeText(patch.model_error, 4096));
+    if (patch.expires_at != null) set("expires_at", safeText(patch.expires_at, 64));
+    set("updated_at", iso(this.now()));
+    values.push(safeText(configurationId, 195));
+    this.db.prepare(`UPDATE collaboration_configuration_sessions SET ${fields.join(", ")} WHERE configuration_id = ?`).run(...values);
+    return this.getConfigurationSession(configurationId);
   }
 
   createRun(input = {}) {

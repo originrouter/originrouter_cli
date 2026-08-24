@@ -44,7 +44,6 @@ const FORWARDED_FLAGS = new Set([
   "--review",
   "--verbose",
   "--yes",
-  "--cloud-advice",
 ]);
 
 function optionValue(argv, index, option) {
@@ -1059,7 +1058,7 @@ function buildRuntimeRows(runtime, columns, maxRows, { focusedInteraction = fals
         || configured.workspace_mode;
       const deviceCount = new Set((configured.participants || []).map((item) => item.device_id)).size;
       pushIndented(`${workspaceModeDefinition(resolved || "auto").label} · ${(configured.participants || []).length} Agent${configured.participants?.length === 1 ? "" : "s"} · ${deviceCount} device${deviceCount === 1 ? "" : "s"}`, 2, muted);
-      if (configured.planning_source === "cloud_advice") pushIndented("Auto decision: advisory model", 2, muted);
+      if (configured.planning_source === "model") pushIndented("Auto decision: target CLI model", 2, muted);
       if (configured.planning_source === "local_fallback") pushIndented("Auto decision: local fallback", 2, muted);
     }
     const workspaceSessionId = runtime.snapshot?.run?.workspace_session_id;
@@ -1240,7 +1239,12 @@ function buildRuntimeRows(runtime, columns, maxRows, { focusedInteraction = fals
       push("Proposed collaboration team", strong);
       const advice = configured.auto_configuration?.advice;
       if (advice?.reason) pushIndented(advice.reason, 2, muted);
-      pushIndented(`Risk ${configured.risk_tier || "green"} · ${configured.planning_source === "cloud_advice" ? "advisory model" : "local policy"} · Session approval ${permissionLabel(configured.supervisor_permission_profile || "guarded", configured.supervisor_policy_id)}`, 2, muted);
+      const planningLabel = configured.planning_source === "model"
+        ? "target CLI model"
+        : configured.planning_source === "local_fallback"
+          ? "local fallback"
+          : "local policy";
+      pushIndented(`Risk ${configured.risk_tier || "green"} · ${planningLabel} · Session approval ${permissionLabel(configured.supervisor_permission_profile || "guarded", configured.supervisor_policy_id)}`, 2, muted);
       for (const participant of participants) {
         const device = workspaceEditorDevice(configured, participant);
         pushIndented(`${participant.planner ? "●" : "○"} ${participant.display_name || participant.participant_id} · ${runtimeDisplayName(participant.runtime)}`, 2, strong);
@@ -2454,11 +2458,6 @@ function collaborationArgs({ objective, coordinator, mode, forwarded }) {
     "--coordinator", coordinator,
     ...forwarded,
   ];
-  // Auto mode delegates task interpretation to the advisory model. Local
-  // rules remain a conservative fallback when the advisory service is down.
-  if (mode === "auto" && !forwarded.includes("--cloud-advice")) {
-    args.push("--cloud-advice");
-  }
   return args;
 }
 
@@ -4080,7 +4079,6 @@ async function runWorkspaceObjective({
             objective,
             workspaceMode: mode,
             coordinator,
-            cloudAdvice: mode === "auto" || forwarded.includes("--cloud-advice"),
             presetConfiguration: continuedConfiguration,
             continuedFromRunId,
             supervisorPermissionProfile: runtime.sessionApprovalOverride.profile,

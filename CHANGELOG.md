@@ -5,6 +5,34 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ## Unreleased
 
+## 0.2.2 - 2026-08-24
+
+### Added
+
+- Added cached npm release checks and a Codex-style interactive startup prompt
+  with Update now, Skip, and Skip until next version choices.
+- Added `originrouter update`, `originrouter update check`, and
+  `originrouter update status`, including JSON status output.
+- Added `updates.mode` configuration with `prompt`, `auto`, and `off` modes.
+- Added npm, pnpm, and Bun global-install detection, an inter-process update
+  lock, local update status API, and idle managed-service restart support.
+- Added post-install version verification, restart-required status, and
+  structured update failure reporting.
+
+### Fixed
+
+- Bounded daemon activity inspection so an unresponsive local service cannot
+  hang startup or manual updates.
+- Update timeouts now terminate the complete installer process tree before the
+  lock is released. A live owner or installer process also prevents an old
+  lock from being reclaimed solely because of its age.
+
+### Security
+
+- Automatic updates never invoke `sudo`, never overwrite source or linked
+  development installs, and defer while Agent sessions or collaboration runs
+  are active or daemon activity cannot be verified.
+
 ## 0.2.1 - 2026-08-23
 
 ### Added

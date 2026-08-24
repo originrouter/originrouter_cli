@@ -77,6 +77,11 @@ import { handleAgentWorkspaceCommand } from "./commands/agentWorkspace.js";
 import { handleHistoryCommand } from "./commands/history.js";
 import { getCompletionCandidates, printCompletion } from "./commands/completion.js";
 import {
+  handleStartupUpdate,
+  handleUpdateCommand,
+} from "./commands/update.js";
+import { setUpdateMode, updateModeFromConfig } from "./update/settings.js";
+import {
   rollbackCompatibilityPack,
 } from "./compatibility/patchStore.js";
 import { checkCompatibilityPack, refreshCompatibilityPack } from "./compatibility/updater.js";
@@ -117,6 +122,7 @@ Usage:
   originrouter "<objective>" [-c codex|claude] [--mode <mode>]
   originrouter --help
   originrouter --version
+  originrouter update [status|check|install] [--json]
   originrouter completion bash|zsh|fish|powershell
   originrouter status
   originrouter doctor [provider <name>]
@@ -236,8 +242,9 @@ Local API auth:
   originrouter local config show                     Print persisted local API bind/port settings
   originrouter local config set [--port <p>] [--bind <addr>] [--allow-lan on|off] [--relay-mode auto|cloud|local|custom] [--relay-url <url>]
 
-Legacy config commands (deprecated, prefer 'originrouter provider add'):
+Configuration:
   originrouter config show
+  originrouter config set updates.mode prompt|auto|off
   originrouter config set claude.<key> <value>
   originrouter config unset claude.<key>
   originrouter claude-config --base-url <url> --api-key <key> --model <model> --small-fast-model <model> [legacy]
@@ -358,6 +365,7 @@ Models and routing:
   route set <agent.slot> Assign a Provider and model to one route slot
   proxy                  Install and manage the local LiteLLM proxy
   compatibility          Inspect signed protocol compatibility updates
+  update                 Check for and install OriginRouter CLI updates
 
   Route aliases: originrouter-claude-model, originrouter-claude-fast-model,
                  and gpt-5.4
@@ -519,12 +527,19 @@ function handleConfig(args) {
 
   if (!action || action === "show") {
     printClaudeConfig(config);
+    console.log(`Update mode: ${updateModeFromConfig(config)}`);
     return;
   }
 
   if (action === "set") {
     if (!path || value === undefined) {
-      throw new Error("Usage: originrouter config set claude.<key> <value>");
+      throw new Error("Usage: originrouter config set updates.mode prompt|auto|off | originrouter config set claude.<key> <value>");
+    }
+    if (path === "updates.mode") {
+      const next = setUpdateMode(config, value);
+      writeConfig(next);
+      console.log(`Update mode: ${updateModeFromConfig(next)}`);
+      return;
     }
     const key = parseClaudePath(path);
     writeConfig(setClaudeConfigValue(config, key, value));
@@ -535,6 +550,13 @@ function handleConfig(args) {
   if (action === "unset") {
     if (!path) {
       throw new Error("Usage: originrouter config unset claude.<key>");
+    }
+    if (path === "updates.mode") {
+      const next = { ...config, updates: { ...(config.updates || {}) } };
+      delete next.updates.mode;
+      writeConfig(next);
+      console.log(`Update mode: ${updateModeFromConfig(next)}`);
+      return;
     }
     const key = parseClaudePath(path);
     writeConfig(unsetClaudeConfigValue(config, key));
@@ -2205,7 +2227,10 @@ export async function main(argv) {
   const [command, ...args] = argv;
 
   if (!command) {
-    if (process.stdin.isTTY && process.stdout.isTTY) await handleAgentWorkspaceCommand([]);
+    if (process.stdin.isTTY && process.stdout.isTTY) {
+      const update = await handleStartupUpdate();
+      if (update.continue) await handleAgentWorkspaceCommand([]);
+    }
     else printSummaryHelp();
     return;
   }
@@ -2218,7 +2243,7 @@ export async function main(argv) {
   if ([
     "-c", "--coordinator", "-m", "--mode", "--team",
     "--detach", "--json", "--no-wait", "--plain", "--raw", "--review",
-    "--verbose", "--yes", "--cloud-advice", "--timeout",
+    "--verbose", "--yes", "--timeout",
   ].some((option) => (
     command === option || command.startsWith(`${option}=`)
   ))) {
@@ -2254,6 +2279,11 @@ export async function main(argv) {
     console.log(`Default relay: ${DEFAULT_RELAY_URL}`);
     console.log(`Default device: ${device?.deviceId || DEFAULT_DEVICE_ID}`);
     console.log(`Default executor: ${DEFAULT_EXECUTOR}`);
+    return;
+  }
+
+  if (command === "update") {
+    await handleUpdateCommand(args);
     return;
   }
 
@@ -2432,6 +2462,7 @@ export async function main(argv) {
     await runLocalAgentSession(agentCommand.agent, agentCommand.args);
     return;
   }
+  await handleStartupUpdate({ interactivePrompt: false });
   await handleAgentWorkspaceCommand([command, ...args]);
 }
 

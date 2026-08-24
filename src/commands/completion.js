@@ -4,7 +4,7 @@ const TOP_LEVEL = [
   "status", "doctor", "sessions", "devices", "env", "agent", "history", "remote",
   "collaborate", "collaboration", "provider", "route", "proxy",
   "compatibility", "login", "logout", "auth", "security", "service", "services",
-  "local", "completion", "help", "claude", "codex", "run",
+  "local", "config", "completion", "help", "update", "claude", "codex", "run",
 ];
 
 const SUBCOMMANDS = {
@@ -13,6 +13,7 @@ const SUBCOMMANDS = {
   collaboration: ["templates", "list", "drafts", "draft", "show", "attach", "attention", "resolve", "doctor", "create", "confirm", "revise", "pause", "resume", "retry", "cancel", "archive", "delete", "export"],
   compatibility: ["status", "list", "inspect", "check", "update", "refresh", "rollback"],
   completion: ["bash", "zsh", "fish", "powershell"],
+  config: ["show", "set", "unset"],
   help: ["all"],
   env: ["print"],
   local: ["key", "token", "config", "api"],
@@ -22,6 +23,7 @@ const SUBCOMMANDS = {
   security: ["status", "rotate"],
   service: ["install", "start", "stop", "restart", "status", "uninstall"],
   services: ["install", "start", "stop", "restart", "status", "uninstall"],
+  update: ["status", "check", "install"],
 };
 
 const NESTED = {
@@ -41,7 +43,7 @@ const NESTED = {
 };
 
 const OPTIONS = {
-  workspace: ["-c", "--coordinator", "-m", "--mode", "--team", "--review", "--yes", "--detach", "--cloud-advice"],
+  workspace: ["-c", "--coordinator", "-m", "--mode", "--team", "--review", "--yes", "--detach"],
   doctor: ["--json"],
   sessions: ["--json"],
   devices: ["--json"],
@@ -54,6 +56,7 @@ const OPTIONS = {
   collaboration: ["--objective", "--participant", "--role", "--route", "--permission", "--preference", "--template", "--coordination-prompt", "--concurrency", "--token-limit", "--amount-limit", "--currency", "--yes", "--detach", "--no-wait", "--timeout", "--review", "--json"],
   claude: ["--originrouter-native-config", "--originrouter-autonomy", "--originrouter-policy", "--originrouter-detail"],
   codex: ["--originrouter-native-config", "--originrouter-autonomy", "--originrouter-policy", "--originrouter-detail"],
+  update: ["--json"],
 };
 
 function providerNames() {
@@ -78,6 +81,7 @@ function valuesFor(previous) {
   if (previous === "--allow-lan") return ["on", "off"];
   if (previous === "--relay-mode") return ["auto", "cloud", "local", "custom"];
   if (previous === "--format") return ["json", "markdown"];
+  if (previous === "updates.mode") return ["prompt", "auto", "off"];
   return [];
 }
 

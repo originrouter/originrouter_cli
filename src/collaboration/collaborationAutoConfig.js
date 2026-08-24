@@ -1,8 +1,5 @@
 import { z } from "zod";
 
-import { accessTokenFor, OAUTH_RESOURCES } from "../runtime/authContract.js";
-import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
-import { selectControlBaseUrl } from "../commands/routeSources.js";
 
 const PARTICIPANT_ID = /^[a-z][a-z0-9_-]{0,31}$/;
 const WORKFLOW_TEMPLATES = new Set([
@@ -106,73 +103,6 @@ export function publicCapabilitySnapshot(devices) {
       protocol_versions: capabilities?.protocol_versions || {},
     };
   }) };
-}
-
-function cloudConfigurationProjection(data) {
-  return {
-    participants: (data.participants || []).map((participant) => ({
-      participant_id: participant.participant_id,
-      display_name: participant.display_name,
-      runtime: participant.runtime,
-      device_id: participant.device_id,
-      workspace_id: participant.workspace_id,
-      role_hint: participant.role_hint,
-      permission_profile: participant.permission_profile,
-      provider: participant.provider ?? null,
-      model: participant.model ?? null,
-    })),
-    planner: data.planner,
-    workflow_template_id: data.workflow_template_id,
-    collaboration_preferences: data.collaboration_preferences,
-    max_concurrency: data.max_concurrency,
-    independent_review: data.independent_review,
-    budget: data.budget,
-  };
-}
-
-export async function requestAutoConfiguration({ objective, devices, answer = null }, {
-  stateDir,
-  fetchFn = globalThis.fetch,
-  ensureFreshAccessTokenFn = ensureFreshAccessToken,
-  selectControlBaseUrlFn = selectControlBaseUrl,
-  env = process.env,
-} = {}) {
-  const credential = await ensureFreshAccessTokenFn({
-    stateDir,
-    resource: OAUTH_RESOURCES.CONTROL,
-    fetchFn,
-  });
-  const token = accessTokenFor(credential, OAUTH_RESOURCES.CONTROL)?.token;
-  if (!token) throw Object.assign(new Error("OriginRouter login is required for cloud collaboration configuration."), { code: "AUTO_CONFIG_LOGIN_REQUIRED" });
-  const controlBaseUrl = String(await selectControlBaseUrlFn({ fetchFn, env })).replace(/\/+$/, "");
-  const response = await fetchFn(`${controlBaseUrl}/cli/v1/collaboration/auto-configurations`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      protocol_version: "1",
-      objective,
-      capability_snapshot: publicCapabilitySnapshot(devices),
-      ...(answer ? { answer } : {}),
-    }),
-    signal: AbortSignal.timeout(45_000),
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok || payload.code !== 0) {
-    const detail = payload.detail || {};
-    throw Object.assign(new Error(detail.message || `Cloud collaboration configuration failed (HTTP ${response.status}).`), { code: detail.code || "AUTO_CONFIG_MODEL_UNAVAILABLE" });
-  }
-  const data = payload.data || {};
-  if (data.status === "question") {
-    const error = new Error(data.question?.prompt || "Cloud collaboration configuration needs one answer.");
-    error.code = "AUTO_CONFIG_CLOUD_QUESTION";
-    error.question = data.question;
-    throw error;
-  }
-  if (data.status === "unable") {
-    throw Object.assign(new Error(data.reason || "Cloud collaboration configuration could not find a safe team."), { code: "AUTO_CONFIG_UNABLE" });
-  }
-  if (data.status !== "configured") throw Object.assign(new Error("Cloud collaboration configuration returned an invalid status."), { code: "AUTO_CONFIG_INVALID_RESPONSE" });
-  return cloudConfigurationProjection(data);
 }
 
 function parseStrictJson(output) {
@@ -298,7 +228,13 @@ export function validateAndNormalizeAutoConfiguration(rawOutput, { objective, de
   };
 }
 
-export async function autoConfigureCollaboration({ objective, devices, modelFn = requestAutoConfiguration, modelOptions = {} }) {
+export async function autoConfigureCollaboration({ objective, devices, modelFn, modelOptions = {} }) {
+  if (typeof modelFn !== "function") {
+    throw Object.assign(
+      new Error("Automatic collaboration configuration must run on the target CLI."),
+      { code: "AUTO_CONFIG_LOCAL_CLI_REQUIRED" },
+    );
+  }
   const output = await modelFn(
     { objective, devices, answer: modelOptions.answer || null },
     modelOptions,
