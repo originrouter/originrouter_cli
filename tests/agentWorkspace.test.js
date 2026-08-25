@@ -10,6 +10,7 @@ import {
   parseAgentWorkspaceArgs,
   redrawPrompt,
   scrollRuntimeContent,
+  workspaceInteractionSurface,
 } from "../src/commands/agentWorkspace.js";
 import {
   completeWorkspaceCommandInput,
@@ -101,6 +102,26 @@ assert.equal(objectiveMentionsRemoteTarget("我想分析一下我远程电脑的
 assert.equal(objectiveMentionsRemoteTarget("explain this local module"), false);
 assert.equal(normalizeWorkspacePathInput('  "/Users/chengaoyan/Desktop/originrouter-cli"  '), "/Users/chengaoyan/Desktop/originrouter-cli");
 assert.equal(normalizeWorkspacePathInput(" '/Users/chengaoyan/project'\n"), "/Users/chengaoyan/project");
+assert.equal(workspaceInteractionSurface({ interaction: false }), "normal");
+assert.equal(workspaceInteractionSurface({ interaction: true, interactionKind: "configuration" }), "focused");
+assert.equal(workspaceInteractionSurface({ interaction: true, interactionKind: "live_workspace_mode" }), "inline");
+assert.equal(workspaceInteractionSurface({ interaction: true, interactionKind: "paused" }), "inline");
+assert.equal(workspaceInteractionSurface({
+  interaction: true,
+  interactionKind: "attention",
+  attention: { actions: ["allow", "deny"], payload: { request: { command: "pwd" } } },
+}, 100, 30), "inline");
+assert.equal(workspaceInteractionSurface({
+  interaction: true,
+  interactionKind: "attention",
+  attention: { actions: ["allow", "deny"], payload: { request: { command: "x".repeat(400) } } },
+}, 100, 30), "focused");
+assert.equal(workspaceInteractionSurface({
+  interaction: true,
+  interactionKind: "attention",
+  interactionSurface: "inline",
+  attention: { actions: ["allow", "deny"], payload: { request: { command: "x".repeat(400) } } },
+}, 40, 10), "inline", "an open interaction keeps its surface across terminal resizes");
 assert.equal(findWorkspaceCommand("/resume")?.name, "resume");
 assert.equal(findWorkspaceCommand("run")?.name, "runs");
 assert.equal(workspaceCommandUsage(findWorkspaceCommand("agents")), "/agents [run-id]");
@@ -298,7 +319,7 @@ assert.match(workspaceScreen, /OriginRouter/);
 assert.match(workspaceScreen, /Agent Workspace/);
 assert.match(workspaceScreen, /Team      Auto/);
 assert.match(workspaceScreen, /Access    Guarded/);
-assert.match(workspaceScreen, /● guarded · session approval/);
+assert.match(workspaceScreen, /● Working  │  Auto  │  guarded approval/);
 assert.doesNotMatch(workspaceScreen, /^OriginRouter\nWorkspace/m);
 
 const inputScreen = buildWorkspaceAppScreen({
@@ -1150,6 +1171,7 @@ const teamEditRun = handleAgentWorkspaceCommand([], {
       },
     });
     setImmediate(() => {
+      teamEditTerminal.input.emit("keypress", undefined, { name: "down" });
       teamEditTerminal.input.emit("keypress", "e", { name: "e" });
       teamEditTerminal.input.emit("keypress", undefined, { name: "return" });
       teamEditTerminal.input.emit("keypress", undefined, { name: "down" });
@@ -1188,6 +1210,38 @@ assert.match(teamEditTerminal.writes.join(""), /Edit collaboration team/);
 assert.match(teamEditTerminal.writes.join(""), /Done editing · return to team review/);
 assert.match(teamEditTerminal.writes.join(""), /Review the updated team, then press Enter to continue/);
 assert.match(teamEditTerminal.writes.join(""), /Choose the Agent Runtime/);
+
+const teamSelectionTerminal = fakeTerminal();
+let teamSelectionDecision;
+const teamSelectionRun = handleAgentWorkspaceCommand([], {
+  input: teamSelectionTerminal.input,
+  output: teamSelectionTerminal.output,
+  workspaceRunner: async (options) => {
+    const configuration = {
+      resolved_workspace_mode: "remote_ops",
+      participants: [
+        { participant_id: "coordinator", display_name: "Coordinator", runtime: "codex", device_id: "local-device", permission_profile: "guarded", planner: true },
+        { participant_id: "remote_operator", display_name: "Remote Operator", runtime: "claude", device_id: "remote-device", permission_profile: "guarded" },
+      ],
+    };
+    setImmediate(() => {
+      teamSelectionTerminal.input.emit("keypress", undefined, { name: "down" });
+      teamSelectionTerminal.input.emit("keypress", undefined, { name: "return" });
+    });
+    teamSelectionDecision = await options.onConfigurationConfirmation(configuration);
+    setTimeout(() => {
+      emitText(teamSelectionTerminal.input, "/exit");
+      teamSelectionTerminal.input.emit("keypress", undefined, { name: "return" });
+    }, 20);
+    return { run: { state: "completed" }, tasks: [], final_report: { summary: "Done." } };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(teamSelectionTerminal.input, "inspect remote machine");
+teamSelectionTerminal.input.emit("keypress", undefined, { name: "return" });
+await teamSelectionRun;
+assert.equal(teamSelectionDecision, "confirm", "selecting an Agent does not change Enter from confirming the team");
+assert.match(teamSelectionTerminal.writes.join(""), /› ○ Remote Operator · Claude Code/);
 assert.match(teamEditTerminal.writes.join(""), /Choose the model route/);
 assert.match(teamEditTerminal.writes.join(""), /Choose this Agent's access policy/);
 
@@ -1380,6 +1434,27 @@ assert.deepEqual(completedFollowupCalls[1].presetConfiguration, continuedTeamCon
 assert.notEqual(completedFollowupCalls[1].presetConfiguration, continuedTeamConfiguration);
 assert.match(completedFollowupTerminal.writes.join(""), /Full first result remains visible/);
 assert.match(completedFollowupTerminal.writes.join(""), /Enter continues with this team/);
+
+const completedCtrlCTerminal = fakeTerminal();
+const completedCtrlCRun = handleAgentWorkspaceCommand([], {
+  input: completedCtrlCTerminal.input,
+  output: completedCtrlCTerminal.output,
+  workspaceRunner: async (options) => {
+    options.onRunId?.("acr_completed_ctrl_c");
+    return {
+      run: { run_id: "acr_completed_ctrl_c", state: "completed" },
+      tasks: [],
+      final_report: { summary: "The result is preserved before exit." },
+    };
+  },
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(completedCtrlCTerminal.input, "complete a task");
+completedCtrlCTerminal.input.emit("keypress", undefined, { name: "return" });
+setTimeout(() => completedCtrlCTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" }), 15);
+setTimeout(() => completedCtrlCTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" }), 30);
+await completedCtrlCRun;
+assert.match(completedCtrlCTerminal.writes.join(""), /Press Ctrl\+C again to exit/);
 
 const completedResumeTerminal = fakeTerminal(100, 30);
 const completedResumeSessionIds = [];
@@ -1737,7 +1812,7 @@ const firstScrollScreen = buildWorkspaceAppScreen({
   runtime: scrollingHeaderRuntime,
 }).replace(/\x1b\[[0-9;]*m/g, "");
 assert.match(firstScrollScreen, /^╭─+ OriginRouter /, "a Run opens at the scrollable title card");
-assert.match(firstScrollScreen, /session approval/, "the status bar remains visible at the bottom");
+assert.match(firstScrollScreen, /completed  │  Auto  │  guarded approval/, "the status bar remains visible at the bottom");
 assert.equal(scrollRuntimeContent(scrollingHeaderRuntime, 1, 100), true);
 const laterScrollScreen = buildWorkspaceAppScreen({
   coordinator: "codex",
@@ -1747,7 +1822,7 @@ const laterScrollScreen = buildWorkspaceAppScreen({
   runtime: scrollingHeaderRuntime,
 }).replace(/\x1b\[[0-9;]*m/g, "");
 assert.doesNotMatch(laterScrollScreen, /OriginRouter/, "the title card scrolls away with the document");
-assert.match(laterScrollScreen, /session approval/, "the status bar does not scroll away");
+assert.match(laterScrollScreen, /completed  │  Auto  │  guarded approval/, "the status bar does not scroll away");
 
 const scrollRuntime = {
   contentLineCount: 30,
@@ -2013,16 +2088,85 @@ const configurationReviewScreen = buildWorkspaceAppScreen({
 assert.match(configurationReviewScreen, /Proposed collaboration team/);
 assert.match(configurationReviewScreen, /A remote operator is required/);
 assert.match(configurationReviewScreen, /Remote Operator · Claude Code/);
-assert.match(configurationReviewScreen, /Esc return to objective/);
+assert.match(configurationReviewScreen, /E edit selection/);
 assert.match(configurationReviewScreen, /● Review the proposed team/);
 assert.doesNotMatch(configurationReviewScreen, /Review the proposed team \(4m/);
 const plainConfigurationReview = configurationReviewScreen.replace(/\x1b\[[0-9;]*m/g, "");
 assert.match(plainConfigurationReview, /\nProposed collaboration team/);
 assert.match(plainConfigurationReview, /\n  A remote operator is required/);
-assert.match(plainConfigurationReview, /\n  ● Coordinator · Codex/);
+assert.match(plainConfigurationReview, /\n  › ● Coordinator · Codex/);
 assert.match(plainConfigurationReview, /\n    local · local-workspace · Agent limit: Guarded/);
 assert.match(plainConfigurationReview, /Session approval Guarded/);
 assert.equal(configurationReviewScreen.split("\n").length <= 24, true, "interaction layout fits the terminal height");
+
+const compactModePickerScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 52,
+  rows: 8,
+  runtime: {
+    objective: "Inspect the remote computer",
+    phase: "executing",
+    interaction: true,
+    interactionKind: "live_workspace_mode",
+    workspaceModeSelection: 6,
+    mode: "auto",
+    snapshot: { run: { state: "running" }, tasks: [] },
+  },
+});
+assert.equal(compactModePickerScreen.split("\n").length <= 8, true, "a compact inline picker never writes past its viewport");
+assert.match(compactModePickerScreen, /› Remote Ops/, "the selected inline option remains visible on a short terminal");
+
+const compactApprovalPickerScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 100,
+  rows: 24,
+  runtime: {
+    phase: "executing",
+    interaction: true,
+    interactionKind: "live_session_permission",
+    mode: "auto",
+    snapshot: { run: { state: "running" }, tasks: [] },
+  },
+}).replace(/\x1b\[[0-9;]*m/g, "");
+assert.match(compactApprovalPickerScreen, /↑\/↓ selects · Enter applies · Esc keeps current approval/);
+assert.doesNotMatch(compactApprovalPickerScreen, /Enter queues next objective/);
+
+const resumePickerScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 100,
+  rows: 24,
+  runtime: {
+    phase: "configuring",
+    interaction: true,
+    interactionKind: "session_resume",
+    mode: "auto",
+    sessionResumeChoices: [{ sessionId: "aws_recent", run: { run_id: "acr_recent", state: "completed" } }],
+    snapshot: { run: { state: "running" }, tasks: [] },
+  },
+}).replace(/\x1b\[[0-9;]*m/g, "");
+assert.match(resumePickerScreen, /↑\/↓ selects · Enter restores · Esc returns to the Workspace prompt/);
+assert.doesNotMatch(resumePickerScreen, /Enter queues next objective/);
+
+const undersizedTerminalScreen = buildWorkspaceAppScreen({
+  coordinator: "codex",
+  mode: "auto",
+  columns: 10,
+  rows: 5,
+  runtime: {
+    phase: "executing",
+    interaction: false,
+    mode: "auto",
+    composerBuffer: "",
+    composerCursor: 0,
+    composerPastes: [],
+    snapshot: { run: { state: "running" }, tasks: [] },
+  },
+}).replace(/\x1b\[[0-9;]*m/g, "");
+assert.equal(undersizedTerminalScreen.split("\n").length, 5, "an undersized terminal never receives extra rows");
+assert.equal(Math.max(...undersizedTerminalScreen.split("\n").map((line) => [...line].length)) <= 10, true, "an undersized terminal never receives oversized rows");
 
 const planReviewScreen = buildWorkspaceAppScreen({
   coordinator: "codex",
@@ -2200,7 +2344,7 @@ assert.match(activityScreen, /Coordinator worked/);
 assert.match(activityScreen, /Inspect local package metadata/);
 assert.match(activityScreen, /› ● Remote Operator is working/);
 assert.match(activityScreen, /macOS and CLI version data collected/);
-assert.match(activityScreen, /↑\/↓ selects an Agent · Ctrl\+O collapses Remote Operator/);
+assert.match(activityScreen, /Ctrl\+O collapses Remote Operator/);
 assert.deepEqual(activityRuntime.activityParticipantIds, ["coordinator", "remote_operator"]);
 
 const narrowScreen = buildWorkspaceAppScreen({

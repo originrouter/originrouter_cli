@@ -1607,6 +1607,29 @@ export class CollaborationStore {
     };
   }
 
+  expireUnconfirmedPlans({ maxAgeMs = 24 * 60 * 60_000 } = {}) {
+    // A plan awaiting confirmation has not started work yet. Keeping it
+    // actionable indefinitely is unsafe: its workspace, permissions, and
+    // device facts can all have changed since the plan was produced.
+    const cutoff = new Date(this.now()).getTime() - Math.max(60_000, Number(maxAgeMs) || 0);
+    const candidates = this.db.prepare(`
+      SELECT run_id, updated_at FROM collaboration_runs
+      WHERE state = 'awaiting_plan_confirmation'
+        AND archived_at IS NULL
+    `).all();
+    const expired = [];
+    for (const candidate of candidates) {
+      const updatedAt = Date.parse(candidate.updated_at || "");
+      if (!Number.isFinite(updatedAt) || updatedAt > cutoff) continue;
+      this.transition(candidate.run_id, "expired", {
+        taskState: "cancelled",
+        taskPhase: "expired",
+      });
+      expired.push(candidate.run_id);
+    }
+    return expired;
+  }
+
   archiveRun(runId, archived = true) {
     const run = this.getRun(runId, { includeMessages: false });
     if (!run) throw new Error("collaboration run not found");
@@ -3473,6 +3496,18 @@ export class CollaborationStore {
               updated_at = ?
           WHERE run_id = ?
         `).run(taskState, taskPhase, taskState, updatedAt, taskState, updatedAt, updatedAt, runId);
+      }
+      // A terminal Run can no longer accept approval, input, or recovery
+      // actions.  Keep the historical attention records, but close them in
+      // the same transaction as the terminal transition so a cancelled Run
+      // cannot remain in the "needs attention" queue.
+      if (terminal) {
+        this.db.prepare(`
+          UPDATE collaboration_attention_items
+          SET status = 'resolved', revision = revision + 1, updated_at = ?,
+              resolved_at = ?, resolved_by = 'run-lifecycle', resolution = ?
+          WHERE run_id = ? AND status = 'pending'
+        `).run(updatedAt, updatedAt, `run_${nextState}`, runId);
       }
     })();
     const eventType = {

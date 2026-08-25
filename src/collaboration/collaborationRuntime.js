@@ -334,6 +334,12 @@ export class CollaborationRuntime {
       deviceId: this.deviceId,
       stateDir: this.store.stateDir,
     });
+    // Confirmation is a short-lived safety boundary, not a durable execution
+    // lease. Expire old unconfirmed plans during daemon startup before the App
+    // can render or execute them again.
+    for (const runId of this.store.expireUnconfirmedPlans()) {
+      void this.syncRun(runId);
+    }
   }
 
   mcpBinding(sessionId) {
@@ -1852,9 +1858,21 @@ export class CollaborationRuntime {
     }
     if (operation === "budget") return { run: await this.updateBudget(runId, input.budget || {}) };
     if (operation === "approval") return { run: await this.updateSupervisorApproval(runId, input) };
-    if (operation === "archive") return { run: this.store.archiveRun(runId, true) };
+    if (operation === "archive") {
+      const run = this.store.archiveRun(runId, true);
+      // Archive removes a Run from normal collaboration history. Keep the
+      // account projection aligned with the canonical CLI so an offline App
+      // cannot resurrect the archived card.
+      void this.removeRunProjection(runId);
+      return { run };
+    }
     if (operation === "delete") {
-      return { deleted: this.store.deleteRun(runId), run_id: runId };
+      const deleted = this.store.deleteRun(runId);
+      // The relay projection is only a display cache. Deleting the canonical
+      // CLI Run must remove that cache as well, otherwise an old pending card
+      // can reappear in the App and point at a Run that no longer exists.
+      if (deleted) void this.removeRunProjection(runId);
+      return { deleted, run_id: runId };
     }
     if (operation === "resolve_attention") {
       return this.resolveAttention(
@@ -2929,6 +2947,21 @@ export class CollaborationRuntime {
       // Collaboration projection is best-effort. Local state remains
       // canonical, and an expired relay login must never terminate the daemon
       // that owns Agent history, control, and E2EE routing.
+      return false;
+    }
+  }
+
+  async removeRunProjection(runId) {
+    if (!this.relayClient) return false;
+    try {
+      await this.relayClient.send("collaboration.run.remove", {
+        sourceDeviceId: this.deviceId,
+        runId: safeText(runId, 195),
+      });
+      return true;
+    } catch {
+      // The projection is non-authoritative. A failed best-effort removal must
+      // never restore or keep alive a locally deleted Run.
       return false;
     }
   }

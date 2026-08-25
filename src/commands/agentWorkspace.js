@@ -494,17 +494,6 @@ export function scrollRuntimeContent(runtime, direction, pageSize = 6) {
   return true;
 }
 
-function moveActivitySelection(runtime, direction) {
-  const participants = runtime.activityParticipantIds || [];
-  if (!direction || participants.length < 2) return false;
-  const current = Math.max(0, Math.min(
-    participants.length - 1,
-    Number(runtime.activitySelection) || 0,
-  ));
-  runtime.activitySelection = (current + direction + participants.length) % participants.length;
-  return true;
-}
-
 function toggleSelectedActivity(runtime) {
   const participants = runtime.activityParticipantIds || [];
   const participantId = participants[Math.max(0, Math.min(
@@ -949,6 +938,16 @@ function recordInteractionResult(runtime, kind, value) {
   ].slice(-12);
 }
 
+// A Workspace interaction owns exactly one visual surface.  Keeping this
+// classification separate from rendering and key handling prevents a new
+// dialog from accidentally drawing its controls in the composer while its
+// arrows still operate the document (or the reverse).
+const INTERACTION_SURFACES = Object.freeze({
+  NORMAL: "normal",
+  INLINE: "inline",
+  FOCUSED: "focused",
+});
+
 const FOCUSED_INTERACTION_KINDS = new Set([
   "device",
   "workspace",
@@ -959,19 +958,38 @@ const FOCUSED_INTERACTION_KINDS = new Set([
   "team_route",
   "team_permission",
   "team_session_permission",
-  "live_session_permission",
-  "live_workspace_mode",
   "session_resume",
   "plan",
   "plan_revision",
   "completion",
 ]);
 
-function interactionUsesFocusedSurface(runtime, columns = 80, rows = 24) {
-  if (!runtime?.interaction) return false;
-  if (FOCUSED_INTERACTION_KINDS.has(runtime.interactionKind)) return true;
+const INLINE_INTERACTION_KINDS = new Set([
+  // These are short decisions. They preserve the conversation viewport and
+  // replace only the composer dock, just like a permission prompt in Codex.
+  "live_session_permission",
+  "live_workspace_mode",
+  "paused",
+  "reconnect",
+]);
+
+export function workspaceInteractionSurface(runtime, columns = 80, rows = 24) {
+  if (!runtime?.interaction) return INTERACTION_SURFACES.NORMAL;
+  // An interaction must not jump between the composer dock and a focus page
+  // merely because a resize changes its wrapping estimate.  The decision loop
+  // locks this value until it resolves, then restores the saved document
+  // viewport as one atomic transition.
+  if (Object.values(INTERACTION_SURFACES).includes(runtime.interactionSurface)) {
+    return runtime.interactionSurface;
+  }
+  if (FOCUSED_INTERACTION_KINDS.has(runtime.interactionKind)) {
+    return INTERACTION_SURFACES.FOCUSED;
+  }
+  if (INLINE_INTERACTION_KINDS.has(runtime.interactionKind)) {
+    return INTERACTION_SURFACES.INLINE;
+  }
   if (!runtime.attention || !["attention", "attention_reply"].includes(runtime.interactionKind)) {
-    return false;
+    return INTERACTION_SURFACES.INLINE;
   }
   const width = Math.max(20, Number(columns) - 8);
   const contextRows = attentionRequestContext(runtime.attention, runtime).reduce(
@@ -983,7 +1001,9 @@ function interactionUsesFocusedSurface(runtime, columns = 80, rows = 24) {
   const hasLargeArtifact = String(request.file_changes_preview || "").length > 240
     || String(request.tool_input_preview || "").length > 320
     || String(request.command || "").length > Math.max(180, width * 2);
-  return hasLargeArtifact || promptRows > Math.max(10, Math.floor(Number(rows || 24) * 0.45));
+  return hasLargeArtifact || promptRows > Math.max(10, Math.floor(Number(rows || 24) * 0.45))
+    ? INTERACTION_SURFACES.FOCUSED
+    : INTERACTION_SURFACES.INLINE;
 }
 
 function runtimePhase(runtime) {
@@ -1259,15 +1279,19 @@ function buildRuntimeRows(runtime, columns, maxRows, {
           ? "local fallback"
           : "local policy";
       pushIndented(`Risk ${configured.risk_tier || "green"} · ${planningLabel} · Session approval ${permissionLabel(configured.supervisor_permission_profile || "guarded", configured.supervisor_policy_id)}`, 2, muted);
-      for (const participant of participants) {
+      const selected = Math.max(0, Math.min(
+        Math.max(0, participants.length - 1),
+        Number(runtime.teamEditSelection) || 0,
+      ));
+      for (const [index, participant] of participants.entries()) {
         const device = workspaceEditorDevice(configured, participant);
-        pushIndented(`${participant.planner ? "●" : "○"} ${participant.display_name || participant.participant_id} · ${runtimeDisplayName(participant.runtime)}`, 2, strong);
+        pushIndented(`${index === selected ? "›" : " "} ${participant.planner ? "●" : "○"} ${participant.display_name || participant.participant_id} · ${runtimeDisplayName(participant.runtime)}`, 2, index === selected ? strong : null);
         pushIndented(`${device?.device_name || participant.device_id} · ${participant.workspace_id || "workspace pending"} · Agent limit: ${permissionLabel(participant.permission_profile || "manual")}`, 4, muted);
         pushIndented(`Model: ${participantRouteLabel(configured, participant)}`, 4, muted);
         if (participant.role_hint) pushIndented(participant.role_hint, 4, muted);
       }
     }
-  } else if (runtime.interactionKind === "live_workspace_mode") {
+  } else if (focusedInteraction && runtime.interactionKind === "live_workspace_mode") {
     const selected = Math.max(0, Math.min(
       WORKSPACE_MODES.length - 1,
       Number(runtime.workspaceModeSelection) || 0,
@@ -1282,7 +1306,7 @@ function buildRuntimeRows(runtime, columns, maxRows, {
       pushIndented(`${index === selected ? "›" : " "} ${option.label}`, 2, index === selected ? strong : null);
       if (index === selected) pushIndented(option.description, 6, muted);
     }
-  } else if (runtime.interactionKind === "live_session_permission") {
+  } else if (focusedInteraction && runtime.interactionKind === "live_session_permission") {
     const options = runtime.sessionPermissionOptions || sessionPermissionOptions({ includePolicies: true });
     push("");
     push("Session approval", strong);
@@ -1400,8 +1424,7 @@ function buildRuntimeRows(runtime, columns, maxRows, {
         (group) => group.participantId === selectedActivityParticipant,
       );
       const action = selectedGroup?.expanded ? "collapses" : "expands";
-      const selectionHint = activityParticipants.length > 1 ? "↑/↓ selects an Agent · " : "";
-      pushIndented(`${selectionHint}Ctrl+O ${action} ${selectedGroup?.title?.replace(/ (?:is working|worked)$/, "") || "Agent"}.`, 2, muted);
+      pushIndented(`Ctrl+O ${action} ${selectedGroup?.title?.replace(/ (?:is working|worked)$/, "") || "Agent"}.`, 2, muted);
     }
   }
 
@@ -1464,20 +1487,20 @@ function buildRuntimeRows(runtime, columns, maxRows, {
 }
 
 function runtimeControls(runtime, columns) {
-  const mode = workspaceModeDefinition(runtime.mode || "auto").label;
-  // This footer has only 71 display columns in an 80-column terminal after
-  // the mode label. Keep the core completion and submission actions visible.
-  let text = runtime.notice || "Shift+drag selects text · Tab completes · Enter queues next objective";
+  // Keep the footer as an action legend only. Mode, Run state, and approval
+  // live together in composerStatus(), so they are not repeated at both ends
+  // of the composer dock.
+  let text = runtime.notice || "↑/↓ history · Enter queues next objective · Shift+drag selects text";
   if (runtime.screenPaused) text = "screen frozen for copying · ctrl+t resumes updates";
   const selectedActivityId = runtime.activityParticipantIds?.[runtime.activitySelection || 0];
   const selectedActivityExpanded = selectedActivityId
     && (runtime.expandedActivityParticipants || []).includes(selectedActivityId);
   if (selectedActivityId && !runtime.interaction) {
-    text = `${(runtime.activityParticipantIds || []).length > 1 ? "↑/↓ Agent · " : ""}ctrl+o ${selectedActivityExpanded ? "collapse" : "expand"} · PgUp/PgDn scroll`;
+    text = `↑/↓ history · Ctrl+O ${selectedActivityExpanded ? "collapses" : "expands"} Agent · Shift+drag selects text`;
   }
   if (runtime.autoFollow === false) {
     const unseen = Number(runtime.unseenActivityCount || 0);
-    text = `${unseen ? `${unseen} new event${unseen === 1 ? "" : "s"} · ` : ""}PgDn/Ctrl+End latest · ctrl+o Agent details`;
+    text = `${unseen ? `${unseen} new event${unseen === 1 ? "" : "s"} · ` : ""}↑/↓ history · PgDn latest · Ctrl+O details · Shift+drag selects text`;
   }
   if (runtime.queuedObjective) text = "next objective queued · ctrl+c interrupts · ← agents";
   if (runtime.phase === "needs_setup") text = runtime.setup?.workspaces?.length && runtime.setupMode !== "path"
@@ -1492,17 +1515,21 @@ function runtimeControls(runtime, columns) {
     } else if (["team_runtime", "team_route", "team_permission", "team_session_permission"].includes(runtime.interactionKind)) {
       text = "↑/↓ selects · Enter continues · Esc goes back";
     } else {
-      text = "↑/↓ reviews · Enter uses this team · E edits team · Esc returns";
+      text = "↑/↓ selects an Agent · E edits selection · Enter uses this team · PgUp/PgDn reviews";
     }
   }
   if (runtime.phase === "reconnecting") text = "connection interrupted · retrying automatically · ctrl+c cancels";
   if (runtime.phase === "connection_paused") text = "Enter reconnects · D detaches · ctrl+c interrupts Run";
   if (runtime.snapshot?.run?.state === "awaiting_confirmation") text = "↑/↓ reviews · Enter starts · E requests changes · Esc leaves pending";
   if (["attention", "attention_reply"].includes(runtime.interactionKind)) {
-    text = "Review the request above · shift+tab changes approval for later requests";
+    text = runtime.interactionKind === "attention_reply"
+      ? "Enter submits · Ctrl+U clears · Esc returns to actions · Shift+Tab approval"
+      : "↑/↓ selects · Enter confirms · Esc stays with Run · D detaches";
   }
+  if (runtime.interactionKind === "paused") text = "Enter resumes · Esc leaves this Run paused";
+  if (runtime.interactionKind === "reconnect") text = "Enter reconnect · D detach · Ctrl+C interrupt Run";
   if (runtime.snapshot?.run?.state === "completed") {
-    text = "Enter continues with this team · /new starts fresh · /exit exits";
+    text = "↑/↓ history · Enter continues with this team · /new starts fresh · /exit exits";
   } else if (["failed", "cancelled", "error"].includes(runtime.snapshot?.run?.state || runtime.phase)) {
     text = "reviewing the result";
   }
@@ -1511,8 +1538,14 @@ function runtimeControls(runtime, columns) {
       ? "↑/↓ selects · Enter saves for /new · Esc keeps current mode"
       : "↑/↓ selects · Enter applies · Esc keeps current mode";
   }
+  if (runtime.interactionKind === "live_session_permission") {
+    text = "↑/↓ selects · Enter applies · Esc keeps current approval";
+  }
+  if (runtime.interactionKind === "session_resume") {
+    text = "↑/↓ selects · Enter restores · Esc returns to the Workspace prompt";
+  }
   if (runtime.notice) text = runtime.notice;
-  return padDisplayRight(muted(`  ${mode} · ${text}`), columns);
+  return padDisplayRight(muted(`  ${text}`), columns);
 }
 
 function composerStatus(columns, runtime = null) {
@@ -1524,8 +1557,16 @@ function composerStatus(columns, runtime = null) {
     || runtime?.snapshot?.run?.supervisor_policy_id
     || runtime?.configuration?.supervisor_policy_id
     || "";
-  const status = `● ${permissionLabel(profile, policyId).toLowerCase()} · session approval`;
-  return `${" ".repeat(Math.max(0, columns - promptDisplayWidth(status) - 2))}${accent(status)}  `;
+  if (!runtime) {
+    const status = `● ${permissionLabel(profile, policyId).toLowerCase()} · session approval`;
+    return `${" ".repeat(Math.max(0, columns - promptDisplayWidth(status) - 2))}${accent(status)}  `;
+  }
+  const state = runtime.snapshot?.run?.state
+    ? String(runtime.snapshot.run.state).replaceAll("_", " ")
+    : runtimePhase(runtime);
+  const mode = workspaceModeDefinition(runtime.mode || "auto").label;
+  const status = `● ${state}  │  ${mode}  │  ${permissionLabel(profile, policyId).toLowerCase()} approval`;
+  return padDisplayRight(accent(`  ${status}`), columns);
 }
 
 function runtimeComposer(runtime, columns) {
@@ -1606,7 +1647,11 @@ function wrappedInteractionLines(lines, columns, maxLines = 16) {
   return rendered.join("\n");
 }
 
-function interactionComposer(runtime, columns, { focusedInteraction = false } = {}) {
+function interactionComposer(runtime, columns, {
+  surface = INTERACTION_SURFACES.INLINE,
+  maxRows = Number.POSITIVE_INFINITY,
+} = {}) {
+  const focusedInteraction = surface === INTERACTION_SURFACES.FOCUSED;
   const kind = runtime.interactionKind;
   let lines;
   if (kind === "device") {
@@ -1645,7 +1690,7 @@ function interactionComposer(runtime, columns, { focusedInteraction = false } = 
   } else if (kind === "configuration") {
     lines = [
       "? Use this collaboration team?",
-      "↑/↓ review · Enter confirm · E edit team · Esc return to objective",
+      "↑/↓ select an Agent · E edit selection · Enter confirm · PgUp/PgDn review · Esc return",
     ];
   } else if (kind === "team_edit") {
     lines = [
@@ -1673,14 +1718,28 @@ function interactionComposer(runtime, columns, { focusedInteraction = false } = 
       "↑/↓ select · Enter save Session approval · Esc back",
     ];
   } else if (kind === "live_session_permission") {
+    const options = runtime.sessionPermissionOptions || sessionPermissionOptions({ includePolicies: true });
+    const selected = Math.max(0, Math.min(
+      Math.max(0, options.length - 1),
+      Number(runtime.teamSessionPermissionSelection) || 0,
+    ));
     lines = [
       "? Change Session approval now?",
-      "↑/↓ select · Enter apply immediately · Esc keep current",
+      ...options.map((option, index) => `${index === selected ? "›" : " "} ${option.label}`),
+      options[selected]?.description || "",
     ];
   } else if (kind === "live_workspace_mode") {
+    const selected = Math.max(0, Math.min(
+      WORKSPACE_MODES.length - 1,
+      Number(runtime.workspaceModeSelection) || 0,
+    ));
     lines = [
       runtime.runId ? "? Use this mode after /new?" : "? Use this collaboration mode?",
-      "↑/↓ select · Enter apply · Esc keep current",
+      runtime.runId
+        ? "The active Run keeps its current team. The selected mode applies after /new."
+        : "Choose how OriginRouter should form the Agent team for the next objective.",
+      ...WORKSPACE_MODES.map((option, index) => `${index === selected ? "›" : " "} ${option.label}`),
+      WORKSPACE_MODES[selected]?.description || "",
     ];
   } else if (kind === "session_resume") {
     lines = [
@@ -1779,20 +1838,40 @@ function interactionComposer(runtime, columns, { focusedInteraction = false } = 
     lines = [
       "? Resume this collaboration?",
       runtime.snapshot?.run?.pause_reason || "The Run is preserved and can continue from its current state.",
-      "Enter resume · Esc leave it paused",
     ];
   } else if (kind === "reconnect") {
     lines = [
       "? Reconnect to this Run?",
       "OriginRouter service still owns this Run and its Agent bindings.",
       "No new Run will be created.",
-      "Enter reconnect · D detach · Ctrl+C interrupt Run",
     ];
   } else {
-    lines = ["? OriginRouter needs your input", "Enter confirm · Esc cancel"];
+    lines = ["? OriginRouter needs your input"];
+  }
+  const visibleLines = lines.filter(Boolean);
+  // The action dock may be the whole available screen on a short terminal.
+  // Keep the currently selected option visible and never emit more rows than
+  // the alternate-screen frame owns; otherwise an ANSI autowrap/scroll would
+  // leak rows beyond the viewport.
+  if (visibleLines.length > maxRows) {
+    const selectedIndex = visibleLines.findIndex((line) => /^›\s/.test(line));
+    if (selectedIndex >= 0 && maxRows > 1) {
+      const optionRows = Math.max(1, maxRows - 1);
+      const start = Math.max(1, Math.min(
+        Math.max(1, visibleLines.length - optionRows),
+        selectedIndex - Math.floor(optionRows / 2),
+      ));
+      lines = [visibleLines[0], ...visibleLines.slice(start, start + optionRows)];
+    } else {
+      lines = visibleLines.slice(0, maxRows);
+    }
+  } else {
+    lines = visibleLines;
   }
   const width = Math.max(1, columns - 1);
-  return lines.map((line) => padDisplayRight(strong(fitDisplayText(line, width)), columns)).join("\n");
+  return lines
+    .map((line) => padDisplayRight(strong(fitDisplayText(line, width)), columns))
+    .join("\n");
 }
 
 function interactionStatus(runtime, columns) {
@@ -1837,6 +1916,13 @@ function runtimeHeaderPanel(runtime) {
   };
 }
 
+function compactTerminalScreen(columns, rows) {
+  const width = Math.max(1, Number(columns) || 1);
+  const height = Math.max(1, Number(rows) || 1);
+  const message = fitDisplayText("OriginRouter · terminal too small — resize to at least 20×8", width);
+  return [padDisplayRight(muted(message), width), ...Array(Math.max(0, height - 1)).fill("")].join("\n");
+}
+
 export function buildWorkspaceAppScreen({
   coordinator = "codex",
   mode = "auto",
@@ -1852,8 +1938,15 @@ export function buildWorkspaceAppScreen({
   commandSuggestionSelection = 0,
   sessionApproval = null,
 } = {}) {
-  const terminalColumns = Math.max(20, Number(columns) || 80);
-  const terminalRows = Math.max(8, Number(rows) || 24);
+  const terminalColumns = Math.max(1, Number(columns) || 80);
+  const terminalRows = Math.max(1, Number(rows) || 24);
+  // Never fabricate a wider or taller viewport than the terminal owns. At
+  // very small sizes the normal frame cannot remain usable, so render a
+  // bounded resize notice instead of letting its padded rows autowrap and
+  // scroll the alternate screen.
+  if (terminalColumns < 20 || terminalRows < 8) {
+    return compactTerminalScreen(terminalColumns, terminalRows);
+  }
   const frameWidth = Math.max(18, Math.min(terminalColumns - 2, 94));
   const contentWidth = frameWidth - 4;
   const modeLabel = workspaceModeDefinition(mode).label;
@@ -1914,7 +2007,8 @@ export function buildWorkspaceAppScreen({
         commandSuggestionsBlock,
       ].filter(Boolean).join("\n")
     : "";
-  const focusedInteraction = interactionUsesFocusedSurface(runtime, terminalColumns, terminalRows);
+  const interactionSurface = workspaceInteractionSurface(runtime, terminalColumns, terminalRows);
+  const focusedInteraction = interactionSurface === INTERACTION_SURFACES.FOCUSED;
   const runtimeCommandSuggestionsBlock = runtime && !runtime.interaction
     ? workspaceCommandSuggestionsBlock(
       commandSuggestionsForInput(
@@ -1928,7 +2022,10 @@ export function buildWorkspaceAppScreen({
     : "";
   const runtimeComposerBlock = runtime
     ? runtime.interaction
-      ? interactionComposer(runtime, terminalColumns, { focusedInteraction })
+      ? interactionComposer(runtime, terminalColumns, {
+        surface: interactionSurface,
+        maxRows: Math.max(1, terminalRows - 4),
+      })
       : [runtimeComposer(runtime, terminalColumns), runtimeCommandSuggestionsBlock]
         .filter(Boolean)
         .join("\n")
@@ -1949,7 +2046,9 @@ export function buildWorkspaceAppScreen({
   const screenRows = runtime ? contentRows : headerRows;
   const separator = border("─".repeat(terminalColumns));
   const blankRows = Math.max(0, terminalRows - screenRows.length - reservedRows);
-  const body = `${screenRows.join("\n")}\n${"\n".repeat(blankRows)}`;
+  const body = screenRows.length
+    ? `${screenRows.join("\n")}\n${"\n".repeat(blankRows)}`
+    : "";
   if (!runtime && composerBuffer === null) {
     return `${body}${composerStatus(terminalColumns, { sessionApprovalOverride: sessionApproval })}\n${separator}\n`;
   }
@@ -2529,16 +2628,19 @@ async function readRuntimeDecision({
   input.resume();
   runtime.interaction = true;
   runtime.interactionKind = kind;
+  delete runtime.interactionSurface;
   const previousViewport = {
     scrollOffset: Number(runtime.scrollOffset || 0),
     autoFollow: runtime.autoFollow !== false,
     unseenActivityCount: Number(runtime.unseenActivityCount || 0),
   };
-  const focusedViewport = interactionUsesFocusedSurface(
+  const interactionSurface = workspaceInteractionSurface(
     runtime,
     runtime.terminalColumns || 80,
     runtime.terminalRows || 24,
   );
+  runtime.interactionSurface = interactionSurface;
+  const focusedViewport = interactionSurface === INTERACTION_SURFACES.FOCUSED;
   if (focusedViewport) {
     runtime.scrollOffset = 0;
     runtime.autoFollow = true;
@@ -2602,6 +2704,7 @@ async function readRuntimeDecision({
       input.off("error", onError);
       runtime.interaction = false;
       runtime.interactionKind = "";
+      delete runtime.interactionSurface;
       if (focusedViewport) {
         runtime.scrollOffset = previousViewport.scrollOffset;
         runtime.autoFollow = previousViewport.autoFollow;
@@ -2646,7 +2749,7 @@ async function readRuntimeDecision({
         return;
       }
       const scrollDirection = reviewScrollDirection(text, key, {
-        arrows: ["configuration", "plan", "completion", "paused", "reconnect"].includes(kind),
+        arrows: ["plan", "completion", "paused", "reconnect"].includes(kind),
       });
       if (scrollDirection) {
         scrollRuntimeContent(runtime, scrollDirection);
@@ -2992,6 +3095,19 @@ async function readRuntimeDecision({
         if (["failed", "cancelled", "expired"].includes(runtime.snapshot?.run?.state)) {
           finish("retry");
         }
+        return;
+      }
+      if (kind === "configuration" && ["up", "down"].includes(key.name)) {
+        const participants = runtime.configuration?.participants || [];
+        if (!participants.length) return;
+        const direction = key.name === "up" ? -1 : 1;
+        const current = Math.max(0, Math.min(
+          participants.length - 1,
+          Number(runtime.teamEditSelection) || 0,
+        ));
+        runtime.teamEditSelection = (current + direction + participants.length) % participants.length;
+        runtime.notice = "";
+        render(true);
         return;
       }
       if (["team_edit", "team_runtime", "team_route", "team_permission", "team_session_permission", "live_session_permission", "live_workspace_mode", "session_resume"].includes(kind)) {
@@ -3576,6 +3692,7 @@ async function runWorkspaceObjective({
     commandSuggestionsDismissed: false,
     sessionPermissionOptions: [],
     approvalUpdatePending: false,
+    completedExitArmed: false,
   };
   const render = (force = false) => {
     runtime.commandCompletionContext = workspaceCommandCompletionContext({
@@ -3637,6 +3754,21 @@ async function runWorkspaceObjective({
   input.setRawMode(true);
   input.resume();
   let noticeTimer = null;
+  let completedExitTimer = null;
+  const clearCompletedExitArm = () => {
+    runtime.completedExitArmed = false;
+    if (completedExitTimer) clearTimeout(completedExitTimer);
+    completedExitTimer = null;
+  };
+  const armCompletedExit = () => {
+    clearCompletedExitArm();
+    runtime.completedExitArmed = true;
+    completedExitTimer = setTimeout(() => {
+      runtime.completedExitArmed = false;
+      completedExitTimer = null;
+    }, 800);
+    completedExitTimer.unref?.();
+  };
   const showNotice = (notice, duration = 1600) => {
     runtime.notice = notice;
     if (noticeTimer) clearTimeout(noticeTimer);
@@ -3732,6 +3864,7 @@ async function runWorkspaceObjective({
   };
   const onActiveKeypress = (text, key = {}) => {
     if (runtime.interaction) return;
+    if (runtime.completedExitArmed && !(key.ctrl && key.name === "c")) clearCompletedExitArm();
     const mouse = consumeWorkspaceMouseKeypress(runtime, text, key);
     if (mouse.handled) {
       if (mouse.direction) {
@@ -3754,8 +3887,11 @@ async function runWorkspaceObjective({
       render(true);
       return;
     }
-    if (["up", "down"].includes(key.name) && moveActivitySelection(runtime, key.name === "up" ? -1 : 1)) {
-      runtime.notice = "";
+    // The composer owns the arrows only while a slash-command menu is open.
+    // With an empty input, match coding-agent TUI behaviour: arrows browse
+    // the transcript, while PgUp/PgDn remain the faster page controls.
+    if (!runtime.composerBuffer && ["up", "down"].includes(key.name)) {
+      scrollRuntimeContent(runtime, key.name === "up" ? -1 : 1, 1);
       render(true);
       return;
     }
@@ -3804,6 +3940,7 @@ async function runWorkspaceObjective({
     }
     if (key.ctrl && key.name === "c") {
       if (runtime.composerBuffer) {
+        clearCompletedExitArm();
         runtime.composerBuffer = "";
         runtime.composerCursor = 0;
         runtime.composerPastes = [];
@@ -3812,7 +3949,14 @@ async function runWorkspaceObjective({
         return;
       }
       if (runtime.snapshot?.run?.state === "completed") {
-        showNotice("Result preserved · type a follow-up, /new, or /exit");
+        if (runtime.completedExitArmed) {
+          clearCompletedExitArm();
+          runtime.exitRequested = true;
+          completedInputResolve?.("exit");
+          return;
+        }
+        armCompletedExit();
+        showNotice("Press Ctrl+C again to exit", 800);
         return;
       }
       onActiveInterrupt();
@@ -4423,6 +4567,7 @@ async function runWorkspaceObjective({
     process.removeListener("SIGINT", onActiveInterrupt);
     input.off("keypress", onActiveKeypress);
     if (noticeTimer) clearTimeout(noticeTimer);
+    clearCompletedExitArm();
     input.setRawMode(false);
     input.pause();
     output.off?.("resize", onResize);

@@ -944,7 +944,12 @@ async function dispatch(ctx, req, res) {
     if (collaborationArchiveMatch && req.method === "POST") {
       const runId = decodeURIComponent(collaborationArchiveMatch[1]);
       try {
-        return sendOk(res, { run: ctx.collaborationStore.archiveRun(runId, true) });
+        return sendOk(
+          res,
+          ctx.collaborationRuntime
+            ? await ctx.collaborationRuntime.handleControlOperation("archive", { run_id: runId })
+            : { run: ctx.collaborationStore.archiveRun(runId, true) },
+        );
       } catch (error) {
         return sendError(res, 409, error.message || "collaboration run could not be archived");
       }
@@ -971,9 +976,11 @@ async function dispatch(ctx, req, res) {
       }
       if (req.method === "DELETE" && !action) {
         try {
-          const deleted = ctx.collaborationStore.deleteRun(runId);
-          return deleted
-            ? sendOk(res, { deleted: true, run_id: runId })
+          const result = ctx.collaborationRuntime
+            ? await ctx.collaborationRuntime.handleControlOperation("delete", { run_id: runId })
+            : { deleted: ctx.collaborationStore.deleteRun(runId), run_id: runId };
+          return result.deleted
+            ? sendOk(res, result)
             : sendError(res, 404, "collaboration run not found");
         } catch (error) {
           return sendError(res, 409, error.message || "collaboration run could not be deleted");

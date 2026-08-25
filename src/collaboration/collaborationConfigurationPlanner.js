@@ -91,8 +91,10 @@ export class CollaborationConfigurationPlanner {
     const proposal = session.state === "proposal_ready"
       ? await this.validateServerProposal(session, session.server_proposal)
       : session.proposal;
+    const continuation = await this.validateContinuation(session);
     const run = this.coordinator.create(normalizeCollaborationCreateRequest({
       ...proposal,
+      ...continuation,
       workspace_mode: "auto",
       planning_source: session.state === "fallback_ready" ? "local_fallback" : "server_model",
       coordinator_runtime: session.coordinator_runtime,
@@ -130,6 +132,80 @@ export class CollaborationConfigurationPlanner {
       preferred_runtime: text(input.coordinator_runtime || input.coordinatorRuntime, 16),
       independent_review: input.independent_review === true,
       prefer_remote_ops: input.prefer_remote_ops === true,
+      // Kept locally with the configuration session. The server's allowlist
+      // intentionally drops these identifiers; they only tell the target CLI
+      // that acceptance is a continuation and which Session it must recheck.
+      workspace_session_id: text(input.workspace_session_id || input.workspaceSessionId, 195),
+      continued_from_run_id: text(input.continued_from_run_id || input.continuedFromRunId, 195),
+      session_continuation: input.session_continuation === true || input.sessionContinuation === true,
+    };
+  }
+
+  async validateContinuation(session) {
+    const request = session.request || {};
+    const workspaceSessionId = text(request.workspace_session_id, 195);
+    const continuedFromRunId = text(request.continued_from_run_id, 195);
+    const continuation = request.session_continuation === true;
+    if (!continuation) return {};
+    if (!workspaceSessionId || !continuedFromRunId) {
+      throw configurationError(
+        "CONFIGURATION_CONTINUATION_INVALID",
+        "A continued collaboration must identify its Workspace Session and previous Run.",
+      );
+    }
+    const workspaceSession = this.store.getWorkspaceSession(workspaceSessionId);
+    if (!workspaceSession?.team) {
+      throw configurationError(
+        "CONFIGURATION_WORKSPACE_SESSION_NOT_FOUND",
+        "The Workspace Session to continue is no longer available on this CLI.",
+      );
+    }
+    if (workspaceSession.latest_run_id !== continuedFromRunId) {
+      throw configurationError(
+        "CONFIGURATION_CONTINUATION_NOT_LATEST",
+        "Only the latest Run in a Workspace Session can be continued.",
+      );
+    }
+    const team = workspaceSession.team;
+    const teamPlannerId = (team.participants || []).find(
+      (participant) => participant.planner === true,
+    )?.participant_id;
+    const participants = (team.participants || []).map((participant) => ({
+      participant_id: participant.participant_id,
+      display_name: participant.display_name || participant.participant_id,
+      runtime: participant.runtime,
+      device_id: participant.device_id,
+      workspace_id: participant.workspace_id || "",
+      role_hint: participant.role_hint || "Existing Session participant",
+      permission_profile: participant.permission_profile || "",
+      provider: participant.provider || null,
+      model: participant.model || null,
+    }));
+    const planner = participants.find((participant) => participant.participant_id === teamPlannerId)
+      || participants[0];
+    // Reuse the same live capability and least-privilege validator used for a
+    // new model proposal. A durable Session identity never authorizes stale
+    // workspaces, runtimes, models, or permission profiles.
+    validateAndNormalizeAutoConfiguration({
+      participants,
+      planner: planner?.participant_id || "",
+      workflow_template_id: team.workflow_template_id || "adaptive",
+      collaboration_preferences: team.preferences || "",
+      max_concurrency: Number(team.budget?.max_concurrency) || 1,
+      independent_review: false,
+      budget: {
+        token_limit: team.budget?.token_limit ?? null,
+        amount_limit_micros: team.budget?.amount_limit_micros ?? null,
+        currency: team.budget?.currency ?? null,
+      },
+    }, {
+      objective: session.objective,
+      devices: await this.liveDevices(session),
+    });
+    return {
+      workspace_session_id: workspaceSessionId,
+      continued_from_run_id: continuedFromRunId,
+      session_continuation: true,
     };
   }
 
@@ -214,8 +290,11 @@ export class CollaborationConfigurationPlanner {
     if (!ALLOWED_TOOLS.has(name)) throw configurationError("CONFIGURATION_TOOL_NOT_ALLOWED", "The server requested a disallowed configuration tool.");
     const device = (session.capability_snapshot?.devices || []).find((item) => item.device_id === deviceId);
     if (!device) throw configurationError("CONFIGURATION_TOOL_DEVICE_UNKNOWN", "The server requested an unknown device.");
-    if (name === "get_device_capabilities") return { name, device_id: deviceId, result: device };
-    if (name === "get_budget_status") return { name, device_id: deviceId, result: device.budget_policy || null };
+    // Preserve the request identity exactly. The server currently treats the
+    // optional workspace ID as part of that identity, even for device- and
+    // budget-level probes where the CLI does not otherwise need it.
+    if (name === "get_device_capabilities") return { name, device_id: deviceId, workspace_id: workspaceId, result: device };
+    if (name === "get_budget_status") return { name, device_id: deviceId, workspace_id: workspaceId, result: device.budget_policy || null };
     const workspace = (device.trusted_workspaces || []).find((item) => item.workspace_id === workspaceId);
     if (!workspace) throw configurationError("CONFIGURATION_TOOL_WORKSPACE_UNKNOWN", "The server requested an unknown workspace.");
     return { name, device_id: deviceId, workspace_id: workspaceId, result: workspace };

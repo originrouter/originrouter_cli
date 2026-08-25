@@ -212,6 +212,73 @@ try {
     replanPayload.run.plan_revision_feedback,
     "Add an independent verification step.",
   );
+
+  // HTTP control routes must never bypass the Runtime. The Runtime owns
+  // best-effort relay projection removal after archive/delete; calling the
+  // Store directly here would leave an old App projection able to reappear.
+  const controlCalls = [];
+  const runtimeControl = {
+    async handleControlOperation(operation, input) {
+      controlCalls.push({ operation, runId: input.run_id });
+      if (operation === "archive") {
+        return { run: store.archiveRun(input.run_id, true) };
+      }
+      if (operation === "delete") {
+        return { deleted: store.deleteRun(input.run_id), run_id: input.run_id };
+      }
+      throw new Error(`unexpected control operation: ${operation}`);
+    },
+  };
+  const controlArchiveRun = coordinator.create({
+    objective: "Archive through the Runtime control path.",
+    participants: [{
+      participant_id: "planner",
+      runtime: "codex",
+      device_id: "local",
+      workspace_id: "/project",
+      planner: true,
+    }],
+  });
+  const controlDeleteRun = coordinator.create({
+    objective: "Delete through the Runtime control path.",
+    participants: [{
+      participant_id: "planner",
+      runtime: "codex",
+      device_id: "local",
+      workspace_id: "/project",
+      planner: true,
+    }],
+  });
+  coordinator.cancel(controlArchiveRun.run_id);
+  coordinator.cancel(controlDeleteRun.run_id);
+  const controlHandle = await startLocalApi({
+    collaborationStore: store,
+    collaborationCoordinator: coordinator,
+    collaborationRuntime: runtimeControl,
+    sessionManager: { sessions: new Map() },
+  }, { port: 0 });
+  const controlBase = `http://127.0.0.1:${controlHandle.port}`;
+  try {
+    const archiveResponse = await fetch(
+      `${controlBase}/collaboration/local/runs/${encodeURIComponent(controlArchiveRun.run_id)}/archive`,
+      { method: "POST", headers },
+    );
+    assert.equal(archiveResponse.status, 200);
+    assert.equal(store.getRun(controlArchiveRun.run_id).archived_at != null, true);
+
+    const deleteResponse = await fetch(
+      `${controlBase}/collaboration/local/runs/${encodeURIComponent(controlDeleteRun.run_id)}`,
+      { method: "DELETE", headers },
+    );
+    assert.equal(deleteResponse.status, 200);
+    assert.equal(store.getRun(controlDeleteRun.run_id), null);
+    assert.deepEqual(controlCalls, [
+      { operation: "archive", runId: controlArchiveRun.run_id },
+      { operation: "delete", runId: controlDeleteRun.run_id },
+    ]);
+  } finally {
+    await controlHandle.close();
+  }
 } finally {
   await handle.close();
   store.close();

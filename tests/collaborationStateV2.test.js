@@ -6,6 +6,26 @@ import { join } from "node:path";
 import { CollaborationStore } from "../src/collaboration/collaborationStore.js";
 import { PlanImplementVerifyCoordinator } from "../src/collaboration/planImplementVerifyCoordinator.js";
 
+const staleStateDir = mkdtempSync(join(tmpdir(), "originrouter-collaboration-expiry-"));
+let staleNow = new Date("2026-08-01T00:00:00.000Z");
+const staleStore = new CollaborationStore({ stateDir: staleStateDir, now: () => staleNow });
+const staleCoordinator = new PlanImplementVerifyCoordinator({ store: staleStore });
+const staleRun = staleCoordinator.create({
+  objective: "Create an old plan that must not remain actionable.",
+  agents: {
+    lead: { runtime: "codex", device_id: "local", responsibilities: ["plan"] },
+    worker: { runtime: "codex", device_id: "local", responsibilities: ["work"] },
+  },
+});
+staleStore.transition(staleRun.run_id, "awaiting_plan_confirmation", {
+  taskState: "ready",
+  taskPhase: "plan_review",
+});
+staleNow = new Date("2026-08-02T00:00:01.000Z");
+assert.deepEqual(staleStore.expireUnconfirmedPlans(), [staleRun.run_id]);
+assert.equal(staleStore.getRun(staleRun.run_id).state, "expired");
+staleStore.close();
+
 const stateDir = mkdtempSync(join(tmpdir(), "originrouter-collaboration-v2-"));
 const store = new CollaborationStore({ stateDir });
 const coordinator = new PlanImplementVerifyCoordinator({ store });
@@ -191,6 +211,31 @@ const resolvedAgain = store.resolveAttention(created.run_id, attention.attention
   resolution: "approve_once",
 });
 assert.equal(resolvedAgain.duplicate, true);
+
+const terminalAttentionRun = coordinator.create({
+  objective: "Cancel a Run with an outstanding approval.",
+  participants: [{
+    participant_id: "planner",
+    runtime: "codex",
+    device_id: "local",
+    workspace_id: "/project",
+    planner: true,
+  }],
+});
+store.createAttention(terminalAttentionRun.run_id, {
+  kind: "approval",
+  title: "A request that must not survive cancellation",
+  actions: ["approve_once", "deny"],
+  idempotencyKey: "approval:terminal-run",
+});
+coordinator.cancel(terminalAttentionRun.run_id);
+const terminalSnapshot = store.getSnapshot(terminalAttentionRun.run_id);
+assert.equal(terminalSnapshot.run.state, "cancelled");
+assert.equal(terminalSnapshot.attention.length, 0);
+assert.ok(store.listRunPage({ category: "recent" }).runs
+  .some((run) => run.run_id === terminalAttentionRun.run_id));
+assert.ok(!store.listRunPage({ category: "attention" }).runs
+  .some((run) => run.run_id === terminalAttentionRun.run_id));
 
 const recoveryRun = coordinator.create({
   objective: "Exercise pause, resume, and task retry semantics.",

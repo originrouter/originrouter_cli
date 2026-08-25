@@ -84,7 +84,11 @@ export class PlanImplementVerifyCoordinator {
 
   cancel(runId) {
     const run = this.store.getRun(runId, { includeMessages: false });
-    if (!run) throw new Error("collaboration run not found");
+    if (!run) {
+      const error = new Error("The collaboration Run no longer exists on this CLI.");
+      error.code = "COLLABORATION_RUN_NOT_FOUND";
+      throw error;
+    }
     if (["completed", "failed", "cancelled", "expired"].includes(run.state)) return this.store.getRun(runId);
     return this.store.transition(runId, "cancelled", { taskState: "cancelled" });
   }
