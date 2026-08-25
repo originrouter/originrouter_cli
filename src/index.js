@@ -70,7 +70,10 @@ import { formatCliError, reportCliError } from "./runtime/cliErrors.js";
 import { runDoctor, printDoctorResults } from "./commands/doctor.js";
 import { handleServiceCommand } from "./commands/service.js";
 import { handleAuthCommand, handleLogin, handleLogout } from "./commands/auth.js";
-import { handleAgentRouteSetup } from "./commands/agentRouteSetup.js";
+import {
+  handleAgentRouteSetup,
+  initializeDefaultCloudRoutes,
+} from "./commands/agentRouteSetup.js";
 import { handleSecurityCommand } from "./commands/security.js";
 import { handleCollaborationCommand } from "./commands/collaboration.js";
 import { handleAgentWorkspaceCommand } from "./commands/agentWorkspace.js";
@@ -294,7 +297,6 @@ OriginRouter OAuth login:
   originrouter login [status] [--surety-url <url>] [--login-url <url>]
                      [--device-name <name>]
                      [--no-browser]
-                     [--configure-agents|--keep-agent-routes|--no-agent-setup]
   originrouter logout [--remove-device]
   originrouter auth status|verify
   originrouter security status|rotate
@@ -311,9 +313,6 @@ OriginRouter OAuth login:
   --surety-url     Surety OAuth base URL. Defaults to SURETY_BASE_URL
                    or https://surety.easytransnote.com.
   --login-url      Browser authorization page base URL.
-  --configure-agents  Apply OriginRouter Cloud recommended Claude/Codex models after login.
-  --keep-agent-routes Keep Agent routes unchanged, including private Provider routes.
-  --no-agent-setup    Alias for --keep-agent-routes; useful in scripts and CI.
 
   The CLI stores one rotating Refresh Token and separate short-lived
   Access Tokens for Control, AI, Coding, and Relay. The installation
@@ -2270,6 +2269,11 @@ export async function main(argv) {
     printCompletion(args[0]);
     return;
   }
+
+  // Seed bundled Cloud defaults once for a fresh CLI state. It is a strict
+  // no-op once config.json exists, so later logins and upgrades never revisit
+  // a person's route choices.
+  initializeDefaultCloudRoutes({ stateDir: ensureStateDir() });
 
   if (command === "status") {
     const stateDir = ensureStateDir();

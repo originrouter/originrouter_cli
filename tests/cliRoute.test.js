@@ -56,10 +56,11 @@ try {
     "--base-url", "https://api.minimax.example/v1",
     "--api-key", "sk-mm", "--model", "MiniMax-M3"], { env });
 
-  // ---- 2. route list with no routes yet ----
+  // ---- 2. fresh CLI state has bundled Cloud routes ----
   {
     const r = await runCli(["route", "list"], { env });
-    assert.match(r.stdout, /no routes configured/);
+    assert.match(r.stdout, /originrouter-cloud \/ claude-sonnet-5/);
+    assert.match(r.stdout, /originrouter-cloud \/ gpt-5.6-sol/);
   }
 
   // ---- 3. atomic Claude profile set ----
@@ -196,7 +197,9 @@ try {
     const r = await runCli(["provider", "remove", "moonshot"], { env });
     assert.match(r.stdout, /cleared routes\.claude\.main/);
     const cfg = readConfig(home);
-    assert.equal(cfg.routes, undefined);
+    assert.deepEqual(cfg.routes, {
+      codex: { main: { provider: "originrouter-cloud", model: "gpt-5.6-sol" } },
+    });
     assert.equal(cfg.providers.moonshot, undefined);
   }
   {
@@ -207,7 +210,9 @@ try {
     const r = await runCli(["provider", "remove", "deepseek"], { env });
     assert.match(r.stdout, /cleared routes\.claude\.main/);
     const cfg = readConfig(home);
-    assert.equal(cfg.routes, undefined, "all route slots cleared → routes object removed");
+    assert.deepEqual(cfg.routes, {
+      codex: { main: { provider: "originrouter-cloud", model: "gpt-5.6-sol" } },
+    }, "the bundled Codex route remains after the Claude profile is cleared");
     assert.equal(cfg.providers.deepseek, undefined);
   }
 } finally {
@@ -247,7 +252,7 @@ try {
     assert.match(r.stdout, /gpt-5-codex/);
   }
 
-  // route list shows both Claude (none) and Codex groups.
+  // route list shows bundled Claude routes and the overridden Codex route.
   {
     const r = await runCli(["route", "list"], { env });
     assert.equal(r.code, 0);
@@ -282,7 +287,12 @@ try {
     assert.equal(r.code, 0);
     assert.match(r.stdout, /Cleared route codex\.main/);
     const cfg = readConfig(home);
-    assert.equal(cfg.routes, undefined);
+    assert.deepEqual(cfg.routes, {
+      claude: {
+        main: { provider: "originrouter-cloud", model: "claude-sonnet-5" },
+        small: { provider: "originrouter-cloud", model: "claude-haiku-4-5" },
+      },
+    });
   }
 
   // provider remove cleans routes.codex.main if it pointed at the removed provider.
@@ -292,7 +302,12 @@ try {
     const r = await runCli(["provider", "remove", "openai_codex"], { env });
     assert.match(r.stdout, /cleared routes\.codex\.main/);
     const cfg = readConfig(home);
-    assert.equal(cfg.routes, undefined);
+    assert.deepEqual(cfg.routes, {
+      claude: {
+        main: { provider: "originrouter-cloud", model: "claude-sonnet-5" },
+        small: { provider: "originrouter-cloud", model: "claude-haiku-4-5" },
+      },
+    });
     assert.equal(cfg.providers.openai_codex, undefined);
   }
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -75,6 +75,27 @@ test("login status is a read-only alias and never starts Agent route setup", asy
   }
 });
 
+test("the first operational CLI command writes bundled Cloud defaults once", async () => {
+  const home = mkdtempSync(join(tmpdir(), "originrouter-cli-default-routes-"));
+  try {
+    const first = await runCli(home, ["route", "list"]);
+    assert.equal(first.code, 0, first.stderr);
+    const seeded = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
+    assert.equal(seeded.routes.claude.main.model, "claude-sonnet-5");
+    assert.equal(seeded.routes.claude.small.model, "claude-haiku-4-5");
+    assert.equal(seeded.routes.codex.main.model, "gpt-5.6-sol");
+
+    seeded.routes.codex.main.model = "user-selected-model";
+    writeFileSync(join(home, "config.json"), JSON.stringify(seeded));
+    const second = await runCli(home, ["status"]);
+    assert.equal(second.code, 0, second.stderr);
+    const preserved = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
+    assert.equal(preserved.routes.codex.main.model, "user-selected-model");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("help exposes the current auth surface only", async () => {
   const home = mkdtempSync(join(tmpdir(), "originrouter-cli-help-"));
   try {
@@ -85,6 +106,8 @@ test("help exposes the current auth surface only", async () => {
     assert.match(result.stdout, /originrouter auth status/);
     assert.doesNotMatch(result.stdout, /auth rotate/);
     assert.doesNotMatch(result.stdout, /auth device list/);
+    assert.doesNotMatch(result.stdout, /configure-agents/);
+    assert.doesNotMatch(result.stdout, /keep-agent-routes/);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

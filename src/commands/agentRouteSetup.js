@@ -1,5 +1,7 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 
 import { addProvider, normalizeProviderForRead } from "../config/providers.js";
 import {
@@ -34,6 +36,15 @@ export const RECOMMENDED_CLOUD_MODELS = Object.freeze({
     "gpt-5.4",
     "gpt-5.4-2026-03-05",
   ]),
+});
+
+// Fresh installations use these exact route values. The ordered lists above
+// are still used only by an explicit `agent setup --cloud`, which can adapt
+// to models currently available to the signed-in account.
+export const DEFAULT_CLOUD_ROUTE_MODELS = Object.freeze({
+  claudeMain: RECOMMENDED_CLOUD_MODELS.claudeMain[0],
+  claudeSmall: RECOMMENDED_CLOUD_MODELS.claudeSmall[0],
+  codexMain: RECOMMENDED_CLOUD_MODELS.codexMain[0],
 });
 
 function firstAvailable(models, preferences, family, fallback = null) {
@@ -86,8 +97,7 @@ export function hasAnyAgentRoutes(config) {
   );
 }
 
-export function applyRecommendedCloudRoutes(config, models) {
-  const selected = recommendedCloudRouteModels(models);
+function applyCloudRoutes(config, selected) {
   const existingCloudNames = originrouterCloudProviderNames(config);
   const existingCloudName = [...existingCloudNames][0] || null;
   const providerName = existingCloudName || ORIGINROUTER_CLOUD_PROVIDER;
@@ -122,6 +132,32 @@ export function applyRecommendedCloudRoutes(config, models) {
     main: { provider: providerName, model: selected.codexMain.id },
   });
   return { config: next, providerName, selected };
+}
+
+export function applyRecommendedCloudRoutes(config, models) {
+  return applyCloudRoutes(config, recommendedCloudRouteModels(models));
+}
+
+export function applyDefaultCloudRoutes(config = {}) {
+  return applyCloudRoutes(config, {
+    claudeMain: { id: DEFAULT_CLOUD_ROUTE_MODELS.claudeMain },
+    claudeSmall: { id: DEFAULT_CLOUD_ROUTE_MODELS.claudeSmall },
+    codexMain: { id: DEFAULT_CLOUD_ROUTE_MODELS.codexMain },
+  });
+}
+
+// A missing config.json is the only first-install marker. Once it exists,
+// the person's routes are preserved across later logins and CLI upgrades.
+export function initializeDefaultCloudRoutes({
+  stateDir,
+  existsFn = existsSync,
+  writeConfigFn = writeConfig,
+} = {}) {
+  if (!stateDir) throw new Error("stateDir is required to initialize default Agent routes");
+  if (existsFn(join(stateDir, "config.json"))) return { status: "existing" };
+  const result = applyDefaultCloudRoutes();
+  writeConfigFn(result.config);
+  return { status: "initialized", ...result };
 }
 
 export function clearOriginrouterCloudRoutes(config) {
@@ -201,15 +237,7 @@ export async function maybeConfigureAgentRoutesAfterLogin({
   warnFn = console.warn,
   confirmFn = confirm,
 } = {}) {
-  const keepNative = args.includes("--keep-agent-routes") || args.includes("--no-agent-setup");
-  const force = args.includes("--configure-agents");
-  if (keepNative && force) {
-    throw new Error("Choose either --configure-agents or --keep-agent-routes, not both.");
-  }
-  if (keepNative) {
-    printFn("Agent routes unchanged. OriginRouter will not override the existing Claude Code or Codex environment.");
-    return { status: "kept" };
-  }
+  const force = args.includes("--cloud");
   const config = readConfigFn();
   const hasRoutes = hasAnyAgentRoutes(config);
   if (!force && (!inputStream.isTTY || !outputStream.isTTY)) {
@@ -287,7 +315,7 @@ export async function handleAgentRouteSetup(args = [], options = {}) {
   }
   return maybeConfigureAgentRoutesAfterLogin({
     ...options,
-    args: cloud ? ["--configure-agents"] : [],
+    args: cloud ? ["--cloud"] : [],
     stateDir: options.stateDir,
   });
 }

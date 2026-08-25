@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  applyDefaultCloudRoutes,
   applyRecommendedCloudRoutes,
   clearOriginrouterCloudRoutes,
   handleAgentRouteSetup,
+  initializeDefaultCloudRoutes,
   maybeConfigureAgentRoutesAfterLogin,
   recommendedCloudRouteModels,
   resetCloudRoutesOnLogout,
@@ -46,6 +48,37 @@ test("applying recommended Cloud setup atomically configures every Agent slot", 
       main: { provider: "originrouter-cloud", model: "gpt-5.6-sol" },
     },
   });
+});
+
+test("fresh CLI defaults are bundled exact Cloud route values", () => {
+  const result = applyDefaultCloudRoutes();
+  assert.deepEqual(result.config.routes, {
+    claude: {
+      main: { provider: "originrouter-cloud", model: "claude-sonnet-5" },
+      small: { provider: "originrouter-cloud", model: "claude-haiku-4-5" },
+    },
+    codex: {
+      main: { provider: "originrouter-cloud", model: "gpt-5.6-sol" },
+    },
+  });
+});
+
+test("default Cloud routes are seeded only while config.json is absent", () => {
+  let written = null;
+  const initial = initializeDefaultCloudRoutes({
+    stateDir: "/tmp/originrouter-fresh-state",
+    existsFn: () => false,
+    writeConfigFn: (config) => { written = config; },
+  });
+  assert.equal(initial.status, "initialized");
+  assert.equal(written.routes.codex.main.model, "gpt-5.6-sol");
+
+  const existing = initializeDefaultCloudRoutes({
+    stateDir: "/tmp/originrouter-existing-state",
+    existsFn: () => true,
+    writeConfigFn: () => { throw new Error("existing config must not be overwritten"); },
+  });
+  assert.deepEqual(existing, { status: "existing" });
 });
 
 test("logout removes only OriginRouter Cloud routes and preserves private Providers", () => {
