@@ -70,7 +70,7 @@ try {
   assert.equal(modeCreateResponse.status, 200);
   const modeCreatePayload = await modeCreateResponse.json();
   assert.equal(modeCreatePayload.run.workspace_mode, "auto");
-  assert.equal(modeCreatePayload.run.resolved_workspace_mode, "plan_build_verify");
+  assert.equal(modeCreatePayload.run.resolved_workspace_mode, "auto");
   assert.equal(modeCreatePayload.run.coordinator_runtime, "claude");
   assert.equal(modeCreatePayload.run.planning_source, "cloud_advice");
   assert.equal(modeCreatePayload.run.risk_tier, "red");

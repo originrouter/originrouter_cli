@@ -2,16 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  autoConfigureCollaboration,
   publicCapabilitySnapshot,
   validateAndNormalizeAutoConfiguration,
 } from "../src/collaboration/collaborationAutoConfig.js";
 import { taskPrompt } from "../src/collaboration/adaptivePlan.js";
 import { workspaceCapabilityCounts } from "../src/collaboration/workspaceModes.js";
 import {
-  automaticCreatePayload,
   autoConfigurationView,
   browseCollaborationWorkspaces,
+  configureOnTargetCli,
   followExistingAgentWorkspaceCollaboration,
   MAX_COLLABORATION_RECONNECT_ATTEMPTS,
   retryAgentWorkspaceCollaboration,
@@ -151,21 +150,6 @@ test("workspace counts distinguish registered folders from unattended-ready fold
   });
 });
 
-test("clear objective produces an automatic configuration with zero questions", async () => {
-  let modelCalls = 0;
-  const result = await autoConfigureCollaboration({
-    objective: "Fix the tests",
-    devices: [device()],
-    modelFn: async () => {
-      modelCalls += 1;
-      return JSON.stringify(proposal());
-    },
-  });
-  assert.equal(modelCalls, 1);
-  assert.equal(result.participants[0].planner, true);
-  assert.equal(result.budget.max_concurrency, 1);
-});
-
 test("Claude and Codex can be combined with an independent reviewer", () => {
   const raw = proposal({
     participants: [
@@ -196,25 +180,6 @@ test("multiple matching workspaces cause one actionable ambiguity", () => {
     (error) => error.code === "AUTO_CONFIG_WORKSPACE_AMBIGUOUS"
       && error.ambiguity.workspaces.length === 2,
   );
-});
-
-test("deterministic fallback derives a local configuration when server planning is unavailable", async () => {
-  const workspaces = [
-    { workspace_id: "one", display_name: "One", canonical_path: "/one" },
-    { workspace_id: "two", display_name: "Two", canonical_path: "/two" },
-  ];
-  const local = capabilities({ workspaces });
-  const result = await automaticCreatePayload({
-    objective: "Fix tests",
-    requestFn: async () => ({ capabilities: local }),
-    loadDeviceDirectoryFn: async () => [],
-    cacheCapabilitiesFn: (value) => value,
-    getCachedCapabilitiesFn: () => null,
-    currentDirectory: "/not-a-trusted-workspace",
-  });
-  assert.equal(result.workspace_mode, "auto");
-  assert.equal(result.planning_source, "local");
-  assert.equal(result.participants.length, 2);
 });
 
 test("a fabricated device is rejected", () => {
@@ -264,69 +229,16 @@ test("offline trusted devices remain waiting instead of being reported online", 
   assert.equal(result.participants[0].waiting_for_device, true);
 });
 
-test("invalid JSON and unavailable fast models fail before Run creation", async () => {
-  await assert.rejects(
-    autoConfigureCollaboration({ objective: "Fix tests", devices: [device()], modelFn: async () => "not json" }),
-    (error) => error.code === "AUTO_CONFIG_INVALID_JSON",
-  );
-  await assert.rejects(
-    autoConfigureCollaboration({ objective: "Fix tests", devices: [device()], modelFn: async () => { throw Object.assign(new Error("offline"), { code: "AUTO_CONFIG_MODEL_UNAVAILABLE" }); } }),
-    (error) => error.code === "AUTO_CONFIG_MODEL_UNAVAILABLE",
-  );
-});
-
-test("automatic payload collection supports a mixed team without interactive prompts", async () => {
-  const local = capabilities();
-  const payload = await automaticCreatePayload({
-    objective: "Implement with an independent review",
-    requestFn: async (path) => {
-      assert.equal(path, "/collaboration/local/capabilities");
-      return { capabilities: local };
-    },
-    loadDeviceDirectoryFn: async () => [],
-    cacheCapabilitiesFn: (value) => value,
-    getCachedCapabilitiesFn: () => null,
-    modelFn: async () => JSON.stringify(proposal({
-      participants: [
-        { ...proposal().participants[0], runtime: "claude", role_hint: "Implement." },
-        { ...proposal().participants[0], participant_id: "reviewer", display_name: "Reviewer", role_hint: "Review." },
-      ],
-      max_concurrency: 2,
-      independent_review: true,
-    })),
-  });
-  assert.equal(payload.participants.length, 2);
-  assert.equal(payload.budget.max_concurrency, 2);
-  assert.equal(payload._workspace_editor.devices[0].device_name, "This device");
-  assert.deepEqual(payload._workspace_editor.devices[0].runtimes, [{ id: "claude" }, { id: "codex" }]);
-  assert.equal(payload._workspace_editor.devices[0].resolved_routes.codex.model, "review-model");
-  assert.equal(JSON.stringify(payload).includes("_workspace_editor"), false, "editor metadata stays local to the CLI");
-});
-
-test("Auto never silently downgrades an explicit remote objective to Solo", async () => {
-  await assert.rejects(
-    automaticCreatePayload({
-      objective: "Inspect my remote computer status",
-      workspaceMode: "auto",
-      requestFn: async () => ({ capabilities: capabilities() }),
-      loadDeviceDirectoryFn: async () => [],
-      cacheCapabilitiesFn: (value) => value,
-      getCachedCapabilitiesFn: () => null,
-    }),
-    (error) => /trusted remote device/.test(error.message),
-  );
-});
-
 test("workspace lifecycle does not create a Run before an unsafe configuration is confirmed", async () => {
   const requests = [];
   const result = await runAgentWorkspaceCollaboration({
     objective: "Inspect the remote computer",
     confirmation: "safe",
-    automaticCreatePayloadFn: async () => ({
+    configurationPayloadFn: async () => ({
       objective: "Inspect the remote computer",
       workspace_mode: "auto",
       resolved_workspace_mode: "solo",
-      planning_source: "local_fallback",
+      planning_source: "manual",
       participants: [{ participant_id: "coordinator", device_id: "local" }],
       auto_configuration: { safe_to_skip_confirmation: true },
     }),
@@ -340,12 +252,97 @@ test("workspace lifecycle does not create a Run before an unsafe configuration i
   assert.equal(requests.length, 0);
 });
 
+test("workspace lifecycle uses the target CLI server session and carries planner questions through the terminal callback", async () => {
+  const paths = [];
+  let receivedAnswer = null;
+  const result = await runAgentWorkspaceCollaboration({
+    objective: "Inspect the remote Mac mini",
+    confirmation: "safe",
+    configureOnTargetCliFn: async ({ onQuestions, onState }) => {
+      const awaitingInput = {
+        configuration_id: "ccs_server",
+        state: "awaiting_input",
+        questions: [{ id: "scope", question: "Which status should be checked?", options: [] }],
+      };
+      onState(awaitingInput);
+      receivedAnswer = await onQuestions(awaitingInput);
+      return {
+        configuration_id: "ccs_server",
+        state: "proposal_ready",
+        proposal: {
+          objective: "Inspect the remote Mac mini",
+          workspace_mode: "auto",
+          resolved_workspace_mode: "remote_ops",
+          planning_source: "server_model",
+          participants: [{
+            participant_id: "coordinator",
+            display_name: "Coordinator",
+            runtime: "codex",
+            device_id: "local",
+            workspace_id: "workspace-main",
+            role_hint: "Coordinate the remote inspection.",
+            permission_profile: "guarded",
+            planner: true,
+          }],
+          budget: { max_concurrency: 1 },
+        },
+      };
+    },
+    onConfigurationQuestions: async () => ({ scope: ["system and CLI version"] }),
+    onConfigurationConfirmation: async () => "confirm",
+    requestFn: async (path) => {
+      paths.push(path);
+      if (path.endsWith("/cancel")) return { configuration: { state: "cancelled" } };
+      if (path === "/collaboration/local/runs") return { run: { run_id: "acr_server", state: "created" } };
+      if (path.endsWith("/start")) return { run: { run_id: "acr_server", state: "designing" } };
+      if (path.includes("/snapshot")) {
+        return { snapshot: { last_sequence: 0, run: { run_id: "acr_server", state: "completed" }, tasks: [] } };
+      }
+      if (path.includes("/events?")) return { events: [] };
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+
+  assert.deepEqual(receivedAnswer, { scope: ["system and CLI version"] });
+  assert.equal(paths[0], "/collaboration/local/configurations/ccs_server/cancel");
+  assert.equal(paths[1], "/collaboration/local/runs");
+  assert.equal(result.run.state, "completed");
+});
+
+test("terminal configuration treats create as a quick session acknowledgement and polls model work", async () => {
+  const paths = [];
+  const states = [];
+  const configuration = await configureOnTargetCli({
+    objective: "Inspect the remote Mac mini",
+    requestFn: async (path) => {
+      paths.push(path);
+      if (path === "/collaboration/local/configurations") {
+        return { configuration: { configuration_id: "ccs_async", state: "planning" } };
+      }
+      return {
+        configuration: {
+          configuration_id: "ccs_async",
+          state: "proposal_ready",
+          proposal: { planning_source: "server_model" },
+        },
+      };
+    },
+    onState: (state) => states.push(state.state),
+  });
+  assert.deepEqual(paths, [
+    "/collaboration/local/configurations",
+    "/collaboration/local/configurations/ccs_async",
+  ]);
+  assert.deepEqual(states, ["planning", "proposal_ready"]);
+  assert.equal(configuration.proposal.planning_source, "server_model");
+});
+
 test("workspace team edits are sent in the Run creation payload", async () => {
   let createdBody = null;
   const result = await runAgentWorkspaceCollaboration({
     objective: "Inspect the remote computer",
     confirmation: "safe",
-    automaticCreatePayloadFn: async () => ({
+    configurationPayloadFn: async () => ({
       objective: "Inspect the remote computer",
       workspace_mode: "auto",
       resolved_workspace_mode: "remote_ops",
@@ -395,7 +392,7 @@ test("workspace lifecycle streams a snapshot and completes without terminal logg
   const result = await runAgentWorkspaceCollaboration({
     objective: "Inspect the remote computer",
     confirmation: "always",
-    automaticCreatePayloadFn: async () => ({
+    configurationPayloadFn: async () => ({
       objective: "Inspect the remote computer",
       workspace_mode: "auto",
       resolved_workspace_mode: "remote_ops",
@@ -437,7 +434,7 @@ test("workspace lifecycle reconnects transient snapshot failures without recreat
     objective: "Inspect the remote computer",
     confirmation: "always",
     interval: 0,
-    automaticCreatePayloadFn: async () => ({
+    configurationPayloadFn: async () => ({
       objective: "Inspect the remote computer",
       workspace_mode: "auto",
       resolved_workspace_mode: "remote_ops",
@@ -574,7 +571,7 @@ test("workspace follow-up reuses the persisted Session Team and creates a direct
     continuedFromRunId: "acr_previous",
     confirmation: "safe",
     interval: 0,
-    automaticCreatePayloadFn: async () => {
+    configurationPayloadFn: async () => {
       automaticConfigurationCalls += 1;
       return {
         ...structuredClone(previousConfiguration),
@@ -647,7 +644,7 @@ test("a follow-up cannot change the Team through automatic reconfiguration", asy
     continuedFromRunId: "acr_previous",
     confirmation: "safe",
     interval: 0,
-    automaticCreatePayloadFn: async () => ({
+    configurationPayloadFn: async () => ({
       objective: "Inspect the newly selected server",
       participants: [{
         participant_id: "operator",
@@ -696,7 +693,7 @@ test("plan review can request changes and waits for the replacement plan", async
     objective: "Inspect the remote computer",
     confirmation: "never",
     interval: 0,
-    automaticCreatePayloadFn: async () => ({
+    configurationPayloadFn: async () => ({
       objective: "Inspect the remote computer",
       participants: [{ participant_id: "coordinator", device_id: "local" }],
       auto_configuration: { safe_to_skip_confirmation: false },
@@ -778,7 +775,7 @@ test("workspace lifecycle resolves an Agent attention request and continues", as
     objective: "Inspect the remote computer",
     confirmation: "always",
     interval: 0,
-    automaticCreatePayloadFn: async () => ({
+    configurationPayloadFn: async () => ({
       objective: "Inspect the remote computer",
       participants: [{ participant_id: "coordinator", device_id: "local" }],
       auto_configuration: { safe_to_skip_confirmation: true },
@@ -818,7 +815,7 @@ test("workspace lifecycle resumes a paused Run in place", async () => {
     objective: "Inspect the remote computer",
     confirmation: "always",
     interval: 0,
-    automaticCreatePayloadFn: async () => ({
+    configurationPayloadFn: async () => ({
       objective: "Inspect the remote computer",
       participants: [{ participant_id: "coordinator", device_id: "local" }],
       auto_configuration: { safe_to_skip_confirmation: true },
@@ -852,7 +849,7 @@ test("workspace lifecycle does not retry non-transient authorization errors", as
     runAgentWorkspaceCollaboration({
       objective: "Inspect the remote computer",
       confirmation: "always",
-      automaticCreatePayloadFn: async () => ({
+      configurationPayloadFn: async () => ({
         objective: "Inspect the remote computer",
         workspace_mode: "solo",
         resolved_workspace_mode: "solo",

@@ -1,6 +1,5 @@
 import {
   classifyWorkspaceRisk,
-  inferWorkspaceMode,
   normalizeCoordinator,
   normalizeWorkspaceMode,
   workspaceModeDefinition,
@@ -17,11 +16,7 @@ export function normalizeCollaborationCreateRequest(input = {}, {
   const suppliedResolvedMode = normalizeWorkspaceMode(
     input.resolved_workspace_mode || "auto",
   );
-  const resolvedMode = requestedMode === "auto"
-    ? (suppliedResolvedMode === "auto"
-      ? inferWorkspaceMode(input.objective)
-      : suppliedResolvedMode)
-    : requestedMode;
+  const resolvedMode = requestedMode === "auto" ? suppliedResolvedMode : requestedMode;
   const planner = Array.isArray(input.participants)
     ? input.participants.find((participant) => participant?.planner === true)
       || input.participants[0]
@@ -45,8 +40,7 @@ export function normalizeCollaborationCreateRequest(input = {}, {
     workspace_mode: requestedMode,
     resolved_workspace_mode: resolvedMode,
     coordinator_runtime: coordinatorRuntime,
-    planning_source: String(input.planning_source || "").trim()
-      || (requestedMode === "auto" ? "local" : "manual"),
+    planning_source: String(input.planning_source || "").trim() || "manual",
     risk_tier: riskTier,
     workflow_template_id:
       input.workflow_template_id || workspaceModeDefinition(resolvedMode).templateId,

@@ -20,7 +20,6 @@ import { readApiToken } from "../persistence/authToken.js";
 import { ensureStateDir, readDaemonState } from "../persistence/state.js";
 import { redactDisplayText, redactDisplayValue } from "../security/displayRedaction.js";
 import {
-  buildLocalWorkspaceConfiguration,
   normalizeCoordinator,
   normalizeWorkspaceMode,
   workspaceModeDefinition,
@@ -1227,111 +1226,6 @@ function positionalObjective(rest) {
   return beforeOption.join(" ").trim();
 }
 
-async function collectAutoConfigurationDevices({
-  requestFn = request,
-  loadDeviceDirectoryFn = (options) => loadCliDeviceDirectory(options),
-  cacheCapabilitiesFn = cacheCollaborationCapabilities,
-  getCachedCapabilitiesFn = getCachedCollaborationCapabilities,
-} = {}) {
-  const localCapabilities = (await requestFn("/collaboration/local/capabilities")).capabilities;
-  cacheCapabilitiesFn(localCapabilities);
-  const devices = await deviceDirectory(
-    localCapabilities,
-    loadDeviceDirectoryFn,
-    getCachedCapabilitiesFn,
-  );
-  for (const device of devices) {
-    if (device.unavailableReason || (device.trustStatus !== "trusted" && !device.local)) continue;
-    try {
-      device.capabilities = await capabilitiesForWizardDevice(
-        device,
-        requestFn,
-        cacheCapabilitiesFn,
-        getCachedCapabilitiesFn,
-      );
-    } catch {
-      // A device without a usable snapshot is omitted from the model's
-      // capability whitelist and can never pass deterministic validation.
-    }
-  }
-  return devices.filter((device) => device.capabilities || device.cachedCapabilities);
-}
-
-function attachWorkspaceEditorMetadata(payload, devices) {
-  const editor = {
-    devices: devices.map((device) => {
-      const capabilities = device.capabilities || device.cachedCapabilities || {};
-      return {
-        device_id: device.deviceId,
-        device_name: device.deviceName || device.deviceId,
-        local: device.local === true,
-        runtimes: (capabilities.runtimes || [])
-          .filter((runtime) => runtime?.available && ["codex", "claude"].includes(runtime.id))
-          .map((runtime) => ({ id: runtime.id })),
-        resolved_routes: Object.fromEntries(
-          ["codex", "claude"].map((runtime) => {
-            const route = capabilities.resolved_routes?.[runtime]?.main;
-            return [runtime, route?.provider && route?.model
-              ? { provider: route.provider, model: route.model }
-              : null];
-          }),
-        ),
-        providers: (capabilities.providers || []).map((provider) => ({
-          name: provider.name,
-          models: (provider.models || []).map((model) => ({ id: model.id })),
-        })).filter((provider) => provider.name && provider.models.length),
-        permission_profiles: (capabilities.permission_profiles || [])
-          .map((profile) => ({
-            id: profile.id,
-            label: profile.label || profile.id,
-            description: profile.description || "",
-          }))
-          .filter((profile) => ["manual", "guarded", "ai_review", "unrestricted", "custom"].includes(profile.id)),
-      };
-    }),
-  };
-  Object.defineProperty(payload, "_workspace_editor", {
-    value: editor,
-    enumerable: false,
-    configurable: true,
-  });
-  return payload;
-}
-
-export async function automaticCreatePayload({
-  objective,
-  workspaceMode = null,
-  coordinator = "codex",
-  currentDirectory = cwd(),
-  requestFn = request,
-  loadDeviceDirectoryFn = (options) => loadCliDeviceDirectory(options),
-  cacheCapabilitiesFn = cacheCollaborationCapabilities,
-  getCachedCapabilitiesFn = getCachedCollaborationCapabilities,
-  workspaceSelections = {},
-  deviceSelections = [],
-} = {}) {
-  const devices = await collectAutoConfigurationDevices({
-    requestFn,
-    loadDeviceDirectoryFn,
-    cacheCapabilitiesFn,
-    getCachedCapabilitiesFn,
-  });
-  if (!devices.length) {
-    throw Object.assign(new Error("No trusted device has a usable collaboration capability snapshot."), { code: "AUTO_CONFIG_CAPABILITIES_UNAVAILABLE" });
-  }
-  const requestedMode = workspaceMode || "auto";
-  const configured = buildLocalWorkspaceConfiguration({
-    objective,
-    mode: requestedMode,
-    coordinator,
-    devices,
-    currentDirectory,
-    workspaceSelections,
-    deviceSelections,
-  });
-  return attachWorkspaceEditorMetadata(configured, devices);
-}
-
 export function autoConfigurationView(payload) {
   return {
     objective: payload.objective,
@@ -1389,8 +1283,17 @@ function printAutoConfiguration(payload) {
 // Auto team design is deliberately executed by the selected daemon, not by
 // this command process. This keeps terminal, local App, and remote App flows
 // on the same model/session, capability, and safety-validation path.
-async function configureOnTargetCli({ objective, workspaceMode, coordinator, prompt, signal }) {
-  const started = await request("/collaboration/local/configurations", {
+export async function configureOnTargetCli({
+  objective,
+  workspaceMode,
+  coordinator,
+  prompt,
+  signal,
+  requestFn = request,
+  onQuestions = null,
+  onState = () => {},
+}) {
+  const started = await requestFn("/collaboration/local/configurations", {
     method: "POST",
     signal,
     body: {
@@ -1401,42 +1304,48 @@ async function configureOnTargetCli({ objective, workspaceMode, coordinator, pro
     },
   });
   let configuration = started.configuration;
+  onState(configuration);
   const deadline = Date.now() + 120_000;
-  while (configuration?.state === "planning") {
-    if (Date.now() >= deadline) {
-      throw Object.assign(new Error("The target CLI is still planning the collaboration. Try again after its model session is available."), { code: "CONFIGURATION_WAIT_TIMEOUT" });
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    throwIfAborted(signal);
-    configuration = (await request(
-      `/collaboration/local/configurations/${encodeURIComponent(configuration.configuration_id)}`,
-      { signal },
-    )).configuration;
-  }
-  while (configuration?.state === "awaiting_input") {
-    if (!prompt) {
-      throw Object.assign(new Error("The target CLI needs more business context. Re-run this command in an interactive terminal."), { code: "CONFIGURATION_INPUT_REQUIRED" });
-    }
-    const answers = {};
-    for (const question of configuration.questions || []) {
-      const options = (question.options || []).map((option) => `${option.id}: ${option.label}`).join(" · ");
-      const answer = await prompt.question(`${question.question}${options ? `\n  ${options}` : ""}\n> `);
-      if (String(answer || "").trim()) answers[question.id] = [String(answer).trim()];
-    }
-    configuration = (await request(
-      `/collaboration/local/configurations/${encodeURIComponent(configuration.configuration_id)}/answer`,
-      { method: "POST", body: { answers }, signal },
-    )).configuration;
+  const pollPlanning = async () => {
     while (configuration?.state === "planning") {
+      if (Date.now() >= deadline) {
+        throw Object.assign(new Error("The target CLI is still planning the collaboration. Try again after its model session is available."), { code: "CONFIGURATION_WAIT_TIMEOUT" });
+      }
       await new Promise((resolve) => setTimeout(resolve, 500));
       throwIfAborted(signal);
-      configuration = (await request(
+      configuration = (await requestFn(
         `/collaboration/local/configurations/${encodeURIComponent(configuration.configuration_id)}`,
         { signal },
       )).configuration;
+      onState(configuration);
     }
+  };
+  await pollPlanning();
+  while (configuration?.state === "awaiting_input") {
+    let answers = null;
+    if (typeof onQuestions === "function") {
+      answers = await onQuestions(configuration);
+    } else if (!prompt) {
+      throw Object.assign(new Error("The target CLI needs more business context. Re-run this command in an interactive terminal."), { code: "CONFIGURATION_INPUT_REQUIRED" });
+    } else {
+      answers = {};
+      for (const question of configuration.questions || []) {
+        const options = (question.options || []).map((option) => `${option.id}: ${option.label}`).join(" · ");
+        const answer = await prompt.question(`${question.question}${options ? `\n  ${options}` : ""}\n> `);
+        if (String(answer || "").trim()) answers[question.id] = [String(answer).trim()];
+      }
+    }
+    if (!answers || !Object.keys(answers).length) {
+      throw Object.assign(new Error("The collaboration configuration needs an answer before planning can continue."), { code: "CONFIGURATION_INPUT_REQUIRED" });
+    }
+    configuration = (await requestFn(
+      `/collaboration/local/configurations/${encodeURIComponent(configuration.configuration_id)}/answer`,
+      { method: "POST", body: { answers }, signal },
+    )).configuration;
+    onState(configuration);
+    await pollPlanning();
   }
-  if (!["proposal_ready", "fallback_ready"].includes(configuration?.state)) {
+  if (configuration?.state !== "proposal_ready") {
     throw Object.assign(new Error(configuration?.model_error || "The target CLI could not prepare a collaboration configuration."), { code: "CONFIGURATION_FAILED" });
   }
   return configuration;
@@ -2071,6 +1980,7 @@ export async function runAgentWorkspaceCollaboration({
   onUpdate = () => {},
   onRunId = () => {},
   onConfigurationConfirmation = async () => "leave",
+  onConfigurationQuestions = null,
   onPlanConfirmation = async () => "leave",
   onAttention = async () => "leave",
   onPaused = async () => "leave",
@@ -2079,7 +1989,8 @@ export async function runAgentWorkspaceCollaboration({
   // does not duplicate events.
   interval = 300,
   requestFn = request,
-  automaticCreatePayloadFn = automaticCreatePayload,
+  configurationPayloadFn = null,
+  configureOnTargetCliFn = configureOnTargetCli,
   presetConfiguration = null,
   continuedFromRunId = "",
   supervisorPermissionProfile = "",
@@ -2092,6 +2003,7 @@ export async function runAgentWorkspaceCollaboration({
   // The first Run establishes the Session Team. Later turns reuse that exact
   // versioned boundary and go straight to the primary Agent; team expansion
   // is a separate, explicit confirmation flow initiated through MCP.
+  let configurationSession = null;
   let payload = presetConfiguration
     ? {
         ...structuredClone(presetConfiguration),
@@ -2107,14 +2019,31 @@ export async function runAgentWorkspaceCollaboration({
           requires_explicit_confirmation: false,
         },
       }
-    : await automaticCreatePayloadFn({
+    : configurationPayloadFn
+      ? await configurationPayloadFn({
         objective,
         workspaceMode,
         coordinator,
         requestFn,
         workspaceSelections,
         deviceSelections,
-      });
+      })
+      : null;
+  if (!payload) {
+    configurationSession = await configureOnTargetCliFn({
+      objective,
+      workspaceMode,
+      coordinator,
+      signal,
+      requestFn,
+      onQuestions: onConfigurationQuestions,
+      onState: (configuration) => onUpdate({
+        type: "configuration_session",
+        configuration,
+      }),
+    });
+    payload = structuredClone(configurationSession.proposal);
+  }
   payload.supervisor_permission_profile = supervisorPermissionProfile
     || payload.supervisor_permission_profile
     || "guarded";
@@ -2128,7 +2057,7 @@ export async function runAgentWorkspaceCollaboration({
   throwIfAborted(signal);
   onUpdate({ type: "configuration", payload });
   const configurationSafe = payload.auto_configuration?.safe_to_skip_confirmation === true
-    && payload.planning_source !== "local_fallback";
+    && payload.planning_source === "server_model";
   const needsConfigurationReview = presetConfiguration
     ? false
     : confirmation === "never" || !configurationSafe;
@@ -2136,6 +2065,12 @@ export async function runAgentWorkspaceCollaboration({
     const decision = await onConfigurationConfirmation(payload);
     throwIfAborted(signal);
     if (decision !== "confirm") {
+      if (configurationSession?.configuration_id) {
+        await requestFn(
+          `/collaboration/local/configurations/${encodeURIComponent(configurationSession.configuration_id)}/cancel`,
+          { method: "POST", body: {}, signal },
+        ).catch(() => null);
+      }
       return {
         run: { state: "configuration_pending" },
         tasks: [],
@@ -2143,6 +2078,13 @@ export async function runAgentWorkspaceCollaboration({
         configuration: payload,
       };
     }
+  }
+
+  if (configurationSession?.configuration_id) {
+    await requestFn(
+      `/collaboration/local/configurations/${encodeURIComponent(configurationSession.configuration_id)}/cancel`,
+      { method: "POST", body: {}, signal },
+    );
   }
 
   let run = (await requestFn("/collaboration/local/runs", {

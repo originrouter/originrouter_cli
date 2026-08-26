@@ -74,20 +74,96 @@ test("device-level tool results preserve a workspace ID requested by the server"
   assert.equal(calls[0].body.tool_results[0].workspace_id, "workspace");
 });
 
-test("server failure presents an explicit deterministic local fallback without creating a Run", async () => {
+test("server failure is explicit and never switches to a second automatic planner", async () => {
   const { planner, store } = fixture({ async create() { throw Object.assign(new Error("offline"), { code: "COLLABORATION_CONFIGURATION_UNAVAILABLE" }); } });
   const created = await planner.create({ objective: "Fix the release checklist" });
-  assert.equal(created.state, "fallback_ready");
-  assert.equal(created.planning_source, "local_fallback");
+  assert.equal(created.state, "failed");
   assert.equal(created.fallback_reason, "COLLABORATION_CONFIGURATION_UNAVAILABLE");
   assert.equal(store.listRuns().length, 0);
 });
 
-test("an invalid server proposal cannot be accepted and falls back locally", async () => {
+test("an invalid server proposal cannot be accepted or replaced by a local automatic plan", async () => {
   const { planner } = fixture({ async create() { return serverSession({ proposal: { ...proposal, participants: [{ ...proposal.participants[0], device_id: "untrusted-device" }] } }); } });
   const created = await planner.create({ objective: "Fix the release checklist" });
-  assert.equal(created.state, "fallback_ready");
-  assert.equal(created.planning_source, "local_fallback");
+  assert.equal(created.state, "failed");
+});
+
+test("App draft participants do not become a second planner input", async () => {
+  const selectedCapabilities = {
+    ...capabilities,
+    trusted_workspaces: [
+      { workspace_id: "workspace-a", display_name: "A", canonical_path: "/workspace-a", unattended_execution: { remote_eligible: true } },
+      { workspace_id: "workspace-b", display_name: "B", canonical_path: "/workspace-b", unattended_execution: { remote_eligible: true } },
+    ],
+  };
+  const store = new CollaborationStore({ stateDir: mkdtempSync(join(tmpdir(), "originrouter-config-")) });
+  const coordinator = new PlanImplementVerifyCoordinator({ store });
+  let serverRequest;
+  const planner = new CollaborationConfigurationPlanner({
+    store,
+    coordinator,
+    deviceId: "device-local",
+    capabilitiesForDevice: async () => selectedCapabilities,
+    serverClient: {
+      async create(body) {
+        serverRequest = body.request;
+        return serverSession({
+          proposal: {
+            ...proposal,
+            participants: [{ ...proposal.participants[0], workspace_id: "workspace-a" }],
+          },
+        });
+      },
+    },
+  });
+
+  const created = await planner.create({
+    objective: "Check the remote Mac mini system version",
+    participants: [{ device_id: "device-local", workspace_id: "workspace-b" }],
+  });
+
+  assert.equal(created.state, "proposal_ready");
+  assert.equal(serverRequest.participants, undefined);
+});
+
+test("the target CLI discovers every trusted device before starting the server session", async () => {
+  let requestBody;
+  const store = new CollaborationStore({ stateDir: mkdtempSync(join(tmpdir(), "originrouter-config-")) });
+  const coordinator = new PlanImplementVerifyCoordinator({ store });
+  const remoteCapabilities = {
+    ...capabilities,
+    device: { name: "Studio Mac mini", cli_version: "0.2.2", platform: "darwin", architecture: "arm64" },
+  };
+  const planner = new CollaborationConfigurationPlanner({
+    store,
+    coordinator,
+    deviceId: "device-local",
+    listDevices: async () => [{
+      deviceId: "device-remote",
+      deviceName: "Studio Mac mini",
+      online: true,
+      trustStatus: "trusted",
+    }],
+    capabilitiesForDevice: async (deviceId) => (
+      deviceId === "device-remote" ? remoteCapabilities : capabilities
+    ),
+    serverClient: {
+      async create(body) {
+        requestBody = body;
+        return serverSession();
+      },
+    },
+  });
+
+  await planner.create({ objective: "Check the remote Mac mini CLI version" });
+
+  assert.deepEqual(
+    requestBody.capability_snapshot.devices.map((device) => device.device_id).sort(),
+    ["device-local", "device-remote"],
+  );
+  const remote = requestBody.capability_snapshot.devices.find((device) => device.device_id === "device-remote");
+  assert.equal(remote.device_name, "Studio Mac mini");
+  assert.equal(remote.cli_version, "0.2.2");
 });
 
 test("a Session follow-up re-enters configuration and revalidates its durable team", async () => {

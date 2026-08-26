@@ -953,6 +953,7 @@ const FOCUSED_INTERACTION_KINDS = new Set([
   "workspace",
   "setup",
   "configuration",
+  "configuration_question",
   "team_edit",
   "team_runtime",
   "team_route",
@@ -1019,6 +1020,7 @@ function runtimePhase(runtime) {
   if (runtime.phase === "needs_device") return "Choose remote devices";
   if (runtime.phase === "connection_paused") return "Connection paused";
   if (runtime.phase === "configuring") return "Choosing the Agent team";
+  if (runtime.phase === "awaiting_configuration_input") return "Planner needs more context";
   if (runtime.phase === "awaiting_configuration") {
     if (runtime.interactionKind === "team_edit") return "Edit the collaboration team";
     if (runtime.interactionKind === "team_runtime") return "Choose an Agent Runtime";
@@ -1092,8 +1094,9 @@ function buildRuntimeRows(runtime, columns, maxRows, {
         || configured.workspace_mode;
       const deviceCount = new Set((configured.participants || []).map((item) => item.device_id)).size;
       pushIndented(`${workspaceModeDefinition(resolved || "auto").label} · ${(configured.participants || []).length} Agent${configured.participants?.length === 1 ? "" : "s"} · ${deviceCount} device${deviceCount === 1 ? "" : "s"}`, 2, muted);
-      if (configured.planning_source === "model") pushIndented("Auto decision: target CLI model", 2, muted);
-      if (configured.planning_source === "local_fallback") pushIndented("Auto decision: local fallback", 2, muted);
+      if (["model", "server_model"].includes(configured.planning_source)) {
+        pushIndented("Auto decision: OriginRouter planner", 2, muted);
+      }
     }
     const workspaceSessionId = runtime.snapshot?.run?.workspace_session_id;
     if (workspaceSessionId) pushIndented(`Session ${workspaceSessionId}`, 2, muted);
@@ -1273,11 +1276,9 @@ function buildRuntimeRows(runtime, columns, maxRows, {
       push("Proposed collaboration team", strong);
       const advice = configured.auto_configuration?.advice;
       if (advice?.reason) pushIndented(advice.reason, 2, muted);
-      const planningLabel = configured.planning_source === "model"
-        ? "target CLI model"
-        : configured.planning_source === "local_fallback"
-          ? "local fallback"
-          : "local policy";
+      const planningLabel = ["model", "server_model"].includes(configured.planning_source)
+        ? "OriginRouter planner"
+        : "manual configuration";
       pushIndented(`Risk ${configured.risk_tier || "green"} · ${planningLabel} · Session approval ${permissionLabel(configured.supervisor_permission_profile || "guarded", configured.supervisor_policy_id)}`, 2, muted);
       const selected = Math.max(0, Math.min(
         Math.max(0, participants.length - 1),
@@ -1691,6 +1692,23 @@ function interactionComposer(runtime, columns, {
     lines = [
       "? Use this collaboration team?",
       "↑/↓ select an Agent · E edit selection · Enter confirm · PgUp/PgDn review · Esc return",
+    ];
+  } else if (kind === "configuration_question") {
+    const question = runtime.configurationQuestion || {};
+    const answer = String(runtime.decisionBuffer || "");
+    const answerChars = [...answer];
+    const answerCursor = Math.max(0, Math.min(runtime.decisionCursor || 0, answerChars.length));
+    const progress = runtime.configurationQuestionCount > 1
+      ? ` · ${Number(runtime.configurationQuestionIndex || 0) + 1}/${runtime.configurationQuestionCount}`
+      : "";
+    lines = [
+      `? ${question.header || "Planner question"}${progress}`,
+      question.question || "Provide the missing collaboration context.",
+      ...(question.options || []).map((option, index) => (
+        `${index + 1}. ${option.label}${option.description ? ` · ${option.description}` : ""}`
+      )),
+      composerLine(answer, answerCursor, columns),
+      "Enter submits · type an option number/label or another answer · Ctrl+U clears · Esc cancels",
     ];
   } else if (kind === "team_edit") {
     lines = [
@@ -2653,7 +2671,7 @@ async function readRuntimeDecision({
   runtime.setupSuggestionSelection = 0;
   runtime.setupBrowseLoading = false;
   runtime.setupBrowseError = "";
-  runtime.decisionBuffer = ["plan_revision", "attention_reply"].includes(kind)
+  runtime.decisionBuffer = ["plan_revision", "attention_reply", "configuration_question"].includes(kind)
     ? String(runtime.decisionBuffer || "")
     : "";
   runtime.decisionCursor = [...runtime.decisionBuffer].length;
@@ -2766,7 +2784,7 @@ async function readRuntimeDecision({
         return;
       }
       if (key.name === "escape" || (key.ctrl && key.name === "c")) {
-        if (["live_session_permission", "live_workspace_mode", "session_resume"].includes(kind)) {
+        if (["live_session_permission", "live_workspace_mode", "session_resume", "configuration_question"].includes(kind)) {
           finish(null);
           return;
         }
@@ -3024,6 +3042,19 @@ async function readRuntimeDecision({
               return;
             }
             finish({ action: "revise", feedback });
+          } else if (kind === "configuration_question") {
+            const answer = String(runtime.decisionBuffer || "").trim();
+            if (!answer) {
+              runtime.notice = "Enter an answer before continuing";
+              render(true);
+              return;
+            }
+            const option = (runtime.configurationQuestion?.options || []).find((item, index) => (
+              String(index + 1) === answer
+              || String(item.id || "").toLowerCase() === answer.toLowerCase()
+              || String(item.label || "").toLowerCase() === answer.toLowerCase()
+            ));
+            finish(option?.id || answer);
           } else if (kind === "attention") {
             const action = runtime.attention?.actions?.[runtime.attentionSelection || 0];
             if (!action) return;
@@ -3251,7 +3282,7 @@ async function readRuntimeDecision({
         render(true);
         return;
       }
-      if (["plan_revision", "attention_reply"].includes(kind)) {
+      if (["plan_revision", "attention_reply", "configuration_question"].includes(kind)) {
         const chars = [...runtime.decisionBuffer];
         let decisionCursor = runtime.decisionCursor;
         if (key.name === "backspace") {
@@ -3630,6 +3661,10 @@ async function runWorkspaceObjective({
     runId: String(existingRunId || retryRunId || ""),
     snapshot: null,
     configuration: continuedConfiguration,
+    configurationSession: null,
+    configurationQuestion: null,
+    configurationQuestionIndex: 0,
+    configurationQuestionCount: 0,
     setup: null,
     setupPath: "",
     setupCursor: 0,
@@ -4237,6 +4272,14 @@ async function runWorkspaceObjective({
     if (update.phase) runtime.phase = update.phase;
     if (Number.isFinite(update.connectionAttempts)) runtime.connectionAttempts = update.connectionAttempts;
     if (typeof update.message === "string") runtime.notice = update.message;
+    if (update.configuration) {
+      runtime.configurationSession = update.configuration;
+      if (update.configuration.state === "planning") {
+        runtime.phase = "configuring";
+      } else if (update.configuration.state === "awaiting_input") {
+        runtime.phase = "awaiting_configuration_input";
+      }
+    }
     if (update.payload) {
       runtime.configuration = update.payload;
       const approval = runtime.sessionApprovalOverride;
@@ -4275,6 +4318,35 @@ async function runWorkspaceObjective({
     const decision = await readRuntimeDecision({ input, runtime, render, kind: "plan" });
     if (decision === "leave") runtime.detachRequested = true;
     return decision;
+  };
+  const answerConfigurationQuestions = async (configuration) => {
+    const questions = configuration?.questions || [];
+    const answers = {};
+    runtime.configurationSession = configuration;
+    runtime.configurationQuestionCount = questions.length;
+    for (const [index, question] of questions.entries()) {
+      runtime.phase = "awaiting_configuration_input";
+      runtime.configurationQuestion = question;
+      runtime.configurationQuestionIndex = index;
+      runtime.decisionBuffer = "";
+      runtime.decisionCursor = 0;
+      const answer = await readRuntimeDecision({
+        input,
+        runtime,
+        render,
+        kind: "configuration_question",
+      });
+      if (!answer) {
+        const error = new Error("Collaboration configuration was cancelled while waiting for user context.");
+        error.code = "ORIGINROUTER_INTERRUPTED";
+        throw error;
+      }
+      answers[question.id] = [String(answer)];
+    }
+    runtime.configurationQuestion = null;
+    runtime.configurationQuestionCount = 0;
+    runtime.phase = "configuring";
+    return answers;
   };
   const reviewAttention = async (attention, snapshotForReview) => {
     runtime.snapshot = snapshotForReview;
@@ -4366,6 +4438,7 @@ async function runWorkspaceObjective({
               if (decision !== "confirm") runtime.draftObjective = objective;
               return decision;
             },
+            onConfigurationQuestions: answerConfigurationQuestions,
             onPlanConfirmation: reviewPlan,
             onAttention: reviewAttention,
             onPaused: reviewPause,

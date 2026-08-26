@@ -63,6 +63,20 @@ assert.equal(JSON.stringify(sent[0]).includes("secret stream"), false);
 const opened = appSession.open(sent[0]);
 assert.equal(opened.payload.event.text, "secret stream");
 
+await transport.send("collaboration.control.response", {
+  sessionId: "agent-session-1",
+  data: {
+    text: "optional response fields are wire-safe",
+    absent: undefined,
+    nested: { absent: undefined, retained: true },
+    values: ["present", undefined, { absent: undefined, retained: "nested" }],
+  },
+});
+const sanitized = appSession.open(sent.at(-1)).payload.data;
+assert.equal("absent" in sanitized, false);
+assert.deepEqual(sanitized.nested, { retained: true });
+assert.deepEqual(sanitized.values, ["present", null, { retained: "nested" }]);
+
 const inboundCollaboration = appSession.seal("collaboration.remote.dispatch", {
   protocolVersion: "1",
   sourceDeviceId: "app-device",
@@ -107,13 +121,13 @@ await transport.send("collaboration.remote.dispatch", {
   role: "worker",
   prompt: "private collaboration objective",
 });
-assert.equal(sent.length, 3);
-assert.equal(sent[2].protocol, "e2ee-v2");
-assert.equal(JSON.stringify(sent[2]).includes("private collaboration objective"), false);
+const firstCollaborationEnvelope = sent.at(-1);
+assert.equal(firstCollaborationEnvelope.protocol, "e2ee-v2");
+assert.equal(JSON.stringify(firstCollaborationEnvelope).includes("private collaboration objective"), false);
 const acceptedCollaboration = DeviceE2eeSession.accept({
   local: app,
   peer: cli.public_identity,
-  firstEnvelope: sent[2],
+  firstEnvelope: firstCollaborationEnvelope,
 });
 assert.equal(
   acceptedCollaboration.firstPayload.payload.prompt,
@@ -133,9 +147,10 @@ await transport.send("collaboration.remote.dispatch", {
   role: "worker",
   prompt: "second private objective",
 });
-assert.notEqual(sent[2].session_id, sent[3].session_id);
-assert.equal(sent[2].sequence, 0);
-assert.equal(sent[3].sequence, 0);
+const secondCollaborationEnvelope = sent.at(-1);
+assert.notEqual(firstCollaborationEnvelope.session_id, secondCollaborationEnvelope.session_id);
+assert.equal(firstCollaborationEnvelope.sequence, 0);
+assert.equal(secondCollaborationEnvelope.sequence, 0);
 
 const deferred = () => {
   let resolve;

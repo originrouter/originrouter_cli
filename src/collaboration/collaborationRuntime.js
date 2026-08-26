@@ -297,6 +297,7 @@ export class CollaborationRuntime {
     catalog = null,
     relayClient = null,
     capabilityProvider = null,
+    configurationDeviceDirectory = async () => [],
     approvalSupervisor = null,
     deviceId = "local",
     registrationTimeoutMs = 15_000,
@@ -310,6 +311,7 @@ export class CollaborationRuntime {
     this.catalog = catalog;
     this.relayClient = relayClient;
     this.capabilityProvider = capabilityProvider;
+    this.configurationDeviceDirectory = configurationDeviceDirectory;
     this.approvalSupervisor = approvalSupervisor || new CollaborationApprovalSupervisor();
     this.deviceId = deviceId;
     this.registrationTimeoutMs = registrationTimeoutMs;
@@ -331,6 +333,7 @@ export class CollaborationRuntime {
       store: this.store,
       coordinator: this.coordinator,
       capabilitiesForDevice: (deviceId) => this.capabilitiesForDevice(deviceId),
+      listDevices: () => this.configurationDeviceDirectory(),
       deviceId: this.deviceId,
       stateDir: this.store.stateDir,
     });

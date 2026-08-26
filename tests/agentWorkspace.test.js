@@ -26,56 +26,12 @@ import {
 } from "../src/commands/collaboration.js";
 import { buildAgentLaunchScreen } from "../src/local/agentLaunchScreen.js";
 import {
-  buildLocalWorkspaceConfiguration,
   inferWorkspaceMode,
   nextWorkspaceMode,
   normalizeWorkspaceMode,
   objectiveMentionsRemoteTarget,
   workspaceRequiresPlanReview,
 } from "../src/collaboration/workspaceModes.js";
-
-const localCapabilities = {
-  device: { device_id: "local-device", default_workspace_path: "/project" },
-  runtimes: [{ id: "codex", available: true }, { id: "claude", available: true }],
-  trusted_workspaces: [{
-    workspace_id: "workspace-local",
-    canonical_path: "/project",
-    repo_root: "/project",
-  }],
-  permission_profiles: [{ id: "guarded" }, { id: "manual" }],
-  defaults: { permission_profile: "guarded" },
-};
-
-const remoteCapabilities = {
-  device: { device_id: "server-a", default_workspace_path: "/srv/project" },
-  runtimes: [{ id: "codex", available: true }, { id: "claude", available: true }],
-  trusted_workspaces: [{
-    workspace_id: "workspace-remote",
-    canonical_path: "/srv/project",
-    repo_root: "/srv/project",
-  }],
-  permission_profiles: [{ id: "guarded" }],
-  defaults: { permission_profile: "guarded" },
-};
-
-const devices = [
-  {
-    deviceId: "local-device",
-    deviceName: "Local Mac",
-    local: true,
-    online: true,
-    trustStatus: "trusted",
-    capabilities: localCapabilities,
-  },
-  {
-    deviceId: "server-a",
-    deviceName: "Server A",
-    local: false,
-    online: true,
-    trustStatus: "trusted",
-    capabilities: remoteCapabilities,
-  },
-];
 
 assert.deepEqual(
   parseAgentWorkspaceArgs(["-c", "claude", "--mode", "build-review", "fix", "login"]),
@@ -191,122 +147,6 @@ await assert.rejects(
   () => listAgentWorkspaceCollaborationRuns({ category: "invalid" }),
   /Run category must be all, attention, active, or recent/,
 );
-
-const buildReview = buildLocalWorkspaceConfiguration({
-  objective: "Fix login and add tests",
-  mode: "build-review",
-  coordinator: "codex",
-  devices,
-  currentDirectory: "/project",
-});
-assert.equal(buildReview.participants.length, 2);
-assert.equal(buildReview.participants[0].runtime, "codex");
-assert.equal(buildReview.participants[0].planner, true);
-assert.equal(buildReview.participants[1].runtime, "claude");
-assert.equal(buildReview.auto_configuration.workspace_mode, "build_review");
-assert.equal(buildReview.auto_configuration.independent_review, true);
-
-const automatic = buildLocalWorkspaceConfiguration({
-  objective: "Investigate several possible causes of the latency",
-  mode: "auto",
-  coordinator: "claude",
-  devices,
-  currentDirectory: "/project",
-});
-assert.equal(automatic.auto_configuration.workspace_mode, "auto");
-assert.equal(automatic.auto_configuration.resolved_workspace_mode, "parallel_research");
-assert.equal(automatic.participants[0].runtime, "claude");
-assert.equal(automatic.participants.length, 3);
-
-const remote = buildLocalWorkspaceConfiguration({
-  objective: "Check service status on server A",
-  mode: "remote-ops",
-  coordinator: "codex",
-  devices,
-  currentDirectory: "/project",
-});
-assert.equal(remote.participants.length, 2);
-assert.equal(remote.participants[1].device_id, "server-a");
-assert.equal(remote.auto_configuration.safe_to_skip_confirmation, false);
-
-const secondRemoteCapabilities = {
-  ...remoteCapabilities,
-  device: { device_id: "server-b", default_workspace_path: "/srv/other" },
-  trusted_workspaces: [{
-    workspace_id: "workspace-remote-b",
-    canonical_path: "/srv/other",
-    repo_root: "/srv/other",
-  }],
-};
-const multipleRemoteDevices = [
-  ...devices,
-  {
-    deviceId: "server-b",
-    deviceName: "Server B",
-    local: false,
-    online: true,
-    trustStatus: "trusted",
-    capabilities: secondRemoteCapabilities,
-  },
-];
-assert.throws(
-  () => buildLocalWorkspaceConfiguration({
-    objective: "Inspect the remote computers",
-    mode: "remote-ops",
-    coordinator: "codex",
-    devices: multipleRemoteDevices,
-    currentDirectory: "/project",
-  }),
-  (error) => error.code === "AUTO_CONFIG_REMOTE_DEVICE_SELECTION_REQUIRED"
-    && error.setup?.devices?.length === 2,
-);
-const multiRemote = buildLocalWorkspaceConfiguration({
-  objective: "Inspect the remote computers",
-  mode: "remote-ops",
-  coordinator: "codex",
-  devices: multipleRemoteDevices,
-  currentDirectory: "/project",
-  deviceSelections: ["server-a", "server-b"],
-});
-assert.deepEqual(
-  multiRemote.participants.filter((participant) => !participant.planner).map((participant) => participant.device_id),
-  ["server-a", "server-b"],
-);
-assert.equal(multiRemote.participants.length, 3);
-
-assert.throws(
-  () => buildLocalWorkspaceConfiguration({
-    objective: "Inspect the remote computer",
-    mode: "remote-ops",
-    coordinator: "codex",
-    devices: devices.map((device) => device.local ? device : {
-      ...device,
-      capabilities: { ...device.capabilities, trusted_workspaces: [] },
-    }),
-    currentDirectory: "/project",
-  }),
-  (error) => error.code === "AUTO_CONFIG_REMOTE_WORKSPACE_REQUIRED"
-    && error.setup?.device_id === "server-a",
-);
-
-const selectedRemote = buildLocalWorkspaceConfiguration({
-  objective: "Inspect the remote computer",
-  mode: "remote-ops",
-  coordinator: "codex",
-  devices: devices.map((device) => device.local ? device : {
-    ...device,
-    capabilities: {
-      ...device.capabilities,
-      trusted_workspaces: [
-        { workspace_id: "workspace-a", canonical_path: "/srv/a" },
-        { workspace_id: "workspace-b", canonical_path: "/srv/b" },
-      ],
-    },
-  }),
-  currentDirectory: "/project",
-  workspaceSelections: { "server-a": "workspace-b" },
-});
-assert.equal(selectedRemote.participants[1].workspace_id, "workspace-b");
 
 const workspaceScreen = buildWorkspaceAppScreen({
   coordinator: "codex",

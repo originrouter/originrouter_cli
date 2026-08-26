@@ -80,10 +80,24 @@ function budgetCeiling(capabilities, runtimes) {
 export function publicCapabilitySnapshot(devices) {
   return { devices: devices.map((device) => {
     const capabilities = capabilityForDevice(device);
+    const defaultWorkspacePath = cleanText(capabilities?.device?.default_workspace_path, 512);
+    const defaultWorkspace = (capabilities?.trusted_workspaces || []).find((workspace) => (
+      cleanText(workspace?.canonical_path, 512) === defaultWorkspacePath
+      && workspace?.unattended_execution?.remote_eligible !== false
+    ));
     return {
       device_id: device.deviceId,
+      device_name: cleanText(
+        device.deviceName || capabilities?.device?.name || device.deviceId,
+        191,
+      ),
       online: device.online !== false,
       trusted: device.trustStatus === "trusted" || device.local === true,
+      capability_available: Boolean(capabilities),
+      cli_version: cleanText(capabilities?.device?.cli_version, 64) || null,
+      platform: cleanText(capabilities?.device?.platform, 32) || null,
+      architecture: cleanText(capabilities?.device?.architecture, 32) || null,
+      default_workspace_id: cleanText(defaultWorkspace?.workspace_id, 191) || null,
       runtimes: (capabilities?.runtimes || []).map(({ id, available }) => ({ id, available })),
       trusted_workspaces: (capabilities?.trusted_workspaces || [])
         .filter((workspace) => workspace?.unattended_execution?.remote_eligible !== false)
@@ -105,17 +119,53 @@ export function publicCapabilitySnapshot(devices) {
   }) };
 }
 
-function parseStrictJson(output) {
-  if (typeof output === "object" && output) return output;
-  const value = cleanText(output, 256_000);
-  if (!value.startsWith("{") || !value.endsWith("}")) {
-    throw Object.assign(new Error("The fast model did not return strict JSON."), { code: "AUTO_CONFIG_INVALID_JSON" });
-  }
-  try {
-    return JSON.parse(value);
-  } catch (cause) {
-    throw Object.assign(new Error("The fast model returned invalid JSON.", { cause }), { code: "AUTO_CONFIG_INVALID_JSON" });
-  }
+export function collaborationConfigurationEditor(devices) {
+  return {
+    devices: devices.map((device) => {
+      const capabilities = capabilityForDevice(device) || {};
+      return {
+        device_id: device.deviceId,
+        device_name: cleanText(
+          device.deviceName || capabilities?.device?.name || device.deviceId,
+          191,
+        ),
+        local: device.local === true,
+        runtimes: (capabilities.runtimes || [])
+          .filter((runtime) => runtime?.available && ["codex", "claude"].includes(runtime.id))
+          .map((runtime) => ({ id: runtime.id })),
+        resolved_routes: Object.fromEntries(
+          ["codex", "claude"].map((runtime) => {
+            const route = capabilities.resolved_routes?.[runtime]?.main;
+            return [runtime, route?.provider && route?.model
+              ? { provider: route.provider, model: route.model }
+              : null];
+          }),
+        ),
+        providers: (capabilities.providers || []).map((provider) => ({
+          name: provider.name,
+          models: (provider.models || []).map((model) => ({ id: model.id })),
+        })).filter((provider) => provider.name && provider.models.length),
+        permission_profiles: (capabilities.permission_profiles || [])
+          .map((profile) => ({
+            id: profile.id,
+            label: profile.label || profile.id,
+            description: profile.description || "",
+          }))
+          .filter((profile) => ["manual", "guarded", "ai_review", "unrestricted", "custom"].includes(profile.id)),
+      };
+    }),
+  };
+}
+
+export function attachCollaborationConfigurationEditor(payload, devices, {
+  enumerable = false,
+} = {}) {
+  Object.defineProperty(payload, "_workspace_editor", {
+    value: collaborationConfigurationEditor(devices),
+    enumerable,
+    configurable: true,
+  });
+  return payload;
 }
 
 function routeExists(capabilities, providerName, modelId) {
@@ -124,7 +174,7 @@ function routeExists(capabilities, providerName, modelId) {
 }
 
 export function validateAndNormalizeAutoConfiguration(rawOutput, { objective, devices }) {
-  const parsed = COLLABORATION_AUTO_CONFIG_SCHEMA.parse(parseStrictJson(rawOutput));
+  const parsed = COLLABORATION_AUTO_CONFIG_SCHEMA.parse(rawOutput);
   const ids = new Set();
   const participants = parsed.participants.map((participant) => {
     if (!PARTICIPANT_ID.test(participant.participant_id) || ids.has(participant.participant_id)) {
@@ -226,18 +276,4 @@ export function validateAndNormalizeAutoConfiguration(rawOutput, { objective, de
       runtimes,
     },
   };
-}
-
-export async function autoConfigureCollaboration({ objective, devices, modelFn, modelOptions = {} }) {
-  if (typeof modelFn !== "function") {
-    throw Object.assign(
-      new Error("Automatic collaboration configuration must run on the target CLI."),
-      { code: "AUTO_CONFIG_LOCAL_CLI_REQUIRED" },
-    );
-  }
-  const output = await modelFn(
-    { objective, devices, answer: modelOptions.answer || null },
-    modelOptions,
-  );
-  return validateAndNormalizeAutoConfiguration(output, { objective, devices });
 }

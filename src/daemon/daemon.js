@@ -63,6 +63,7 @@ import { storeDeviceE2eeDirectoryCache } from "../security/deviceE2eeDirectoryCa
 import { DeviceE2eeRelayTransport } from "../security/deviceE2eeRelayTransport.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import { refreshCompatibilityPack } from "../compatibility/updater.js";
+import { loadCliDeviceDirectory } from "../commands/routeSources.js";
 
 function httpHost(address) {
   return String(address).includes(":") && !String(address).startsWith("[")
@@ -340,6 +341,7 @@ export async function startDaemon(args) {
       version: VERSION,
       source: "account_e2ee",
     }),
+    configurationDeviceDirectory: () => loadCliDeviceDirectory({ stateDir }),
   });
 
   // Stage 4: ProxyManager owns the LiteLLM proxy lifecycle. The session

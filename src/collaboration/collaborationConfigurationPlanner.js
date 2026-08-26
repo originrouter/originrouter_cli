@@ -1,7 +1,11 @@
-import { publicCapabilitySnapshot, validateAndNormalizeAutoConfiguration } from "./collaborationAutoConfig.js";
+import {
+  attachCollaborationConfigurationEditor,
+  publicCapabilitySnapshot,
+  validateAndNormalizeAutoConfiguration,
+} from "./collaborationAutoConfig.js";
 import { CollaborationConfigurationClient } from "./collaborationConfigurationClient.js";
 import { normalizeCollaborationCreateRequest } from "./createRunRequest.js";
-import { buildLocalWorkspaceConfiguration, normalizeCoordinator } from "./workspaceModes.js";
+import { normalizeCoordinator } from "./workspaceModes.js";
 
 const POLICY = Object.freeze({
   server_plans_only: true,
@@ -9,7 +13,7 @@ const POLICY = Object.freeze({
   read_only_tools_only: true,
   no_secrets: true,
 });
-const READY_STATES = new Set(["proposal_ready", "fallback_ready"]);
+const READY_STATES = new Set(["proposal_ready"]);
 const ALLOWED_TOOLS = new Set(["get_device_capabilities", "get_workspace_details", "get_budget_status"]);
 
 function text(value, maximum = 16_000) { return String(value ?? "").trim().slice(0, maximum); }
@@ -18,10 +22,19 @@ function configurationError(code, message) { return Object.assign(new Error(mess
 // The server owns multi-turn model context. This target CLI retains the only
 // authority to inspect local facts, run read-only probes, validate, and create a Run.
 export class CollaborationConfigurationPlanner {
-  constructor({ store, coordinator, capabilitiesForDevice, deviceId = "local", stateDir, serverClient } = {}) {
+  constructor({
+    store,
+    coordinator,
+    capabilitiesForDevice,
+    listDevices = async () => [],
+    deviceId = "local",
+    stateDir,
+    serverClient,
+  } = {}) {
     this.store = store;
     this.coordinator = coordinator;
     this.capabilitiesForDevice = capabilitiesForDevice;
+    this.listDevices = listDevices;
     this.deviceId = deviceId;
     this.serverClient = serverClient || new CollaborationConfigurationClient({ stateDir });
   }
@@ -44,13 +57,13 @@ export class CollaborationConfigurationPlanner {
         idempotency_key: session.configuration_id,
         objective,
         coordinator_runtime: runtime,
-        request: this.safeHints(input),
+        request: session.request,
         capability_snapshot: session.capability_snapshot,
         policy: POLICY,
       });
       await this.consumeRemote(session.configuration_id, remote, devices);
     } catch (error) {
-      await this.fallback(session.configuration_id, devices, error);
+      await this.fail(session.configuration_id, error);
     }
     return this.local(session.configuration_id);
   }
@@ -61,7 +74,7 @@ export class CollaborationConfigurationPlanner {
     try {
       await this.consumeRemote(configurationId, await this.serverClient.get(session.server_configuration_id));
     } catch (error) {
-      if (["planning", "awaiting_tool"].includes(session.state)) await this.fallback(configurationId, await this.liveDevices(session), error);
+      if (["planning", "awaiting_tool"].includes(session.state)) await this.fail(configurationId, error);
     }
     return this.local(configurationId);
   }
@@ -78,7 +91,7 @@ export class CollaborationConfigurationPlanner {
       });
       await this.consumeRemote(configurationId, remote);
     } catch (error) {
-      await this.fallback(configurationId, await this.liveDevices(session), error);
+      await this.fail(configurationId, error);
     }
     return this.local(configurationId);
   }
@@ -88,15 +101,13 @@ export class CollaborationConfigurationPlanner {
     if (!READY_STATES.has(session.state) || !session.proposal) {
       throw configurationError("CONFIGURATION_NOT_READY", "The collaboration configuration is not ready for confirmation.");
     }
-    const proposal = session.state === "proposal_ready"
-      ? await this.validateServerProposal(session, session.server_proposal)
-      : session.proposal;
+    const proposal = await this.validateServerProposal(session, session.server_proposal);
     const continuation = await this.validateContinuation(session);
     const run = this.coordinator.create(normalizeCollaborationCreateRequest({
       ...proposal,
       ...continuation,
       workspace_mode: "auto",
-      planning_source: session.state === "fallback_ready" ? "local_fallback" : "server_model",
+      planning_source: "server_model",
       coordinator_runtime: session.coordinator_runtime,
     }, { coordinatorDeviceId: this.deviceId }));
     this.store.updateConfigurationSession(configurationId, { state: "consumed", proposal });
@@ -210,26 +221,81 @@ export class CollaborationConfigurationPlanner {
   }
 
   async collectDevices(input) {
-    const ids = [...new Set([
-      this.deviceId,
+    let directory = [];
+    try {
+      const listed = await this.listDevices();
+      if (Array.isArray(listed)) directory = listed;
+    } catch {
+      // The local capability remains enough for a local-only planning session.
+    }
+    const explicitIds = [
       ...(Array.isArray(input.candidate_device_ids) ? input.candidate_device_ids : []),
       ...(Array.isArray(input.participants) ? input.participants.map((item) => item?.device_id ?? item?.deviceId) : []),
-    ].map((value) => text(value, 191)).filter(Boolean))];
-    const devices = [];
-    for (const id of ids) {
-      try {
-        const capabilities = await this.capabilitiesForDevice(id);
-        if (capabilities) devices.push({ deviceId: id, local: id === this.deviceId || id === "local", online: true, trustStatus: "trusted", capabilities });
-      } catch { /* unreachable candidates must not be sent as facts */ }
+    ].map((value) => text(value, 191)).filter(Boolean);
+    const trustedDirectory = directory.filter((item) => (
+      item?.deviceId === this.deviceId
+      || item?.device_id === this.deviceId
+      || item?.isSelf === true
+      || item?.trustStatus === "trusted"
+      || item?.trust_status === "trusted"
+    ));
+    const descriptors = new Map();
+    descriptors.set(this.deviceId, {
+      deviceId: this.deviceId,
+      deviceName: "This device",
+      local: true,
+      online: true,
+      trustStatus: "trusted",
+    });
+    for (const item of trustedDirectory) {
+      const id = text(item?.deviceId ?? item?.device_id, 191);
+      if (!id) continue;
+      descriptors.set(id, {
+        deviceId: id,
+        deviceName: text(item?.deviceName ?? item?.device_name, 191) || id,
+        local: id === this.deviceId || item?.isSelf === true,
+        online: item?.online !== false,
+        trustStatus: "trusted",
+      });
     }
-    if (!devices.some((item) => item.local)) {
+    for (const id of explicitIds) {
+      if (!descriptors.has(id)) {
+        descriptors.set(id, {
+          deviceId: id,
+          deviceName: id,
+          local: id === this.deviceId,
+          online: true,
+          trustStatus: "trusted",
+        });
+      }
+    }
+    const devices = (await Promise.all([...descriptors.values()].map(async (descriptor) => {
+      if (!descriptor.local && descriptor.online === false) {
+        return { ...descriptor, capabilities: null };
+      }
+      try {
+        const capabilities = await this.capabilitiesForDevice(descriptor.deviceId);
+        return {
+          ...descriptor,
+          deviceName: text(capabilities?.device?.name, 191) || descriptor.deviceName,
+          capabilities: capabilities || null,
+        };
+      } catch {
+        return descriptor.local ? null : { ...descriptor, capabilities: null };
+      }
+    }))).filter(Boolean);
+    if (!devices.some((item) => item.local && item.capabilities)) {
       throw configurationError("CONFIGURATION_CAPABILITIES_UNAVAILABLE", "The target CLI could not read its collaboration capabilities.");
     }
     return devices.map((item) => item.deviceId === "local" ? { ...item, deviceId: this.deviceId, local: true } : item);
   }
 
   async liveDevices(session) {
-    const ids = [...new Set((session.capability_snapshot?.devices || []).map((item) => item.device_id).filter(Boolean))];
+    const snapshots = session.capability_snapshot?.devices || [];
+    const ids = [...new Set(snapshots
+      .filter((item) => item.online !== false && item.capability_available !== false)
+      .map((item) => item.device_id)
+      .filter(Boolean))];
     const devices = [];
     for (const id of ids) {
       try {
@@ -254,8 +320,11 @@ export class CollaborationConfigurationPlanner {
       session = this.local(configurationId);
     }
     if (session.state === "proposal_ready") {
+      const devices = knownDevices || await this.liveDevices(session);
+      const proposal = await this.validateServerProposal(session, session.proposal, devices);
+      attachCollaborationConfigurationEditor(proposal, devices, { enumerable: true });
       this.store.updateConfigurationSession(configurationId, {
-        proposal: await this.validateServerProposal(session, session.proposal, knownDevices),
+        proposal,
         planning_source: "server_model",
       });
     } else if (session.state === "failed") {
@@ -328,34 +397,14 @@ export class CollaborationConfigurationPlanner {
     return result;
   }
 
-  async fallback(configurationId, devices, error) {
+  async fail(configurationId, error) {
     const session = this.local(configurationId);
-    // A raw server proposal reaches proposal_ready before CLI live validation.
-    // Therefore a validator failure must be able to replace it with fallback.
-    if (["fallback_ready", "consumed", "cancelled"].includes(session.state)) return session;
-    let usable = devices;
-    try { if (!usable?.length) usable = await this.liveDevices(session); } catch { /* retain primary error */ }
-    try {
-      let proposal;
-      try {
-        proposal = buildLocalWorkspaceConfiguration({ objective: session.objective, mode: "auto", coordinator: session.coordinator_runtime, devices: usable || [], currentDirectory: process.cwd() });
-      } catch (autoError) {
-        // Auto classifications such as review panels may need devices that are
-        // currently unavailable. A fallback must remain non-blocking, so use a
-        // least-privilege Solo proposal before reporting failure.
-        proposal = buildLocalWorkspaceConfiguration({ objective: session.objective, mode: "solo", coordinator: session.coordinator_runtime, devices: usable || [], currentDirectory: process.cwd() });
-      }
-      this.store.updateConfigurationSession(configurationId, {
-        state: "fallback_ready", proposal: { ...proposal, planning_source: "local_fallback" }, planning_source: "local_fallback",
-        fallback_reason: text(error?.code, 512) || "configuration_server_planner_failed",
-        model_error: text(error?.message, 4096) || "The server planner failed; a deterministic local proposal is available.",
-      });
-    } catch (fallbackError) {
-      this.store.updateConfigurationSession(configurationId, {
-        state: "failed", fallback_reason: text(error?.code, 512) || "configuration_server_planner_failed",
-        model_error: `${text(error?.message, 2_000)}; fallback failed: ${text(fallbackError?.message, 2_000)}`,
-      });
-    }
+    if (["failed", "consumed", "cancelled"].includes(session.state)) return session;
+    this.store.updateConfigurationSession(configurationId, {
+      state: "failed",
+      fallback_reason: text(error?.code, 512) || "configuration_server_planner_failed",
+      model_error: text(error?.message, 4096) || "The server collaboration planner failed.",
+    });
     return this.local(configurationId);
   }
 }

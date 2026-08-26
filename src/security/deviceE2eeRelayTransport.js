@@ -63,6 +63,25 @@ function text(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+// E2EE envelopes are canonically signed before they are encrypted. Unlike
+// JSON.stringify, the canonical encoder intentionally rejects `undefined`;
+// optional fields from runtime responses therefore must be normalized at the
+// transport boundary. Keep normal JSON wire semantics: omit object fields and
+// represent missing array values as null.
+function withoutUndefined(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => item === undefined ? null : withoutUndefined(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== undefined)
+        .map(([key, item]) => [key, withoutUndefined(item)]),
+    );
+  }
+  return value;
+}
+
 function routeKeys(payload = {}, routing = {}) {
   const values = [
     text(payload.sessionId),
@@ -334,15 +353,16 @@ export class DeviceE2eeRelayTransport {
     if (!PROTECTED_DEVICE_MESSAGE_TYPES.has(type)) {
       return this.relayClient.send(type, payload);
     }
-    const keys = routeKeys(payload);
+    const wirePayload = withoutUndefined(payload);
+    const keys = routeKeys(wirePayload);
     const route = keys.find((key) => this.routes.has(key));
     const sessionId = route ? this.routes.get(route) : null;
     let session = type === "collaboration.remote.dispatch"
       ? null
       : sessionId ? this.sessions.get(sessionId) : null;
     if (!session) {
-      const targetDeviceId = text(payload.targetDeviceId)
-        || text(payload.target_device_id);
+      const targetDeviceId = text(wirePayload.targetDeviceId)
+        || text(wirePayload.target_device_id);
       if (targetDeviceId) {
         const peer = await this.currentPeer(targetDeviceId);
         session = DeviceE2eeSession.initiate({
@@ -377,11 +397,11 @@ export class DeviceE2eeRelayTransport {
         throw error;
       }
       const routing = {
-        ...(text(payload.sessionId) ? { session_id: text(payload.sessionId) } : {}),
-        ...(text(payload.requestId) ? { request_id: text(payload.requestId) } : {}),
+        ...(text(wirePayload.sessionId) ? { session_id: text(wirePayload.sessionId) } : {}),
+        ...(text(wirePayload.requestId) ? { request_id: text(wirePayload.requestId) } : {}),
         directory_head: deviceE2eeDirectoryHead(cache),
       };
-      const envelope = session.seal(type, payload, { routing });
+      const envelope = session.seal(type, wirePayload, { routing });
       const result = await this.relayClient.sendEnvelope(envelope);
       const delivery = result?.data || result || {};
       if (delivery.accepted === false) {
