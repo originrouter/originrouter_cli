@@ -24,7 +24,6 @@ import {
   listAgentWorkspaceCollaborationRuns,
   resolveAgentWorkspaceSession,
 } from "../src/commands/collaboration.js";
-import { buildAgentLaunchScreen } from "../src/local/agentLaunchScreen.js";
 import {
   inferWorkspaceMode,
   nextWorkspaceMode,
@@ -219,22 +218,6 @@ const wrappedRuntimeInputScreen = buildWorkspaceAppScreen({
 assert.doesNotMatch(wrappedRuntimeInputScreen, /editable…/);
 assert.match(wrappedRuntimeInputScreen, /without truncating/);
 assert.match(wrappedRuntimeInputScreen, /editable text/);
-
-const launchScreen = buildAgentLaunchScreen({
-  agent: "codex",
-  workspaceName: "originrouter-cli",
-  cwd: "~/Desktop/originrouter-cli",
-  detailLabel: "Detailed",
-  controlLabel: "local-only",
-  sessionLabel: "Codex native session",
-  columns: 80,
-});
-assert.match(launchScreen, /OriginRouter/);
-assert.doesNotMatch(launchScreen, /Agent Console/);
-assert.match(launchScreen, /OpenAI Codex/);
-assert.match(launchScreen, /Runtime/);
-assert.match(launchScreen, /Workspace/);
-assert.match(launchScreen, /Starting session/);
 
 const writes = [];
 const output = {

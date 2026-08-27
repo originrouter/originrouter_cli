@@ -510,17 +510,24 @@ projectionRuntime.store = {
   }),
 };
 let projectionPayload = null;
+let projectionOutboxId = null;
 projectionRuntime.relayClient = {
   async send(type, payload) {
     assert.equal(type, "collaboration.run.project");
     projectionPayload = payload;
   },
 };
+projectionRuntime.sendRemoteDurable = async (type, payload, { outboxId } = {}) => {
+  projectionOutboxId = outboxId;
+  return projectionRuntime.relayClient.send(type, payload);
+};
 assert.equal(await projectionRuntime.syncRun("run-projection"), true);
 assert.equal(projectionPayload.workspaceSessionId, "workspace-session-projection");
 assert.equal(projectionPayload.continuedFromRunId, "run-projection-previous");
 assert.equal(projectionPayload.teamRevision, 3);
 assert.equal(projectionPayload.sessionContinuation, true);
+assert.equal(projectionPayload.targetDeviceId, "__originrouter_server__");
+assert.match(projectionOutboxId, /^projection:run-projection:/);
 
 projectionRuntime.relayClient = {
   async send() {

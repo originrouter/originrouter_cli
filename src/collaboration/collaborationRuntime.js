@@ -1866,15 +1866,18 @@ export class CollaborationRuntime {
       // Archive removes a Run from normal collaboration history. Keep the
       // account projection aligned with the canonical CLI so an offline App
       // cannot resurrect the archived card.
-      void this.removeRunProjection(runId);
+      void this.removeRunProjection(runId, Number(run?.revision || 0));
       return { run };
     }
     if (operation === "delete") {
+      const existing = this.store.getRun(runId, { includeMessages: false });
       const deleted = this.store.deleteRun(runId);
       // The relay projection is only a display cache. Deleting the canonical
       // CLI Run must remove that cache as well, otherwise an old pending card
       // can reappear in the App and point at a Run that no longer exists.
-      if (deleted) void this.removeRunProjection(runId);
+      if (deleted) {
+        void this.removeRunProjection(runId, Number(existing?.revision || 0));
+      }
       return { deleted, run_id: runId };
     }
     if (operation === "resolve_attention") {
@@ -2916,13 +2919,17 @@ export class CollaborationRuntime {
     void this.syncRun(runId);
   }
 
-  async syncRun(runId) {
+  async syncRun(runId, { reconciliationId = "" } = {}) {
     if (!this.relayClient) return false;
     const run = this.store.getRun(runId, { includeMessages: false });
     if (!run) return false;
     try {
-      await this.relayClient.send("collaboration.run.project", {
+      const payload = {
         sourceDeviceId: this.deviceId,
+        // The projection is delivered to the Server control plane rather than
+        // another Agent device. The marker also lets the existing durable
+        // outbox retain and retry it without weakening device-message rules.
+        targetDeviceId: "__originrouter_server__",
         runId: run.run_id,
         workspaceSessionId: run.workspace_session_id || "",
         continuedFromRunId: run.continued_from_run_id || "",
@@ -2935,6 +2942,7 @@ export class CollaborationRuntime {
         coordinatorRuntime: run.coordinator_runtime,
         planningSource: run.planning_source,
         riskTier: run.risk_tier,
+        revision: Math.max(0, Number(run.revision || 0)),
         objectivePreview: "",
         state: run.state,
         taskTitle: "",
@@ -2944,29 +2952,59 @@ export class CollaborationRuntime {
         counters: run.counters,
         createdAt: Math.floor(new Date(run.created_at).getTime() / 1000),
         finishedAt: run.finished_at ? Math.floor(new Date(run.finished_at).getTime() / 1000) : null,
+      };
+      const reconcileSuffix = safeText(reconciliationId, 32);
+      await this.sendRemoteDurable("collaboration.run.project", payload, {
+        outboxId: `projection:${compactId(run.run_id, 105)}:${Math.max(0, Number(run.revision || 0))}${reconcileSuffix ? `:${reconcileSuffix}` : ""}`,
       });
       return true;
     } catch {
-      // Collaboration projection is best-effort. Local state remains
-      // canonical, and an expired relay login must never terminate the daemon
-      // that owns Agent history, control, and E2EE routing.
+      // Local state remains canonical. The durable outbox will retry after a
+      // reconnect without terminating the daemon that owns the Run.
       return false;
     }
   }
 
-  async removeRunProjection(runId) {
+  async removeRunProjection(runId, revision = 0) {
     if (!this.relayClient) return false;
     try {
-      await this.relayClient.send("collaboration.run.remove", {
+      const normalizedRunId = safeText(runId, 195);
+      await this.sendRemoteDurable("collaboration.run.remove", {
         sourceDeviceId: this.deviceId,
-        runId: safeText(runId, 195),
+        targetDeviceId: "__originrouter_server__",
+        runId: normalizedRunId,
+        revision: Math.max(0, Number(revision || 0)),
+      }, {
+        outboxId: `projection-remove:${compactId(normalizedRunId, 110)}:${Math.max(0, Number(revision || 0))}`,
       });
       return true;
     } catch {
-      // The projection is non-authoritative. A failed best-effort removal must
-      // never restore or keep alive a locally deleted Run.
+      // The tombstone remains pending in the durable outbox.
       return false;
     }
+  }
+
+  async syncRunDirectory({ pageSize = 50 } = {}) {
+    const normalizedSize = Math.max(1, Math.min(50, Number(pageSize) || 50));
+    const reconciliationId = `reconcile-${Date.now().toString(36)}`;
+    let page = 1;
+    let synced = 0;
+    let failed = 0;
+    while (true) {
+      const current = this.store.listRunPage({
+        category: "all",
+        page,
+        pageSize: normalizedSize,
+        includeArchived: false,
+      });
+      for (const run of current.runs) {
+        if (await this.syncRun(run.run_id, { reconciliationId })) synced += 1;
+        else failed += 1;
+      }
+      if (page >= current.total_pages) break;
+      page += 1;
+    }
+    return { synced, failed };
   }
 
   async reportUsage(runId, usageId, usage) {

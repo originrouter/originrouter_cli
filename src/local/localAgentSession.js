@@ -70,7 +70,6 @@ import {
   AGENT_DETAIL_PROFILES,
   resolveAgentDetailProfile,
 } from "../runtime/agentDetailProfile.js";
-import { showAgentLaunchScreen } from "./agentLaunchScreen.js";
 import { LocalAgentBridgeClient } from "./localAgentBridgeClient.js";
 import { createTerminalOutputPump } from "./terminalOutputPump.js";
 
@@ -403,21 +402,6 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // When LiteLLM is running for the selected openai-compatible provider,
   // buildAgentProviderEnv routes Claude Code through it.
   const proxyStatus = staticProxyStatusFn(readLocalProxySnapshot());
-
-  const launchAllowed = await showAgentLaunchScreen({
-    input: process.stdin,
-    output: process.stdout,
-    agent,
-    workspaceName: basename(cwd),
-    cwd,
-    detailLabel: detail.label,
-    controlLabel: relayModeDescription(relayPlan),
-    sessionLabel: agent === "claude" ? "Claude Code native session" : "Codex native session",
-  });
-  if (!launchAllowed) {
-    process.exitCode = 130;
-    return;
-  }
 
   // Stage 9.2: when the resolved route is type=remote, target=proxy, the
   // local wrapper owns the caller-side `RemoteCodingRelayProxy`. We

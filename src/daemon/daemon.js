@@ -919,6 +919,11 @@ export async function startDaemon(args) {
             reportLocalControlHeartbeat().catch(() => {});
             syncDeviceE2eeIdentity()
               .then(() => collaborationRuntime.flushOutbox())
+              // Reconcile every current Run on connection. Each projection is
+              // revision-guarded by the Server, while the per-connection key
+              // repairs a missing account-directory row after an outage.
+              .then(() => collaborationRuntime.syncRunDirectory())
+              .then(() => collaborationRuntime.flushOutbox())
               .catch((error) => {
                 console.error(`[daemon] device E2EE registration: ${error.code || error.message}`);
               });
