@@ -540,9 +540,9 @@ test("buildRuntimeEventEnvelope maps wrapper lifecycle events to server vocabula
 
   assert.equal(started.event_type, "session_started");
   assert.equal(started.status, "running");
-  assert.equal(exited.event_type, "session_failed");
+  assert.equal(exited.event_type, "session_terminated");
   assert.equal(exited.status, "failed");
-  assert.equal(stopped.event_type, "session_stopped");
+  assert.equal(stopped.event_type, "session_terminated");
   assert.equal(stopped.status, "stopped");
 });
 
@@ -708,4 +708,71 @@ test("createRuntimeEventReporter serializes events and deduplicates dual approva
     "agent.task.complete",
   ]);
   assert.equal(new Set(reported.map((item) => item.client_event_id)).size, 3);
+});
+
+test("runtime reporter does not treat an empty session exit as a task result", async () => {
+  const reported = [];
+  const reporter = createRuntimeEventReporter({
+    sessionId: "session-empty",
+    agentType: "claude",
+    title: "Empty session",
+    reportRuntimeEventFn: async (payload) => {
+      reported.push(payload);
+      return { ok: true };
+    },
+  });
+
+  reporter.report("session.started", {});
+  reporter.report("session.exited", { code: 0, signal: null });
+  await reporter.flush();
+
+  assert.deepEqual(reported.map((item) => item.event_type), [
+    "session_started",
+    "session_terminated",
+  ]);
+  assert.equal(reported[1].status, "completed");
+  assert.equal(reported.some((item) => item.event_type === "task_result_ready"), false);
+});
+
+test("runtime reporter creates one task outcome for an active structured task", async () => {
+  const reported = [];
+  const reporter = createRuntimeEventReporter({
+    sessionId: "session-task",
+    agentType: "claude",
+    title: "Task session",
+    reportRuntimeEventFn: async (payload) => {
+      reported.push(payload);
+      return { ok: true };
+    },
+  });
+
+  reporter.report("agent.event", { event: { type: "agent.task.started" } });
+  reporter.report("agent.event", { event: { type: "agent.task.completed" } });
+  reporter.report("session.exited", { code: 0, signal: null });
+  await reporter.flush();
+
+  assert.deepEqual(reported.map((item) => item.event_type), [
+    "agent.task.started",
+    "task_result_ready",
+    "session_terminated",
+  ]);
+
+  const failing = [];
+  const failureReporter = createRuntimeEventReporter({
+    sessionId: "session-failure",
+    agentType: "claude",
+    title: "Failure session",
+    reportRuntimeEventFn: async (payload) => {
+      failing.push(payload);
+      return { ok: true };
+    },
+  });
+  failureReporter.report("agent.event", { event: { type: "agent.task.started" } });
+  failureReporter.report("session.exited", { code: 1, signal: null });
+  await failureReporter.flush();
+
+  assert.deepEqual(failing.map((item) => item.event_type), [
+    "agent.task.started",
+    "task_failed",
+  ]);
 });

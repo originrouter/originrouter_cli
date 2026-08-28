@@ -952,6 +952,16 @@ export async function runClaudeSdkSession(rawArgs) {
     },
   });
   await report("session.started", { runtime: "claude-sdk", executor: "sdk" });
+  if (initialMessage) {
+    // The launch prompt bypasses the remote-message handler below, so mark it
+    // explicitly. The reporter uses this pairing to distinguish a real task
+    // result from a session that was merely opened and closed.
+    await sendAgentEvent({
+      type: "agent.task.started",
+      provider: "claude",
+      id: `launch:${sessionId}`,
+    });
+  }
   stopHeartbeat = startAgentSessionHeartbeat({ sessionId, stateDir });
 
   for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {

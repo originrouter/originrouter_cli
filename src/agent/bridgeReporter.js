@@ -303,11 +303,11 @@ function projectRuntimeEvent({ eventType, event, summary, riskLevel }) {
       .includes(signal);
     const succeeded = Number(event?.code ?? 0) === 0 && !event?.signal;
     return {
-      eventType: stoppedBySignal
-        ? "session_stopped"
-        : succeeded
-          ? "session_completed"
-          : "session_failed",
+      // A process ending is a session lifecycle fact, not evidence that a
+      // user-requested task produced a result. Task completion is projected
+      // below from the structured Agent event and is the only completion that
+      // may become a user notification.
+      eventType: "session_terminated",
       status: stoppedBySignal ? "stopped" : succeeded ? "completed" : "failed",
       summary: stoppedBySignal
         ? "Agent session stopped"
@@ -322,9 +322,11 @@ function projectRuntimeEvent({ eventType, event, summary, riskLevel }) {
   }
   if (eventType === "session.error") {
     return {
-      eventType: "session_failed",
-      status: "failed",
-      summary: "Agent session failed",
+      // The wrapper always follows this diagnostic with session.exited. Keep
+      // the diagnostic visible without creating a second terminal outcome.
+      eventType: "session_runtime_error",
+      status: "running",
+      summary: "Agent runtime reported an error",
       detail: "",
       currentStep: "Failed",
     };
@@ -443,6 +445,7 @@ function projectRuntimeEvent({ eventType, event, summary, riskLevel }) {
     "agent.tool_call.end",
     "agent.task.complete",
     "agent.task.aborted",
+    "agent.task.failed",
     "agent.adapter.status",
     "agent.activity",
   ]);
@@ -565,6 +568,11 @@ export function createRuntimeEventReporter({
   let tail = Promise.resolve();
   const deliveredDedupeKeys = new Set();
   const pendingDedupeKeys = new Set();
+  // Agent runtimes are generally single-turn per session. Keep this state at
+  // the reporting boundary so a clean process exit cannot masquerade as a
+  // completed task, while still allowing real structured turn results to
+  // notify the user.
+  let taskActive = false;
 
   const sendWithRetry = async (payload) => {
     let result = { ok: false, error: "request_failed" };
@@ -597,6 +605,38 @@ export function createRuntimeEventReporter({
         : `orev_${randomUUID()}`,
     });
     if (!payload) return tail;
+    if (payload.event_type === "agent.task.started") {
+      // Launching a runtime and receiving the provider's structured turn
+      // start can describe the same task. One activity event is enough.
+      if (taskActive) return tail;
+      taskActive = true;
+    } else if (
+      payload.event_type === "agent.task.complete" ||
+      payload.event_type === "agent.task.failed"
+    ) {
+      if (taskActive) {
+        payload.event_type = payload.event_type === "agent.task.complete"
+          ? "task_result_ready"
+          : "task_failed";
+        payload.summary = payload.event_type === "task_result_ready"
+          ? "Task result ready"
+          : "Task needs attention";
+        payload.current_step = payload.summary;
+        taskActive = false;
+      }
+    } else if (
+      eventType === "session.exited" &&
+      payload.status === "failed" &&
+      taskActive
+    ) {
+      // If an active task loses its runtime before it can emit a structured
+      // failure, report one actionable task failure. A later clean exit
+      // cannot emit another notification because taskActive is now false.
+      payload.event_type = "task_failed";
+      payload.summary = "Task interrupted before completion";
+      payload.current_step = payload.summary;
+      taskActive = false;
+    }
     let dedupeKey = "";
     if (payload.event_type === "approval_requested" || payload.event_type === "interaction_requested") {
       dedupeKey = `approval_requested:${payload.interaction_id}`;

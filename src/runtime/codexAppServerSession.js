@@ -830,6 +830,13 @@ export async function runCodexAppServerSession(rawArgs) {
   const sendMessage = async (message, messageId = null) => {
     const text = String(message || "").trim();
     if (!text || !threadId) return false;
+    if (!currentTurnId) {
+      await sendAgentEvent({
+        type: "agent.task.started",
+        provider: "codex",
+        id: messageId || `turn:${Date.now()}`,
+      });
+    }
     await sendAgentEvent({
       type: "user.text",
       provider: "codex",
