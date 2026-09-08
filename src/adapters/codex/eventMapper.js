@@ -253,16 +253,12 @@ function mapCodexAppServerEventInternal(message) {
     const totalTokens = Number(
       total.totalTokens ?? total.total_tokens
       ?? (Number(total.inputTokens ?? total.input_tokens ?? 0)
-        + Number(total.outputTokens ?? total.output_tokens ?? 0)
-        + Number(total.cachedInputTokens ?? total.cached_input_tokens ?? 0)
-        + Number(total.reasoningOutputTokens ?? total.reasoning_output_tokens ?? 0)),
+        + Number(total.outputTokens ?? total.output_tokens ?? 0)),
     );
     const lastTokens = Number(
       last.totalTokens ?? last.total_tokens
       ?? (Number(last.inputTokens ?? last.input_tokens ?? 0)
-        + Number(last.outputTokens ?? last.output_tokens ?? 0)
-        + Number(last.cachedInputTokens ?? last.cached_input_tokens ?? 0)
-        + Number(last.reasoningOutputTokens ?? last.reasoning_output_tokens ?? 0)),
+        + Number(last.outputTokens ?? last.output_tokens ?? 0)),
     );
     const active = Object.keys(last).length > 0 ? last : total;
     const inputTokens = Math.max(0, Number(active.inputTokens ?? active.input_tokens ?? 0) || 0);

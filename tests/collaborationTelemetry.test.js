@@ -41,7 +41,11 @@ test("collaboration execution events are mirrored to telemetry without affecting
       summary: "done",
       idempotency_key: "idem-1",
       metadata: { from_model: "gpt-5.4", to_model: "gpt-5.5" },
-      payload: { provider: "originrouter-cloud", model: "gpt-5.5" },
+      payload: {
+        provider: "originrouter-cloud",
+        model: "gpt-5.5",
+        token_usage: { inputTokens: 10, outputTokens: 4, cacheReadInputTokens: 3 },
+      },
     });
     assert.equal(result.duplicate, false);
     const telemetry = events.find((item) => item.input?.eventId === "event-1");
@@ -51,6 +55,15 @@ test("collaboration execution events are mirrored to telemetry without affecting
     assert.equal(telemetry.input.eventId, "event-1");
     assert.equal(telemetry.input.payload.provider, "originrouter-cloud");
     assert.equal(telemetry.input.payload.model, "gpt-5.5");
+    assert.deepEqual(telemetry.input.payload.token_usage, {
+      input_tokens: 10,
+      output_tokens: 4,
+      reasoning_tokens: undefined,
+      cache_read_input_tokens: 3,
+      cache_write_input_tokens: undefined,
+      cache_write_5m_input_tokens: undefined,
+      cache_write_1h_input_tokens: undefined,
+    });
     assert.deepEqual(telemetry.input.payload.metadata, {
       from_model: "gpt-5.4",
       to_model: "gpt-5.5",
@@ -80,6 +93,33 @@ test("non-cloud collaboration events retain metadata-only source context", () =>
     const localEvent = events.find((item) => item[0]?.eventId === "event-local");
     assert.ok(localEvent);
     assert.notEqual(localEvent[1].providerSource, "originrouter-coding");
+    store.close();
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("dynamic execution route type overrides the Agent's static route type", () => {
+  const stateDir = tempDir();
+  const events = [];
+  try {
+    const store = new CollaborationStore({
+      stateDir,
+      telemetryQueue: { enqueue(input, context) { events.push({ input, context }); return { inserted: true }; } },
+      telemetryContextProvider: () => ({ providerType: "originrouter", trainingEligible: true }),
+    });
+    const created = store.createRun({ conversationId: "conv-reroute", templateId: "plan_implement_verify", templateVersion: "1", objective: "test", agents: {
+      lead: { agent_id: "agent-1", role: "lead", runtime: "codex", device_id: "dev-1", provider: "cloud", model: "x", responsibilities: ["plan"] },
+      worker: { agent_id: "agent-2", role: "worker", runtime: "codex", device_id: "dev-1", provider: "cloud", model: "x", responsibilities: ["work"] },
+    } });
+    store.recordExecutionEvent(created.run_id, {
+      event_id: "event-reroute", participant_id: "agent-1", type: "agent.activity",
+      payload: { provider: "local-route", provider_type: "proxy", model: "local-model" },
+    });
+    const telemetry = events.find((item) => item.input?.eventId === "event-reroute");
+    assert.equal(telemetry.context.provider, "local-route");
+    assert.equal(telemetry.context.providerType, "proxy");
+    assert.equal(telemetry.context.providerSource, "");
     store.close();
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
@@ -218,6 +258,7 @@ test("execution projection preserves provider reroutes and gateway response fact
   const projected = executionEventProjection({
     type: "agent.activity",
     provider: "codex",
+    providerType: "originrouter",
     model: "gpt-5.5",
     activity: "model_rerouted",
     metadata: {
@@ -229,6 +270,7 @@ test("execution projection preserves provider reroutes and gateway response fact
     gatewayResponseIds: ["resp_gateway_1"],
   });
   assert.equal(projected.payload.provider, "codex");
+  assert.equal(projected.payload.provider_type, "originrouter");
   assert.equal(projected.payload.model, "gpt-5.5");
   assert.deepEqual(projected.payload.metadata, {
     from_model: "gpt-5.4",

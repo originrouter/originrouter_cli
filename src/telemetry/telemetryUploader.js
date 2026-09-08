@@ -6,6 +6,7 @@ import { buildRunBundle } from "./runBundle.js";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const RETRY_DELAY_MS = 30_000;
+const RUN_QUIESCENCE_MS = 2_000;
 const MAX_ARCHIVE_BYTES = Math.max(
   1,
   Number(process.env.ORIGINROUTER_CLI_UPLOAD_MAX_BYTES) || 64 * 1024 * 1024,
@@ -25,7 +26,7 @@ async function authForTelemetry({ stateDir, ensureFreshAccessTokenFn }) {
     resource: OAUTH_RESOURCES.RELAY,
   });
   const token = accessTokenFor(credential, OAUTH_RESOURCES.RELAY)?.token;
-  if (!credential?.deviceId || !token) return null;
+  if (!credential?.deviceId || !credential?.sessionId || !token) return null;
   return { credential, token };
 }
 
@@ -48,13 +49,16 @@ export class TelemetryUploader {
     this.timer = null;
   }
 
-  async request(path, options = {}) {
+  async request(path, { expectedAccountSessionId = "", ...options } = {}) {
     if (typeof this.fetchFn !== "function") return { ok: false, error: "fetch_unavailable" };
     const auth = await authForTelemetry({
       stateDir: this.stateDir,
       ensureFreshAccessTokenFn: this.ensureFreshAccessTokenFn,
     }).catch(() => null);
     if (!auth) return { ok: false, error: "login_required" };
+    if (expectedAccountSessionId && auth.credential.sessionId !== expectedAccountSessionId) {
+      return { ok: false, error: "account_session_changed" };
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
@@ -79,6 +83,14 @@ export class TelemetryUploader {
 
   async status() {
     return this.request("/cli/v1/telemetry/status", { method: "GET" });
+  }
+
+  async currentAccountSessionId() {
+    const auth = await authForTelemetry({
+      stateDir: this.stateDir,
+      ensureFreshAccessTokenFn: this.ensureFreshAccessTokenFn,
+    }).catch(() => null);
+    return auth?.credential?.sessionId || "";
   }
 
   async flush({ limit = 50 } = {}) {
@@ -113,7 +125,11 @@ export class TelemetryUploader {
     const status = await this.status();
     if (!status.ok) return { ok: false, error: status.error || "telemetry_status_failed", sent: 0 };
     const accountSessionId = this.accountSessionId || "";
-    const pending = this.queue.pending({ limit, accountSessionId: accountSessionId || null });
+    if (!accountSessionId) {
+      return { ok: false, blocked: true, error: "account_session_required", sent: 0 };
+    }
+    this.queue.dropPostTerminalEvents?.(accountSessionId);
+    const pending = this.queue.pending({ limit, accountSessionId });
     if (!pending.length) return { ok: true, sent: 0, pending: 0 };
     const excluded = pending.filter((event) => event.bundle_origin !== "collaboration_run");
     if (excluded.length) {
@@ -121,11 +137,7 @@ export class TelemetryUploader {
     }
     const eligible = pending.filter((event) => event.bundle_origin === "collaboration_run");
     if (!eligible.length) return { ok: true, sent: 0, dropped: excluded.length };
-    const accountEligible = accountSessionId
-      ? eligible.filter((event) => event.account_session_id === this.accountSessionId)
-      // Test doubles and legacy in-memory queues do not have a credential
-      // session. Production requests always set accountSessionId above.
-      : eligible;
+    const accountEligible = eligible.filter((event) => event.account_session_id === accountSessionId);
     if (!accountEligible.length) {
       return { ok: true, sent: 0, pending_account_session: eligible.length };
     }
@@ -143,21 +155,24 @@ export class TelemetryUploader {
       : this.maxArchiveBytes;
     const runResult = await this._flushCompletedRuns({
       maxArchiveBytes,
-      eligibleRunIds: accountSessionId ? new Set(accountEligible.map((event) => event.run_id)) : null,
-      accountSessionId: accountSessionId || null,
+      accountSessionId,
     });
-    if (runResult.more_pending) this.schedule({ delayMs: 0, limit });
+    if (runResult.more_pending && !runResult.waiting_for_quiescence) {
+      this.schedule({ delayMs: 0, limit });
+    }
     return runResult.sent > 0 || runResult.error
       ? runResult
       : { ok: true, sent: 0, pending_runs: eligible.length };
   }
 
-  async _flushCompletedRuns({ maxArchiveBytes = this.maxArchiveBytes, eligibleRunIds = null, accountSessionId = null } = {}) {
+  async _flushCompletedRuns({ maxArchiveBytes = this.maxArchiveBytes, accountSessionId = null } = {}) {
     if (!this.queue?.pendingRunIds) return { sent: 0 };
     let sent = 0;
     let bundles = 0;
-    for (const runId of this.queue.pendingRunIds({ limit: 20, accountSessionId })) {
-      if (eligibleRunIds && !eligibleRunIds.has(runId)) continue;
+    const terminalRunIds = this.queue.pendingTerminalRunIds
+      ? this.queue.pendingTerminalRunIds({ limit: 20, accountSessionId, minIdleMs: RUN_QUIESCENCE_MS })
+      : this.queue.pendingRunIds({ limit: 20, accountSessionId });
+    for (const runId of terminalRunIds) {
       const events = this.queue.pendingForRun(runId, { accountSessionId });
       if (events.some((event) => event.bundle_origin !== "collaboration_run")) {
         this.queue.markDropped?.(events.map((event) => event.event_id), "direct_wrapper_excluded");
@@ -193,6 +208,7 @@ export class TelemetryUploader {
         };
       }
       const grant = await this.request("/cli/v1/telemetry/upload-grant", {
+        expectedAccountSessionId: accountSessionId || "",
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -214,6 +230,10 @@ export class TelemetryUploader {
         this.queue.markRetry?.(events.map((event) => event.event_id), "invalid_upload_grant");
         return { ok: false, sent, error: "invalid_upload_grant" };
       }
+      if (accountSessionId && await this.currentAccountSessionId() !== accountSessionId) {
+        this.queue.markRetry?.(events.map((event) => event.event_id), "account_session_changed");
+        return { ok: false, sent, error: "account_session_changed" };
+      }
       const upload = await this._uploadArchive(data, archive);
       if (!upload.ok) {
         this.queue.markRetry?.(events.map((event) => event.event_id), upload.error || `http_${upload.status || 0}`);
@@ -224,8 +244,20 @@ export class TelemetryUploader {
       sent += events.length;
       bundles += 1;
     }
-    const morePending = this.queue.pendingRunIds({ limit: 1, accountSessionId }).length > 0;
-    return { ok: true, sent, bundle_count: bundles, more_pending: morePending };
+    const morePending = this.queue.pendingTerminalRunIds
+      ? this.queue.pendingTerminalRunIds({ limit: 1, accountSessionId }).length > 0
+      : false;
+    const waitingForQuiescence = morePending && terminalRunIds.length === 0;
+    if (waitingForQuiescence) {
+      this.schedule({ delayMs: RUN_QUIESCENCE_MS });
+    }
+    return {
+      ok: true,
+      sent,
+      bundle_count: bundles,
+      more_pending: morePending,
+      waiting_for_quiescence: waitingForQuiescence,
+    };
   }
 
   async _uploadArchive(grant, built) {

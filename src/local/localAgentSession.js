@@ -447,7 +447,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
   const providerEnv = providerResult.env;
   const resolvedProvider = providerResult.provider;
   const providerSource = providerResult.source;
-  const telemetry = createTelemetryPipeline({ stateDir });
+  const telemetry = createTelemetryPipeline({ stateDir, uploadOwner: false });
   if (typeof adapter.setRoutedModel === "function") {
     adapter.setRoutedModel(providerEnv.OPENAI_MODEL);
   }
@@ -876,7 +876,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     }
     send("session.exited", { code, signal });
     await report("session.exited", { code, signal });
-    await telemetry.uploader.flush().catch(() => {});
+    await telemetry.uploader?.flush().catch(() => {});
     telemetry.queue.close();
     activityLastAt = exitedAt;
     await syncCatalog(signal ? "stopped" : code === 0 ? "completed" : "failed")

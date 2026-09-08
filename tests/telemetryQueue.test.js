@@ -88,6 +88,18 @@ test("only a Run terminal event completes a bundle and queue ownership stays loc
   queue.close();
 });
 
+test("late facts after a sent terminal bundle are retained locally only as a drop reason", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "originrouter-telemetry-late-"));
+  const queue = new TelemetryQueue({ stateDir });
+  const context = { runId: "acr_late", accountSessionId: "session_a", trainingEligible: true };
+  queue.enqueue({ event_id: "te_terminal", event_type: "run.completed", event_seq: 4 }, context);
+  queue.markSent(["te_terminal"]);
+  queue.enqueue({ event_id: "te_late", event_type: "agent.activity", event_seq: 5 }, context);
+  assert.equal(queue.dropPostTerminalEvents("session_a"), 1);
+  assert.equal(queue.pendingForRun("acr_late", { accountSessionId: "session_a" }).length, 0);
+  queue.close();
+});
+
 test("uploader retains non-Cloud collaboration facts and rejects direct sessions", async () => {
   const nonCloudEvents = [{
     event_id: "te_non_cloud_terminal",
@@ -184,13 +196,119 @@ test("uploader does not infer Run completion from a long silent period", async (
   assert.equal(result.sent, 0);
 });
 
+test("uploader skips incomplete Runs without spinning or blocking a later completed Run", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "originrouter-telemetry-terminal-"));
+  let now = Date.parse("2026-09-08T00:00:00.000Z");
+  const queue = new TelemetryQueue({ stateDir, now: () => now });
+  for (let index = 0; index < 50; index += 1) {
+    queue.enqueue({ event_id: `te_open_${index}`, event_type: "agent.activity" }, {
+      runId: `acr_open_${index}`,
+      accountSessionId: "session_test",
+    });
+  }
+  queue.enqueue({ event_id: "te_completed", event_type: "run.completed" }, {
+    runId: "acr_completed",
+    accountSessionId: "session_test",
+  });
+  now += 2_001;
+  const sent = [];
+  const scheduled = [];
+  const uploader = new TelemetryUploader({ queue });
+  uploader.status = async () => ({ ok: true, data: { data: { enabled: true } } });
+  uploader.accountSessionId = "session_test";
+  uploader.request = async (_path, options) => {
+    assert.equal(options.expectedAccountSessionId, "session_test");
+    return { ok: true, data: { data: { upload_url: "https://storage.invalid/upload", upload_id: "u", grant: "g" } } };
+  };
+  uploader.currentAccountSessionId = async () => "session_test";
+  uploader._uploadArchive = async () => ({ ok: true });
+  const originalMarkSent = queue.markSent.bind(queue);
+  queue.markSent = (ids) => { sent.push(...ids); return originalMarkSent(ids); };
+  uploader.schedule = (options) => scheduled.push(options);
+  const result = await uploader.flush();
+  assert.equal(result.sent, 1);
+  assert.deepEqual(sent, ["te_completed"]);
+  assert.deepEqual(scheduled, []);
+  queue.close();
+});
+
+test("uploader waits for Run quiescence and includes usage arriving after the terminal event", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "originrouter-telemetry-quiescence-"));
+  let now = Date.parse("2026-09-08T00:00:00.000Z");
+  const queue = new TelemetryQueue({ stateDir, now: () => now });
+  const context = { runId: "acr_quiet", accountSessionId: "session_test" };
+  queue.enqueue({ event_id: "te_quiet_terminal", event_type: "run.completed", event_seq: 1 }, context);
+  now += 500;
+  queue.enqueue({
+    event_id: "te_quiet_usage",
+    event_type: "agent.usage",
+    event_seq: 2,
+    payload: { sampled_tokens: 120 },
+  }, context);
+  const uploaded = [];
+  const scheduled = [];
+  const uploader = new TelemetryUploader({ queue });
+  uploader.status = async () => ({ ok: true, data: { data: { enabled: true } } });
+  uploader.accountSessionId = "session_test";
+  uploader.request = async () => ({ ok: true, data: { data: { upload_url: "https://storage.invalid/upload", upload_id: "u", grant: "g" } } });
+  uploader.currentAccountSessionId = async () => "session_test";
+  uploader._uploadArchive = async (_grant, archive) => { uploaded.push(archive); return { ok: true }; };
+  uploader.schedule = (options) => scheduled.push(options);
+  const early = await uploader.flush();
+  assert.equal(early.sent, 0);
+  assert.equal(scheduled.at(-1).delayMs, 2_000);
+  now += 2_001;
+  const settled = await uploader.flush();
+  assert.equal(settled.sent, 2);
+  assert.equal(uploaded.length, 1);
+  assert.equal(queue.pendingForRun("acr_quiet", { accountSessionId: "session_test" }).length, 0);
+  queue.close();
+});
+
+test("uploader refuses a grant after the OAuth session changes", async () => {
+  const retried = [];
+  const events = [{
+    event_id: "te_account_switch",
+    event_type: "run.completed",
+    occurred_at: "2026-09-08T00:00:00.000Z",
+    run_id: "acr_account_switch",
+    account_session_id: "session_a",
+    bundle_origin: "collaboration_run",
+    payload: {},
+  }];
+  const queue = {
+    pendingRunIds: () => ["acr_account_switch"],
+    pendingForRun: () => events,
+    markRetry: (ids, reason) => retried.push({ ids, reason }),
+  };
+  const uploader = new TelemetryUploader({ queue });
+  uploader.request = async (_path, options) => {
+    assert.equal(options.expectedAccountSessionId, "session_a");
+    return { ok: false, error: "account_session_changed" };
+  };
+  const result = await uploader._flushCompletedRuns({ accountSessionId: "session_a" });
+  assert.equal(result.error, "account_session_changed");
+  assert.equal(retried[0].reason, "account_session_changed");
+});
+
+test("run bundles retain the authoritative collaboration event sequence", () => {
+  const built = buildRunBundle("acr_sequence", [
+    { event_id: "late-clock", event_type: "task.completed", occurred_at: "2026-09-08T00:00:02.000Z", event_seq: 1, run_id: "acr_sequence", bundle_origin: "collaboration_run", payload: {} },
+    { event_id: "early-clock", event_type: "run.completed", occurred_at: "2026-09-08T00:00:01.000Z", event_seq: 2, run_id: "acr_sequence", bundle_origin: "collaboration_run", payload: {} },
+  ]);
+  assert.deepEqual(built.bundle.events.map((event) => event.event_seq), [1, 2]);
+  assert.deepEqual(built.bundle.events.map((event) => event.event_id), ["late-clock", "early-clock"]);
+});
+
 test("uploader blocks an oversize completed Run without requesting an upload grant", async () => {
   const blocked = [];
   const events = [{
     event_id: "te_large",
     event_type: "run.completed",
     occurred_at: "2026-09-08T00:00:00.000Z",
+    run_id: "acr_large",
     bundle_origin: "collaboration_run",
+    account_session_id: "session_test",
     payload: { activity: "completed" },
   }];
   const queue = {
@@ -205,6 +323,7 @@ test("uploader blocks an oversize completed Run without requesting an upload gra
     ok: true,
     data: { data: { enabled: true, max_upload_bytes: 1 } },
   });
+  uploader.accountSessionId = "session_test";
   uploader.request = async () => assert.fail("oversize archive must not request grant");
   const result = await uploader.flush();
   assert.equal(result.blocked, true);
@@ -256,13 +375,31 @@ test("TelemetryQueue accepts collaboration facts only and is idempotent", () => 
   queue.close();
 });
 
+test("TelemetryQueue assigns a durable sequence to facts without a source sequence", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "originrouter-telemetry-sequence-"));
+  const queue = new TelemetryQueue({ stateDir });
+  queue.enqueue({ event_id: "te_sequence_1", event_type: "plan.created" }, {
+    runId: "acr_sequence_queue", accountSessionId: "session_test",
+  });
+  queue.enqueue({ event_id: "te_sequence_2", event_type: "run.completed" }, {
+    runId: "acr_sequence_queue", accountSessionId: "session_test",
+  });
+  assert.deepEqual(
+    queue.pendingForRun("acr_sequence_queue", { accountSessionId: "session_test" })
+      .map((event) => event.event_seq),
+    [1, 2],
+  );
+  queue.close();
+});
+
 test("privacy disable drops every locally pending collaboration event", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "originrouter-telemetry-"));
   const queue = new TelemetryQueue({ stateDir });
-  queue.enqueue({ event_id: "te_privacy_1", event_type: "run.completed" }, { runId: "acr_privacy" });
-  queue.enqueue({ event_id: "te_privacy_2", event_type: "task.completed" }, { runId: "acr_privacy" });
+  queue.enqueue({ event_id: "te_privacy_1", event_type: "run.completed" }, { runId: "acr_privacy", accountSessionId: "session_test" });
+  queue.enqueue({ event_id: "te_privacy_2", event_type: "task.completed" }, { runId: "acr_privacy", accountSessionId: "session_test" });
   const uploader = new TelemetryUploader({ queue });
   uploader.request = async () => ({ ok: true, data: { data: { enabled: false } } });
+  uploader.accountSessionId = "session_test";
   const result = await uploader.flush();
   assert.equal(result.reason, "privacy_disabled");
   assert.equal(result.dropped, 2);

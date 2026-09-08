@@ -49,4 +49,15 @@ assert.deepEqual(codex[0].tokenUsage, {
   reasoningTokens: 0,
   cacheReadInputTokens: 0,
 });
+
+const codexWithoutNativeTotal = mapCodexAppServerEvent({
+  type: "token_count",
+  last: {
+    inputTokens: 80,
+    outputTokens: 20,
+    cachedInputTokens: 60,
+    reasoningOutputTokens: 10,
+  },
+});
+assert.equal(codexWithoutNativeTotal[0].sampledTokens, 100);
 console.log("Agent usage mapping tests passed");

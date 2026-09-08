@@ -1,4 +1,5 @@
 import { cwd, stdin as defaultInput, stdout as defaultOutput } from "node:process";
+import { spawn } from "node:child_process";
 import {
   clearScreenDown,
   cursorTo,
@@ -120,6 +121,7 @@ const ANSI = {
 };
 
 const workspaceScreenCache = new WeakMap();
+const workspaceSelectionCache = new WeakMap();
 const LARGE_PASTE_CHAR_THRESHOLD = 1000;
 const PASTE_TOKEN_CODE_POINT_START = 0xF0000;
 const TERMINAL_WORKSPACE_RUN_STATES = new Set(["completed", "failed", "cancelled", "expired"]);
@@ -446,35 +448,161 @@ function reviewScrollDirection(text, key = {}, { arrows = false } = {}) {
   if (key.name === "pagedown" || sequence === "\x1b[6~" || (key.ctrl && key.name === "f")) return 1;
   if (arrows && key.name === "up") return -1;
   if (arrows && key.name === "down") return 1;
-  if (/^\x1b\[<64;\d+;\d+[mM]$/.test(sequence)) return -1;
-  if (/^\x1b\[<65;\d+;\d+[mM]$/.test(sequence)) return 1;
   return 0;
 }
 
+// SGR mouse reports can arrive as a single keypress or as several fragments.
+// Keeping this parser independent from the UI lets every Workspace surface
+// share the same pointer semantics.
 export function consumeWorkspaceMouseKeypress(state, text, key = {}) {
   const sequence = String(key.sequence || text || "");
   let buffer = String(state?.mouseSequenceBuffer || "");
   if (!buffer) {
-    if (!sequence.startsWith("\x1b[<")) return { handled: false, direction: 0 };
+    if (!sequence.startsWith("\x1b[<")) return { handled: false };
     buffer = sequence;
   } else {
     buffer += sequence;
   }
   if (buffer.length > 64) {
     state.mouseSequenceBuffer = "";
-    return { handled: true, direction: 0 };
+    return { handled: true };
   }
   if (!/[mM]$/.test(buffer)) {
     state.mouseSequenceBuffer = buffer;
-    return { handled: true, direction: 0 };
+    return { handled: true };
   }
   state.mouseSequenceBuffer = "";
-  const match = /^\x1b\[<(\d+);\d+;\d+[mM]$/.exec(buffer);
-  const button = Number(match?.[1]);
+  const match = /^\x1b\[<(\d+);(\d+);(\d+)([mM])$/.exec(buffer);
+  if (!match) return { handled: true };
+  const code = Number(match[1]);
+  const x = Number(match[2]);
+  const y = Number(match[3]);
+  if (code === 64 || code === 65) {
+    return { handled: true, type: "wheel", direction: code === 64 ? -1 : 1, x, y };
+  }
+  const button = code & 3;
+  const motion = (code & 32) !== 0;
+  if (match[4] === "m") return { handled: true, type: "release", button, x, y };
+  if (motion) return { handled: true, type: "move", button, x, y };
+  return { handled: true, type: "press", button, x, y };
+}
+
+function workspaceSelection(output) {
+  let selection = workspaceSelectionCache.get(output);
+  if (!selection) {
+    selection = { anchor: null, focus: null, dragging: false };
+    workspaceSelectionCache.set(output, selection);
+  }
+  return selection;
+}
+
+function clearWorkspaceSelection(output) {
+  const selection = workspaceSelectionCache.get(output);
+  if (!selection) return;
+  selection.anchor = null;
+  selection.focus = null;
+  selection.dragging = false;
+}
+
+function clampWorkspacePoint(output, point = {}) {
   return {
-    handled: true,
-    direction: button === 64 ? -1 : button === 65 ? 1 : 0,
+    x: Math.max(1, Math.min(Number(output.columns) || 80, Number(point.x) || 1)),
+    y: Math.max(1, Math.min(Number(output.rows) || 24, Number(point.y) || 1)),
   };
+}
+
+function compareWorkspacePoints(left, right) {
+  if (left.y !== right.y) return left.y - right.y;
+  return left.x - right.x;
+}
+
+function displaySlice(value, startColumn, endColumn) {
+  const start = Math.max(1, Number(startColumn) || 1);
+  const end = Math.max(start, Number(endColumn) || start);
+  let column = 1;
+  let text = "";
+  for (const char of stripAnsi(String(value || ""))) {
+    const width = Math.max(0, promptDisplayWidth(char));
+    const charStart = column;
+    const charEnd = width ? column + width - 1 : column;
+    if (charEnd >= start && charStart <= end) text += char;
+    if (width) column += width;
+    if (column > end) break;
+  }
+  return text;
+}
+
+export function workspaceSelectionText(lines, selection) {
+  if (!selection?.anchor || !selection?.focus) return "";
+  let start = selection.anchor;
+  let end = selection.focus;
+  if (compareWorkspacePoints(start, end) > 0) [start, end] = [end, start];
+  const rows = [];
+  for (let row = start.y; row <= end.y; row += 1) {
+    const line = lines[row - 1] || "";
+    const from = row === start.y ? start.x : 1;
+    const to = row === end.y ? end.x : Number.MAX_SAFE_INTEGER;
+    rows.push(displaySlice(line, from, to).replace(/[ \t]+$/g, ""));
+  }
+  return rows.join("\n").replace(/[\n\s]+$/g, "");
+}
+
+function renderWorkspaceSelection(output, lines) {
+  const selection = workspaceSelectionCache.get(output);
+  if (!selection?.anchor || !selection?.focus) return;
+  let start = selection.anchor;
+  let end = selection.focus;
+  if (compareWorkspacePoints(start, end) > 0) [start, end] = [end, start];
+  for (let row = start.y; row <= end.y; row += 1) {
+    const from = row === start.y ? start.x : 1;
+    const to = row === end.y ? end.x : Number(output.columns) || 80;
+    const text = displaySlice(lines[row - 1] || "", from, to);
+    if (!text) continue;
+    output.write(`\x1b[${row};${from}H\x1b[7m${text}\x1b[27m`);
+  }
+}
+
+function copyWorkspaceSelection(text) {
+  if (!text) return;
+  if (process.platform === "darwin") {
+    const child = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+    child.on("error", () => {});
+    child.stdin.end(text);
+  }
+}
+
+function handleWorkspaceMouseKeypress({ output, state, text, key, runtime = null, render }) {
+  const mouse = consumeWorkspaceMouseKeypress(state, text, key);
+  if (!mouse.handled) return false;
+  if (mouse.type === "wheel") {
+    clearWorkspaceSelection(output);
+    if (runtime && mouse.direction) scrollRuntimeContent(runtime, mouse.direction, 3);
+    render?.(true);
+    return true;
+  }
+  if (mouse.button !== 0) return true;
+  const selection = workspaceSelection(output);
+  const point = clampWorkspacePoint(output, mouse);
+  if (mouse.type === "press") {
+    selection.anchor = point;
+    selection.focus = point;
+    selection.dragging = true;
+    render?.(true);
+    return true;
+  }
+  if (mouse.type === "move" && selection.dragging) {
+    selection.focus = point;
+    render?.(true);
+    return true;
+  }
+  if (mouse.type === "release" && selection.dragging) {
+    selection.focus = point;
+    selection.dragging = false;
+    const copied = workspaceSelectionText(workspaceScreenCache.get(output)?.lines || [], selection);
+    copyWorkspaceSelection(copied);
+    render?.(true);
+  }
+  return true;
 }
 
 export function scrollRuntimeContent(runtime, direction, pageSize = 6) {
@@ -1502,17 +1630,16 @@ function runtimeControls(runtime, columns) {
   // Keep the footer as an action legend only. Mode, Run state, and approval
   // live together in composerStatus(), so they are not repeated at both ends
   // of the composer dock.
-  let text = runtime.notice || "↑/↓ history · Enter queues next objective · Ctrl+T copy mode";
-  if (runtime.screenPaused) text = "screen frozen for copying · drag selects text · Ctrl+T resumes updates";
+  let text = runtime.notice || "↑/↓ history · Enter queues next objective";
   const selectedActivityId = runtime.activityParticipantIds?.[runtime.activitySelection || 0];
   const selectedActivityExpanded = selectedActivityId
     && (runtime.expandedActivityParticipants || []).includes(selectedActivityId);
   if (selectedActivityId && !runtime.interaction) {
-    text = `↑/↓ history · Ctrl+O ${selectedActivityExpanded ? "collapses" : "expands"} Agent · Ctrl+T copy mode`;
+    text = `↑/↓ history · Ctrl+O ${selectedActivityExpanded ? "collapses" : "expands"} Agent`;
   }
   if (runtime.autoFollow === false) {
     const unseen = Number(runtime.unseenActivityCount || 0);
-    text = `${unseen ? `${unseen} new event${unseen === 1 ? "" : "s"} · ` : ""}↑/↓ history · PgDn latest · Ctrl+O details · Ctrl+T copy mode`;
+    text = `${unseen ? `${unseen} new event${unseen === 1 ? "" : "s"} · ` : ""}↑/↓ history · PgDn latest · Ctrl+O details`;
   }
   if (runtime.queuedObjective) text = "next objective queued · ctrl+c interrupts · ← agents";
   if (runtime.phase === "needs_setup") text = runtime.setup?.workspaces?.length && runtime.setupMode !== "path"
@@ -1560,6 +1687,28 @@ function runtimeControls(runtime, columns) {
   return padDisplayRight(muted(`  ${text}`), columns);
 }
 
+function runtimeStatusVisible(runtime) {
+  if (!runtime) return false;
+  if (runtime.interaction || runtime.notice || runtime.queuedObjective) return true;
+  const state = String(runtime.snapshot?.run?.state || "").toLowerCase();
+  const phase = String(runtime.phase || "").toLowerCase();
+  return ["running", "in_progress", "planning", "executing", "reconnecting", "connection_paused"]
+    .includes(state) || ["running", "planning", "executing", "reconnecting", "connection_paused"]
+    .includes(phase);
+}
+
+function runtimeControlsVisible(runtime) {
+  if (!runtime) return false;
+  return Boolean(
+    runtime.autoFollow === false
+      || runtime.notice
+      || runtime.interaction
+      || runtime.queuedObjective
+      || runtime.snapshot?.run?.state === "awaiting_confirmation"
+      || ["attention", "attention_reply", "paused", "reconnect"].includes(runtime.interactionKind),
+  );
+}
+
 function composerStatus(columns, runtime = null) {
   const profile = runtime?.sessionApprovalOverride?.profile
     || runtime?.snapshot?.run?.supervisor_permission_profile
@@ -1573,11 +1722,7 @@ function composerStatus(columns, runtime = null) {
     const status = `● ${permissionLabel(profile, policyId).toLowerCase()} · session approval`;
     return `${" ".repeat(Math.max(0, columns - promptDisplayWidth(status) - 2))}${accent(status)}  `;
   }
-  const state = runtime.snapshot?.run?.state
-    ? String(runtime.snapshot.run.state).replaceAll("_", " ")
-    : runtimePhase(runtime);
-  const mode = workspaceModeDefinition(runtime.mode || "auto").label;
-  const status = `● ${state}  │  ${mode}  │  ${permissionLabel(profile, policyId).toLowerCase()} approval`;
+  const status = `● ${runtimePhase(runtime)} · Esc to interrupt`;
   return padDisplayRight(accent(`  ${status}`), columns);
 }
 
@@ -2007,14 +2152,11 @@ export function buildWorkspaceAppScreen({
 
   const compactHeader = runtime || terminalRows < 14 || terminalColumns < 56;
   const headerRows = compactHeader
-    ? [
+    ? runtime
+      ? [appLine(strong(`OriginRouter · ${workspace}${runtime.runId ? ` · ${runtime.runId}` : ""}`), terminalColumns)]
+      : [
         titleLine("OriginRouter", frameWidth),
-        appLine(
-          runtime
-            ? `${workspace} · ${modeLabel} · ${runtimePhase(runtime)}${runtime.runId ? ` · ${runtime.runId}` : ""}`
-            : `${workspace} · ${modeLabel} · Ready for an objective`,
-          contentWidth,
-        ),
+        appLine(`${workspace} · ${modeLabel} · Ready for an objective`, contentWidth),
         bottomLine(frameWidth),
       ]
     : [
@@ -2059,8 +2201,15 @@ export function buildWorkspaceAppScreen({
         .filter(Boolean)
         .join("\n")
     : "";
+  const runtimeStatus = runtime && runtimeStatusVisible(runtime)
+    ? (runtime.interaction ? interactionStatus(runtime, terminalColumns) : composerStatus(terminalColumns, runtime))
+    : "";
+  const runtimeFooter = runtime && runtimeControlsVisible(runtime)
+    ? runtimeControls(runtime, terminalColumns)
+    : "";
   const reservedRows = runtime
-    ? 4 + runtimeComposerBlock.split("\n").length
+    ? (runtimeStatus ? 1 : 0) + 1 + runtimeComposerBlock.split("\n").length
+      + (runtimeFooter ? 2 : 0)
     : normalComposerBlock
       ? 4 + normalComposerBlock.split("\n").length
       : 5;
@@ -2079,7 +2228,7 @@ export function buildWorkspaceAppScreen({
     ? `${screenRows.join("\n")}\n${"\n".repeat(blankRows)}`
     : "";
   if (!runtime && composerBuffer === null) {
-    return `${body}${composerStatus(terminalColumns, { sessionApprovalOverride: sessionApproval })}\n${separator}\n`;
+    return `${body}${separator}\n`;
   }
   if (!runtime) {
     return [
@@ -2091,16 +2240,9 @@ export function buildWorkspaceAppScreen({
     ].join("\n");
   }
   const composer = runtimeComposerBlock;
-  const status = runtime.interaction
-    ? interactionStatus(runtime, terminalColumns)
-    : composerStatus(terminalColumns, runtime);
-  return [
-    `${body}${status}`,
-    separator,
-    composer,
-    separator,
-    runtimeControls(runtime, terminalColumns),
-  ].join("\n");
+  const runtimeRows = [`${body}${runtimeStatus}`, separator, composer];
+  if (runtimeFooter) runtimeRows.push(separator, runtimeFooter);
+  return runtimeRows.join("\n");
 }
 
 function redrawWorkspaceApp(output, {
@@ -2166,6 +2308,7 @@ function redrawWorkspaceApp(output, {
     rows: output.rows,
     lines: nextLines,
   });
+  writeFrame(() => renderWorkspaceSelection(output, nextLines));
 }
 
 function supportsAppScreen(output) {
@@ -2174,29 +2317,23 @@ function supportsAppScreen(output) {
 
 function enterWorkspaceApp(output) {
   if (!supportsAppScreen(output)) return () => {};
-  // Mouse tracking is required for reliable in-app wheel scrolling. It does
-  // capture normal drag selection, so Ctrl+T temporarily disables tracking
-  // while freezing the screen for native terminal copy/selection.
+  // Match Claude Code's terminal model: receive drag and wheel events in the
+  // alternate screen, render the selection ourselves, and copy it when the
+  // drag ends. This avoids Terminal.app falling back to shell scrollback.
   // Disable autowrap while the app owns the screen. Writing a full-width row
   // into the bottom-right cell can otherwise scroll the alternate buffer and
   // expose the shell's scrollback above the app.
-  output.write("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?7l\x1b[?2004h\x1b[?25l\x1b[H\x1b[2J");
+  output.write("\x1b[?1049h");
+  output.write("\x1b[?1002h\x1b[?1006h");
+  output.write("\x1b[?7l\x1b[?2004h\x1b[?25l\x1b[H\x1b[2J");
   let exited = false;
-  let mouseTracking = true;
-  const setMouseTracking = (enabled) => {
-    const next = Boolean(enabled);
-    if (next === mouseTracking || exited) return;
-    mouseTracking = next;
-    output.write(next ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l");
-  };
-  output.setOriginRouterMouseTracking = setMouseTracking;
   const exit = () => {
     if (exited) return;
-    setMouseTracking(false);
     exited = true;
     workspaceScreenCache.delete(output);
-    output.write("\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l");
-    delete output.setOriginRouterMouseTracking;
+    clearWorkspaceSelection(output);
+    workspaceSelectionCache.delete(output);
+    output.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l");
   };
   process.once("exit", exit);
   const onSigterm = () => {
@@ -2452,10 +2589,13 @@ async function readWorkspaceLine({
       inputFrameScheduler.request();
     };
     const onKeypress = (text, key = {}) => {
-      // Mouse tracking is enabled for the Workspace as a whole. The home
-      // composer has no document to scroll, but it must still consume wheel
-      // reports so those escape sequences never become typed input.
-      if (consumeWorkspaceMouseKeypress(mouseState, text, key).handled) return;
+      if (handleWorkspaceMouseKeypress({
+        output,
+        state: mouseState,
+        text,
+        key,
+        render: renderInput,
+      })) return;
       if (key.name === "paste-start") {
         pasteBuffer = "";
         return;
@@ -2655,6 +2795,7 @@ function isInterrupted(error) {
 
 async function readRuntimeDecision({
   input,
+  output = defaultOutput,
   runtime,
   render,
   kind,
@@ -2664,6 +2805,7 @@ async function readRuntimeDecision({
   emitKeypressEvents(input);
   input.setRawMode(true);
   input.resume();
+  const mouseState = { mouseSequenceBuffer: "" };
   runtime.interaction = true;
   runtime.interactionKind = kind;
   delete runtime.interactionSurface;
@@ -2759,14 +2901,14 @@ async function readRuntimeDecision({
       reject(error);
     };
     const onKeypress = (text, key = {}) => {
-      const mouse = consumeWorkspaceMouseKeypress(runtime, text, key);
-      if (mouse.handled) {
-        if (mouse.direction) {
-          scrollRuntimeContent(runtime, mouse.direction, 3);
-          render(true);
-        }
-        return;
-      }
+      if (handleWorkspaceMouseKeypress({
+        output: runtime.output || output,
+        state: mouseState,
+        text,
+        key,
+        runtime,
+        render,
+      })) return;
       if (((key.shift && key.name === "tab") || key.sequence === "\x1b[Z")
         && typeof cycleSessionApproval === "function") {
         void Promise.resolve(cycleSessionApproval()).catch((error) => {
@@ -3488,6 +3630,7 @@ async function readWorkspaceModePicker({
     terminalColumns: output.columns,
     terminalRows: output.rows,
   };
+  Object.defineProperty(runtime, "output", { value: output });
   const render = (force = false) => {
     runtime.terminalColumns = output.columns;
     runtime.terminalRows = output.rows;
@@ -3545,6 +3688,7 @@ async function readWorkspaceSessionPicker({
     terminalColumns: output.columns,
     terminalRows: output.rows,
   };
+  Object.defineProperty(runtime, "output", { value: output });
   const render = (force = false) => {
     runtime.terminalColumns = output.columns;
     runtime.terminalRows = output.rows;
@@ -3724,8 +3868,6 @@ async function runWorkspaceObjective({
     decisionBuffer: "",
     decisionCursor: 0,
     draftObjective: "",
-    screenPaused: false,
-    mouseSequenceBuffer: "",
     attention: null,
     attentionSelection: 0,
     detachRequested: false,
@@ -3749,6 +3891,7 @@ async function runWorkspaceObjective({
     approvalUpdatePending: false,
     completedExitArmed: false,
   };
+  Object.defineProperty(runtime, "output", { value: output });
   const render = (force = false) => {
     runtime.commandCompletionContext = workspaceCommandCompletionContext({
       approvalOptions: runtime.commandApprovalOptions,
@@ -3766,16 +3909,16 @@ async function runWorkspaceObjective({
   };
   const frameScheduler = createWorkspaceFrameScheduler({ render });
   const scheduleRender = () => {
-    if (!runtime.screenPaused) frameScheduler.request(false);
+    frameScheduler.request(false);
   };
   const onResize = () => scheduleRender();
   const timer = setInterval(() => {
-    // Do not invalidate native terminal text selection while a setup/composer
-    // interaction is active. State is redrawn on keypress and resize.
+    // A setup/composer interaction redraws on input and resize, rather than
+    // competing with the focused decision surface on every animation tick.
     const terminal = ["completed", "failed", "cancelled", "expired", "error"].includes(
       runtime.snapshot?.run?.state || runtime.phase,
     );
-    if (!runtime.interaction && !runtime.screenPaused && !terminal && runtime.phase !== "needs_setup") {
+    if (!runtime.interaction && !terminal && runtime.phase !== "needs_setup") {
       runtime.animationFrame = (runtime.animationFrame + 1) % SPINNER_FRAMES.length;
       scheduleRender();
     }
@@ -3818,6 +3961,7 @@ async function runWorkspaceObjective({
   emitKeypressEvents(input);
   input.setRawMode(true);
   input.resume();
+  const mouseState = { mouseSequenceBuffer: "" };
   let noticeTimer = null;
   let completedExitTimer = null;
   const clearCompletedExitArm = () => {
@@ -3930,14 +4074,14 @@ async function runWorkspaceObjective({
   const onActiveKeypress = (text, key = {}) => {
     if (runtime.interaction) return;
     if (runtime.completedExitArmed && !(key.ctrl && key.name === "c")) clearCompletedExitArm();
-    const mouse = consumeWorkspaceMouseKeypress(runtime, text, key);
-    if (mouse.handled) {
-      if (mouse.direction) {
-        scrollRuntimeContent(runtime, mouse.direction, 3);
-        render(true);
-      }
-      return;
-    }
+    if (handleWorkspaceMouseKeypress({
+      output,
+      state: mouseState,
+      text,
+      key,
+      runtime,
+      render,
+    })) return;
     if (key.ctrl && key.name === "o") {
       if (!toggleSelectedActivity(runtime)) runtime.notice = "No Agent activity is available yet";
       render(true);
@@ -3989,13 +4133,6 @@ async function runWorkspaceObjective({
         return;
       }
       runtime.composerPasteBuffer += pastedKeyText(text, key);
-      return;
-    }
-    if (key.ctrl && key.name === "t") {
-      runtime.screenPaused = !runtime.screenPaused;
-      output.setOriginRouterMouseTracking?.(!runtime.screenPaused);
-      runtime.notice = runtime.screenPaused ? "Screen frozen for copying" : "Screen updates resumed";
-      render(true);
       return;
     }
     const scrollDirection = reviewScrollDirection(text, key);

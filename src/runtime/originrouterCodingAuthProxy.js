@@ -111,6 +111,7 @@ export class OriginRouterCodingAuthProxy {
     fetchFn = globalThis.fetch,
     ensureFreshAccessTokenFn = ensureFreshAccessToken,
     maxRequestBytes = MAX_REQUEST_BYTES,
+    onGatewayResponseIds = null,
   }) {
     this.stateDir = stateDir;
     this.upstreamBaseUrl = trimBaseUrl(upstreamBaseUrl);
@@ -118,6 +119,7 @@ export class OriginRouterCodingAuthProxy {
     this.fetchFn = fetchFn;
     this.ensureFreshAccessTokenFn = ensureFreshAccessTokenFn;
     this.maxRequestBytes = maxRequestBytes;
+    this.onGatewayResponseIds = typeof onGatewayResponseIds === "function" ? onGatewayResponseIds : null;
     this.localToken = `or_local_${randomBytes(32).toString("base64url")}`;
     this._server = null;
     this._port = null;
@@ -198,6 +200,22 @@ export class OriginRouterCodingAuthProxy {
     });
   }
 
+  _observeGatewayResponseIds(headers) {
+    if (!this.onGatewayResponseIds) return;
+    const values = [
+      headers.get("x-originrouter-response-id"),
+      headers.get("x-originrouter-request-id"),
+      headers.get("x-gateway-response-id"),
+      headers.get("x-response-id"),
+      headers.get("x-openai-request-id"),
+      headers.get("x-request-id"),
+    ].filter((value) => typeof value === "string" && value.trim())
+      .map((value) => value.trim().slice(0, 255));
+    if (values.length) {
+      try { this.onGatewayResponseIds([...new Set(values)]); } catch {}
+    }
+  }
+
   async _handle(req, res) {
     if (!safeEqual(localCredential(req), this.localToken)) {
       sendJson(res, 401, { error: "unauthorized" });
@@ -228,6 +246,7 @@ export class OriginRouterCodingAuthProxy {
         token = refreshed;
         upstream = await this._fetchUpstream(req, body, token, controller.signal);
       }
+      this._observeGatewayResponseIds(upstream.headers);
       res.writeHead(upstream.status, responseHeaders(upstream.headers));
       if (!upstream.body) {
         res.end();
@@ -258,6 +277,7 @@ export class OriginRouterCodingAuthProxy {
 export async function protectOriginrouterCodingEnv(agent, providerResult, {
   stateDir,
   runId = "",
+  onGatewayResponseIds = null,
   proxyFactory = (options) => new OriginRouterCodingAuthProxy(options),
 } = {}) {
   if (providerResult?.source !== "originrouter-coding") {
@@ -267,6 +287,7 @@ export async function protectOriginrouterCodingEnv(agent, providerResult, {
     stateDir,
     upstreamBaseUrl: DEFAULT_ORIGINROUTER_BASE_URL,
     runId,
+    onGatewayResponseIds,
   });
   const status = await proxy.start();
   const localBase = `http://${status.host}:${status.port}`;

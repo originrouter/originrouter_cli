@@ -42,8 +42,10 @@ const SAFE_USAGE_KEYS = new Set([
   "input_tokens", "inputTokens", "output_tokens", "outputTokens",
   "reasoning_tokens", "reasoningTokens",
   "cached_input_tokens", "cachedInputTokens", "total_tokens", "totalTokens",
-  "cache_read_input_tokens", "cache_write_input_tokens",
-  "cache_write_5m_input_tokens", "cache_write_1h_input_tokens",
+  "cache_read_input_tokens", "cacheReadInputTokens",
+  "cache_write_input_tokens", "cacheWriteInputTokens",
+  "cache_write_5m_input_tokens", "cacheWrite5mInputTokens",
+  "cache_write_1h_input_tokens", "cacheWrite1hInputTokens",
   "fencing_token", "fencingToken",
   "contains_secret", "containsSecret",
 ]);
@@ -67,6 +69,22 @@ function id(prefix) {
 
 function parseJson(value, fallback) {
   try { return JSON.parse(value); } catch { return fallback; }
+}
+
+function telemetryTokenUsage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return {
+    input_tokens: value.input_tokens ?? value.inputTokens,
+    output_tokens: value.output_tokens ?? value.outputTokens,
+    reasoning_tokens: value.reasoning_tokens ?? value.reasoningTokens,
+    cache_read_input_tokens: value.cache_read_input_tokens
+      ?? value.cacheReadInputTokens
+      ?? value.cached_input_tokens
+      ?? value.cachedInputTokens,
+    cache_write_input_tokens: value.cache_write_input_tokens ?? value.cacheWriteInputTokens,
+    cache_write_5m_input_tokens: value.cache_write_5m_input_tokens ?? value.cacheWrite5mInputTokens,
+    cache_write_1h_input_tokens: value.cache_write_1h_input_tokens ?? value.cacheWrite1hInputTokens,
+  };
 }
 
 function assertNoSecretFields(value) {
@@ -3265,7 +3283,7 @@ export class CollaborationStore {
       const provider = safeText(input.provider || event.payload?.provider || agent?.provider, 191);
       const suppliedContext = this.telemetryContextProvider?.(run, event, input) || {};
       const providerType = safeText(
-        input.provider_type || input.providerType || suppliedContext.providerType,
+        input.provider_type || input.providerType || event.payload?.provider_type || suppliedContext.providerType,
         32,
       );
       const explicitSource = safeText(input.provider_source || input.providerSource, 64);
@@ -3318,7 +3336,7 @@ export class CollaborationStore {
           delegation_detected: event.payload?.delegation_detected,
           response_id: event.payload?.response_id,
           gateway_response_ids: event.payload?.gateway_response_ids,
-          token_usage: event.payload?.token_usage,
+          token_usage: telemetryTokenUsage(event.payload?.token_usage ?? event.payload?.tokenUsage),
           sampled_tokens: event.payload?.sampled_tokens,
           amount_micros: event.payload?.amount_micros,
           currency: event.payload?.currency,

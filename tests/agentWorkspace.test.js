@@ -10,6 +10,7 @@ import {
   parseAgentWorkspaceArgs,
   redrawPrompt,
   scrollRuntimeContent,
+  workspaceSelectionText,
   workspaceInteractionSurface,
 } from "../src/commands/agentWorkspace.js";
 import {
@@ -162,7 +163,7 @@ assert.match(workspaceScreen, /OriginRouter/);
 assert.match(workspaceScreen, /Agent Workspace/);
 assert.match(workspaceScreen, /Team      Auto/);
 assert.match(workspaceScreen, /Access    Guarded/);
-assert.match(workspaceScreen, /● Working  │  Auto  │  guarded approval/);
+assert.doesNotMatch(workspaceScreen, /● Working/);
 assert.doesNotMatch(workspaceScreen, /^OriginRouter\nWorkspace/m);
 
 const inputScreen = buildWorkspaceAppScreen({
@@ -761,16 +762,21 @@ setTimeout(() => {
 }, 20);
 await liveApprovalRun;
 assert.equal(
-  liveApprovalTerminal.writes.join("").includes("\x1b[?1000h"),
+  liveApprovalTerminal.writes.join("").includes("\x1b[?1002h"),
   true,
-  "the live workspace enables mouse tracking so wheel scrolling stays inside the TUI",
+  "the live workspace captures drag events for its own text selection",
 );
 assert.equal(
   liveApprovalTerminal.writes.join("").includes("\x1b[?1006h"),
   true,
-  "the live workspace uses SGR mouse reporting for wheel events",
+  "the live workspace receives coordinate-rich SGR mouse reports",
 );
-assert.match(liveApprovalTerminal.writes.join(""), /Ctrl\+T copy mode/);
+assert.equal(
+  liveApprovalTerminal.writes.join("").includes("\x1b[?1006l\x1b[?1002l"),
+  true,
+  "mouse reporting is disabled before leaving the alternate screen",
+);
+assert.doesNotMatch(liveApprovalTerminal.writes.join(""), /Ctrl\+T copy mode/);
 
 const runtimeClearTerminal = fakeTerminal();
 const runtimeClearCancelled = [];
@@ -1616,8 +1622,8 @@ assert.match(runtimeScreen, /Remote Ops · 2 Agents · 2 devices/);
 assert.match(runtimeScreen, /Inspect remote status/);
 assert.match(runtimeScreen, /acr_runtime/);
 assert.match(runtimeScreen, /› queue another check/);
-assert.match(runtimeScreen, /Enter queues next objective/);
-assert.match(runtimeScreen, /Ctrl\+T copy mode/);
+assert.match(runtimeScreen, /● Agents are working · Esc to interrupt/);
+assert.doesNotMatch(runtimeScreen, /Ctrl\+T copy mode/);
 assert.match(runtimeScreen.replace(/\x1b\[[0-9;]*m/g, ""), /\n› Inspect the remote computer/);
 const plainRuntimeScreen = runtimeScreen.replace(/\x1b\[[0-9;]*m/g, "");
 assert.match(plainRuntimeScreen, /\n⠋ Agents are working/);
@@ -1681,8 +1687,8 @@ const firstScrollScreen = buildWorkspaceAppScreen({
   rows: 16,
   runtime: scrollingHeaderRuntime,
 }).replace(/\x1b\[[0-9;]*m/g, "");
-assert.match(firstScrollScreen, /^╭─+ OriginRouter /, "a Run opens at the scrollable title card");
-assert.match(firstScrollScreen, /completed  │  Auto  │  guarded approval/, "the status bar remains visible at the bottom");
+assert.match(firstScrollScreen, /^OriginRouter · originrouter-cli/, "a Run keeps a lightweight workspace header");
+assert.match(firstScrollScreen, /new event.*↑\/↓ history.*PgDn latest/, "scroll controls appear while detached from the live tail");
 assert.equal(scrollRuntimeContent(scrollingHeaderRuntime, 1, 100), true);
 const laterScrollScreen = buildWorkspaceAppScreen({
   coordinator: "codex",
@@ -1691,8 +1697,8 @@ const laterScrollScreen = buildWorkspaceAppScreen({
   rows: 16,
   runtime: scrollingHeaderRuntime,
 }).replace(/\x1b\[[0-9;]*m/g, "");
-assert.doesNotMatch(laterScrollScreen, /OriginRouter/, "the title card scrolls away with the document");
-assert.match(laterScrollScreen, /completed  │  Auto  │  guarded approval/, "the status bar does not scroll away");
+assert.match(laterScrollScreen, /OriginRouter · originrouter-cli/, "the workspace header stays fixed");
+assert.match(laterScrollScreen, /new event.*↑\/↓ history.*PgDn latest/, "scroll controls remain visible while detached");
 
 const scrollRuntime = {
   contentLineCount: 30,
@@ -1711,31 +1717,39 @@ assert.equal(scrollRuntimeContent(scrollRuntime, 1, 20), true);
 assert.equal(scrollRuntime.autoFollow, true, "PageDown at the bottom resumes live following");
 assert.equal(scrollRuntime.unseenActivityCount, 0);
 
-const completeMouseState = { mouseSequenceBuffer: "" };
+const mouseState = { mouseSequenceBuffer: "" };
 assert.deepEqual(
-  consumeWorkspaceMouseKeypress(completeMouseState, undefined, { sequence: "\x1b[<64;10;5M" }),
-  { handled: true, direction: -1 },
+  consumeWorkspaceMouseKeypress(mouseState, undefined, { sequence: "\x1b[<0;4;3M" }),
+  { handled: true, type: "press", button: 0, x: 4, y: 3 },
 );
 assert.deepEqual(
-  consumeWorkspaceMouseKeypress(completeMouseState, undefined, { sequence: "\x1b[<65;10;5M" }),
-  { handled: true, direction: 1 },
+  consumeWorkspaceMouseKeypress(mouseState, undefined, { sequence: "\x1b[<32;12;7M" }),
+  { handled: true, type: "move", button: 0, x: 12, y: 7 },
 );
 assert.deepEqual(
-  consumeWorkspaceMouseKeypress(completeMouseState, "x", { sequence: "x" }),
-  { handled: false, direction: 0 },
+  consumeWorkspaceMouseKeypress(mouseState, undefined, { sequence: "\x1b[<0;12;7m" }),
+  { handled: true, type: "release", button: 0, x: 12, y: 7 },
 );
-
+assert.deepEqual(
+  consumeWorkspaceMouseKeypress(mouseState, undefined, { sequence: "\x1b[<64;12;7M" }),
+  { handled: true, type: "wheel", direction: -1, x: 12, y: 7 },
+);
 const fragmentedMouseState = { mouseSequenceBuffer: "" };
-for (const sequence of ["\x1b[<", "6", "4", ";", "1", "0", ";", "5"]) {
-  assert.deepEqual(
-    consumeWorkspaceMouseKeypress(fragmentedMouseState, sequence, { sequence }),
-    { handled: true, direction: 0 },
-  );
-}
 assert.deepEqual(
-  consumeWorkspaceMouseKeypress(fragmentedMouseState, "M", { sequence: "M" }),
-  { handled: true, direction: -1 },
-  "readline-fragmented SGR mouse input is reconstructed before scrolling",
+  consumeWorkspaceMouseKeypress(fragmentedMouseState, "\x1b[<32;9", { sequence: "\x1b[<32;9" }),
+  { handled: true },
+);
+assert.deepEqual(
+  consumeWorkspaceMouseKeypress(fragmentedMouseState, ";4M", { sequence: ";4M" }),
+  { handled: true, type: "move", button: 0, x: 9, y: 4 },
+);
+assert.equal(
+  workspaceSelectionText(
+    ["\x1b[1mAlpha bravo\x1b[0m", "Second line", "Third"],
+    { anchor: { x: 7, y: 1 }, focus: { x: 6, y: 2 } },
+  ),
+  "bravo\nSecond",
+  "selection text is reconstructed from visible terminal cells, without ANSI styling",
 );
 
 const interactionScreen = buildWorkspaceAppScreen({

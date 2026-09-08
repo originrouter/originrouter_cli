@@ -386,10 +386,12 @@ export async function runCodexAppServerSession(rawArgs) {
   let originrouterCodingProxy = null;
   let localAgentBridge = null;
   let relayViaDaemon = false;
+  let emitGatewayResponseIds = null;
   ({ providerResult, proxy: originrouterCodingProxy } =
     await protectOriginrouterCodingEnv("codex", providerResult, {
       stateDir,
       runId: options.runId,
+      onGatewayResponseIds: (ids) => { void emitGatewayResponseIds?.(ids); },
     }));
   const telemetry = createTelemetryPipeline({
     stateDir,
@@ -524,6 +526,14 @@ export async function runCodexAppServerSession(rawArgs) {
     await refreshTranscriptPath();
     const transientEvent = {
       ...event,
+      // "codex" identifies the runtime, not the routed model provider.
+      // Preserve the actual route so collaboration telemetry can join cost,
+      // model and gateway facts across processes.
+      provider: event.provider && event.provider !== "codex"
+        ? event.provider
+        : (providerResult.provider?.name || event.provider || "codex"),
+      providerType: event.providerType || event.provider_type || providerResult.provider?.type || "",
+      model: event.model || model || "",
       eventId: event.eventId || `ate_${randomUUID()}`,
       createdAt: event.createdAt || Math.floor(Date.now() / 1000),
     };
@@ -545,6 +555,20 @@ export async function runCodexAppServerSession(rawArgs) {
     provider: event.provider || "originrouter",
   });
   const agentEventQueue = createSerialAgentEventQueue(sendAgentEvent);
+  emitGatewayResponseIds = async (ids) => {
+    const gatewayResponseIds = [...new Set((Array.isArray(ids) ? ids : [])
+      .filter((value) => typeof value === "string" && value.trim())
+      .map((value) => value.trim().slice(0, 255)))];
+    if (!gatewayResponseIds.length) return;
+    await agentEventQueue.enqueue({
+      type: "agent.activity",
+      activity: "gateway_response",
+      summary: "Codex gateway response received",
+      gatewayResponseIds,
+      responseId: gatewayResponseIds[0],
+      metadata: { gateway_response_id: gatewayResponseIds[0] },
+    });
+  };
   const interactions = new PendingInteractionRegistry({
     onRequested: async (request) => {
       await Promise.all([

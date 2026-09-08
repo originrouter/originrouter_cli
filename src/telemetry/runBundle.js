@@ -18,13 +18,16 @@ function eventTerminal(event) {
 
 export function buildRunBundle(runId, events, { accountId = 0 } = {}) {
   const ordered = [...events].sort((a, b) => {
+    const sequenceA = Number(a.event_seq || 0);
+    const sequenceB = Number(b.event_seq || 0);
+    if (sequenceA > 0 && sequenceB > 0 && sequenceA !== sequenceB) {
+      return sequenceA - sequenceB;
+    }
     const time = String(a.occurred_at).localeCompare(String(b.occurred_at));
     return time || String(a.event_id).localeCompare(String(b.event_id));
-  }).map((event, index) => {
-    // OAuth session ownership is only a local queue guard. It must never be
-    // included in the training archive.
+  }).map((event) => {
     const { account_session_id, ...archiveEvent } = event;
-    return { ...archiveEvent, event_seq: index + 1 };
+    return archiveEvent;
   });
   const started = ordered[0]?.occurred_at || "";
   const ended = ordered.at(-1)?.occurred_at || started;

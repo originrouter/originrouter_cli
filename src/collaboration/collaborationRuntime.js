@@ -113,6 +113,7 @@ export function executionEventProjection(event = {}) {
     activity,
     provider: safeText(event.provider, 191) || undefined,
     model: safeText(event.model, 191) || undefined,
+    provider_type: safeText(event.providerType || event.provider_type, 32) || undefined,
     status: safeText(event.status, 32) || undefined,
     tool: safeText(event.tool || event.toolName || event.tool_name, 128) || undefined,
     call_id: safeText(event.callId || event.call_id, 191) || undefined,

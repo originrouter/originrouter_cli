@@ -286,6 +286,12 @@ export class TelemetryQueue {
         ON telemetry_events(state, next_attempt_at, created_at);
       CREATE INDEX IF NOT EXISTS idx_telemetry_run
         ON telemetry_events(run_id, occurred_at);
+      CREATE TABLE IF NOT EXISTS telemetry_run_sequences (
+        run_id TEXT NOT NULL,
+        account_session_id TEXT NOT NULL DEFAULT '',
+        last_event_seq INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (run_id, account_session_id)
+      ) STRICT;
     `);
     for (const statement of [
       "ALTER TABLE telemetry_events ADD COLUMN event_seq INTEGER NOT NULL DEFAULT 0",
@@ -319,6 +325,11 @@ export class TelemetryQueue {
     if (!event.training_eligible) return { event, inserted: false, skipped: "non_collaboration_run" };
     if (event.bundle_origin !== "collaboration_run") {
       return { event, inserted: false, skipped: "direct_wrapper_excluded" };
+    }
+    if (event.run_id && event.event_seq < 1) {
+      event.event_seq = this.nextEventSeq(event.run_id, event.account_session_id);
+    } else if (event.run_id) {
+      this.observeEventSeq(event.run_id, event.account_session_id, event.event_seq);
     }
     const now = iso(this.now());
     const result = this.db.prepare(`
@@ -376,6 +387,33 @@ export class TelemetryQueue {
     };
   }
 
+  nextEventSeq(runId, accountSessionId) {
+    const run = text(runId, 96);
+    const account = text(accountSessionId, 191);
+    if (!run) return 0;
+    const row = this.db.prepare(`
+      INSERT INTO telemetry_run_sequences(run_id, account_session_id, last_event_seq)
+      VALUES (?, ?, 1)
+      ON CONFLICT(run_id, account_session_id)
+      DO UPDATE SET last_event_seq = telemetry_run_sequences.last_event_seq + 1
+      RETURNING last_event_seq
+    `).get(run, account);
+    return Number(row?.last_event_seq || 1);
+  }
+
+  observeEventSeq(runId, accountSessionId, eventSeq) {
+    const run = text(runId, 96);
+    const account = text(accountSessionId, 191);
+    const sequence = Math.max(0, Number(eventSeq) || 0);
+    if (!run || sequence < 1) return;
+    this.db.prepare(`
+      INSERT INTO telemetry_run_sequences(run_id, account_session_id, last_event_seq)
+      VALUES (?, ?, ?)
+      ON CONFLICT(run_id, account_session_id)
+      DO UPDATE SET last_event_seq = MAX(telemetry_run_sequences.last_event_seq, excluded.last_event_seq)
+    `).run(run, account, sequence);
+  }
+
   pending({ limit = 50, now = this.now(), accountSessionId = null } = {}) {
     const account = text(accountSessionId, 191);
     const rows = this.db.prepare(`
@@ -395,6 +433,26 @@ export class TelemetryQueue {
         AND (? = '' OR account_session_id = ?)
       GROUP BY run_id ORDER BY MIN(created_at) ASC LIMIT ?
     `).all(Number(now) || Date.now(), account, account, Math.max(1, Math.min(100, Number(limit) || 20)))
+      .map((row) => row.run_id);
+  }
+
+  pendingTerminalRunIds({
+    limit = 20,
+    now = this.now(),
+    accountSessionId = null,
+    minIdleMs = 0,
+  } = {}) {
+    const account = text(accountSessionId, 191);
+    const idleCutoff = iso((Number(now) || Date.now()) - Math.max(0, Number(minIdleMs) || 0));
+    return this.db.prepare(`
+      SELECT run_id FROM telemetry_events
+      WHERE state = 'pending' AND run_id <> '' AND next_attempt_at <= ?
+        AND (? = '' OR account_session_id = ?)
+      GROUP BY run_id
+      HAVING SUM(CASE WHEN event_type IN ('run.completed', 'run.failed', 'run.cancelled') THEN 1 ELSE 0 END) > 0
+        AND MAX(created_at) <= ?
+      ORDER BY MIN(created_at) ASC LIMIT ?
+    `).all(Number(now) || Date.now(), account, account, idleCutoff, Math.max(1, Math.min(100, Number(limit) || 20)))
       .map((row) => row.run_id);
   }
 
@@ -461,6 +519,24 @@ export class TelemetryQueue {
       SET state='dropped', dropped_at=?, updated_at=?, last_error=?
       WHERE state='pending' AND account_session_id=?
     `).run(now, now, text(reason, 512), account).changes;
+  }
+
+  dropPostTerminalEvents(accountSessionId = null) {
+    const account = text(accountSessionId, 191);
+    const now = iso(this.now());
+    return this.db.prepare(`
+      UPDATE telemetry_events AS late
+      SET state='dropped', dropped_at=?, updated_at=?, last_error='post_terminal_bundle_sent'
+      WHERE late.state='pending' AND (? = '' OR late.account_session_id = ?)
+        AND EXISTS (
+          SELECT 1 FROM telemetry_events AS terminal
+          WHERE terminal.run_id = late.run_id
+            AND terminal.account_session_id = late.account_session_id
+            AND terminal.state = 'sent'
+            AND terminal.event_type IN ('run.completed', 'run.failed', 'run.cancelled')
+            AND terminal.event_seq < late.event_seq
+        )
+    `).run(now, now, account, account).changes;
   }
 
   prune({

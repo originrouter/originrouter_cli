@@ -259,7 +259,7 @@ export async function startDaemon(args) {
       const agent = Object.values(run?.agents || {}).find((item) => (
         String(item?.agent_id || "") === participantId || String(item?.role || "") === participantId
       )) || Object.values(run?.agents || {})[0];
-      const providerName = String(input?.provider || agent?.provider || "");
+      const providerName = String(input?.provider || event?.payload?.provider || agent?.provider || "");
       const providerType = normalizeProviderForRead(readConfig().providers?.[providerName])?.type || "";
       return {
         providerType,

@@ -80,6 +80,26 @@ test("collaboration proxy attaches a server-issued discount grant", async () => 
   }
 });
 
+test("coding auth proxy forwards an upstream gateway response id to its observer", async () => {
+  const observed = [];
+  const proxy = new OriginRouterCodingAuthProxy({
+    stateDir: "/tmp/originrouter-test",
+    onGatewayResponseIds: (ids) => observed.push(...ids),
+    ensureFreshAccessTokenFn: async () => credential("or_at_coding"),
+    fetchFn: async () => new Response("{}", {
+      status: 200,
+      headers: { "X-OriginRouter-Response-Id": "resp_gateway_123" },
+    }),
+  });
+  await proxy.start();
+  try {
+    assert.equal((await localRequest(proxy, "/coding/v1/responses")).status, 200);
+    assert.deepEqual(observed, ["resp_gateway_123"]);
+  } finally {
+    await proxy.stop();
+  }
+});
+
 test("coding auth proxy forwards all supported routes with a managed token", async () => {
   const calls = [];
   const proxy = new OriginRouterCodingAuthProxy({
