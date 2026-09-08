@@ -43,6 +43,7 @@ import {
 } from "../relay/agentRelayPolicy.js";
 import { RelayClient } from "../relay/relayClient.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
+import { createTelemetryPipeline } from "../telemetry/index.js";
 import { PendingInteractionRegistry } from "../runtime/pendingInteractionRegistry.js";
 import {
   buildAutonomyStatusEvent,
@@ -324,10 +325,7 @@ export function extractOriginRouterOptions(args) {
       ];
       continue;
     }
-    if (
-      arg === "--originrouter-native-config" ||
-      arg === "--originrouter-native"
-    ) {
+    if (arg === "--native-config") {
       options.nativeConfig = true;
       continue;
     }
@@ -380,7 +378,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
   const useNativeConfig = options.nativeConfig === true;
   if (useNativeConfig && options.provider) {
     throw new Error(
-      "--provider cannot be combined with --originrouter-native-config",
+      "--provider cannot be combined with --native-config",
     );
   }
   const adapter = createAdapter({
@@ -441,11 +439,15 @@ export async function runLocalAgentSession(agent, rawArgs) {
   let originrouterCodingProxy = null;
   if (!useNativeConfig) {
     ({ providerResult, proxy: originrouterCodingProxy } =
-      await protectOriginrouterCodingEnv(agent, providerResult, { stateDir }));
+      await protectOriginrouterCodingEnv(agent, providerResult, {
+        stateDir,
+        runId: options.runId,
+      }));
   }
   const providerEnv = providerResult.env;
   const resolvedProvider = providerResult.provider;
   const providerSource = providerResult.source;
+  const telemetry = createTelemetryPipeline({ stateDir });
   if (typeof adapter.setRoutedModel === "function") {
     adapter.setRoutedModel(providerEnv.OPENAI_MODEL);
   }
@@ -522,6 +524,22 @@ export async function runLocalAgentSession(agent, rawArgs) {
     title: `${agent} session`,
     deviceName: device.displayName || device.host,
     stateDir: ensureStateDir(),
+    telemetryQueue: telemetry.queue,
+    telemetryUploader: telemetry.uploader,
+    telemetryContext: () => ({
+      providerSource,
+      providerType: resolvedProvider?.type,
+      provider: resolvedProvider?.name,
+      model: resolvedProvider?.model,
+      deviceId: effectiveDeviceId,
+      conversationId,
+      runId: options.runId || sessionId,
+      bundleOrigin: String(options.runId || "").startsWith("acr_")
+        ? "collaboration_run"
+        : "direct_wrapper",
+      trainingEligible: false,
+      controlOrigin: options.controlOrigin || "cli",
+    }),
   });
   const report = (type, extra = {}) => {
     if (
@@ -858,6 +876,8 @@ export async function runLocalAgentSession(agent, rawArgs) {
     }
     send("session.exited", { code, signal });
     await report("session.exited", { code, signal });
+    await telemetry.uploader.flush().catch(() => {});
+    telemetry.queue.close();
     activityLastAt = exitedAt;
     await syncCatalog(signal ? "stopped" : code === 0 ? "completed" : "failed")
       .catch(() => ({ ok: false }));

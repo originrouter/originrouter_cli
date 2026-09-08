@@ -88,7 +88,7 @@ function retryableDeliveryError(error) {
   );
 }
 
-function executionEventProjection(event = {}) {
+export function executionEventProjection(event = {}) {
   const type = safeText(event.type, 96) || "agent.activity";
   const activity = safeText(event.activity, 64);
   const interactionPayload = event.payload && typeof event.payload === "object"
@@ -109,11 +109,63 @@ function executionEventProjection(event = {}) {
       || event.reason,
     8192,
   );
+  const facts = {
+    activity,
+    provider: safeText(event.provider, 191) || undefined,
+    model: safeText(event.model, 191) || undefined,
+    status: safeText(event.status, 32) || undefined,
+    tool: safeText(event.tool || event.toolName || event.tool_name, 128) || undefined,
+    call_id: safeText(event.callId || event.call_id, 191) || undefined,
+    is_error: event.isError ?? event.is_error,
+    duration_ms: event.durationMs ?? event.duration_ms,
+    num_turns: event.numTurns ?? event.num_turns,
+    stop_reason: safeText(event.stopReason || event.stop_reason, 64) || undefined,
+    retry: event.retry,
+    retry_count: event.retryCount ?? event.retry_count,
+    verification_passed: event.verificationPassed ?? event.verification_passed,
+    task_completed: event.taskCompleted ?? event.task_completed,
+    task_failed: event.taskFailed ?? event.task_failed,
+    retry_attempt: event.retryAttempt ?? event.retry_attempt,
+    response_id: safeText(event.responseId || event.response_id, 255) || undefined,
+    gateway_response_ids: Array.isArray(event.gatewayResponseIds || event.gateway_response_ids)
+      ? (event.gatewayResponseIds || event.gateway_response_ids)
+      : ((event.gatewayResponseId || event.gateway_response_id) ? [event.gatewayResponseId || event.gateway_response_id] : undefined),
+    token_usage: event.tokenUsage || event.token_usage,
+    sampled_tokens: event.sampledTokens ?? event.sampled_tokens,
+    amount_micros: event.amountMicros ?? event.amount_micros,
+    currency: safeText(event.currency, 3).toUpperCase() || undefined,
+    cost_source: safeText(event.costSource || event.cost_source, 64) || undefined,
+    agent_id: safeText(event.agentId || event.agent_id, 195) || undefined,
+    parent_agent_id: safeText(event.parentAgentId || event.parent_agent_id, 195) || undefined,
+    delegation_id: safeText(event.delegationId || event.delegation_id || event.parentToolUseId, 195) || undefined,
+    delegation_depth: event.delegationDepth ?? event.delegation_depth,
+    delegation_detected: event.delegationDetected ?? event.delegation_detected,
+    task_role: safeText(event.taskRole || event.task_role, 64) || undefined,
+    task_kind: safeText(event.taskKind || event.task_kind, 96) || undefined,
+    model_tier: safeText(event.modelTier || event.model_tier, 64) || undefined,
+    decision: safeText(event.decision, 64) || undefined,
+    risk_level: safeText(event.riskLevel || event.risk_level, 32) || undefined,
+    confidence: event.confidence,
+  };
+  const metadata = event.metadata && typeof event.metadata === "object"
+    ? Object.fromEntries(Object.entries(event.metadata).filter(([key, value]) => (
+      [
+        "from_model", "to_model", "model_provider_id", "model", "provider",
+        "reasoning_effort", "service_tier", "wire_api", "response_id",
+        "gateway_response_id",
+      ].includes(key)
+      && ["string", "number", "boolean"].includes(typeof value)
+    )))
+    : {};
+  const projectedPayload = Object.fromEntries(
+    Object.entries(facts).filter(([, value]) => value !== undefined && value !== null && value !== ""),
+  );
   return {
     type,
     summary,
     detail,
     payload: type.startsWith("agent.interaction.") ? {
+      ...projectedPayload,
       interaction_id: safeText(event.interactionId || event.callId, 191),
       kind: safeText(event.kind, 64) || null,
       source: safeText(event.source, 64) || null,
@@ -150,7 +202,10 @@ function executionEventProjection(event = {}) {
           containsSecret: event.containsSecret === true,
         },
       } : {}),
-    } : {},
+    } : {
+      ...projectedPayload,
+      ...(Object.keys(metadata).length ? { metadata } : {}),
+    },
     metadata: {
       ...(activity ? { activity } : {}),
       ...(safeText(event.kind, 64) ? { kind: safeText(event.kind, 64) } : {}),
@@ -1548,6 +1603,26 @@ export class CollaborationRuntime {
         error.code = String(data.reason || "COLLABORATION_REMOTE_DISPATCH_REJECTED");
         throw error;
       }
+      this.store.recordExecutionEvent(run.run_id, {
+        type: "remote_assignment.dispatched",
+        taskId: effectiveTaskId,
+        participantId: role,
+        attempt: agent.attempt,
+        provider: agent.provider,
+        model: agent.model,
+        payload: {
+          assignment_id: assignmentId,
+          assignment_phase: effectivePhase,
+          assignment_status: data.queued ? "queued" : "dispatched",
+          assignment_runtime: agent.runtime,
+          assignment_role: role,
+          assignment_attempt: agent.attempt,
+          assignment_fence: agent.fencing_token,
+          assignment_source_device_id: this.deviceId,
+          assignment_target_device_id: agent.device_id,
+        },
+        idempotencyKey: `remote-assignment-dispatched:${deliveryId}`,
+      });
       this.store.updateAgent(run.run_id, role, {
         status: data.queued ? "waiting_device" : "dispatched",
         currentTaskId: effectiveTaskId,
@@ -1568,6 +1643,8 @@ export class CollaborationRuntime {
           sessionId,
           conversationId,
           runId: run.run_id,
+          taskId: effectiveTaskId,
+          telemetryOwner: false,
           agentType: agent.runtime,
           workspaceId: agent.workspace_id,
           provider: agent.provider,
@@ -2471,6 +2548,8 @@ export class CollaborationRuntime {
         sessionId,
         conversationId,
         runId: assignment.run_id,
+        taskId: assignment.task_id,
+        telemetryOwner: false,
         agentType: assignment.runtime,
         workspaceId: assignment.workspace_id,
         provider: assignment.provider,

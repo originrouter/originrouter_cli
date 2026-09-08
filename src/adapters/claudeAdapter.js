@@ -174,6 +174,15 @@ export function mapClaudeHookEvent(payload = {}) {
     type: "agent.activity",
     provider: "claude",
     activity,
+    ...((eventName === "SubagentStart" || eventName === "SubagentStop")
+      ? {
+          taskId: safeText(payload.task_id, 195),
+          agentId: safeText(payload.agent_id, 195),
+          parentAgentId: safeText(payload.parent_agent_id, 195),
+          delegationId: safeText(payload.task_id || payload.agent_id, 195),
+          delegationDetected: true,
+        }
+      : {}),
     summary,
     detail: safeText(payload.error || payload.reason, 4096),
     metadata: {

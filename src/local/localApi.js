@@ -1234,16 +1234,36 @@ async function dispatch(ctx, req, res) {
         try {
           queryPlan = await new AiAuditQueryPlanner({
             stateDir: ctx.stateDir || getStateDir(),
+            onTelemetry: (fact, context) => ctx.sessionManager?.enqueueAiTelemetryFact?.(fact, context),
           }).plan({
             queryId: body.query_id,
             domain,
             query: body.query,
+            telemetryContext: {
+              runId: body.runId || body.run_id,
+              sessionId,
+            },
           });
         } catch {}
         const evidenceBundle = buildAuditEvidenceBundle({
           auditStore: ctx.auditStore,
           sessionId,
           request: { ...body, domain, query_plan: queryPlan },
+        });
+        ctx.sessionManager?.enqueueAiTelemetryFact?.({
+          type: "audit.evidence.answered",
+          provider: "originrouter",
+          payload: {
+            success: true,
+            task_kind: "evidence_qa",
+            evidence_ref_count: evidenceBundle.evidence?.length || 0,
+            status: evidenceBundle.abstained ? "abstained" : "answered",
+            metadata: { mode: domain },
+          },
+        }, {
+          runId: body.runId || body.run_id,
+          sessionId,
+          idempotencyKey: `ai:${body.runId || body.run_id}:${sessionId}:audit.evidence.answered:${body.query_id || "unknown"}`,
         });
         return sendOk(res, { evidence_bundle: evidenceBundle });
       } catch (error) {
@@ -1310,6 +1330,7 @@ async function dispatch(ctx, req, res) {
             agent: session.agent || session.agentType || "",
             runtime: session.runtime || "",
             title: session.title || "",
+            runId: session.run_id || session.runId || "",
           }, body.event || {});
           return sendOk(res, { sessionId, sequence });
         }

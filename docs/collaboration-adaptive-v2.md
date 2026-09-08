@@ -11,10 +11,12 @@ Planner replace the fixed Lead/Worker form.
    device and trusted workspace. The first participant is the default Planner.
 3. Optionally describe collaboration preferences, choose a built-in starting
    pattern, or add coordination instructions.
-4. The Planner produces a validated task DAG in read-only mode.
-5. The App or CLI shows the proposed plan. No execution task starts before the
+4. For an automatically generated Team, the App or CLI shows the proposed
+   configuration and waits for confirmation before creating the Run.
+5. The Planner produces a validated task DAG in read-only mode.
+6. The App or CLI shows the proposed plan. No execution task starts before the
    user confirms it.
-6. The runtime dispatches dependency-ready tasks. Different participants may
+7. The runtime dispatches dependency-ready tasks. Different participants may
    run concurrently; one participant receives only one task at a time.
 
 Built-in patterns are prompts, not hard-coded state machines:
@@ -49,9 +51,12 @@ originrouter collaboration create \
   --preference "research independently when useful; do not edit before the plan is confirmed"
 ```
 
-The command prints the proposed plan and asks for confirmation in an
-interactive terminal. In scripts it leaves the plan pending unless `--yes` is
-provided.
+An objective-based launch first presents its generated Team/configuration, then
+prints the proposed plan; both gates require confirmation by default. In
+scripts, the Run remains pending unless `--yes` is supplied. `--yes` selects
+the explicit `always_auto` startup policy; it does not bypass the individual
+Agent-action approval policy. `--review` is accepted for compatibility but is
+equivalent to the default required review, and cannot be combined with `--yes`.
 
 ```sh
 originrouter collaboration show <run-id>

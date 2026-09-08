@@ -21,14 +21,40 @@ const proposal = {
 };
 
 function serverSession(overrides = {}) {
-  return { configuration_id: "server-config", revision: 1, state: "proposal_ready", questions: [], tool_requests: [], proposal, planning_source: "server_model", ...overrides };
+  return {
+    configuration_id: "server-config",
+    revision: 1,
+    state: "proposal_ready",
+    questions: [],
+    tool_requests: [],
+    proposal,
+    planning_source: "server_model",
+    planner_invocation: {
+      model: "planner-model",
+      response_id: "resp_planner_1",
+      duration_ms: 42,
+      token_usage: { input_tokens: 10, output_tokens: 5 },
+    },
+    ...overrides,
+  };
 }
 
 function fixture(serverClient) {
-  const store = new CollaborationStore({ stateDir: mkdtempSync(join(tmpdir(), "originrouter-config-")) });
+  const telemetry = [];
+  const store = new CollaborationStore({
+    stateDir: mkdtempSync(join(tmpdir(), "originrouter-config-")),
+    telemetryQueue: {
+      enqueue(input, context) {
+        telemetry.push({ input, context });
+        return { inserted: true };
+      },
+    },
+    telemetryContextProvider: () => ({ providerType: "originrouter", trainingEligible: true }),
+  });
   const coordinator = new PlanImplementVerifyCoordinator({ store });
   return {
     store,
+    telemetry,
     coordinator,
     planner: new CollaborationConfigurationPlanner({
       store, serverClient, deviceId: "device-local", capabilitiesForDevice: async () => capabilities,
@@ -39,7 +65,7 @@ function fixture(serverClient) {
 
 test("server plans, target CLI executes only requested read-only probes, and accept alone creates a Run", async () => {
   const calls = [];
-  const { planner, store } = fixture({
+  const { planner, store, telemetry } = fixture({
     async create(body) { calls.push({ type: "create", body }); return serverSession({ state: "awaiting_tool", proposal: {}, tool_requests: [{ name: "get_workspace_details", device_id: "device-local", workspace_id: "workspace" }] }); },
     async toolResults(id, body) { calls.push({ type: "tool", id, body }); return serverSession({ revision: 2 }); },
     async get() { return serverSession({ revision: 2 }); },
@@ -52,6 +78,16 @@ test("server plans, target CLI executes only requested read-only probes, and acc
   const accepted = await planner.accept(created.configuration_id);
   assert.equal(accepted.run.state, "created");
   assert.equal(accepted.run.planning_source, "server_model");
+  const plannerFact = store.listExecutionEvents(accepted.run.run_id)
+    .find((event) => event.type === "ai.planner.completed");
+  assert.equal(plannerFact.payload.model, "planner-model");
+  assert.equal(plannerFact.payload.response_id, "resp_planner_1");
+  assert.deepEqual(plannerFact.payload.token_usage, { input_tokens: 10, output_tokens: 5 });
+  const uploadedFact = telemetry.find((item) => item.input.eventType === "ai.planner.completed");
+  assert.equal(uploadedFact.input.payload.model, "planner-model");
+  assert.equal(uploadedFact.input.payload.response_id, "resp_planner_1");
+  assert.match(uploadedFact.context.runId, /^acr_/);
+  assert.equal(uploadedFact.context.providerSource, "originrouter-coding");
 });
 
 test("device-level tool results preserve a workspace ID requested by the server", async () => {

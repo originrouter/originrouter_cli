@@ -36,6 +36,7 @@ import { getAllRoutes } from "../config/routes.js";
 import { normalizeProviderForRead } from "../config/providers.js";
 import { remoteShareModelEntries } from "../config/providerModels.js";
 import { LocalAuditStore } from "../persistence/localAuditStore.js";
+import { createTelemetryPipeline } from "../telemetry/index.js";
 import { AiOperationReviewer } from "../runtime/aiOperationReviewer.js";
 import { AgentCatalog } from "../persistence/agentCatalog.js";
 import { readSessions } from "../persistence/sessionLog.js";
@@ -242,12 +243,33 @@ export async function startDaemon(args) {
     localIdentityProvider: () => readDeviceE2eeIdentity(stateDir),
     apiTokenPath: apiTokenFile,
   });
+  const operationReviewer = new AiOperationReviewer({ stateDir });
   const auditStore = new LocalAuditStore({
     stateDir,
-    operationReviewer: new AiOperationReviewer({ stateDir }),
+    operationReviewer,
   });
+  const telemetry = createTelemetryPipeline({ stateDir });
   const agentBudgetStore = new AgentBudgetStore({ stateDir });
-  const collaborationStore = new CollaborationStore({ stateDir });
+  const collaborationStore = new CollaborationStore({
+    stateDir,
+    telemetryQueue: telemetry.queue,
+    telemetryUploader: telemetry.uploader,
+    telemetryContextProvider: (run, event, input) => {
+      const participantId = String(event?.participant_id || input?.participant_id || input?.participantId || "");
+      const agent = Object.values(run?.agents || {}).find((item) => (
+        String(item?.agent_id || "") === participantId || String(item?.role || "") === participantId
+      )) || Object.values(run?.agents || {})[0];
+      const providerName = String(input?.provider || agent?.provider || "");
+      const providerType = normalizeProviderForRead(readConfig().providers?.[providerName])?.type || "";
+      return {
+        providerType,
+        trainingEligible: String(run?.run_id || "").startsWith("acr_"),
+        controlOrigin: run?.coordinator_device_id && run.coordinator_device_id !== effectiveDeviceId
+          ? "app_remote"
+          : "cli",
+      };
+    },
+  });
   const collaborationCoordinator = new PlanImplementVerifyCoordinator({
     store: collaborationStore,
   });
@@ -367,9 +389,11 @@ export async function startDaemon(args) {
     managedAgentSupervisor,
     agentBudgetStore,
     stateDir,
+    telemetry,
     compatibilityAutomaticUpdates:
       relayMode !== "local" && process.env.ORIGINROUTER_COMPATIBILITY_UPDATES !== "off",
   });
+  operationReviewer.onTelemetry = (fact, context) => sessionManager.enqueueAiTelemetryFact(fact, context);
 
   // Stage 3 + Stage 4 + Stage 6: start the local 127.0.0.1-only HTTP API.
   // Stage 6: pass `apiTokenPath` so dispatch can validate the bearer header
@@ -560,6 +584,11 @@ export async function startDaemon(args) {
       collaborationStore.close();
     } catch (e) {
       console.error(`[daemon] collaboration store close: ${e.message}`);
+    }
+    try {
+      telemetry.queue.close();
+    } catch (e) {
+      console.error(`[daemon] telemetry queue close: ${e.message}`);
     }
     try {
       agentBudgetStore.close();

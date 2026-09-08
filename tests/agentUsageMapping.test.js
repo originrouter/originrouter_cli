@@ -1,6 +1,26 @@
 import assert from "node:assert/strict";
 import { mapClaudeSdkMessage } from "../src/runtime/claudeSdkEvents.js";
 import { mapCodexAppServerEvent } from "../src/adapters/codex/eventMapper.js";
+import { TelemetryUploader } from "../src/telemetry/index.js";
+
+assert.equal(typeof TelemetryUploader, "function");
+
+const claudeResponse = mapClaudeSdkMessage({
+  type: "assistant",
+  uuid: "assistant-event",
+  message: {
+    id: "msg_gateway_123",
+    content: [{ type: "text", text: "done" }],
+  },
+});
+assert.equal(claudeResponse[0].gatewayResponseId, "msg_gateway_123");
+
+const codexResponse = mapCodexAppServerEvent({
+  type: "codex.notification",
+  method: "response.completed",
+  params: { response: { id: "resp_gateway_456" } },
+});
+assert.equal(codexResponse[0].gatewayResponseId, "resp_gateway_456");
 
 const claude = mapClaudeSdkMessage({
   type: "result",

@@ -27,17 +27,58 @@ function credential(token) {
   };
 }
 
-async function localRequest(proxy, path, { method = "POST", body = "{}", token } = {}) {
+async function localRequest(proxy, path, {
+  method = "POST",
+  body = "{}",
+  token,
+  headers = {},
+} = {}) {
   const status = proxy.status();
   return fetch(`http://${status.host}:${status.port}${path}`, {
     method,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token || status.localToken}`,
+      ...headers,
     },
     body: method === "GET" ? undefined : body,
   });
 }
+
+test("collaboration proxy attaches a server-issued discount grant", async () => {
+  const calls = [];
+  const proxy = new OriginRouterCodingAuthProxy({
+    stateDir: "/tmp/originrouter-test",
+    runId: "acr_12345678",
+    ensureFreshAccessTokenFn: async ({ resource }) => {
+      const value = credential("or_at_coding");
+      value.accessTokens.relay = {
+        token: "or_at_relay",
+        expiresAt: Date.now() + 600_000,
+        scopes: ["relay.connect"],
+      };
+      assert.ok(resource === "originrouter.coding" || resource === "originrouter.relay");
+      return value;
+    },
+    fetchFn: async (url, options) => {
+      calls.push({ url: String(url), options });
+      return new Response("{}", { status: 200 });
+    },
+  });
+  await proxy.start();
+  try {
+    const response = await localRequest(proxy, "/coding/v1/messages", {
+      headers: {
+        "X-OriginRouter-Collaboration-Run": "acr_spoofed",
+      },
+    });
+    assert.equal(response.status, 200);
+    const upstream = calls.find((call) => call.url.includes("/coding/v1/messages"));
+    assert.equal(upstream.options.headers["X-OriginRouter-Collaboration-Run"], "acr_12345678");
+  } finally {
+    await proxy.stop();
+  }
+});
 
 test("coding auth proxy forwards all supported routes with a managed token", async () => {
   const calls = [];

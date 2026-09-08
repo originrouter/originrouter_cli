@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { writeCodingAuth } from "../src/persistence/codingAuth.js";
 import { AiApprovalReviewer } from "../src/runtime/aiApprovalReviewer.js";
+import { AiAuditQueryPlanner } from "../src/runtime/aiAuditQueryPlanner.js";
 
 function credential() {
   const expiresAt = Date.now() + 10 * 60_000;
@@ -57,19 +58,58 @@ const policySnapshot = {
   content_hash: "a".repeat(64),
 };
 
+test("AI audit query facts carry a stable collaboration idempotency key", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "originrouter-ai-query-"));
+  writeCodingAuth(stateDir, credential());
+  const telemetry = [];
+  const planner = new AiAuditQueryPlanner({
+    stateDir,
+    endpoint: "https://chat.example/audit-query",
+    onTelemetry: (event, context) => telemetry.push({ event, context }),
+    fetchFn: async () => ({
+      ok: true,
+      async json() {
+        return { data: {
+          model: "audit-query-v1",
+          response_id: "resp_query_1",
+          plan: { terms: ["approval"] },
+        } };
+      },
+    }),
+  });
+  await planner.plan({
+    queryId: "query-1",
+    domain: "approval",
+    query: "Who approved it?",
+    telemetryContext: { runId: "acr_run_1", sessionId: "session-1" },
+  });
+  assert.equal(telemetry.length, 1);
+  assert.equal(telemetry[0].event.model, "audit-query-v1");
+  assert.equal(
+    telemetry[0].context.idempotencyKey,
+    "ai:acr_run_1:session-1:ai.audit_query.planned:query-1",
+  );
+});
+
 test("AI approval review uses the AI token and redacts secret-like payload fields", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "originrouter-ai-reviewer-"));
   writeCodingAuth(stateDir, credential());
   let captured;
+  const telemetry = [];
   const reviewer = new AiApprovalReviewer({
     stateDir,
     endpoint: "https://chat.example/ai-review",
+    onTelemetry: (event) => telemetry.push(event),
     fetchFn: async (url, options) => {
       captured = { url, options };
       return {
         ok: true,
         async json() {
-          return { data: { review: { decision: "allow", risk: "low", confidence: 0.99 } } };
+          return { data: {
+            model: "approval-model-v1",
+            response_id: "resp_approval_1",
+            review: { decision: "allow", risk: "low", confidence: 0.99 },
+          } };
         },
       };
     },
@@ -95,6 +135,11 @@ test("AI approval review uses the AI token and redacts secret-like payload field
   assert.equal(body.interaction.payload.nested.authorization, "[redacted]");
   assert.deepEqual(body.ai_review_policy, policySnapshot);
   assert.doesNotMatch(captured.options.body, /must-not-leave-device|Bearer secret/);
+  assert.equal(telemetry.length, 1);
+  assert.equal(telemetry[0].activity, "ai_approval_review");
+  assert.equal(telemetry[0].model, "approval-model-v1");
+  assert.equal(telemetry[0].responseId, "resp_approval_1");
+  assert.equal(telemetry[0].metadata.decision, "allow");
 });
 
 test("secret interactions escalate locally without calling the reviewer", async () => {

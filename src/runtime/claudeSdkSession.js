@@ -16,6 +16,7 @@ import {
   updateAgentActivitySnapshot,
 } from "../agent/bridgeReporter.js";
 import { buildAgentProviderEnv } from "../config/claudeConfig.js";
+import { createTelemetryPipeline } from "../telemetry/index.js";
 import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
 import { DEFAULT_DEVICE_ID, DEFAULT_RELAY_URL } from "../constants.js";
 import {
@@ -173,6 +174,8 @@ function extractOriginRouterOptions(args) {
     else if (arg === "--originrouter-session") take("session");
     else if (arg === "--originrouter-conversation") take("conversationId");
     else if (arg === "--originrouter-run") take("runId");
+    else if (arg === "--originrouter-task") take("taskId");
+    else if (arg === "--originrouter-telemetry-owner") take("telemetryOwner");
     else if (arg === "--originrouter-workspace") take("workspaceId");
     else if (arg === "--originrouter-title") take("title");
     else if (arg === "--provider") take("provider");
@@ -350,7 +353,14 @@ export async function runClaudeSdkSession(rawArgs) {
   let runtimeSettingsOverride = null;
   let relayViaDaemon = false;
   ({ providerResult, proxy: originrouterCodingProxy } =
-    await protectOriginrouterCodingEnv("claude", providerResult, { stateDir }));
+    await protectOriginrouterCodingEnv("claude", providerResult, {
+      stateDir,
+      runId: options.runId,
+    }));
+  const telemetry = createTelemetryPipeline({
+    stateDir,
+    uploadOwner: options.telemetryOwner === "1",
+  });
   const modelSelection = resolveClaudeSdkModelSelection(options, providerResult);
   let model = modelSelection.model;
   const messageQueue = new AsyncMessageQueue();
@@ -367,6 +377,24 @@ export async function runClaudeSdkSession(rawArgs) {
     title: sessionTitle,
     deviceName: device.displayName || device.host,
     stateDir,
+    telemetryQueue: telemetry.queue,
+    telemetryUploader: telemetry.uploader,
+    telemetryContext: () => ({
+      providerSource: providerResult.source,
+      providerType: providerResult.provider?.type,
+      provider: providerResult.provider?.name,
+      model,
+      deviceId: effectiveDeviceId,
+      conversationId: options.conversationId || sessionId,
+      runId: options.runId || sessionId,
+      taskId: options.taskId || "",
+      telemetryOwner: options.telemetryOwner === "1",
+      bundleOrigin: String(options.runId || "").startsWith("acr_")
+        ? "collaboration_run"
+        : "direct_wrapper",
+      trainingEligible: options.telemetryOwner === "1",
+      controlOrigin: options.controlOrigin || "cli",
+    }),
   });
   let queryRef = null;
   let claudeSessionId =
@@ -464,6 +492,10 @@ export async function runClaudeSdkSession(rawArgs) {
         : Promise.resolve(),
     ]);
   };
+  aiApprovalReviewer.onTelemetry = (event) => sendAgentEvent({
+    ...event,
+    provider: event.provider || "originrouter",
+  });
   const interactions = new PendingInteractionRegistry({
     onRequested: async (request) => {
       await Promise.all([
@@ -635,6 +667,8 @@ export async function runClaudeSdkSession(rawArgs) {
     await report("session.exited", { code: 0, signal });
     await syncCatalog(signal ? "stopped" : "completed");
     await runtimeReporter.flush();
+    await telemetry.uploader.flush().catch(() => {});
+    telemetry.queue.close();
     if (exitProcess) {
       // claude-sdk owns background handles that can survive an aborted async
       // iterator. This command runs one managed session per process, so a

@@ -22,13 +22,16 @@ export class AiApprovalReviewer {
     stateDir,
     endpoint = process.env.ORIGINROUTER_AI_APPROVAL_URL || DEFAULT_ENDPOINT,
     fetchFn = globalThis.fetch,
+    onTelemetry = null,
   }) {
     this.stateDir = stateDir;
     this.endpoint = endpoint;
     this.fetchFn = fetchFn;
+    this.onTelemetry = onTelemetry;
   }
 
   async review({ request, classification, runtime, workspaceRoot, aiReviewPolicy }) {
+    const startedAt = Date.now();
     if (request?.containsSecret) return { decision: "escalate", reason: "secret_input", risk: "high", confidence: 1 };
     const credential = await ensureFreshAccessToken({
       stateDir: this.stateDir,
@@ -69,13 +72,32 @@ export class AiApprovalReviewer {
       signal: AbortSignal.timeout(90_000),
     });
     if (!response.ok) {
-      throw Object.assign(new Error(`AI approval reviewer HTTP ${response.status}`), { code: "AI_APPROVAL_REVIEW_FAILED" });
+      const { aiClientError } = await import("./aiClientErrors.js");
+      throw await aiClientError(response, "AI_APPROVAL_REVIEW_FAILED", "AI approval reviewer");
     }
     const payload = await response.json();
     const review = payload?.data?.review;
     if (!review || !["allow", "deny", "escalate"].includes(review.decision)) {
       throw Object.assign(new Error("AI approval reviewer returned an invalid decision"), { code: "AI_APPROVAL_INVALID_RESPONSE" });
     }
+    await Promise.resolve(this.onTelemetry?.({
+      type: "agent.activity",
+      activity: "ai_approval_review",
+      summary: "AI approval review completed",
+      provider: "originrouter",
+      model: payload?.data?.model || review.model,
+      responseId: payload?.data?.response_id || review.response_id,
+      durationMs: Date.now() - startedAt,
+      decision: review.decision,
+      riskLevel: review.risk,
+      confidence: review.confidence,
+      metadata: {
+        decision: review.decision,
+        risk_level: review.risk,
+        confidence: review.confidence,
+        decision_method: review.decision_method,
+      },
+    })).catch(() => {});
     return review;
   }
 }

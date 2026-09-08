@@ -69,6 +69,7 @@ import { formatCliError, reportCliError } from "./runtime/cliErrors.js";
 // Stage 9.8: `originrouter doctor` 诊断命令。
 import { runDoctor, printDoctorResults } from "./commands/doctor.js";
 import { handleServiceCommand } from "./commands/service.js";
+import { handleSetupCommand } from "./commands/setup.js";
 import { handleAuthCommand, handleLogin, handleLogout } from "./commands/auth.js";
 import {
   handleAgentRouteSetup,
@@ -78,7 +79,7 @@ import { handleSecurityCommand } from "./commands/security.js";
 import { handleCollaborationCommand } from "./commands/collaboration.js";
 import { handleAgentWorkspaceCommand } from "./commands/agentWorkspace.js";
 import { handleHistoryCommand } from "./commands/history.js";
-import { getCompletionCandidates, printCompletion } from "./commands/completion.js";
+import { getCompletionCandidates, handleCompletionCommand } from "./commands/completion.js";
 import {
   handleStartupUpdate,
   handleUpdateCommand,
@@ -126,9 +127,13 @@ Usage:
   originrouter --help
   originrouter --version
   originrouter update [status|check|install] [--json]
-  originrouter completion bash|zsh|fish|powershell
+  originrouter completion <shell>
+  originrouter completion install [--shell <shell>] [--dry-run]
+  originrouter completion uninstall [--shell <shell>] [--dry-run]
   originrouter status
   originrouter doctor [provider <name>]
+  originrouter setup [--no-proxy] [--yes] [--dry-run]
+  originrouter setup --verify [--no-proxy]
   originrouter sessions [--json]
   originrouter devices [--json]
   originrouter env print [--provider <name>] [--agent claude|codex]
@@ -172,8 +177,9 @@ Agent collaboration:
   originrouter collaboration archive <run-id>
   originrouter collaboration delete <run-id> [--yes]
   originrouter collaboration export <run-id> [--format json|markdown]
+  Confirmation defaults to required (review before Team/plan execution); --yes enables always_auto.
 
-Local LiteLLM provider management:
+Local Proxy provider management:
   originrouter provider add <name> [--type proxy] [--base-url <u>] [--model <m>]
                                    [--engine <e>] [--litellm-provider <id>] [--api-key <k>] [--auth-token <k>]
                                    [--organization <o>] [--small-fast-model <m> [legacy]] [--api-version <v>]
@@ -184,7 +190,7 @@ Local LiteLLM provider management:
                                    [--vertex-project <id>] [--vertex-location <loc>] [--vertex-credentials <json>]
                                    [--google-application-credentials <path>] [--azure-ad-token <t>] [--hf-token <t>]
 
-  --type proxy         Local LiteLLM proxy. Use --engine litellm (default) + --litellm-provider <id>.
+  --type proxy         Local Proxy. Use --engine litellm (default) + --litellm-provider <id>.
                         --type litellm is accepted as an alias and persisted as proxy(engine=litellm).
   OriginRouter Cloud and remote devices are login-backed route sources, not local providers.
 
@@ -213,7 +219,7 @@ Model routes:
   originrouter remote workspace request <path> --device <device-id>
   Aliases are fixed: originrouter-claude-model, originrouter-claude-fast-model, and gpt-5.4.
 
-LiteLLM proxy:
+Proxy runtime:
   originrouter proxy install [--version <v>]      default version 1.83.0
   originrouter proxy start --port <p>            routes mode (default; reads routes.claude)
   originrouter proxy start --provider <name> --port <p>   legacy / debug — NOT for use with originrouter claude
@@ -232,7 +238,7 @@ Model compatibility patches:
   originrouter compatibility rollback
 
 Provider field metadata:
-  Every --flag maps to a catalog field for the chosen --litellm-provider.
+  Every --flag maps to a catalog field for the chosen Provider adapter.
   Unknown flags are rejected. Fields can be literal values or env references
   (e.g. --api-key os.environ/DEEPSEEK_API_KEY). Secret fields are masked in
   all CLI / API output.
@@ -269,7 +275,7 @@ Other:
 
 Examples:
   originrouter run -- bash
-  # Proxy provider (LiteLLM via local proxy). The --type litellm
+  # Proxy provider (via the local runtime). The --type litellm
   # alias and --engine litellm are equivalent to the canonical --type proxy.
   originrouter provider add minimax --type proxy --engine litellm --litellm-provider anthropic --base-url https://api.easytransnote.com/coding --api-key sk-v1-xxx --model MiniMax-M3 --small-fast-model MiniMax-M2.7
   # Login-backed source selectors: Cloud presents the available models; Remote
@@ -286,7 +292,7 @@ Examples:
   originrouter sessions
   originrouter sessions --json
   # Provider fields can be env references. The shell var name is
-  # stored verbatim; LiteLLM reads the env itself at startup.
+  # stored verbatim; the Proxy runtime reads the env itself at startup.
   originrouter provider add bedrock-irsa --type proxy --engine litellm --litellm-provider bedrock \
     --aws-region os.environ/AWS_REGION_NAME \
     --aws-role-name arn:aws:iam::123456789012:role/MyBedrockRole \
@@ -333,8 +339,7 @@ OriginRouter wrapper options for claude/codex:
                                                  workspace_edits, workspace_commands, additional_permissions,
                                                  destructive_commands, elevated_commands, network_mutations,
                                                  outside_workspace, unknown_tools
-  --originrouter-native-config                   Native TUI only: use the installed Claude/Codex auth, model, environment, and config; keep OriginRouter remote control only
-  --originrouter-native                          Alias for --originrouter-native-config
+  --native-config                                Use the installed Claude/Codex auth, model, environment, and config; keep OriginRouter remote control only
 `);
 }
 
@@ -353,6 +358,7 @@ Usage:
 
 Start here:
   doctor                 Check dependencies, account, relay, and providers
+  setup                  Install Agent runtimes, local Proxy, and configure this device
   service                Install, start, stop, or inspect the background service
   agent setup            Choose native configuration or an OriginRouter route
   claude | codex         Launch a native agent with remote control
@@ -362,7 +368,7 @@ Models and routing:
   route                  Assign local, cloud, or remote models to agent slots
   route list             Show every configured Agent route
   route set <agent.slot> Assign a Provider and model to one route slot
-  proxy                  Install and manage the local LiteLLM proxy
+  proxy                  Install and manage the local Proxy runtime
   compatibility          Inspect signed protocol compatibility updates
   update                 Check for and install OriginRouter CLI updates
 
@@ -1034,7 +1040,7 @@ function assertManualProviderWriteIsLocalProxy(config, opts, action) {
   }
   if (requestedType !== "proxy" && requestedType !== "litellm") {
     throw new Error(
-      `provider ${action} only supports local LiteLLM proxy providers. ` +
+      `provider ${action} only supports local Proxy providers. ` +
       "Use `originrouter route cloud set <agent>.<slot>` for OriginRouter Cloud " +
       "or `originrouter route remote set <agent>.<slot>` for an authorized device.",
     );
@@ -1084,7 +1090,7 @@ function printRouteList(config) {
   );
   if (!hasAny) {
     console.log("(no routes configured)");
-    console.log(`Run \`originrouter route set ${ROUTE_AGENTS[0]}.main --provider <litellm-name> --model <model>\` to start.`);
+    console.log(`Run \`originrouter route set ${ROUTE_AGENTS[0]}.main --provider <proxy-name> --model <model>\` to start.`);
     return;
   }
   for (const agent of ROUTE_AGENTS) {
@@ -1358,18 +1364,14 @@ async function handleProxy(args) {
   }
 
   if (action === "install") {
-    const { detectPythonAvailability } = await import("./utils/detect.js");
-    const py = await detectPythonAvailability();
-    if (!py.available) {
-      console.error(py.error || "Python 3.10+ not found on PATH.");
-      process.exitCode = 1;
-      return;
-    }
+    const { ensureManagedPython } = await import("./runtime/managedPython.js");
     const version = opts["--version"] || LITELLM_VERSION;
-    process.stdout.write(`[proxy] python ${py.version} detected at ${py.path}\n`);
-    process.stdout.write(`[proxy] creating venv at ~/.originrouter/runtimes/litellm/${version}/venv ...\n`);
     try {
-      const result = await proxy.install({ version });
+      const py = await ensureManagedPython(stateDir);
+      process.stdout.write(`[proxy] managed Python ${py.version} ready at ${py.path}\n`);
+      process.stdout.write(`[proxy] ensuring venv at ~/.originrouter/runtimes/litellm/${version}/venv ...\n`);
+      const managedProxy = new ProxyManager({ stateDir, pythonCommand: py.path });
+      const result = await managedProxy.install({ version });
       process.stdout.write(`[proxy] installed. python=${result.pythonPath}\n`);
     } catch (err) {
       console.error(`[proxy] install failed: ${err.message}`);
@@ -2266,7 +2268,7 @@ export async function main(argv) {
   }
 
   if (command === "completion") {
-    printCompletion(args[0]);
+    handleCompletionCommand(args);
     return;
   }
 
@@ -2293,6 +2295,11 @@ export async function main(argv) {
 
   if (command === "doctor") {
     await printDoctor(args);
+    return;
+  }
+
+  if (command === "setup") {
+    await handleSetupCommand(args);
     return;
   }
 

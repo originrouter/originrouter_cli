@@ -43,6 +43,21 @@ import {
 import { formatCliError, reportCliError } from "../runtime/cliErrors.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import { resetCloudRoutesOnLogout } from "./agentRouteSetup.js";
+import { TelemetryQueue } from "../telemetry/telemetryQueue.js";
+
+function discardPendingTelemetryForSession(stateDir, sessionId) {
+  if (!sessionId) return;
+  let queue;
+  try {
+    queue = new TelemetryQueue({ stateDir });
+    queue.dropPendingForAccount(sessionId, "account_logged_out");
+  } catch {
+    // Logout must still clear credentials when a local telemetry database is
+    // unavailable or damaged.
+  } finally {
+    queue?.close();
+  }
+}
 
 function parseFlag(args, name) {
   for (let index = 0; index < args.length; index++) {
@@ -100,6 +115,7 @@ export async function inspectStoredLogin({
     return { state: "active", credential };
   } catch (error) {
     if (!storedLoginIsInvalid(error)) throw error;
+    discardPendingTelemetryForSession(stateDir, stored.sessionId);
     clearCodingAuth(stateDir);
     return { state: "invalid", credential: null, error };
   }
@@ -277,6 +293,7 @@ export async function handleLogout(args = [], {
         accessToken: fresh.accessTokens.control.token,
         signedRemoval: signCurrentDeviceRemoval(identity),
       });
+      discardPendingTelemetryForSession(stateDir, stored.sessionId);
       clearCodingAuth(stateDir);
       resetCloudRoutesFn();
       invalidateDeviceE2eeIdentity(stateDir);
@@ -312,6 +329,7 @@ export async function handleLogout(args = [], {
       console.warn(`logout: remote revocation failed (${error.code || "unavailable"})`);
     }
   }
+  discardPendingTelemetryForSession(stateDir, stored.sessionId);
   clearCodingAuth(stateDir);
   resetCloudRoutesFn();
   console.log("Logged out. This device remains trusted for a later sign-in.");

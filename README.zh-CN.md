@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/readme-hero-zh.webp" alt="OriginRouter CLI — Claude Code 与 Codex，一个本地控制平面。" width="100%" />
+  <img src="assets/readme-hero-zh.webp" alt="OriginRouter CLI — Claude Code 与 Codex 的本地控制层。" width="100%" />
 </p>
 
 <p align="center">
@@ -7,8 +7,8 @@
 </p>
 
 <p align="center">
-  在一个由本机掌控的工作区中运行 Codex 与 Claude Code。<br />
-  统一 Agent 协作、模型路由、远程会话与本地审批策略。
+  用一个本地控制层运行 Claude Code 与 Codex。<br />
+  统一任务协作、模型路由、审批和跨设备跟进。
 </p>
 
 <p align="center">
@@ -20,346 +20,207 @@
 
 <p align="center">
   <a href="#快速开始">快速开始</a>
-  · <a href="#agent-workspace">Agent Workspace</a>
-  · <a href="#命令地图">命令</a>
-  · <a href="https://originrouter.com/docs/originrouter-tools/cli">文档</a>
+  · <a href="#选择使用入口">选择入口</a>
+  · <a href="https://originrouter.com/docs/originrouter-cli/overview">CLI 文档</a>
+  · <a href="https://originrouter.com/docs/originrouter-app/overview">App 文档</a>
   · <a href="https://github.com/originrouter/originrouter_cli/issues">问题反馈</a>
 </p>
 
 > [!IMPORTANT]
-> OriginRouter CLI 当前仍处于 1.0 之前的预览阶段。兼容性敏感的命令和持久化
-> 结构会谨慎变更，但预览版本仍可能包含有明确说明的迁移。
+> OriginRouter CLI 当前处于 1.0 之前的预览阶段。升级前请阅读发布说明；预览
+> 版本可能包含已说明的迁移要求。
 
-## OriginRouter 能做什么
+## OriginRouter CLI 是什么？
 
-OriginRouter 是你现有 Coding Agent 的本地控制平面，而不是 Codex 或 Claude
-Code 的替代品。实际工作仍由它们的执行引擎完成，OriginRouter 在外层提供统一
-的工作区和协作能力。
+OriginRouter CLI 是围绕现有 Coding Agent 的本地执行与控制层。Claude Code 和
+Codex 仍负责实际执行，OriginRouter 为它们提供统一的工作区、模型路由、协作、
+审批、会话控制和远程跟进能力。
 
-- 直接输入最终目标，不需要手动组合多个 Agent 命令。
-- 选择 Codex 或 Claude Code 作为协调者，或由 Auto 自动组织参与者。
-- 协调规划、实现、审查、验证以及跨设备任务。
-- 保留 Agent 原生配置、参数、TUI 和会话恢复流程。
-- 在本地、Cloud 与远程设备之间统一配置模型路由。
-- 在真正执行 Agent 的设备上应用审批策略。
-- 从其他已授权设备查看会话并控制支持的操作。
-- 保留 display-safe 活动和审计记录，不上传原始工作区内容。
+- 直接提交目标，不需要手动拼接多个智能体命令。
+- 直接使用 Claude Code 或 Codex，也可以让智能体工作区协调团队。
+- 在 OriginRouter Cloud、本地模型服务和可信远程推理集群之间路由，并按数据区域和负载策略分配请求。
+- 命令、工具、工作区访问和审批决定都留在真正执行任务的设备上。
+- 连接可选的 OriginRouter App，查看状态、处理审批并远程跟进任务。
 
-```text
-OriginRouter App（可选）
-        │ 认证的 Local API / 加密账户 Bridge
-        ▼
-OriginRouter CLI daemon ─── 工作区 · 会话 · 策略 · 本地审计
-        │
-        ├── Codex app-server
-        ├── Claude Agent SDK / Claude Code
-        └── Compatibility Gateway ── LiteLLM ── 模型 Provider
-```
+<p align="center">
+  <img src="assets/readme-architecture-zh.svg" alt="OriginRouter 通过 App 和本地 CLI 组织协作，运行多个智能体，并将请求路由到云端、本地或远程模型服务，支持按数据区域选择推理位置。" width="980" />
+</p>
+
+## 选择使用入口
+
+| 入口 | 适合场景 |
+| --- | --- |
+| `originrouter` | 需要持续工作区、任务规划、分工或审查。 |
+| `originrouter claude` | 想保留 Claude Code 原生终端体验，同时使用 OriginRouter 的控制能力。 |
+| `originrouter codex` | 想保留 Codex 原生终端体验，同时使用 OriginRouter 的控制能力。 |
+| OriginRouter App | 想从另一台设备查看状态、处理审批或远程跟进。 |
+
+App 不是必需组件。命令、工具和工作区访问始终在 CLI 所在设备执行。
 
 ## 安装
 
-运行要求：
+### 推荐：官方安装程序
 
-- Node.js 22 或更新版本
-- 需要使用的 Codex 和/或 Claude Code
-- 只有使用受管的本地 LiteLLM Proxy 时才需要 Python 3.10 或更新版本
+macOS、Linux 和 WSL：
 
-安装公开 npm 包：
+```bash
+curl -fsSL https://originrouter.com/install.sh | bash
+```
+
+Windows PowerShell：
+
+```powershell
+irm https://originrouter.com/install.ps1 | iex
+```
+
+安装程序会安装 CLI 并启动引导式初始化。初始化会检查并在确认后补齐缺少的
+Claude Code、Codex、OriginRouter 后台服务、受管 Python 和 Local Proxy 运行时。
+
+### 通过 npm 安装
+
+如果你需要自行管理 CLI 版本，可以使用 npm：
 
 ```bash
 npm install --global @originrouter/cli
-originrouter --version
+originrouter setup
 ```
 
-完整命令名和短命令都可以使用：
+运行要求：
+
+- Node.js 22 或更新版本。
+- 能访问 npm 以及 Claude Code、Codex 官方安装服务的网络环境。
+- 是否需要 Cloud 账户或模型服务凭据，取决于你之后选择的路由。
+
+完整初始化默认包含 Local Proxy，因为它支持本地、第三方、企业网关和自部署模型。
+如果你只使用 OriginRouter Cloud 或已经授权的远程设备，不需要接入第三方 API、自部署
+模型或本地模型服务，可以明确跳过：
 
 ```bash
-originrouter --help
-or --help
+originrouter setup --no-proxy
 ```
 
-### CLI 更新
-
-OriginRouter 会在 Agent Workspace 启动时后台检查 npm 的 `latest` 版本。
-检查结果缓存 20 小时，启动过程不会等待 npm Registry。缓存中已经发现新版时，
-交互启动会提供“立即更新”“本次跳过”和“跳过直到下一个版本”。
-
-```bash
-originrouter update status
-originrouter update check
-originrouter update
-```
-
-默认模式为 `prompt`。自动更新需要用户主动开启，并且只会在安装方式受支持、
-全局包目录可写、没有运行中的 Agent Session 或协作任务时执行：
-
-```bash
-originrouter config set updates.mode prompt
-originrouter config set updates.mode auto
-originrouter config set updates.mode off
-```
-
-OriginRouter 可以识别 npm、pnpm 和 Bun 的全局安装。更新程序不会调用 `sudo`，
-不会覆盖源码仓库或链接的开发安装；检查或安装失败时会继续使用当前版本。
-受管后台服务会在空闲更新成功后自动重启，手动启动的 daemon 需要手动重启。
-
-版本检查最多等待 5 秒且不会阻塞启动。安装前的 daemon 活动检查最多等待 3 秒；
-如果无法确认 daemon 已空闲，更新会按安全原则延后。安装程序最多运行 5 分钟，
-超时后会终止整个安装进程树，确认退出后才释放更新锁。安装成功还会重新读取实际
-安装的包版本进行校验；`originrouter update status` 会显示结构化失败原因以及是否
-需要重启。启动阶段更新失败会继续进入 Agent Workspace；显式执行
-`originrouter update` 失败则返回非零退出码。任何更新路径都不会请求提权，也不会
-静默改用 `sudo` 重试。
+自动化环境使用 `originrouter setup --yes`，只查看计划使用
+`originrouter setup --dry-run`。平台差异和完整安装说明见
+[CLI 概览与安装](https://originrouter.com/docs/originrouter-cli/overview)。
 
 ## 快速开始
 
-在实际运行 Agent 的机器上执行一次：
-
-```bash
-# 检查 Agent、账户状态、Relay 连接和 Provider 配置
-originrouter doctor
-
-# 安装并启动用户级后台服务
-originrouter service install
-originrouter service start
-```
-
-然后进入项目并打开 Agent Workspace：
+安装完成后，进入项目并打开智能体工作区：
 
 ```bash
 cd 你的项目
 originrouter
 ```
 
-也可以直接提交目标。默认协调者是 Codex：
+也可以直接提交目标：
 
 ```bash
 originrouter "修复登录超时并补充回归测试"
-originrouter -c claude --mode build-review \
-  "实现这个修改，并让另一个 Agent 独立审查"
 ```
 
-Agent Workspace 会自动使用当前目录，不需要额外输入项目路径。
-
-### 远程设置、Remote Share 与工作区授权
-
-`originrouter remote setup` 应在**目标设备的管理上下文**执行，例如目标设备终端、
-SSH、屏幕共享或设备管理工具；只有操作系统要求交互确认时，才需要进入目标设备的
-图形界面。它汇总远程能力的状态，但不会把任一项授权自动扩大到另一项：
+如果你想保留智能体原生终端：
 
 ```bash
-# 查看设备信任、Remote Share 和已登记工作区
-originrouter remote status
-
-# 显式共享指定 LiteLLM Provider；只共享其 remote-enabled 模型
-originrouter remote share start --providers openai,anthropic
-
-# 在一次 setup 中启用共享并登记一个工作区
-originrouter remote setup --providers openai,anthropic \
-  --workspace ~/Desktop/client-a
+originrouter claude
+originrouter codex
 ```
 
-远程功能分成三个相互独立的 scope：
-
-| Scope | 入口 | 授予的能力 |
-| --- | --- | --- |
-| 设备信任 | `originrouter login`，必要时在 App 批准设备 | 该设备可加入可信设备网络与 E2EE 通信。 |
-| Remote Share | `originrouter remote share start` | 仅把选定 Provider 的 remote-enabled 模型提供给其他可信设备路由；不会泄露 Provider 密钥，也不授予文件访问。 |
-| 工作区 | `originrouter remote workspace authorize <path>` | 仅允许远程 Agent 在该目录及其子目录工作；不共享模型或账户凭据。 |
-
-可信控制端可以请求目标设备登记普通目录，但远程 Agent 不能借此自行扩大权限：
+首次使用 OriginRouter Cloud 路由时，登录并初始化一次：
 
 ```bash
-originrouter remote workspace request /path/to/project --device <device-id>
+originrouter login
+originrouter agent setup --cloud
+originrouter doctor
 ```
 
-目标 daemon 只会自动接受无需触发交互式系统权限或挂载凭据的目录。受保护目录会明确
-返回“需要目标设备授权”，随后从目标设备的管理上下文执行
-`remote workspace authorize`。这并不等于必须物理坐在目标设备前。OriginRouter 会
-显式标记受管 Agent 进程，并拒绝这些进程执行 request 或 authorize，防止 Agent 自行
-扩大工作区范围。
+如果你希望继续使用 Claude Code 或 Codex 官方订阅、登录状态、环境变量和项目配置，
+可以使用原生配置模式：
 
-工作区可位于 Desktop、Documents、Downloads、iCloud/CloudStorage、OneDrive 或网络
-挂载等位置，但必须先从目标设备的管理上下文执行 `remote workspace authorize`。
-此步骤用 daemon 的当前运行身份做读写预检；若 macOS TCC、Windows 安全策略或挂载
-凭据需要确认，才要求用户进入目标设备处理。随后远程启动只使用已登记且仍匹配该
-运行身份的目录；未登记或授权失效的目录会直接返回“需要目标设备授权”，不会在远程
-任务中等待系统弹窗。
+```bash
+originrouter claude --native-config
+originrouter codex --native-config
+```
 
-推荐仍将长期远程项目放在 `~/Developer` / `~/OriginRouterWorkspaces`（Windows 为
-`%USERPROFILE%\\Developer`），以减少系统隐私策略与云盘同步造成的维护成本。企业
-受管设备可通过 MDM、GPO 或系统配置预配相应的文件访问、Defender 和挂载权限。
+完整首次运行流程见 [CLI 快速开始](https://originrouter.com/docs/originrouter-cli/quickstart)。
 
-## Agent Workspace
+## 接下来可以做什么
 
-Agent Workspace 让用户始终停留在 OriginRouter 中，由 daemon 在后台运行受管
-的 Codex 或 Claude 会话。一个长期 Workspace Session 可以包含多个有限 Run；
-每次用户目标都有独立的任务、审批、预算、审计与最终结果，但完成一个 Run 不会
-结束整个对话。继续输入目标会留在当前 Session，`/new` 才会建立新的团队与上下文。
+### 协调更复杂的任务
 
-重新打开 Workspace 后使用 `/resume` 选择最近 Session，或使用
-`/resume <session-id>` 恢复指定 Session。Session 历史严格按顺序推进；
-单个 Run ID 仍可用于查看、重试和审计，但不能作为历史分支的继续点。
+智能体工作区会围绕项目保留长期对话，适合规划、实现、独立审查、验证和支持的
+跨设备任务。可以通过 `--mode` 选择模式，也可以在工作区内切换。
 
-新 Session 的第一条目标负责选择 Team 并生成可审查计划。后续目标直接交给当前
-主 Agent，由它通过 Agent MCP gateway 自行决定是否调用现有成员，不会每次重新
-自动配置团队。如果需要新增机器、目录、runtime、模型或扩大权限，主 Agent 必须
-发起版本化 Team 变更；Workspace 会显示具体差异并等待本机用户确认，确认前新成员
-不能执行任务。未变化成员会跨 Run 保留安全的原生会话连续性。
+```bash
+originrouter --mode plan-build-verify "准备并验证这次迁移"
+```
 
-Session Team 只保存在协调端 CLI 的本地协作数据库中。跨设备派发与 Agent MCP
-通信继续使用现有已认证的 E2EE Relay/Server bridge；服务端只路由密文与在线状态，
-不保存 Team 或原生 Agent 凭据。为了让 App 能按 Session 展示与继续任务，账户投影
-只保存无敏感内容的连续性标识：`workspace_session_id`、前一 Run ID、Team revision
-编号与 continuation 标记。部署时先执行
-`originrouter_server/sql/024_collaboration_workspace_session_projection.sql`，
-再升级 Server、所有参与协作的 CLI，最后升级 App。
+参阅[智能体工作区](https://originrouter.com/docs/originrouter-cli/agent-workspace)
+和[多智能体协作](https://originrouter.com/docs/originrouter-cli/collaboration)。
 
-可以通过 `--mode` 选择协作模式，也可以在交互式工作区中使用
-`/mode <名称>` 或 Shift+Tab 切换。
+### 接入模型服务
 
-| 模式 | 适用场景 |
+最简单的方式是使用 Cloud 路由。如果凭据和网络必须留在本机，也可以接入本地模型
+服务、企业网关或自部署模型。使用 `provider` 和 `route` 命令配置，Local Proxy
+文档会说明可用的接入方式。
+
+参阅[模型与路由](https://originrouter.com/docs/originrouter-cli/routing)
+和[模型服务参考](https://originrouter.com/docs/originrouter-cli/providers-reference)。
+
+### 从 App 或另一台设备跟进任务
+
+安装 OriginRouter App 并登录，然后连接一台在线且可信的 CLI 设备。App 可以查看
+会话、发送受支持的输入和处理审批。模型共享与工作区访问是相互独立的权限，只有
+确实需要时才启用。
+
+参阅[远程访问](https://originrouter.com/docs/originrouter-cli/remote)、
+[App 概览](https://originrouter.com/docs/originrouter-app/overview)和
+[设备与安全](https://originrouter.com/docs/originrouter-app/devices-security)。
+
+## 常用命令
+
+| 目的 | 命令 |
 | --- | --- |
-| `auto` | 根据目标自动选择最小且有效的参与者结构 |
-| `solo` | 问答和范围明确的小任务 |
-| `build-review` | 完成实现后交给另一个 Agent 独立审查 |
-| `plan-build-verify` | 大型、生产敏感或跨模块任务 |
-| `parallel-research` | 对多个方向进行相互独立的并行调查 |
-| `review-panel` | 架构决策和多种方案比较 |
-| `remote-ops` | 需要另一台可信设备参与的远程任务 |
+| 打开当前项目 | `originrouter` |
+| 运行 Claude Code | `originrouter claude` |
+| 运行 Codex | `originrouter codex` |
+| 检查安装和连接状态 | `originrouter doctor` |
+| 初始化或修复本机环境 | `originrouter setup` |
+| 登录或退出账户 | `originrouter login` / `originrouter logout` |
+| 管理模型服务 | `originrouter provider` |
+| 查看路由 | `originrouter route list` |
+| 查看设备和会话 | `originrouter devices` / `originrouter sessions` |
+| 查看全部命令和参数 | `originrouter help all` |
 
-常用参数：
+运行 `originrouter --help` 可以查看按任务组织的命令概览。
 
-```bash
-originrouter -c codex "<目标>"
-originrouter -c claude "<目标>"
-originrouter --mode plan-build-verify "<目标>"
-```
+## 安全与数据边界
 
-目标 CLI 会将白名单能力快照交给服务端专用的协作配置 API，由服务端进行有上限的多轮团队规划。
-目标 CLI 只执行被请求的只读探针，并在当前机器上完成最终实时安全校验；用户确认后仍由它创建并执行 Run。
-App 是可视化控制面；服务端不会访问工作区，也不能创建 Run。
+- 工作区文件、Shell 命令、工具调用和智能体执行都留在 CLI 所在设备。
+- 即使只监听 `127.0.0.1`，本地接口仍需要设备密钥。
+- 远程控制不会自动暴露模型服务凭据，也不会自动授予工作区访问权限。
+- 发送给 Cloud 或其他模型服务的请求，仍按对应服务的条款和数据策略处理。
 
-交互命令、确认策略、后台 Run 和并行写入安全规则参见
-[Agent Workspace 指南](docs/agent-workspace.md)。
+完整说明见[数据与执行边界](https://originrouter.com/docs/originrouter-concepts/data-boundaries)
+和 [SECURITY.md](SECURITY.md)。
 
-## 原生 Agent 与模型路由
+## 文档
 
-你随时可以直接启动 Agent，并保留它已有的配置：
-
-```bash
-originrouter codex --originrouter-native-config
-originrouter claude --originrouter-native-config
-```
-
-OriginRouter 支持三种模型来源：
-
-| 来源 | 适用场景 | 配置方式 |
-| --- | --- | --- |
-| Agent 原生配置 | 保留 Agent 已有的登录状态和模型 | `--originrouter-native-config` |
-| LiteLLM 本地 Provider | 使用保存在自己设备上的 Provider 凭据 | `provider`、`route`、`proxy` |
-| OriginRouter Cloud 或远程 CLI | 使用账户模型或另一台可信设备 | `login`、`route cloud`、`route remote` |
-
-可以从 `originrouter agent setup` 开始，Provider 和 Route 示例参见
-[CLI 使用指南](https://originrouter.com/docs/originrouter-tools/cli)。
-
-## 审批与远程控制
-
-审批策略在实际执行 Agent 的设备上进行判断：
-
-```bash
-originrouter claude --originrouter-autonomy guarded
-originrouter codex --originrouter-autonomy ai_review
-originrouter claude --originrouter-autonomy custom \
-  --originrouter-policy ~/.originrouter/policies/team-default.json
-```
-
-| 模式 | 行为 |
-| --- | --- |
-| `manual` | 由用户处理支持的审批决定 |
-| `guarded` | 自动允许保守的内置安全范围 |
-| `ai_review` | 在硬安全边界内交给已配置的审查模型判断 |
-| `unrestricted` | 对支持的决定不进行交互式审查 |
-| `custom` | 在 CLI 设备上评估版本化的审批策略文档 |
-
-未知工具、含糊的 Shell 展开、证据不足和无法安全解析的路径都会回退到用户审查。
-
-已授权设备可以查看会话、发送消息、停止任务并处理支持的交互请求。Provider
-凭据保留在本机，远程 Agent 数据使用设备端到端加密。
-
-## Shell 命令补全
-
-OriginRouter 为命令、参数、模式和本机已配置的 Provider 名称提供上下文补全。
-
-```bash
-# zsh：加入 ~/.zshrc
-source <(originrouter completion zsh)
-
-# bash：加入 ~/.bashrc
-source <(originrouter completion bash)
-
-# fish
-originrouter completion fish > ~/.config/fish/completions/originrouter.fish
-
-# PowerShell：加入 $PROFILE
-originrouter completion powershell | Out-String | Invoke-Expression
-```
-
-## 命令地图
-
-| 领域 | 命令 |
-| --- | --- |
-| Agent Workspace | `originrouter`、`-c`、`--mode` |
-| Agent | `claude`、`codex`、`agent setup`、`agent detail`、`agent budget` |
-| 协作 | `collaborate`、`collaboration` |
-| 模型 | `provider`、`route`、`proxy`、`compatibility` |
-| 会话 | `sessions`、`devices`、`history` |
-| 账户与安全 | `login`、`logout`、`auth`、`security` |
-| 本地控制 | `service`、`local`、`token`、`daemon` |
-| 工具 | `doctor`、`completion`、`run -- <command>` |
-
-运行 `originrouter --help` 查看面向任务的概览，运行 `originrouter help all` 查看
-完整命令面。
-
-## 安全模型
-
-- Provider key、OAuth token、设备授权和原始请求不会进入 display-safe Cloud 索引。
-- 完整对话、工具输出、源代码、命令和路径保留在 CLI 设备，除非通过加密设备
-  通道明确传输。
-- Local API 即使只监听 loopback，也要求每次安装随机生成的 bearer key。
-- 审批策略在真正执行 Agent 的设备上评估。
-- Compatibility 模块不能访问文件系统、网络、环境变量、进程、凭据、审批能力
-  或 E2EE key。
-
-安全问题报告方式参见 [SECURITY.md](SECURITY.md)。
-
-## 文档与贡献
-
-- [CLI 使用指南](https://originrouter.com/docs/originrouter-tools/cli)
+- [CLI 概览与安装](https://originrouter.com/docs/originrouter-cli/overview)
+- [CLI 快速开始](https://originrouter.com/docs/originrouter-cli/quickstart)
+- [智能体工作区](https://originrouter.com/docs/originrouter-cli/agent-workspace)
+- [模型与路由](https://originrouter.com/docs/originrouter-cli/routing)
 - [命令参考](https://originrouter.com/docs/originrouter-cli/commands)
-- [Agent Workspace 指南](docs/agent-workspace.md)
-- [贡献指南](CONTRIBUTING.md)
-- [发布流程](docs/releasing.md)
+- [CLI 故障排查](https://originrouter.com/docs/originrouter-cli/troubleshooting)
+- [OriginRouter App 文档](https://originrouter.com/docs/originrouter-app/overview)
 
-开发环境与测试命令统一放在 `CONTRIBUTING.md` 中，不再混入普通用户的安装流程。
+开发环境与贡献规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-## 第三方产品与法律声明
+## 第三方产品与许可证
 
-OriginRouter 是独立的开源项目，与 Anthropic 或 OpenAI 不存在隶属、赞助、
-认可或合作关系。
+OriginRouter 是独立的开源项目，与 Anthropic 或 OpenAI 没有隶属、背书或赞助关系。
+Claude Code 和 Codex 仍然受各自账户、许可证、服务条款和使用政策约束。
 
-OriginRouter 可与包括 Claude Code 和 Codex 在内的第三方开发工具及服务进行
-互操作。用户需要自行取得并维护相应的账户、订阅、许可证和访问权限，并遵守
-适用的第三方条款与政策。
+智能体生成的内容和执行结果可能不准确或不安全，请在依赖或执行前进行检查。
 
-第三方软件及依赖项继续受其各自许可证和使用条款约束。产品名称和标识归其
-各自权利人所有；相关名称仅用于说明兼容性，不代表任何认可或合作关系。
-
-AI 生成的内容和操作可能不准确、不完整或不安全。用户有责任在依赖或执行前
-进行审核。
-
-依赖项和运行时组件的许可详情参见[第三方声明](THIRD_PARTY_NOTICES.md)。
-
-## 许可证
-
-[Apache License 2.0](LICENSE)
+OriginRouter 使用 [Apache License 2.0](LICENSE)。依赖和运行时许可说明见
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

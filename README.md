@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/readme-hero-en.webp" alt="OriginRouter CLI — Claude Code and Codex. One local control plane." width="100%" />
+  <img src="assets/readme-hero-en.webp" alt="OriginRouter CLI — Claude Code and Codex from one local control plane." width="100%" />
 </p>
 
 <p align="center">
@@ -7,8 +7,8 @@
 </p>
 
 <p align="center">
-  Run Codex and Claude Code from one device-owned workspace.<br />
-  Coordinate Agents, route models, control remote sessions, and keep approval decisions local.
+  Run Claude Code and Codex from one local control plane.<br />
+  Coordinate work, route models, apply approvals, and follow sessions from another device.
 </p>
 
 <p align="center">
@@ -20,377 +20,218 @@
 
 <p align="center">
   <a href="#quick-start">Quick start</a>
-  · <a href="#agent-workspace">Agent Workspace</a>
-  · <a href="#command-map">Commands</a>
-  · <a href="https://originrouter.com/docs/originrouter-tools/cli">Documentation</a>
+  · <a href="#choose-your-entry-point">Choose an entry point</a>
+  · <a href="https://originrouter.com/docs/originrouter-cli/overview">CLI docs</a>
+  · <a href="https://originrouter.com/docs/originrouter-app/overview">App docs</a>
   · <a href="https://github.com/originrouter/originrouter_cli/issues">Issues</a>
 </p>
 
 > [!IMPORTANT]
-> OriginRouter CLI is pre-1.0. Compatibility-sensitive commands and stored
-> schemas are changed carefully, but preview releases may include documented
-> migrations.
+> OriginRouter CLI is pre-1.0. Read the release notes before upgrading; preview
+> releases may include documented migrations.
 
-## What OriginRouter does
+## What is OriginRouter CLI?
 
-OriginRouter is a local control plane for the coding Agents you already use. It
-does not replace Codex or Claude Code. Their execution engines still do the
-work; OriginRouter adds a shared workspace around them.
+OriginRouter CLI is the local execution and control layer around the coding
+Agents you already use. Claude Code and Codex remain the execution engines;
+OriginRouter gives them one workspace for routing, collaboration, approvals,
+session control, and remote follow-up.
 
-- Start with a goal instead of manually assembling Agent commands.
-- Choose Codex or Claude Code as coordinator, or let Auto mode build the team.
-- Coordinate planning, implementation, review, verification, and remote work.
-- Preserve native Agent configuration, arguments, TUI, and resume workflows.
-- Route local, cloud, and remote models through one configuration surface.
-- Apply approval policy on the device that actually executes the Agent.
-- Inspect sessions and control supported work from another authorized device.
-- Keep display-safe activity and audit records without uploading raw workspaces.
+- Start with an objective instead of assembling several Agent commands by hand.
+- Use Claude Code or Codex directly, or let the Agent Workspace coordinate a team.
+- Route requests through OriginRouter Cloud, local model services, or trusted remote clusters, with policy-based load balancing across regions.
+- Keep commands, tools, workspace access, and approval decisions on the executing device.
+- Connect the optional OriginRouter App to inspect state, handle approvals, and follow work remotely.
 
-```text
-OriginRouter App (optional)
-        │ authenticated Local API / encrypted account bridge
-        ▼
-OriginRouter CLI daemon ─── workspace · sessions · policy · local audit
-        │
-        ├── Codex app-server
-        ├── Claude Agent SDK / Claude Code
-        └── Compatibility Gateway ── LiteLLM ── model provider
-```
+<p align="center">
+  <img src="assets/readme-architecture-en.svg" alt="OriginRouter collaboration flows through the App and local CLI, which runs agents and routes requests through cloud, local, or remote model services, including data-region inference." width="980" />
+</p>
+
+## Choose your entry point
+
+| Entry point | Use it when |
+| --- | --- |
+| `originrouter` | You need a persistent workspace, planning, delegation, or review. |
+| `originrouter claude` | You want the native Claude Code terminal experience with OriginRouter control. |
+| `originrouter codex` | You want the native Codex terminal experience with OriginRouter control. |
+| OriginRouter App | You want visual status, approvals, or remote follow-up from another device. |
+
+The App is optional. Local commands, tools, and workspace access always run on
+the CLI device.
 
 ## Install
 
-Requirements:
+### Recommended: official installer
 
-- Node.js 22 or later
-- Codex and/or Claude Code for the runtime you want to use
-- Python 3.10 or later only when using the managed local LiteLLM proxy
+macOS, Linux, and WSL:
 
-Install the public npm package:
+```bash
+curl -fsSL https://originrouter.com/install.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://originrouter.com/install.ps1 | iex
+```
+
+The installer installs the CLI and starts the guided setup. Setup checks and,
+after confirmation, installs missing Claude Code and Codex runtimes, the
+OriginRouter background service, managed Python, and the Local Proxy runtime.
+
+### Install from npm
+
+Use npm when you need to manage the CLI version yourself:
 
 ```bash
 npm install --global @originrouter/cli
-originrouter --version
+originrouter setup
 ```
 
-Both executable names are available:
+Requirements:
+
+- Node.js 22 or later.
+- Network access to npm and the official Claude Code and Codex installers.
+- A Cloud account or model-service credentials are only needed for the route you choose later.
+
+Local Proxy is included in the complete setup because it supports local,
+third-party, enterprise, and self-hosted model services. If you only use
+OriginRouter Cloud or already-authorized remote devices and do not need those
+model-service routes, skip it explicitly:
 
 ```bash
-originrouter --help
-or --help
+originrouter setup --no-proxy
 ```
 
-### CLI updates
-
-OriginRouter checks the npm `latest` release in the background when Agent
-Workspace starts. The check is cached for 20 hours, so startup never waits for
-the registry. When a newer version is already cached, an interactive launch
-offers **Update now**, **Skip**, and **Skip until next version**.
-
-```bash
-originrouter update status
-originrouter update check
-originrouter update
-```
-
-The default mode is `prompt`. Automatic updates are opt-in and run only when
-the installation method is supported, the global package directory is
-writable, and no Agent session or collaboration run is active:
-
-```bash
-originrouter config set updates.mode prompt
-originrouter config set updates.mode auto
-originrouter config set updates.mode off
-```
-
-OriginRouter recognizes global npm, pnpm, and Bun installations. It never
-invokes `sudo`, never overwrites a source checkout or linked development
-install, and continues with the installed version if an update check or
-installation fails. A managed background service is restarted after a
-successful idle update; a manually started daemon must be restarted manually.
-
-Update checks time out after 5 seconds and never block startup. Before an
-install, daemon activity detection is bounded to 3 seconds and fails closed:
-if OriginRouter cannot prove the daemon is idle, the update is deferred. An
-installer may run for at most 5 minutes; on timeout OriginRouter terminates the
-whole installer process tree before releasing its update lock. Successful
-installs are verified by reading the installed package version, and
-`originrouter update status` reports structured failure details and whether a
-restart is required. A startup update failure returns to Agent Workspace;
-the explicit `originrouter update` command instead exits non-zero. No update
-path requests elevation or silently retries with `sudo`.
+For automation, use `originrouter setup --yes`; preview the plan with
+`originrouter setup --dry-run`. See the [CLI installation guide](https://originrouter.com/docs/originrouter-cli/overview)
+for platform-specific details.
 
 ## Quick start
 
-Run these commands once on the machine that will execute your Agents:
-
-```bash
-# Check installed runtimes, account state, relay connectivity, and providers
-originrouter doctor
-
-# Install and start the user-level background service
-originrouter service install
-originrouter service start
-```
-
-Then open a project and start Agent Workspace:
+After installation, open a project and start the Agent Workspace:
 
 ```bash
 cd your-project
 originrouter
 ```
 
-Or submit a goal directly. Codex is the default coordinator:
+Submit an objective directly:
 
 ```bash
 originrouter "Fix the login timeout and add regression tests"
-originrouter -c claude --mode build-review \
-  "Implement the change and have another Agent review it"
 ```
 
-Agent Workspace uses the current directory automatically. You do not need to
-pass the project path.
-
-### Remote setup, Remote Share, and workspace authorization
-
-Run `originrouter remote setup` in the target device's management context (for
-example its terminal, SSH session, screen sharing session, or device-management
-tool). Physical presence is required only if the operating system asks for an
-interactive permission decision. It is a one-time onboarding entry point that
-reports remote readiness without silently broadening any permission:
+Or keep the native Agent terminal:
 
 ```bash
-# Inspect device trust, Remote Share, and registered workspaces
-originrouter remote status
-
-# Share only selected remote-enabled LiteLLM Providers
-originrouter remote share start --providers openai,anthropic
-
-# Configure sharing and register a workspace in one local setup step
-originrouter remote setup --providers openai,anthropic \
-  --workspace ~/Desktop/client-a
+originrouter claude
+originrouter codex
 ```
 
-Remote access has three independently scoped permissions:
-
-| Scope | Entry point | Granted capability |
-| --- | --- | --- |
-| Device trust | `originrouter login`, and App approval when required | Join the trusted-device network and use E2EE transport. |
-| Remote Share | `originrouter remote share start` | Route only selected remote-enabled Provider models to trusted devices; it never exposes Provider credentials or filesystem access. |
-| Workspace | `originrouter remote workspace authorize <path>` | Let remote Agents work only in that workspace and its children; it neither shares models nor account credentials. |
-
-A trusted controller can request registration of an ordinary folder without
-letting a remote Agent expand its own permissions:
+To use OriginRouter Cloud routes, sign in and initialize them once:
 
 ```bash
-originrouter remote workspace request /path/to/project --device <device-id>
+originrouter login
+originrouter agent setup --cloud
+originrouter doctor
 ```
 
-The target daemon accepts the request only when it can safely validate the
-folder without triggering an interactive OS or mount prompt. Protected folders
-return a target-authorization-required error instead. Complete those with
-`remote workspace authorize` in the target device's management context.
-OriginRouter marks managed Agent processes explicitly and rejects both request
-and authorize commands from those processes, preventing workspace self-expansion.
+Use the native Agent configuration instead when you want to keep the official
+Claude Code or Codex subscription, login state, environment, and project
+configuration:
 
-Desktop, Documents, Downloads, iCloud/CloudStorage, OneDrive, and mounted
-locations remain supported. Before unattended remote use, authorize them from
-the target device's management context with `remote workspace authorize`. The
-daemon performs the preflight under its own runtime identity. If macOS TCC,
-Windows security, or mount credentials require interaction, the command asks
-for it on the target device; otherwise it completes silently. A later remote Run uses only
-registered, still-valid workspaces and fails clearly rather than waiting on an
-invisible OS prompt.
+```bash
+originrouter claude --native-config
+originrouter codex --native-config
+```
 
-## Agent Workspace
+Read [CLI quickstart](https://originrouter.com/docs/originrouter-cli/quickstart)
+for the complete first-run flow.
 
-Agent Workspace keeps the user in OriginRouter while the daemon runs managed
-Codex or Claude sessions in the background. Plans, tasks, approvals, budgets,
-messages, and results remain attached to durable collaboration Runs within one
-long-lived Workspace Session. A completed Run is a result, not the end of the
-conversation: type the next objective to continue the Session, or use `/new`
-to begin a fresh team and context.
+## What you can do next
 
-After reopening Workspace, use `/resume` to choose a recent Session, or
-`/resume <session-id>` to restore a specific one. Session history is
-strictly ordered: individual Run IDs remain available for inspection, retry,
-and audit, but cannot be used as historical continuation points.
+### Coordinate larger tasks
 
-The first objective in a new Session selects the Team and creates its initial
-reviewable plan. Follow-up objectives reuse the persisted Team and go directly
-to its primary Agent, which can delegate through the Agent MCP gateway. A
-follow-up never silently adds a machine, directory, runtime, model, or wider
-permission. If the current boundary is insufficient, the primary Agent must
-request a versioned Team change; Workspace shows the exact change and waits for
-local confirmation before the new member can run. Unchanged Agents retain safe
-native conversation continuity across Runs.
+The Agent Workspace keeps a long-lived conversation around a project. Use it
+for planning, implementation, independent review, verification, and supported
+cross-device work. Choose a mode with `--mode`, or switch inside the Workspace.
 
-The Session Team is stored only in the coordinating CLI's local collaboration
-database. Cross-device dispatch and Agent MCP traffic continue through the
-existing authenticated E2EE Relay/Server bridge; the server routes ciphertext
-and presence but does not receive Team state or native Agent credentials. The
-App reads only display-safe Session continuity metadata (`workspace_session_id`,
-previous Run ID, Team revision number, and continuation flag) from the account
-projection. From the `originrouter_server` release, deploy
-`sql/024_collaboration_workspace_session_projection.sql` before the updated
-Server, then update every participating CLI and the App.
+```bash
+originrouter --mode plan-build-verify "Prepare and verify the migration"
+```
 
-Choose a collaboration mode with `--mode` or switch inside the interactive
-workspace with `/mode <name>` or Shift+Tab.
+See [Agent Workspace](https://originrouter.com/docs/originrouter-cli/agent-workspace)
+and [multi-agent collaboration](https://originrouter.com/docs/originrouter-cli/collaboration).
 
-| Mode | Best for |
+### Connect a model service
+
+Use Cloud routes for the simplest start. Use a local model service, enterprise
+gateway, or self-hosted model when its credentials and network should remain on
+your device. Configure it with `provider` and `route` commands; the Local Proxy
+guide explains the available integrations.
+
+See [models and routing](https://originrouter.com/docs/originrouter-cli/routing)
+and the [model-service reference](https://originrouter.com/docs/originrouter-cli/providers-reference).
+
+### Follow work from the App or another device
+
+Install OriginRouter App, sign in, and connect a CLI device that is online and
+trusted. The App can display sessions, deliver supported input, and handle
+approvals. Remote model sharing and workspace access are separate permissions
+that you enable only when needed.
+
+See [remote access](https://originrouter.com/docs/originrouter-cli/remote),
+[App overview](https://originrouter.com/docs/originrouter-app/overview), and
+[devices and security](https://originrouter.com/docs/originrouter-app/devices-security).
+
+## Common commands
+
+| Goal | Command |
 | --- | --- |
-| `auto` | Let OriginRouter choose the smallest useful team for the goal |
-| `solo` | Questions and small, self-contained tasks |
-| `build-review` | Implementation followed by an independent review |
-| `plan-build-verify` | Larger, production-sensitive, or cross-module work |
-| `parallel-research` | Independent investigation across several areas |
-| `review-panel` | Architecture choices and competing approaches |
-| `remote-ops` | Work that requires a trusted participant on another device |
+| Open the current project | `originrouter` |
+| Run Claude Code | `originrouter claude` |
+| Run Codex | `originrouter codex` |
+| Check installation and connectivity | `originrouter doctor` |
+| Initialize or repair the local runtime | `originrouter setup` |
+| Sign in or sign out | `originrouter login` / `originrouter logout` |
+| Manage model services | `originrouter provider` |
+| Inspect routes | `originrouter route list` |
+| Inspect devices and sessions | `originrouter devices` / `originrouter sessions` |
+| Show every command and option | `originrouter help all` |
 
-Useful options:
+Run `originrouter --help` for the task-oriented overview.
 
-```bash
-originrouter -c codex "<objective>"
-originrouter -c claude "<objective>"
-originrouter --mode plan-build-verify "<objective>"
-```
+## Security and data boundaries
 
-The target CLI sends an allowlisted capability snapshot to the server-owned
-Collaboration Configuration API, which performs bounded multi-turn team
-planning. The target CLI executes only requested read-only probes, performs the
-final live safety validation, then creates and executes the Run itself after
-confirmation. The App is a visual control surface; the Server never accesses a
-workspace or creates a Run.
+- Workspace files, shell commands, tools, and Agent execution stay on the CLI device.
+- The Local API requires a device key, including when it listens only on `127.0.0.1`.
+- Remote control does not expose model-service credentials or grant workspace access by itself.
+- Requests sent to Cloud or another model service follow that service's terms and data policy.
 
-Read the [Agent Workspace guide](docs/agent-workspace.md) for interactive
-commands, confirmation policy, detached runs, and parallel-write safety.
+Read [data and execution boundaries](https://originrouter.com/docs/originrouter-concepts/data-boundaries)
+and [SECURITY.md](SECURITY.md) for the full model.
 
-## Native Agents and model routing
+## Documentation
 
-You can always launch an Agent directly and keep its existing configuration:
-
-```bash
-originrouter codex --originrouter-native-config
-originrouter claude --originrouter-native-config
-```
-
-OriginRouter supports three model sources:
-
-| Source | Use it when | Configure with |
-| --- | --- | --- |
-| Native Agent configuration | Keep the Agent's existing login and model | `--originrouter-native-config` |
-| Local provider through LiteLLM | Use credentials stored on your own device | `provider`, `route`, `proxy` |
-| OriginRouter Cloud or remote CLI | Use account models or another trusted device | `login`, `route cloud`, `route remote` |
-
-Start with `originrouter agent setup`, or read the
-[CLI documentation](https://originrouter.com/docs/originrouter-tools/cli) for
-provider and route examples.
-
-## Approval and remote control
-
-Approval policy is evaluated on the device executing the Agent:
-
-```bash
-originrouter claude --originrouter-autonomy guarded
-originrouter codex --originrouter-autonomy ai_review
-originrouter claude --originrouter-autonomy custom \
-  --originrouter-policy ~/.originrouter/policies/team-default.json
-```
-
-| Mode | Behavior |
-| --- | --- |
-| `manual` | Ask the user for supported approval decisions |
-| `guarded` | Automatically allow a conservative built-in scope |
-| `ai_review` | Ask the configured review model inside hard safety boundaries |
-| `unrestricted` | Allow supported decisions without interactive review |
-| `custom` | Evaluate a versioned policy document on the CLI device |
-
-Unknown tools, ambiguous shell expansion, insufficient evidence, and unsafe
-path resolution fail closed to user review.
-
-Authorized devices can inspect sessions, send messages, stop work, and answer
-supported interactions. Provider credentials remain local, while remote Agent
-payloads use device end-to-end encryption.
-
-## Shell completion
-
-OriginRouter provides contextual completion for commands, options, modes, and
-locally configured provider names.
-
-```bash
-# zsh — add to ~/.zshrc
-source <(originrouter completion zsh)
-
-# bash — add to ~/.bashrc
-source <(originrouter completion bash)
-
-# fish
-originrouter completion fish > ~/.config/fish/completions/originrouter.fish
-
-# PowerShell — add to $PROFILE
-originrouter completion powershell | Out-String | Invoke-Expression
-```
-
-## Command map
-
-| Area | Commands |
-| --- | --- |
-| Agent Workspace | `originrouter`, `-c`, `--mode` |
-| Agents | `claude`, `codex`, `agent setup`, `agent detail`, `agent budget` |
-| Collaboration | `collaborate`, `collaboration` |
-| Models | `provider`, `route`, `proxy`, `compatibility` |
-| Sessions | `sessions`, `devices`, `history` |
-| Account and security | `login`, `logout`, `auth`, `security` |
-| Local control | `service`, `local`, `token`, `daemon` |
-| Utilities | `doctor`, `completion`, `run -- <command>` |
-
-Run `originrouter --help` for the task-oriented overview and
-`originrouter help all` for the exhaustive command surface.
-
-## Security model
-
-- Provider keys, OAuth tokens, device grants, and raw requests are excluded
-  from display-safe cloud indexes.
-- Full transcripts, tool output, source code, commands, and paths stay on the
-  CLI device unless explicitly transported through an encrypted device channel.
-- The Local API requires a per-installation bearer key, including on loopback.
-- Approval policy is evaluated on the machine executing the Agent.
-- Compatibility modules cannot access the filesystem, network, environment,
-  processes, credentials, approval capabilities, or E2EE keys.
-
-See [SECURITY.md](SECURITY.md) for vulnerability reporting.
-
-## Documentation and contributing
-
-- [CLI documentation](https://originrouter.com/docs/originrouter-tools/cli)
+- [CLI overview and installation](https://originrouter.com/docs/originrouter-cli/overview)
+- [CLI quickstart](https://originrouter.com/docs/originrouter-cli/quickstart)
+- [Agent Workspace](https://originrouter.com/docs/originrouter-cli/agent-workspace)
+- [Models and routing](https://originrouter.com/docs/originrouter-cli/routing)
 - [Command reference](https://originrouter.com/docs/originrouter-cli/commands)
-- [Agent Workspace guide](docs/agent-workspace.md)
-- [Contributing guide](CONTRIBUTING.md)
-- [Release process](docs/releasing.md)
+- [CLI troubleshooting](https://originrouter.com/docs/originrouter-cli/troubleshooting)
+- [OriginRouter App documentation](https://originrouter.com/docs/originrouter-app/overview)
 
-Development setup and test commands live in `CONTRIBUTING.md` rather than the
-end-user installation flow.
+For development setup and contribution rules, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Third-party products and legal notice
+## Third-party products and license
 
 OriginRouter is an independent open-source project. It is not affiliated with,
-endorsed by, or sponsored by Anthropic or OpenAI.
+endorsed by, or sponsored by Anthropic or OpenAI. Claude Code and Codex remain
+subject to their own accounts, licenses, terms, and policies.
 
-OriginRouter interoperates with third-party developer tools and services,
-including Claude Code and Codex. Users must obtain and maintain their own
-accounts, subscriptions, licenses, and access rights, and must comply with the
-applicable third-party terms and policies.
+AI-generated output and actions can be inaccurate or unsafe. Review them before
+relying on or executing them.
 
-Third-party software and dependencies remain subject to their own licenses and
-terms. Product names and marks belong to their respective owners; references
-identify compatible products and do not imply endorsement or partnership.
-
-AI-generated outputs and actions may be inaccurate, incomplete, or unsafe.
-Users are responsible for reviewing them before relying on or executing them.
-
-See [Third-party notices](THIRD_PARTY_NOTICES.md) for dependency and runtime
-licensing details.
-
-## License
-
-[Apache License 2.0](LICENSE)
+OriginRouter is licensed under the [Apache License 2.0](LICENSE). See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dependency and runtime notices.

@@ -41,6 +41,7 @@ const launched = await supervisor.start({
   sessionId: "session-1",
   conversationId: "conversation-1",
   runId: "run-1",
+  taskId: "task-1",
   agentType: "codex",
   workspaceId: workspace.workspace_id,
   initialMessage: "Fix the checkout callback.",
@@ -57,6 +58,8 @@ assert.equal(spawns[0].options.env.ORIGINROUTER_MANAGED_AGENT, "1");
 assert.ok(spawns[0].args.includes("codex-app-server"));
 assert.ok(spawns[0].args.includes("--originrouter-conversation"));
 assert.ok(spawns[0].args.includes("--originrouter-workspace"));
+assert.ok(spawns[0].args.includes("--originrouter-task"));
+assert.ok(spawns[0].args.includes("task-1"));
 assert.ok(spawns[0].args.includes(workspace.workspace_id));
 assert.ok(spawns[0].args.includes("--originrouter-title"));
 assert.ok(spawns[0].args.includes("Fix the checkout callback."));

@@ -3,7 +3,7 @@
 > **Stage 8.3.** This doc is the repeatable recipe for verifying the
 > Codex chain end-to-end on a real machine. It follows Stages 8.0
 > (routes backend), 8.1 (runtime robustness), and 8.2 (UI wiring).
-> Run the A–G sections in order with a working LiteLLM provider.
+> Run the A–G sections in order with a working Proxy provider.
 
 ## Three rules
 
@@ -15,7 +15,7 @@ Read these before starting. They are non-negotiable.
    start a real Codex app-server and does not hit any upstream. If
    that suite is green, the local chain is intact. If you need proof
    the network path was actually exercised, you must read the
-   LiteLLM log — see section F.
+   Proxy log — see section F.
 
 2. **`env print` proves env injection only.** It renders what
    `buildAgentProviderEnv("codex", config, ...)` would inject into the
@@ -26,7 +26,7 @@ Read these before starting. They are non-negotiable.
    the CodexAdapter block of `tests/codexE2eOffline.test.js` and
    verified manually in section E.
 
-3. **The LiteLLM log is the only source of truth.** The model name
+3. **The Proxy log is the only source of truth.** The model name
    that Codex Code self-reports in its UI is **not** a verification
    source. It reflects what Codex Code reads from its own argv /
    state, not necessarily what OriginRouter wrote into the proxy
@@ -135,7 +135,7 @@ OPENAI_MODEL=gpt-5.4
 ```
 
 The `OPENAI_API_KEY` is intentionally a no-op bearer — the local
-LiteLLM proxy accepts any value and forwards auth upstream.
+The local proxy accepts any value and forwards auth upstream.
 
 **Caveat:** this proves env injection only. The `--model` CLI
 argument to the Codex child process is not exercised by `env print`.
@@ -191,10 +191,10 @@ the warning text (`warning: --model passed on the command line`).
 You do not need to re-verify this manually unless you are debugging
 a regression in that suite.
 
-## F. LiteLLM log truth (the only network-path proof)
+## F. Proxy log truth (the only network-path proof)
 
 This section exercises the actual code path: Codex app-server →
-LiteLLM proxy → upstream. The log file path is in
+Proxy → upstream. The log file path is in
 `proxy.state.json.logPath` (default
 `~/.originrouter/logs/litellm.log`):
 
@@ -270,9 +270,9 @@ route or the stopped proxy, depending on which check fires first.
 
 ## Known failure modes
 
-- **Log shows upstream model, not alias.** LiteLLM's default log
+- **Log shows upstream model, not alias.** The proxy runtime's default log
   level collapses the alias to the upstream model. Re-run with
-  `--detailed-debug` (LiteLLM flag) or increase log verbosity. The
+  `--detailed-debug` (proxy runtime flag) or increase log verbosity. The
   alias must still appear in `route show codex` and `proxy.state.json`.
 
 - **`originrouter codex` ignores `OPENAI_MODEL`.** Some Codex CLI

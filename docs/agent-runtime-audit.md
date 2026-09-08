@@ -2,7 +2,7 @@
 
 Current runtime invariants:
 
-- Local user providers are LiteLLM proxy configurations.
+- Local user providers are Proxy configurations.
 - OriginRouter Cloud and remote-device routes require OAuth login.
 - Cloud catalogue requests use only the AI Access Token.
 - Cloud Claude/Codex requests use only the Coding Access Token.

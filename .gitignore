@@ -6,6 +6,7 @@ dist/
 .DS_Store
 *.log
 .originrouter/
+template/
 
 # Local secrets and certificates
 *.pem

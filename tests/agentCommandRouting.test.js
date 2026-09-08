@@ -26,7 +26,7 @@ assert.equal(resolveAgentCommand("status", []), null);
 
 assert.deepEqual(
   extractOriginRouterOptions([
-    "--originrouter-native-config",
+    "--native-config",
     "-r",
     "claude-session-id",
   ]),
@@ -46,17 +46,6 @@ assert.deepEqual(
   {
     options: { detailProfile: "detailed" },
     passthrough: ["--resume", "claude-session-id"],
-  },
-);
-assert.deepEqual(
-  extractOriginRouterOptions([
-    "--originrouter-native",
-    "resume",
-    "codex-session-id",
-  ]),
-  {
-    options: { nativeConfig: true },
-    passthrough: ["resume", "codex-session-id"],
   },
 );
 assert.deepEqual(

@@ -263,6 +263,11 @@ export class ManagedAgentSupervisor {
       "--originrouter-workspace",
       workspace.workspace_id,
     ];
+    const taskId = safeText(payload.taskId || payload.task_id, 195);
+    if (taskId) args.push("--originrouter-task", taskId);
+    if (payload.telemetryOwner === true || payload.telemetryOwner === false) {
+      args.push("--originrouter-telemetry-owner", payload.telemetryOwner ? "1" : "0");
+    }
     const provider = safeText(payload.provider, 191);
     const model = safeText(payload.model, 191);
     if (provider) args.push("--provider", provider);

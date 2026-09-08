@@ -45,6 +45,10 @@ assert.deepEqual(
     forwarded: ["--timeout", "120"],
   },
 );
+assert.throws(
+  () => parseAgentWorkspaceArgs(["--yes", "--review", "inspect", "the", "workspace"]),
+  /cannot be used together/,
+);
 assert.equal(normalizeWorkspaceMode("plan"), "plan_build_verify");
 assert.equal(nextWorkspaceMode("auto").id, "solo");
 assert.equal(inferWorkspaceMode("explain the authentication flow"), "solo");
@@ -655,6 +659,49 @@ assert.deepEqual(cancelledRuns, ["acr_test_interrupt"]);
 assert.match(activeInterruptTerminal.writes.join(""), /Interrupting the collaboration/);
 assert.match(activeInterruptTerminal.writes.join(""), /acr_test_interrupt/);
 
+const activeExitTerminal = fakeTerminal();
+const activeExitCancelledRuns = [];
+let activeExitStarted = false;
+let activeExitReady;
+const activeExitReadyPromise = new Promise((resolve) => {
+  activeExitReady = resolve;
+});
+const activeExitRun = handleAgentWorkspaceCommand([], {
+  input: activeExitTerminal.input,
+  output: activeExitTerminal.output,
+  workspaceRunner: async (options) => {
+    activeExitStarted = true;
+    options.onRunId?.("acr_active_exit");
+    options.onUpdate?.({
+      type: "snapshot",
+      snapshot: {
+        run: { run_id: "acr_active_exit", state: "running" },
+        tasks: [{ task_key: "inspect", title: "Inspect service", state: "running" }],
+      },
+      events: [],
+    });
+    activeExitReady();
+    await new Promise((resolve, reject) => {
+      options.signal?.addEventListener("abort", () => {
+        const error = new Error("detached");
+        error.code = "ORIGINROUTER_INTERRUPTED";
+        reject(error);
+      }, { once: true });
+    });
+  },
+  cancelCollaborationRun: async (runId) => activeExitCancelledRuns.push(runId),
+});
+await new Promise((resolve) => setImmediate(resolve));
+emitText(activeExitTerminal.input, "inspect while I leave");
+activeExitTerminal.input.emit("keypress", undefined, { name: "return" });
+await activeExitReadyPromise;
+emitText(activeExitTerminal.input, "/exit");
+activeExitTerminal.input.emit("keypress", undefined, { name: "return" });
+await activeExitRun;
+assert.equal(activeExitStarted, true);
+assert.deepEqual(activeExitCancelledRuns, [], "/exit detaches without cancelling the active Run");
+assert.match(activeExitTerminal.writes.join(""), /collaboration Run will continue in the service/);
+
 const liveApprovalTerminal = fakeTerminal();
 const liveApprovalUpdates = [];
 let liveApprovalResolve;
@@ -716,14 +763,14 @@ await liveApprovalRun;
 assert.equal(
   liveApprovalTerminal.writes.join("").includes("\x1b[?1000h"),
   true,
-  "the live workspace enables mouse reporting so wheel scrolling stays inside the TUI",
+  "the live workspace enables mouse tracking so wheel scrolling stays inside the TUI",
 );
 assert.equal(
   liveApprovalTerminal.writes.join("").includes("\x1b[?1006h"),
   true,
   "the live workspace uses SGR mouse reporting for wheel events",
 );
-assert.match(liveApprovalTerminal.writes.join(""), /Shift\+drag selects text/);
+assert.match(liveApprovalTerminal.writes.join(""), /Ctrl\+T copy mode/);
 
 const runtimeClearTerminal = fakeTerminal();
 const runtimeClearCancelled = [];
@@ -1570,7 +1617,7 @@ assert.match(runtimeScreen, /Inspect remote status/);
 assert.match(runtimeScreen, /acr_runtime/);
 assert.match(runtimeScreen, /› queue another check/);
 assert.match(runtimeScreen, /Enter queues next objective/);
-assert.match(runtimeScreen, /Shift\+drag selects text/);
+assert.match(runtimeScreen, /Ctrl\+T copy mode/);
 assert.match(runtimeScreen.replace(/\x1b\[[0-9;]*m/g, ""), /\n› Inspect the remote computer/);
 const plainRuntimeScreen = runtimeScreen.replace(/\x1b\[[0-9;]*m/g, "");
 assert.match(plainRuntimeScreen, /\n⠋ Agents are working/);

@@ -44,6 +44,20 @@ assert.deepEqual(codexEvents[0], {
   input: { command: "npm test", cwd: "/repo" },
 });
 
+assert.deepEqual(mapCodexAppServerEvent({
+  type: "task_complete",
+  turn_id: "turn-rate-limited",
+  error: { message: "usage limit reached" },
+}), [{
+  type: "agent.task.complete",
+  provider: "codex",
+  id: "turn-rate-limited",
+  status: "failed",
+  isError: true,
+  error: "usage limit reached",
+  message: "usage limit reached",
+}]);
+
 const codexAssistantEvents = mapCodexAppServerEvent({
   type: "agent_message",
   message: "<think>private chain of thought</think>\nVisible answer",

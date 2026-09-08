@@ -3,8 +3,8 @@
 ## Purpose
 
 OriginRouter runs a local compatibility gateway in front of its managed
-LiteLLM process. Claude Code, Codex, App chat and remote E2EE requests use the
-stable public proxy port, while LiteLLM listens on a private random loopback
+Proxy process. Claude Code, Codex, App chat and remote E2EE requests use the
+stable public proxy port, while the runtime listens on a private random loopback
 port.
 
 ```text
@@ -14,7 +14,7 @@ Claude / Codex / App / remote E2EE request
 OriginRouter Compatibility Gateway
                     |
                     v
-LiteLLM private loopback port
+Proxy private loopback port
                     |
                     v
 Provider
@@ -99,7 +99,7 @@ An infinite loop is terminated with the Worker rather than blocking the Daemon.
 ## Matching and deterministic order
 
 Host-side matching occurs before a module is invoked. A manifest may match
-method, path, protocol, runtime, provider, provider family, model, LiteLLM
+method, path, protocol, runtime, provider, provider family, model, Proxy
 version and streaming mode.
 
 Patches execute only in their phase: `request`, `response`, `stream` or `error`.
@@ -125,7 +125,7 @@ for development, private deployments and rotation testing.
 The CLI checks on startup and every six hours unless relay mode is `local` or
 updates are disabled. Installation verifies signature, engine range, expiry,
 module structure, capabilities and revision before an atomic mode-0600 write.
-Running Gateways reload the snapshot without restarting LiteLLM.
+Running Gateways reload the snapshot without restarting the runtime.
 
 ```bash
 originrouter compatibility status

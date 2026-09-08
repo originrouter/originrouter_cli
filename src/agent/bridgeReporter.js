@@ -563,6 +563,9 @@ export function createRuntimeEventReporter({
   deviceName,
   stateDir = getStateDir(),
   reportRuntimeEventFn = reportRuntimeEvent,
+  telemetryQueue = null,
+  telemetryUploader = null,
+  telemetryContext = null,
 } = {}) {
   let sequence = 0;
   let tail = Promise.resolve();
@@ -573,6 +576,7 @@ export function createRuntimeEventReporter({
   // completed task, while still allowing real structured turn results to
   // notify the user.
   let taskActive = false;
+  let activeDirectRootTaskId = "";
 
   const sendWithRetry = async (payload) => {
     let result = { ok: false, error: "request_failed" };
@@ -605,6 +609,103 @@ export function createRuntimeEventReporter({
         : `orev_${randomUUID()}`,
     });
     if (!payload) return tail;
+    if (telemetryQueue?.enqueue) {
+      const rawEvent = eventType === "agent.event" ? extra.event : extra;
+      const context = typeof telemetryContext === "function"
+        ? telemetryContext()
+        : (telemetryContext || {});
+      const rawTaskId = rawEvent?.taskId || rawEvent?.task_id
+        || (String(rawEvent?.type || "").startsWith("agent.task.") ? rawEvent?.id : "");
+      const isDirectWrapper = context?.bundleOrigin === "direct_wrapper"
+        || context?.bundle_origin === "direct_wrapper";
+      if (isDirectWrapper && String(rawEvent?.type || "") === "agent.task.started" && rawTaskId) {
+        activeDirectRootTaskId = String(rawTaskId);
+      }
+      const rootTaskId = rawEvent?.rootTaskId || rawEvent?.root_task_id
+        || (isDirectWrapper ? activeDirectRootTaskId || rawTaskId : "");
+      telemetryQueue.enqueue({
+        eventId: payload.client_event_id,
+        idempotencyKey: `runtime:${sessionId}:${payload.sequence}:${payload.event_type}`,
+        eventType: payload.event_type,
+        occurredAt: rawEvent?.createdAt || rawEvent?.created_at || new Date().toISOString(),
+        sessionId,
+        agentType,
+        eventSeq: payload.sequence,
+        taskId: rawTaskId || undefined,
+        rootTaskId: rootTaskId || undefined,
+        parentTaskId: rawEvent?.parentTaskId || rawEvent?.parent_task_id,
+        agentId: rawEvent?.agentId || rawEvent?.agent_id,
+        parentAgentId: rawEvent?.parentAgentId || rawEvent?.parent_agent_id,
+        delegationId: rawEvent?.delegationId || rawEvent?.delegation_id || rawEvent?.parentToolUseId,
+        delegationDepth: rawEvent?.delegationDepth || rawEvent?.delegation_depth,
+        delegationDetected: rawEvent?.delegationDetected ?? rawEvent?.delegation_detected
+          ?? ["subagent", "subagent_started", "subagent_stopped"].includes(rawEvent?.activity),
+        taskRole: rawEvent?.taskRole || rawEvent?.task_role,
+        taskKind: rawEvent?.taskKind || rawEvent?.task_kind,
+        modelTier: rawEvent?.modelTier || rawEvent?.model_tier,
+        attempt: rawEvent?.attempt,
+        provider: rawEvent?.provider,
+        model: rawEvent?.model,
+        responseId: rawEvent?.responseId || rawEvent?.response_id,
+        gatewayResponseIds: rawEvent?.gatewayResponseIds
+          || rawEvent?.gateway_response_ids
+          || (rawEvent?.gatewayResponseId || rawEvent?.gateway_response_id
+            ? [rawEvent.gatewayResponseId || rawEvent.gateway_response_id]
+            : undefined),
+        payload: {
+          summary: rawEvent?.summary || payload.summary,
+          status: rawEvent?.status || payload.status,
+          type: rawEvent?.type || eventType,
+          activity: rawEvent?.activity,
+          metadata: rawEvent?.metadata,
+          tool: rawEvent?.tool,
+          call_id: rawEvent?.callId || rawEvent?.call_id,
+          is_error: rawEvent?.isError ?? rawEvent?.is_error,
+          token_usage: rawEvent?.tokenUsage || rawEvent?.token_usage,
+          sampled_tokens: rawEvent?.sampledTokens || rawEvent?.sampled_tokens,
+          amount_micros: rawEvent?.amountMicros ?? rawEvent?.amount_micros,
+          currency: rawEvent?.currency,
+          cost_source: rawEvent?.costSource || rawEvent?.cost_source,
+          duration_ms: rawEvent?.durationMs ?? rawEvent?.duration_ms,
+          num_turns: rawEvent?.numTurns ?? rawEvent?.num_turns,
+          stop_reason: rawEvent?.stopReason || rawEvent?.stop_reason,
+          retry: rawEvent?.retry,
+          retry_count: rawEvent?.retryCount ?? rawEvent?.retry_count,
+          verification_passed: rawEvent?.verificationPassed ?? rawEvent?.verification_passed,
+          task_completed: rawEvent?.taskCompleted
+            ?? rawEvent?.task_completed
+            ?? ["agent.task.complete", "agent.task.completed", "task_complete"].includes(rawEvent?.type),
+          task_failed: rawEvent?.taskFailed
+            ?? rawEvent?.task_failed
+            ?? ["agent.task.failed", "task_failed", "turn_aborted"].includes(rawEvent?.type),
+          retry_attempt: rawEvent?.retryAttempt
+            ?? rawEvent?.retry_attempt
+            ?? rawEvent?.metadata?.attempt,
+          event_seq: payload.sequence,
+          task_role: rawEvent?.taskRole || rawEvent?.task_role,
+          task_kind: rawEvent?.taskKind || rawEvent?.task_kind,
+          model_tier: rawEvent?.modelTier || rawEvent?.model_tier,
+          risk_level: rawEvent?.riskLevel || rawEvent?.risk_level,
+          decision: rawEvent?.decision,
+          confidence: rawEvent?.confidence,
+          success: rawEvent?.success,
+          response_id: rawEvent?.responseId || rawEvent?.response_id,
+          gateway_response_ids: rawEvent?.gatewayResponseIds
+            || rawEvent?.gateway_response_ids
+            || (rawEvent?.gatewayResponseId || rawEvent?.gateway_response_id
+              ? [rawEvent.gatewayResponseId || rawEvent.gateway_response_id]
+              : undefined),
+        },
+      }, {
+        ...context,
+        sessionId,
+        agentType,
+        provider: rawEvent?.provider || context.provider,
+        model: rawEvent?.model || context.model,
+      });
+      if (telemetryUploader?.schedule) telemetryUploader.schedule();
+      else if (telemetryUploader?.flush) void telemetryUploader.flush().catch(() => {});
+    }
     if (payload.event_type === "agent.task.started") {
       // Launching a runtime and receiving the provider's structured turn
       // start can describe the same task. One activity event is enough.

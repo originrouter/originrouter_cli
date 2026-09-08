@@ -155,11 +155,23 @@ preference.
 
 ## Confirmation policy
 
-Routine local workspace objectives use the active guarded permission profile
-and can start after planning without an extra plan prompt. Production,
-deployment, release, destructive, privileged, payment, database-migration, and
-Remote Ops objectives require explicit interactive review. Tool-level approval
-policies remain authoritative regardless of plan confirmation.
+The default startup-confirmation policy is `required`: when a new Session Team
+or a task plan is proposed, Workspace shows it for review and waits for the
+user to confirm or request changes before execution begins. This applies to
+routine local work as well as production, deployment, release, destructive,
+privileged, payment, database-migration, and Remote Ops work.
+
+`--yes` selects `always_auto` for a non-interactive or deliberately automated
+launch and accepts the Team/configuration and plan gates. `--review` remains a
+compatible spelling for the default `required` behavior; it must not be used
+with `--yes`. The internal `safe_auto` policy is reserved for an explicit
+future caller that may auto-accept only a proposal classified as low risk; it
+is not the Workspace default.
+
+These startup gates are distinct from Session Approval. `/approval`,
+Shift+Tab, and a policy such as Guarded, AI Review, Rules, or Full govern
+individual Agent actions after a Run starts. `--yes` never bypasses those
+tool-level approvals.
 
 ## Interactive commands
 

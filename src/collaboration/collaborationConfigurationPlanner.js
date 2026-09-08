@@ -110,6 +110,27 @@ export class CollaborationConfigurationPlanner {
       planning_source: "server_model",
       coordinator_runtime: session.coordinator_runtime,
     }, { coordinatorDeviceId: this.deviceId }));
+    const invocation = session.planner_invocation;
+    if (invocation && typeof invocation === "object") {
+      this.store.recordExecutionEvent(run.run_id, {
+        type: "ai.planner.completed",
+        participantId: run.planner_role,
+        provider: "originrouter",
+        provider_type: "originrouter",
+        provider_source: "originrouter-coding",
+        payload: {
+          success: true,
+          task_kind: "collaboration_planner",
+          model: text(invocation.model || session.selected_model, 191),
+          response_id: text(invocation.response_id, 255),
+          duration_ms: Math.max(0, Number(invocation.duration_ms) || 0),
+          token_usage: invocation.token_usage && typeof invocation.token_usage === "object"
+            ? invocation.token_usage
+            : {},
+        },
+        idempotencyKey: `ai-planner:${session.server_configuration_id || configurationId}:${session.server_revision}`,
+      });
+    }
     this.store.updateConfigurationSession(configurationId, { state: "consumed", proposal });
     return { run, configuration: this.local(configurationId) };
   }
@@ -347,6 +368,9 @@ export class CollaborationConfigurationPlanner {
       server_proposal: remote.proposal && typeof remote.proposal === "object" ? remote.proposal : {},
       proposal: remote.proposal && typeof remote.proposal === "object" ? remote.proposal : {},
       planning_source: "server_model",
+      planner_invocation: remote.planner_invocation && typeof remote.planner_invocation === "object"
+        ? remote.planner_invocation
+        : {},
       fallback_reason: text(remote.fallback_reason, 512),
       model_error: text(remote.model_error, 4096),
     });

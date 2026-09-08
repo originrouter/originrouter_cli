@@ -24,6 +24,40 @@ const PROVIDERS = {
   },
 };
 
+test("SessionManager records specialized AI facts only for collaboration Runs", () => {
+  const events = [];
+  let schedules = 0;
+  const manager = new SessionManager({
+    relayClient: { send: async () => ({ ok: true }) },
+    deviceId: "device-test",
+    defaultExecutor: "fake",
+    telemetry: {
+      queue: {
+        enqueue(input, context) {
+          events.push({ input, context });
+          return { inserted: true };
+        },
+      },
+      uploader: { schedule() { schedules += 1; } },
+    },
+  });
+  manager.enqueueAiTelemetryFact({
+    type: "audit.evidence.answered",
+    provider: "originrouter",
+    payload: { task_kind: "evidence_qa", evidence_ref_count: 2 },
+  }, { runId: "direct-session", sessionId: "session-1" });
+  assert.equal(events.length, 0);
+  manager.enqueueAiTelemetryFact({
+    type: "audit.evidence.answered",
+    provider: "originrouter",
+    payload: { task_kind: "evidence_qa", evidence_ref_count: 2 },
+  }, { runId: "acr_run_1", sessionId: "session-1" });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].input.payload.task_kind, "evidence_qa");
+  assert.equal(events[0].context.bundleOrigin, "collaboration_run");
+  assert.equal(schedules, 1);
+});
+
 test("SessionManager applies local-control route updates from relay events", async () => {
   const prevHome = process.env.ORIGINROUTER_HOME;
   const home = mkdtempSync(join(tmpdir(), "originrouter-local-control-test-"));

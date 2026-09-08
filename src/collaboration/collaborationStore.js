@@ -38,8 +38,12 @@ const SUPERVISOR_PERMISSION_PROFILES = new Set([
 const FORBIDDEN_KEYS = /token|secret|password|authorization|cookie|api[_-]?key|service[_-]?key|environment|env_dump/i;
 const SAFE_USAGE_KEYS = new Set([
   "token_limit", "token_budget", "sampled_tokens", "sampledTokens",
+  "token_usage", "tokenUsage",
   "input_tokens", "inputTokens", "output_tokens", "outputTokens",
+  "reasoning_tokens", "reasoningTokens",
   "cached_input_tokens", "cachedInputTokens", "total_tokens", "totalTokens",
+  "cache_read_input_tokens", "cache_write_input_tokens",
+  "cache_write_5m_input_tokens", "cache_write_1h_input_tokens",
   "fencing_token", "fencingToken",
   "contains_secret", "containsSecret",
 ]);
@@ -229,16 +233,27 @@ function publicRun(row) {
 }
 
 export class CollaborationStore {
-  constructor({ stateDir = ensureStateDir(), dbPath = null, now = () => new Date() } = {}) {
+  constructor({
+    stateDir = ensureStateDir(),
+    dbPath = null,
+    now = () => new Date(),
+    telemetryQueue = null,
+    telemetryUploader = null,
+    telemetryContextProvider = null,
+  } = {}) {
     this.stateDir = stateDir;
     this.dbPath = dbPath || join(stateDir, "collaboration.sqlite3");
     this.now = now;
+    this.telemetryQueue = telemetryQueue;
+    this.telemetryUploader = telemetryUploader;
+    this.telemetryContextProvider = telemetryContextProvider;
     this.db = new Database(this.dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("synchronous = NORMAL");
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
     this.installSchema();
+    this.reconcileTerminalTelemetry();
     try { chmodSync(this.dbPath, 0o600); } catch {}
   }
 
@@ -552,6 +567,7 @@ export class CollaborationStore {
         proposal_json TEXT NOT NULL DEFAULT '{}',
         fallback_reason TEXT NOT NULL DEFAULT '',
         model_error TEXT NOT NULL DEFAULT '',
+        planner_invocation_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         expires_at TEXT NOT NULL DEFAULT ''
@@ -612,6 +628,7 @@ export class CollaborationStore {
     this.ensureColumn("collaboration_configuration_sessions", "tool_requests_json", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureColumn("collaboration_configuration_sessions", "server_proposal_json", "TEXT NOT NULL DEFAULT '{}'");
     this.ensureColumn("collaboration_configuration_sessions", "planning_source", "TEXT NOT NULL DEFAULT 'server_model'");
+    this.ensureColumn("collaboration_configuration_sessions", "planner_invocation_json", "TEXT NOT NULL DEFAULT '{}'");
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_collaboration_runs_workspace_session
         ON collaboration_runs(workspace_session_id, created_at ASC, run_id ASC);
@@ -705,6 +722,57 @@ export class CollaborationStore {
     })();
   }
 
+  reconcileTerminalTelemetry() {
+    if (!this.telemetryQueue?.enqueue) return;
+    const terminalTypes = {
+      completed: "run.completed",
+      failed: "run.failed",
+      cancelled: "run.cancelled",
+      expired: "run.cancelled",
+    };
+    const runs = this.db.prepare(`
+      SELECT * FROM collaboration_runs
+      WHERE state IN ('completed', 'failed', 'cancelled', 'expired')
+      ORDER BY updated_at ASC
+    `).all();
+    for (const row of runs) {
+      const eventType = terminalTypes[row.state];
+      if (!eventType) continue;
+      try {
+        const existing = this.db.prepare(`
+          SELECT * FROM collaboration_execution_events
+          WHERE run_id = ? AND type = ?
+          ORDER BY sequence DESC LIMIT 1
+        `).get(row.run_id, eventType);
+        if (existing) {
+          // The event may have been committed just before a process crash, but
+          // its queue mirror may not have been written. Re-enqueue is
+          // idempotent and repairs that cross-database gap on restart.
+          this.enqueueTelemetryEvent(
+            publicRun(row),
+            this.publicExecutionEvent(existing),
+          );
+          continue;
+        }
+        this.recordExecutionEvent(row.run_id, {
+          type: eventType,
+          summary: {
+            "run.completed": "The collaboration completed.",
+            "run.failed": "The collaboration failed.",
+            "run.cancelled": row.state === "expired"
+              ? "The collaboration expired."
+              : "The collaboration was cancelled.",
+          }[eventType],
+          idempotencyKey: `run-terminal-recovery:${row.run_id}:${row.state}`,
+          createdAt: row.finished_at || row.updated_at,
+        });
+      } catch {
+        // Reconciliation must never prevent the local collaboration store
+        // from opening; the next daemon start will retry it.
+      }
+    }
+  }
+
   touchRun(runId, updatedAt = iso(this.now())) {
     this.db.prepare(`
       UPDATE collaboration_runs
@@ -737,6 +805,7 @@ export class CollaborationStore {
       planning_source: row.planning_source || (row.state === "fallback_ready" ? "local_fallback" : "server_model"),
       fallback_reason: row.fallback_reason || null,
       model_error: row.model_error || null,
+      planner_invocation: parseJson(row.planner_invocation_json, null),
       created_at: row.created_at,
       updated_at: row.updated_at,
       expires_at: row.expires_at || null,
@@ -822,6 +891,7 @@ export class CollaborationStore {
     if (patch.proposal != null) set("proposal_json", JSON.stringify(patch.proposal));
     if (patch.fallback_reason != null) set("fallback_reason", safeText(patch.fallback_reason, 512));
     if (patch.model_error != null) set("model_error", safeText(patch.model_error, 4096));
+    if (patch.planner_invocation != null) set("planner_invocation_json", JSON.stringify(patch.planner_invocation));
     if (patch.expires_at != null) set("expires_at", safeText(patch.expires_at, 64));
     set("updated_at", iso(this.now()));
     values.push(safeText(configurationId, 195));
@@ -1699,6 +1769,12 @@ export class CollaborationStore {
     if (run.state !== "designing") throw new Error("collaboration plan is not being designed");
     const updatedAt = iso(this.now());
     const planRevision = Math.max(1, Number(run.plan_revision || 0) + 1);
+    const plannedTasks = plan.tasks.map((task) => ({
+      task,
+      taskId: id("act"),
+      agent: run.agents[task.participant_id],
+    }));
+    const taskIdByKey = new Map(plannedTasks.map((item) => [item.task.id, item.taskId]));
     this.db.transaction(() => {
       this.db.prepare("DELETE FROM collaboration_tasks WHERE run_id = ? AND task_key <> '__planner__'").run(runId);
       const insertTask = this.db.prepare(`
@@ -1708,10 +1784,9 @@ export class CollaborationStore {
           deliverable, result_summary, created_at, updated_at
         ) VALUES (?, ?, ?, ?, '', 'pending', ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
       `);
-      for (const task of plan.tasks) {
-        const agent = run.agents[task.participant_id];
+      for (const { task, taskId, agent } of plannedTasks) {
         insertTask.run(
-          id("act"), runId, agent.agent_id, task.title, task.mode,
+          taskId, runId, agent.agent_id, task.title, task.mode,
           task.id, task.participant_id, JSON.stringify(task.depends_on),
           task.instructions, task.mode, task.deliverable, updatedAt, updatedAt,
         );
@@ -1750,6 +1825,25 @@ export class CollaborationStore {
       idempotencyKey: `plan-generated:${planRevision}:${updatedAt}`,
       createdAt: updatedAt,
     });
+    for (const { task, taskId, agent } of plannedTasks) {
+      const dependencyTaskIds = (Array.isArray(task.depends_on) ? task.depends_on : [])
+        .map((taskKey) => taskIdByKey.get(taskKey))
+        .filter(Boolean);
+      this.recordExecutionEvent(runId, {
+        type: "task.planned",
+        taskId,
+        participantId: task.participant_id,
+        task_kind: task.mode,
+        role: task.participant_id,
+        payload: {
+          plan_version: planRevision,
+          dependency_count: dependencyTaskIds.length,
+          depends_on_task_ids: dependencyTaskIds,
+        },
+        idempotencyKey: `task-planned:${planRevision}:${taskId}`,
+        createdAt: updatedAt,
+      });
+    }
     this.recordExecutionEvent(runId, {
       type: "run.plan_ready",
       summary: "The collaboration plan is ready for review.",
@@ -2176,17 +2270,43 @@ export class CollaborationStore {
       input.reset_agent_identity === true || input.resetAgentIdentity === true ? 1 : 0,
       input.reset_agent_identity === true || input.resetAgentIdentity === true ? 1 : 0,
     );
-    return {
-      assignment: this.getRemoteAssignment(assignmentId),
+    const assignment = this.getRemoteAssignment(assignmentId);
+    const result = {
+      assignment,
       duplicate: false,
       stale: false,
       legacy: !hasFencing,
     };
+    if (this.getRun(runId, { includeMessages: false })) {
+      this.recordExecutionEvent(runId, {
+        type: "remote_assignment.created",
+        taskId,
+        participantId: role,
+        attempt,
+        provider: assignment.provider,
+        model: assignment.model,
+        payload: {
+          assignment_id: assignment.assignment_id,
+          assignment_phase: assignment.phase,
+          assignment_status: assignment.status,
+          assignment_runtime: assignment.runtime,
+          assignment_role: assignment.role,
+          assignment_attempt: assignment.attempt,
+          assignment_fence: assignment.fencing_token,
+          assignment_source_device_id: assignment.source_device_id,
+          assignment_target_device_id: assignment.target_device_id,
+        },
+        idempotencyKey: `remote-assignment-created:${assignment.assignment_id}:${assignment.attempt}:${assignment.fencing_token}`,
+        createdAt: now,
+      });
+    }
+    return result;
   }
 
   updateRemoteAssignment(assignmentId, payload = {}) {
     const current = this.getRemoteAssignment(assignmentId);
     if (!current) throw new Error("remote collaboration assignment not found");
+    const updatedAt = iso(this.now());
     this.db.prepare(`
       UPDATE collaboration_remote_assignments SET
         phase = ?, status = ?, native_session_id = ?,
@@ -2198,9 +2318,34 @@ export class CollaborationStore {
       safeText(payload.native_session_id ?? payload.nativeSessionId ?? current.native_session_id, 191),
       safeText(payload.originrouter_session_id ?? payload.originrouterSessionId ?? current.originrouter_session_id, 64),
       safeText(payload.conversation_id ?? payload.conversationId ?? current.conversation_id, 96),
-      iso(this.now()), assignmentId,
+      updatedAt, assignmentId,
     );
-    return this.getRemoteAssignment(assignmentId);
+    const assignment = this.getRemoteAssignment(assignmentId);
+    if (assignment && (assignment.status !== current.status || assignment.phase !== current.phase)
+        && this.getRun(assignment.run_id, { includeMessages: false })) {
+      this.recordExecutionEvent(assignment.run_id, {
+        type: "remote_assignment.updated",
+        taskId: assignment.task_id,
+        participantId: assignment.role,
+        attempt: assignment.attempt,
+        provider: assignment.provider,
+        model: assignment.model,
+        payload: {
+          assignment_id: assignment.assignment_id,
+          assignment_phase: assignment.phase,
+          assignment_status: assignment.status,
+          assignment_runtime: assignment.runtime,
+          assignment_role: assignment.role,
+          assignment_attempt: assignment.attempt,
+          assignment_fence: assignment.fencing_token,
+          assignment_source_device_id: assignment.source_device_id,
+          assignment_target_device_id: assignment.target_device_id,
+        },
+        idempotencyKey: `remote-assignment-updated:${assignment.assignment_id}:${assignment.attempt}:${assignment.fencing_token}:${assignment.status}:${assignment.phase}:${updatedAt}`,
+        createdAt: updatedAt,
+      });
+    }
+    return assignment;
   }
 
   touchRemoteAssignmentLease(assignmentId, { ttlMs = 30 * 60_000 } = {}) {
@@ -2434,8 +2579,8 @@ export class CollaborationStore {
         participantId: safeText(input.participant_id ?? input.participantId, 32),
         summary: `Created artifact: ${artifact.display_name}`,
         payload: {
-          artifact_id: artifact.artifact_id,
-          kind: artifact.kind,
+          artifact_kind: artifact.kind,
+          artifact_owner_agent_id: artifact.owner_agent_id,
           sensitivity: artifact.sensitivity,
         },
         idempotencyKey: `artifact-created:${artifact.artifact_id}`,
@@ -2994,7 +3139,29 @@ export class CollaborationStore {
     this.db.prepare(`INSERT INTO collaboration_messages(message_id, run_id, task_id, correlation_id, type, sequence, created_at, idempotency_key, sender_json, recipient_json, payload_json, parent_message_id, causation_id, artifact_refs_json, evidence_refs_json, requires_ack, sensitivity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(messageId, runId, taskId, safeText(input.correlation_id ?? input.correlationId, 191) || taskId, type, sequence, createdAt, idempotencyKey, JSON.stringify(sender), JSON.stringify(recipient), JSON.stringify(payload), safeText(input.parent_message_id, 195) || null, safeText(input.causation_id, 195) || null, JSON.stringify(input.artifact_refs || []), JSON.stringify(input.evidence_refs || []), input.requires_ack ? 1 : 0, ["normal", "sensitive", "high"].includes(input.sensitivity) ? input.sensitivity : "normal");
     this.db.prepare("UPDATE collaboration_runs SET updated_at = ? WHERE run_id = ?").run(createdAt, runId);
-    return { message: this.publicMessage(this.db.prepare("SELECT * FROM collaboration_messages WHERE message_id = ?").get(messageId)), duplicate: false };
+    const message = this.publicMessage(this.db.prepare("SELECT * FROM collaboration_messages WHERE message_id = ?").get(messageId));
+    this.recordExecutionEvent(runId, {
+      type: "collaboration.message.recorded",
+      taskId: message.task_id,
+      participantId: safeText(message.sender?.agent_id, 32),
+      payload: {
+        message_id: message.message_id,
+        message_type: message.type,
+        message_sequence: message.sequence,
+        correlation_id: message.correlation_id,
+        parent_message_id: message.parent_message_id || "",
+        causation_id: message.causation_id || "",
+        sender_kind: safeText(message.sender?.kind, 32),
+        recipient_kind: safeText(message.recipient?.kind, 32),
+        requires_ack: message.requires_ack,
+        artifact_ref_count: message.artifact_refs.length,
+        evidence_ref_count: message.evidence_refs.length,
+        sensitivity: message.sensitivity,
+      },
+      idempotencyKey: `message-recorded:${message.message_id}`,
+      createdAt,
+    });
+    return { message, duplicate: false };
   }
 
   publicMessage(row) {
@@ -3082,7 +3249,125 @@ export class CollaborationStore {
     const inserted = this.db.prepare(
       "SELECT * FROM collaboration_execution_events WHERE event_id = ?",
     ).get(eventId);
-    return { duplicate: false, event_id: eventId, event: this.publicExecutionEvent(inserted) };
+    const publicEvent = this.publicExecutionEvent(inserted);
+    this.enqueueTelemetryEvent(run, publicEvent, input);
+    return { duplicate: false, event_id: eventId, event: publicEvent };
+  }
+
+  enqueueTelemetryEvent(run, event, input = {}) {
+    if (!this.telemetryQueue?.enqueue) return;
+    try {
+      const participantId = safeText(event.participant_id || input.participant_id || input.participantId, 195);
+      const agent = participantId
+        ? this.db.prepare("SELECT provider, model, runtime, device_id FROM collaboration_agents WHERE run_id = ? AND (agent_id = ? OR role = ?) LIMIT 1")
+          .get(run.run_id, participantId, participantId)
+        : null;
+      const provider = safeText(input.provider || event.payload?.provider || agent?.provider, 191);
+      const suppliedContext = this.telemetryContextProvider?.(run, event, input) || {};
+      const providerType = safeText(
+        input.provider_type || input.providerType || suppliedContext.providerType,
+        32,
+      );
+      const explicitSource = safeText(input.provider_source || input.providerSource, 64);
+      const providerSource = explicitSource
+        || (providerType === "originrouter" ? "originrouter-coding" : "");
+      const context = {
+        ...suppliedContext,
+        providerType,
+        providerSource,
+        provider,
+        model: safeText(input.model || event.payload?.model || agent?.model, 191),
+        deviceId: safeText(input.device_id || input.deviceId || agent?.device_id, 191),
+        runId: run.run_id,
+        taskId: event.task_id || "",
+        agentId: participantId,
+        sessionId: event.session_id || "",
+        conversationId: run.conversation_id || "",
+      };
+      const result = this.telemetryQueue.enqueue({
+        eventId: event.event_id,
+        idempotencyKey: event.idempotency_key || event.event_id,
+        eventType: event.type,
+        occurredAt: event.created_at,
+        eventSeq: event.sequence,
+        attempt: event.attempt,
+        taskRole: input.role || input.task_role || event.payload?.role,
+        taskKind: input.task_kind || input.taskKind || event.payload?.kind,
+        modelTier: input.model_tier || input.modelTier || event.payload?.model_tier,
+        payload: {
+          category: event.category,
+          severity: event.severity,
+          visibility: event.visibility,
+          attempt: event.attempt,
+          metadata: { ...(event.metadata || {}), ...(event.payload?.metadata || {}) },
+          provider: event.payload?.provider,
+          model: event.payload?.model,
+          task_completed: ["task.completed", "agent.task.complete", "agent.task.completed"].includes(event.type),
+          task_failed: ["task.failed", "agent.task.failed", "agent.task.aborted"].includes(event.type),
+          verification_passed: event.type === "verification.passed"
+            ? true
+            : event.type === "verification.failed"
+              ? false
+              : undefined,
+          rework_requested: event.type === "rework.requested",
+          retry_scheduled: event.type === "task.retry_scheduled" || event.type === "run.retry_created",
+          agent_id: event.payload?.agent_id,
+          parent_agent_id: event.payload?.parent_agent_id,
+          delegation_id: event.payload?.delegation_id,
+          delegation_depth: event.payload?.delegation_depth,
+          delegation_detected: event.payload?.delegation_detected,
+          response_id: event.payload?.response_id,
+          gateway_response_ids: event.payload?.gateway_response_ids,
+          token_usage: event.payload?.token_usage,
+          sampled_tokens: event.payload?.sampled_tokens,
+          amount_micros: event.payload?.amount_micros,
+          currency: event.payload?.currency,
+          cost_source: event.payload?.cost_source,
+          duration_ms: event.payload?.duration_ms,
+          num_turns: event.payload?.num_turns,
+          stop_reason: event.payload?.stop_reason,
+          retry: event.payload?.retry,
+          retry_count: event.payload?.retry_count,
+          retry_attempt: event.payload?.retry_attempt,
+          decision: event.payload?.decision,
+          risk_level: event.payload?.risk_level,
+          confidence: event.payload?.confidence,
+          tool: event.payload?.tool,
+          call_id: event.payload?.call_id,
+          is_error: event.payload?.is_error,
+          plan_version: event.payload?.plan_version,
+          task_count: event.payload?.task_count,
+          dependency_count: event.payload?.dependency_count,
+          depends_on_task_ids: event.payload?.depends_on_task_ids,
+          message_id: event.payload?.message_id,
+          message_type: event.payload?.message_type,
+          message_sequence: event.payload?.message_sequence,
+          correlation_id: event.payload?.correlation_id,
+          parent_message_id: event.payload?.parent_message_id,
+          causation_id: event.payload?.causation_id,
+          sender_kind: event.payload?.sender_kind,
+          recipient_kind: event.payload?.recipient_kind,
+          requires_ack: event.payload?.requires_ack,
+          artifact_ref_count: event.payload?.artifact_ref_count,
+          evidence_ref_count: event.payload?.evidence_ref_count,
+          sensitivity: event.payload?.sensitivity,
+          artifact_kind: event.payload?.artifact_kind,
+          artifact_owner_agent_id: event.payload?.artifact_owner_agent_id,
+          assignment_id: event.payload?.assignment_id,
+          assignment_phase: event.payload?.assignment_phase,
+          assignment_status: event.payload?.assignment_status,
+          assignment_runtime: event.payload?.assignment_runtime,
+          assignment_role: event.payload?.assignment_role,
+          assignment_attempt: event.payload?.assignment_attempt,
+          assignment_fence: event.payload?.assignment_fence,
+          assignment_source_device_id: event.payload?.assignment_source_device_id,
+          assignment_target_device_id: event.payload?.assignment_target_device_id,
+        },
+        gatewayResponseIds: input.gateway_response_ids || input.gatewayResponseIds || event.payload?.gateway_response_ids,
+        controlOrigin: input.control_origin || input.controlOrigin || context.controlOrigin,
+      }, context);
+      if (result.inserted) this.telemetryUploader?.schedule?.();
+    } catch {}
   }
 
   publicExecutionEvent(row) {
@@ -3445,7 +3730,7 @@ export class CollaborationStore {
   }
 
   persistFinalReport(runId) {
-    const run = this.getRun(runId, { includeMessages: false });
+    const run = this.getRun(runId, { includeMessages: true });
     if (!run) throw new Error("collaboration run not found");
     if (!new Set(["completed", "failed", "cancelled", "expired"]).has(run.state)) return null;
     if (run.final_report) return run.final_report;

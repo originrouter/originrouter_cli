@@ -729,7 +729,7 @@ OPTIONS preflight returns 204 with `Access-Control-Max-Age: 600`.
 
 ---
 
-## 8. LiteLLM proxy wire (Stage 4)
+## 8. Proxy wire (Stage 4)
 
 When the user runs `originrouter proxy start --provider deepseek`, the daemon's `ProxyManager` writes a `config-<provider>.yaml` like:
 
@@ -744,7 +744,7 @@ litellm_settings:
   drop_params: true
 ```
 
-Then it spawns `python -m litellm --config <path> --host 127.0.0.1 --port <port>`, polls `GET http://127.0.0.1:<port>/health/liveliness` until 200 OK or 15s timeout, and on success writes `~/.originrouter/proxy.state.json` with the bound port + pid + provider.
+Then it spawns the managed proxy runtime with the generated config, polls `GET http://127.0.0.1:<port>/health/liveliness` until 200 OK or 15s timeout, and on success writes `~/.originrouter/proxy.state.json` with the bound port + pid + provider.
 
 When the user runs `originrouter claude --provider deepseek` (or `provider use deepseek --agent claude` + `originrouter claude`), the launchers call `buildAgentProviderEnv("claude", config, { provider: "deepseek", proxyStatus })`. If `proxyStatus.state === "running"` and `proxyStatus.currentProvider === "deepseek"`, the function returns:
 
@@ -752,7 +752,7 @@ When the user runs `originrouter claude --provider deepseek` (or `provider use d
 {
   env: {
     ANTHROPIC_BASE_URL: "http://127.0.0.1:<port>",
-    ANTHROPIC_API_KEY: "sk-noop-litellm-passthrough",  // placeholder; LiteLLM does not validate this
+    ANTHROPIC_API_KEY: "sk-noop-litellm-passthrough",  // placeholder; the proxy runtime does not validate this
     ANTHROPIC_MODEL: "<provider.model>",
     ANTHROPIC_SMALL_FAST_MODEL: "<provider.smallFastModel>" // if set
   },
@@ -762,7 +762,7 @@ When the user runs `originrouter claude --provider deepseek` (or `provider use d
 }
 ```
 
-The PTY inherits this env alongside `process.env`. Claude Code sends requests to `ANTHROPIC_BASE_URL` (the LiteLLM proxy); LiteLLM translates Anthropic format to OpenAI format and forwards to `provider.baseUrl` with `provider.apiKey`. The `ANTHROPIC_API_KEY` placeholder is never validated by LiteLLM, so the user's real DeepSeek key stays in `config-<provider>.yaml` and never enters Claude Code's process environment.
+The PTY inherits this env alongside `process.env`. Claude Code sends requests to `ANTHROPIC_BASE_URL` (the local proxy); the proxy runtime translates Anthropic format to OpenAI format and forwards to `provider.baseUrl` with `provider.apiKey`. The `ANTHROPIC_API_KEY` placeholder is never validated by the runtime, so the user's real DeepSeek key stays in `config-<provider>.yaml` and never enters Claude Code's process environment.
 
 **No silent fallback**: when the proxy is `not-installed` / `stopped` / `running for a different provider`, `buildAgentProviderEnv` throws `PROVIDER_UNSUPPORTED` with a clear hint to run `originrouter proxy install` and `originrouter proxy start --provider <name>`. The user always knows why their session didn't launch.
 
@@ -808,7 +808,7 @@ The PTY inherits this env alongside `process.env`. Claude Code sends requests to
 OriginRouter has one canonical provider shape, post-Stage 7.6:
 
 - `type=litellm` — **the only writable type.** The provider record carries `litellmProvider` (one of the 34 catalog ids). The proxy YAML is rendered from the catalog profile.
-- `type=anthropic` and `type=openai-compatible` are **legacy read-projection only**. They are auto-migrated to `type=litellm, litellmProvider=anthropic|custom_openai` on the next `PUT /providers/:name` or `provider update` save. Direct paths were removed in Stage 7.6 — Claude Code always goes through the local LiteLLM proxy.
+- `type=anthropic` and `type=openai-compatible` are **legacy read-projection only**. They are auto-migrated to `type=litellm, litellmProvider=anthropic|custom_openai` on the next `PUT /providers/:name` or `provider update` save. Direct paths were removed in Stage 7.6 — Claude Code always goes through the local Proxy.
 
 ### 9.2 Field metadata (Stage 7.7)
 
@@ -840,7 +840,7 @@ os.environ/VAR_NAME
 
 - `VAR_NAME` must match `/^[A-Za-z_][A-Za-z0-9_]*$/` (a single env-var name).
 - Anything that starts with `os.environ/` but doesn't match the regex is **rejected** (e.g. `os.environ/`, `os.environ/A B`, `os.environ/1foo`, `os.environ/A/B`).
-- The shell variable name is stored **verbatim** — OriginRouter does not perform substitution; LiteLLM reads the env itself at startup.
+- The shell variable name is stored **verbatim** — OriginRouter does not perform substitution; the proxy runtime reads the env itself at startup.
 - The multi-env strings in `envVar` (e.g. `AWS_REGION_NAME / AWS_REGION / AWS_DEFAULT_REGION`) are UI hints only — the env-ref syntax accepts exactly one var per field.
 
 Example:
@@ -946,17 +946,17 @@ originrouter provider add bedrock-irsa \
   --model anthropic.claude-3-5-sonnet-20241022-v2:0
 ```
 
-The advanced fields are rendered only when set; LiteLLM/boto3 reads the env at startup. The shell variable name is stored verbatim — nothing is substituted by OriginRouter.
+The advanced fields are rendered only when set; the proxy runtime/boto3 reads the env at startup. The shell variable name is stored verbatim — nothing is substituted by OriginRouter.
 
-Add inline AWS credentials with `--aws-access-key-id` / `--aws-secret-access-key`; without them LiteLLM/boto3 falls back to env / profile / SSO / instance role.
+Add inline AWS credentials with `--aws-access-key-id` / `--aws-secret-access-key`; without them the proxy runtime/boto3 falls back to env / profile / SSO / instance role.
 
 ### 9.9 Security note
 
-AWS secret keys / GCP service-account JSON paths are persisted to `~/.originrouter/config.json` (mode `0o600`) only when the user explicitly provides them. For shared or root-access hosts, leave the fields empty and let LiteLLM/boto3 use instance/container role credentials. All secret fields are masked via `maskSecret()` in CLI / HTTP API output.
+AWS secret keys / GCP service-account JSON paths are persisted to `~/.originrouter/config.json` (mode `0o600`) only when the user explicitly provides them. For shared or root-access hosts, leave the fields empty and let the proxy runtime/boto3 use instance/container role credentials. All secret fields are masked via `maskSecret()` in CLI / HTTP API output.
 
 ## 10. Model routes (Stage 7.5 + 7.6 + 7.8 + 7.9 + 8.0: routes owned by the routes layer for both Claude and Codex; Codex only has main)
 
-Stage 7.5 introduced a **Route** layer. Stage 7.6 collapses the entire provider system to a single path: every Claude Code session goes through the local LiteLLM proxy and two fixed alias names that never change. There is no direct path for Claude.
+Stage 7.5 introduced a **Route** layer. Stage 7.6 collapses the entire provider system to a single path: every Claude Code session goes through the local Proxy and two fixed alias names that never change. There is no direct path for Claude.
 
 Stage 8.0 extends this contract to **Codex** with a third alias `gpt-5.4`. Codex 8.0 has only one slot (`main`); `codex.small` is a hard error. Codex and Claude routes do not share, do not fallback into each other, and do not inherit each other's slots. The proxy YAML renders whichever aliases are configured — if only Codex routes exist, only the Codex alias appears.
 
@@ -969,19 +969,19 @@ Claude Code  →  ANTHROPIC_MODEL=originrouter-claude-model
                           ▼
                 OriginRouter daemon
                 reads routes.claude.{main, small}
-                → renders LiteLLM YAML → spawns/refreshes proxy
+                → renders Proxy YAML → spawns/refreshes proxy
                           │
                           ▼
-                LiteLLM proxy on 127.0.0.1
+                Proxy on 127.0.0.1
                 originrouter-claude-model      → deepseek/deepseek-chat
                 originrouter-claude-fast-model  → moonshot/moonshot-v1-8k
 ```
 
 ### 10.1 Concepts
 
-- **Provider** = inventory (a configured upstream). All providers are `type=litellm`; the catalog profile (`litellmProvider`) selects the LiteLLM adapter. 34 catalog entries in §9.3.
+- **Provider** = inventory (a configured upstream). All providers are `type=litellm`; the catalog profile (`litellmProvider`) selects the Provider adapter. 34 catalog entries in §9.3.
 - **Route** = current choice (which provider/model each alias points at).
-- **Proxy** = executor (LiteLLM on 127.0.0.1; YAML rendered from routes).
+- **Proxy** = executor (the local runtime on 127.0.0.1; YAML rendered from routes).
 - **Daemon** = control plane (HTTP API + proxy lifecycle owner).
 
 ### 10.2 Storage shape
@@ -1144,10 +1144,10 @@ invoke `originrouter codex` inside a wrapper that prints argv (or
 `originrouter codex --help` against an argv shim) and confirm the
 flag is present, absent when the user passed one.
 
-**LiteLLM log is truth.** Automated offline tests cover the route →
+**Proxy log is truth.** Automated offline tests cover the route →
 config → proxy-snapshot → env-print chain shape. They do not
 exercise the network path. The single source of truth for "did
-Codex Code actually use the configured route" is the LiteLLM proxy
+Codex Code actually use the configured route" is the proxy
 log file (path stored in `proxy.state.json.logPath`, default
 `~/.originrouter/logs/litellm.log`). Look for an inbound request to
 the OpenAI-compatible endpoint with

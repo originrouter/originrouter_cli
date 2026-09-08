@@ -40,20 +40,24 @@ export function venvDir(stateDir, version = LITELLM_VERSION) {
 }
 
 export function pythonBinaryPath(stateDir, version = LITELLM_VERSION) {
-  // macOS/Linux: bin/python. Windows: Scripts/python.exe — Stage 4 is
-  // macOS/Linux only per user direction, but the helper handles both.
   const venv = venvDir(stateDir, version);
-  return join(venv, "bin", "python");
+  return process.platform === "win32"
+    ? join(venv, "Scripts", "python.exe")
+    : join(venv, "bin", "python");
 }
 
 export function litellmBinaryPath(stateDir, version = LITELLM_VERSION) {
   const venv = venvDir(stateDir, version);
-  return join(venv, "bin", "litellm");
+  return process.platform === "win32"
+    ? join(venv, "Scripts", "litellm.exe")
+    : join(venv, "bin", "litellm");
 }
 
 export function pipBinaryPath(stateDir, version = LITELLM_VERSION) {
   const venv = venvDir(stateDir, version);
-  return join(venv, "bin", "pip");
+  return process.platform === "win32"
+    ? join(venv, "Scripts", "pip.exe")
+    : join(venv, "bin", "pip");
 }
 
 export function isInstalled(stateDir, version = LITELLM_VERSION) {

@@ -41,6 +41,24 @@ function safeToolResult(content) {
   return safeText(content, 16_384);
 }
 
+// The coding gateway's response id is opaque. Preserve only fields that are
+// explicitly response identifiers; never derive one from a local event UUID.
+function gatewayResponseId(message) {
+  const candidates = [
+    message?.gateway_response_id,
+    message?.gatewayResponseId,
+    message?.response_id,
+    message?.responseId,
+    message?.response?.id,
+    message?.response?.response_id,
+    message?.message?.gateway_response_id,
+    message?.message?.gatewayResponseId,
+    message?.message?.response_id,
+    message?.message?.id,
+  ];
+  return candidates.find((value) => typeof value === "string" && value.trim()) || null;
+}
+
 export function mapClaudeSdkMessage(message) {
   const events = [];
 
@@ -84,6 +102,10 @@ export function mapClaudeSdkMessage(message) {
           eventId: messageEventId(message, "assistant", blockIndex),
           messageId: messageEventId(message, "assistant", blockIndex),
           parentToolUseId: message.parent_tool_use_id || null,
+          agentId: safeText(message.agent_id, 195),
+          parentAgentId: safeText(message.parent_agent_id, 195),
+          delegationId: safeText(message.parent_tool_use_id, 195),
+          delegationDetected: Boolean(message.parent_tool_use_id || message.subagent_type),
           subagentType: safeText(message.subagent_type, 128),
           taskDescription: safeText(message.task_description, 512),
         });
@@ -95,6 +117,10 @@ export function mapClaudeSdkMessage(message) {
           text: block.thinking || block.text || "",
           eventId: messageEventId(message, "thinking", blockIndex),
           parentToolUseId: message.parent_tool_use_id || null,
+          agentId: safeText(message.agent_id, 195),
+          parentAgentId: safeText(message.parent_agent_id, 195),
+          delegationId: safeText(message.parent_tool_use_id, 195),
+          delegationDetected: Boolean(message.parent_tool_use_id || message.subagent_type),
           subagentType: safeText(message.subagent_type, 128),
         });
       }
@@ -224,7 +250,7 @@ export function mapClaudeSdkMessage(message) {
 
   if (message.type === "system" && ["hook_started", "hook_progress", "hook_response"].includes(message.subtype)) {
     const phase = message.subtype.replace("hook_", "");
-    events.push(activity(
+    const background = activity(
       message,
       "hook",
       `Claude hook ${message.hook_name || message.hook_event || "hook"} ${phase}`,
@@ -239,7 +265,15 @@ export function mapClaudeSdkMessage(message) {
         outcome: message.outcome,
         exit_code: message.exit_code,
       },
-    ));
+    );
+    background.taskId = safeText(message.task_id, 195);
+    background.agentId = safeText(message.agent_id, 195);
+    background.parentAgentId = safeText(message.parent_agent_id, 195);
+    background.delegationId = safeText(message.task_id || message.tool_use_id, 195);
+    background.delegationDetected = Boolean(
+      message.task_id || message.tool_use_id || message.subagent_type,
+    );
+    events.push(background);
   }
 
   if (message.type === "system" && ["task_started", "task_progress", "task_updated", "task_notification"].includes(message.subtype)) {
@@ -377,7 +411,8 @@ export function mapClaudeSdkMessage(message) {
     }));
   }
 
-  // stream_event duplicates the final assistant message, while thinking_tokens
-  // is high-frequency telemetry. Neither is forwarded as a standalone event.
-  return events;
+  const responseId = gatewayResponseId(message);
+  return responseId
+    ? events.map((event) => ({ ...event, gatewayResponseId: responseId }))
+    : events;
 }

@@ -16,7 +16,7 @@
 // host != 127.0.0.1 the manager throws before spawn.
 
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -121,10 +121,13 @@ export class ProxyManager {
   async install({ version = LITELLM_PACKAGE.match(/==(.+)$/)[1], force = false } = {}) {
     const venv = venvDir(this.stateDir, version);
     const py = pythonBinaryPath(this.stateDir, version);
-    if (!force && existsSync(py)) {
+    if (!force && await this.verifyInstall(version)) {
       return { ok: true, version, pythonPath: py, alreadyInstalled: true };
     }
 
+    // A failed pip/venv run can leave both entry points present but unusable.
+    // Recreate only this versioned, OriginRouter-owned environment.
+    if (existsSync(venv)) rmSync(venv, { recursive: true, force: true });
     mkdirSync(dirname(venv), { recursive: true });
 
     // Step 1: python3 -m venv <venv>. Idempotent only if --force was given.
@@ -136,7 +139,26 @@ export class ProxyManager {
     const pkg = `litellm[proxy]==${version}`;
     await this._runCommand(pip, ["install", pkg], { streamOutput: true });
 
+    if (!await this.verifyInstall(version)) {
+      throw new Error(`LiteLLM ${version} was installed but failed runtime verification.`);
+    }
+
     return { ok: true, version, pythonPath: py, alreadyInstalled: false };
+  }
+
+  async verifyInstall(version = LITELLM_PACKAGE.match(/==(.+)$/)[1]) {
+    if (!isInstalled(this.stateDir, version)) return false;
+    const py = pythonBinaryPath(this.stateDir, version);
+    const probe = [
+      "import importlib.metadata as m",
+      `raise SystemExit(0 if m.version('litellm') == '${version}' else 1)`,
+    ].join("; ");
+    try {
+      await this._runCommand(py, ["-c", probe]);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // ----------------------------------------------------------------

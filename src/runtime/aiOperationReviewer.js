@@ -4,13 +4,20 @@ import { ensureFreshAccessToken } from "./oauthTokenRefresher.js";
 const DEFAULT_ENDPOINT = "https://app.easytransnote.com/ai/v1/ai-audit/reviews";
 
 export class AiOperationReviewer {
-  constructor({ stateDir, endpoint = process.env.ORIGINROUTER_AI_AUDIT_URL || DEFAULT_ENDPOINT, fetchFn = globalThis.fetch } = {}) {
+  constructor({
+    stateDir,
+    endpoint = process.env.ORIGINROUTER_AI_AUDIT_URL || DEFAULT_ENDPOINT,
+    fetchFn = globalThis.fetch,
+    onTelemetry = null,
+  } = {}) {
     this.stateDir = stateDir;
     this.endpoint = endpoint;
     this.fetchFn = fetchFn;
+    this.onTelemetry = onTelemetry;
   }
 
   async review({ session, event, analysis }) {
+    const startedAt = Date.now();
     const credential = await ensureFreshAccessToken({
       stateDir: this.stateDir,
       resource: OAUTH_RESOURCES.AI,
@@ -44,7 +51,8 @@ export class AiOperationReviewer {
     const payload = await response.json().catch(() => ({}));
     const jobId = payload?.data?.job_id;
     if (!response.ok || !jobId) {
-      throw new Error(`AI audit reviewer failed (${response.status})`);
+      const { aiClientError } = await import("./aiClientErrors.js");
+      throw await aiClientError(response, "AI_OPERATION_REVIEW_FAILED", "AI audit reviewer", payload);
     }
     const resultUrl = `${this.endpoint.replace(/\/$/, "")}/${encodeURIComponent(jobId)}`;
     const deadline = Date.now() + 180_000;
@@ -59,6 +67,24 @@ export class AiOperationReviewer {
       if (result?.data?.state !== "completed") continue;
       const review = result?.data?.review;
       if (!review || typeof review.record !== "boolean") break;
+      await Promise.resolve(this.onTelemetry?.({
+        type: "ai.operation_review.completed",
+        provider: "originrouter",
+        model: result?.data?.model || review.model,
+        responseId: result?.data?.response_id || review.response_id,
+        durationMs: Date.now() - startedAt,
+        payload: {
+          success: true,
+          task_kind: "sensitive_operation_audit",
+          decision: review.record ? "record" : "ignore",
+          risk_level: review.risk,
+          confidence: review.confidence,
+        },
+      }, {
+        runId: session?.runId || session?.run_id,
+        sessionId: session?.sessionId || session?.session_id,
+        idempotencyKey: `ai:${session?.runId || session?.run_id || ""}:${session?.sessionId || session?.session_id || ""}:ai.operation_review.completed:${event?.callId || event?.id || jobId}`,
+      })).catch(() => {});
       return review;
     }
     throw new Error("AI audit reviewer timed out");

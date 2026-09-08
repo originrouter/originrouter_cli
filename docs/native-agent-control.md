@@ -17,21 +17,19 @@ originrouter codex
 
 ### Native configuration mode
 
-Use `--originrouter-native-config` when Claude/Codex should use the machine's
+Use `--native-config` when Claude/Codex should use the machine's
 existing environment, authentication, selected model, and user/project config
 instead of OriginRouter's model route:
 
 ```bash
-originrouter claude --originrouter-native-config
-originrouter codex --originrouter-native-config
+originrouter claude --native-config
+originrouter codex --native-config
 ```
-
-`--originrouter-native` is an alias.
 
 In native configuration mode OriginRouter does not:
 
 - resolve or apply an OriginRouter Provider route;
-- start the LiteLLM or Remote Coding proxy;
+- start the local or Remote Coding proxy;
 - acquire or inject an OriginRouter Coding token;
 - override the agent's Base URL, API key, auth token, or model;
 - inject `gpt-5.4` or `OPENAI_MODEL` into Codex.
@@ -42,7 +40,7 @@ Claude receives an additional temporary Hook settings file for remote event and
 approval capture; Claude's normal user, project, and local settings continue to
 load.
 
-`--provider` cannot be combined with `--originrouter-native-config` because the
+`--provider` cannot be combined with `--native-config` because the
 two options express conflicting provider ownership.
 
 ## Resume an existing session
@@ -66,7 +64,7 @@ With local Claude credentials and configuration:
 
 ```bash
 originrouter claude \
-  --originrouter-native-config \
+  --native-config \
   --resume da7a6062-aaef-4b1e-9bcf-c6a50a537e49
 ```
 
@@ -84,8 +82,8 @@ originrouter codex resume --last
 With local Codex credentials and configuration:
 
 ```bash
-originrouter codex --originrouter-native-config resume <session-id-or-name>
-originrouter codex --originrouter-native-config resume --last
+originrouter codex --native-config resume <session-id-or-name>
+originrouter codex --native-config resume --last
 ```
 
 All native resume arguments are passed to the installed agent unchanged after
@@ -112,7 +110,7 @@ OriginRouter wrapper session ID.
 
 Use `originrouter codex-terminal` when structured Codex approvals and
 unattended approval handling are required. Managed sessions intentionally do
-not support `--originrouter-native-config`; they require an explicit provider
+not support `--native-config`; they require an explicit provider
 environment.
 
 Claude native configuration mode can be combined with the session-scoped
@@ -120,7 +118,7 @@ unattended policy:
 
 ```bash
 originrouter claude \
-  --originrouter-native-config \
+  --native-config \
   --originrouter-autonomy guarded \
   --resume da7a6062-aaef-4b1e-9bcf-c6a50a537e49
 ```

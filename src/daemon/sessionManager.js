@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import {
   createRuntimeEventReporter,
   createTerminalActivityReporter,
@@ -58,6 +60,7 @@ export class SessionManager {
     onLocalControlChanged = null,
     stateDir = ensureStateDir(),
     compatibilityAutomaticUpdates = true,
+    telemetry = null,
   }) {
     this.relayClient = relayClient;
     this.deviceId = deviceId;
@@ -76,7 +79,11 @@ export class SessionManager {
     this.onLocalControlChanged = onLocalControlChanged;
     this.stateDir = stateDir;
     this.compatibilityAutomaticUpdates = compatibilityAutomaticUpdates;
-    this.auditQueryPlanner = new AiAuditQueryPlanner({ stateDir });
+    this.telemetry = telemetry;
+    this.auditQueryPlanner = new AiAuditQueryPlanner({
+      stateDir,
+      onTelemetry: (fact, context) => this.enqueueAiTelemetryFact(fact, context),
+    });
     this.lastCompatibilityOperation = null;
     this.sessions = new Map();
     // Stage 9.2: per-requestId abort controllers for in-flight remote
@@ -84,6 +91,38 @@ export class SessionManager {
     // the worker's local proxy can clean up.
     this.activeRemoteRequests = new Map();
     this.recentRemoteRequests = new Map();
+  }
+
+  enqueueAiTelemetryFact(fact = {}, context = {}) {
+    const runId = String(context?.runId || context?.run_id || "");
+    if (!/^acr_/.test(runId) || !this.telemetry?.queue?.enqueue) return;
+    const result = this.telemetry.queue.enqueue({
+      eventId: `ai_${randomUUID().replaceAll("-", "")}`,
+      idempotencyKey: fact.idempotencyKey || context?.idempotencyKey
+        || `ai:${runId}:${context?.sessionId || ""}:${fact.type || "invocation"}:${fact.responseId || Date.now()}`,
+      eventType: fact.type || "ai.invocation",
+      occurredAt: new Date().toISOString(),
+      runId,
+      sessionId: context?.sessionId || "",
+      provider: fact.provider,
+      model: fact.model,
+      responseId: fact.responseId,
+      durationMs: fact.durationMs,
+      payload: {
+        ...(fact.payload || {}),
+        duration_ms: fact.durationMs,
+        response_id: fact.responseId,
+      },
+    }, {
+      runId,
+      sessionId: context?.sessionId || "",
+      providerType: "originrouter",
+      providerSource: "originrouter-coding",
+      trainingEligible: true,
+      bundleOrigin: "collaboration_run",
+      controlOrigin: "cli",
+    });
+    if (result.inserted) this.telemetry.uploader?.schedule?.();
   }
 
   async resolveLocalProxyUrl() {
@@ -432,6 +471,22 @@ export class SessionManager {
       agentType: agent,
       title: payload.title || `${agent} session`,
       deviceName: payload.deviceName || "",
+      telemetryQueue: this.telemetry?.queue,
+      telemetryUploader: this.telemetry?.uploader,
+      telemetryContext: () => ({
+        providerSource,
+        providerType: resolvedProvider?.type,
+        provider: resolvedProvider?.name,
+        model: payload.model || resolvedProvider?.model,
+        deviceId: this.deviceId,
+        conversationId: payload.conversationId || sessionId,
+        runId: payload.runId || sessionId,
+        bundleOrigin: String(payload.runId || "").startsWith("acr_")
+          ? "collaboration_run"
+          : "direct_wrapper",
+        trainingEligible: false,
+        controlOrigin: "app_remote",
+      }),
     });
     const report = (type, extra = {}) => {
       if (type !== "session.started" && type !== "session.exited" && type !== "session.error" && type !== "agent.event") {
@@ -540,6 +595,7 @@ export class SessionManager {
         });
         const protectedResult = await protectOriginrouterCodingEnv(agent, providerResult, {
           stateDir: ensureStateDir(),
+          runId: payload.runId,
         });
         providerResult = protectedResult.providerResult;
         session.originrouterCodingProxy = protectedResult.proxy;
@@ -583,7 +639,7 @@ export class SessionManager {
           send("terminal.output", { data });
           terminalActivityReporter.ingest(data);
           for (const event of adapter.handleOutput(data)) {
-            this.auditStore?.appendEvent({ sessionId, cwd, agent }, event);
+            this.auditStore?.appendEvent({ sessionId, cwd, agent, runId: payload.runId || sessionId }, event);
             this.agentCatalog?.recordEvent(sessionId, event);
             send("agent.event", { event });
             report("agent.event", { event });
@@ -677,7 +733,7 @@ export class SessionManager {
       if (typeof adapter.scanStructuredEvents === "function") {
         session.scanTimer = setInterval(() => {
           for (const event of adapter.scanStructuredEvents()) {
-            this.auditStore?.appendEvent({ sessionId, cwd, agent }, event);
+            this.auditStore?.appendEvent({ sessionId, cwd, agent, runId: payload.runId || sessionId }, event);
             this.agentCatalog?.recordEvent(sessionId, event);
             send("agent.event", { event });
             report("agent.event", { event });
@@ -920,6 +976,10 @@ export class SessionManager {
             queryId: payload.query_id,
             domain: payload.domain,
             query: payload.query,
+            telemetryContext: {
+              runId: payload.runId || payload.run_id,
+              sessionId,
+            },
           });
         } catch {}
         const evidenceBundle = buildAuditEvidenceBundle({
@@ -935,6 +995,21 @@ export class SessionManager {
             token_budget: payload.token_budget,
             query_plan: queryPlan,
           },
+        });
+        this.enqueueAiTelemetryFact({
+          type: "audit.evidence.answered",
+          provider: "originrouter",
+          payload: {
+            success: true,
+            task_kind: "evidence_qa",
+            evidence_ref_count: evidenceBundle.evidence?.length || 0,
+            status: evidenceBundle.abstained ? "abstained" : "answered",
+            metadata: { mode: payload.domain },
+          },
+        }, {
+          runId: payload.runId || payload.run_id,
+          sessionId,
+          idempotencyKey: `ai:${payload.runId || payload.run_id}:${sessionId}:audit.evidence.answered:${payload.query_id || requestId}`,
         });
         return this.relayClient.send("agent.inquiry.page", {
           sessionId,

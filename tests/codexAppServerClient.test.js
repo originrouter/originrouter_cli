@@ -18,6 +18,7 @@ import { mapCodexApprovalRequest } from "../src/adapters/codex/eventMapper.js";
 import {
   buildCodexCollaborationMode,
   createSerialAgentEventQueue,
+  gatewayResponseIdsFromTurnResult,
 } from "../src/runtime/codexAppServerSession.js";
 import {
   permissionEventToInteraction,
@@ -40,6 +41,15 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
     /requires a resolved model/,
   );
 }
+
+assert.deepEqual(
+  gatewayResponseIdsFromTurnResult({
+    turn: { id: "turn_local", response: { id: "resp_gateway" } },
+    thread: { id: "thread_local" },
+  }),
+  ["resp_gateway"],
+  "turn ids must not be mistaken for gateway response ids",
+);
 
 {
   const delivered = [];

@@ -50,6 +50,7 @@ import {
 } from "../relay/agentRelayPolicy.js";
 import { RelayClient } from "../relay/relayClient.js";
 import { LocalAgentBridgeClient } from "../local/localAgentBridgeClient.js";
+import { createTelemetryPipeline } from "../telemetry/index.js";
 import { codexAgentGatewayConfigArgs } from "../mcp/agentGatewayConfig.js";
 import {
   buildInteractionRequest,
@@ -135,6 +136,8 @@ function extractOptions(args) {
     else if (arg === "--originrouter-session") take("session");
     else if (arg === "--originrouter-conversation") take("conversationId");
     else if (arg === "--originrouter-run") take("runId");
+    else if (arg === "--originrouter-task") take("taskId");
+    else if (arg === "--originrouter-telemetry-owner") take("telemetryOwner");
     else if (arg === "--originrouter-workspace") take("workspaceId");
     else if (arg === "--originrouter-title") take("title");
     else if (arg === "--provider") take("provider");
@@ -172,6 +175,29 @@ function extractOptions(args) {
 
 function textInput(text) {
   return [{ type: "text", text, text_elements: [] }];
+}
+
+// Codex's turn/start result is provider-owned data. Keep only explicitly
+// named response identifiers; turn/thread/item ids are local app-server ids
+// and must never be presented as gateway response ids.
+export function gatewayResponseIdsFromTurnResult(result = {}) {
+  const values = [
+    result?.gateway_response_id,
+    result?.gatewayResponseId,
+    result?.response_id,
+    result?.responseId,
+    result?.response?.id,
+    result?.response?.response_id,
+    result?.turn?.gateway_response_id,
+    result?.turn?.gatewayResponseId,
+    result?.turn?.response_id,
+    result?.turn?.responseId,
+    result?.turn?.response?.id,
+    result?.turn?.response?.response_id,
+  ];
+  return [...new Set(values
+    .filter((value) => typeof value === "string" && value.trim())
+    .map((value) => value.trim().slice(0, 255)))];
 }
 
 function requestInteractionId(method, params, id) {
@@ -361,7 +387,14 @@ export async function runCodexAppServerSession(rawArgs) {
   let localAgentBridge = null;
   let relayViaDaemon = false;
   ({ providerResult, proxy: originrouterCodingProxy } =
-    await protectOriginrouterCodingEnv("codex", providerResult, { stateDir }));
+    await protectOriginrouterCodingEnv("codex", providerResult, {
+      stateDir,
+      runId: options.runId,
+    }));
+  const telemetry = createTelemetryPipeline({
+    stateDir,
+    uploadOwner: options.telemetryOwner === "1",
+  });
   let model =
     options.model ||
     providerResult.env.OPENAI_MODEL ||
@@ -382,6 +415,24 @@ export async function runCodexAppServerSession(rawArgs) {
     title: sessionTitle,
     deviceName: device.displayName || device.host,
     stateDir,
+    telemetryQueue: telemetry.queue,
+    telemetryUploader: telemetry.uploader,
+    telemetryContext: () => ({
+      providerSource: providerResult.source,
+      providerType: providerResult.provider?.type,
+      provider: providerResult.provider?.name,
+      model,
+      deviceId: effectiveDeviceId,
+      conversationId: options.conversationId || sessionId,
+      runId: options.runId || sessionId,
+      taskId: options.taskId || "",
+      telemetryOwner: options.telemetryOwner === "1",
+      bundleOrigin: String(options.runId || "").startsWith("acr_")
+        ? "collaboration_run"
+        : "direct_wrapper",
+      trainingEligible: options.telemetryOwner === "1",
+      controlOrigin: options.controlOrigin || "cli",
+    }),
   });
   let threadId = null;
   let transcriptPath = null;
@@ -489,6 +540,10 @@ export async function runCodexAppServerSession(rawArgs) {
         : Promise.resolve(),
     ]);
   };
+  aiApprovalReviewer.onTelemetry = (event) => sendAgentEvent({
+    ...event,
+    provider: event.provider || "originrouter",
+  });
   const agentEventQueue = createSerialAgentEventQueue(sendAgentEvent);
   const interactions = new PendingInteractionRegistry({
     onRequested: async (request) => {
@@ -857,6 +912,18 @@ export async function runCodexAppServerSession(rawArgs) {
       collaborationMode: buildCodexCollaborationMode(currentMode, model),
     });
     currentTurnId = result?.turn?.id || currentTurnId;
+    const gatewayResponseIds = gatewayResponseIdsFromTurnResult(result);
+    if (gatewayResponseIds.length) {
+      await sendAgentEvent({
+        type: "agent.activity",
+        provider: "codex",
+        activity: "gateway_response",
+        summary: "Codex gateway response received",
+        gatewayResponseIds,
+        responseId: gatewayResponseIds[0],
+        metadata: { gateway_response_id: gatewayResponseIds[0] },
+      });
+    }
     return true;
   };
 
@@ -889,6 +956,8 @@ export async function runCodexAppServerSession(rawArgs) {
     await report("session.exited", { code, signal });
     await syncCatalog(signal ? "stopped" : code === 0 ? "completed" : "failed");
     await runtimeReporter.flush();
+    await telemetry.uploader.flush().catch(() => {});
+    telemetry.queue.close();
   };
 
   const handleRemoteEvent = async (payload) => {

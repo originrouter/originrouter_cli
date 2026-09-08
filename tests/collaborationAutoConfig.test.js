@@ -252,6 +252,30 @@ test("workspace lifecycle does not create a Run before an unsafe configuration i
   assert.equal(requests.length, 0);
 });
 
+test("workspace lifecycle defaults to required configuration confirmation even for low-risk proposals", async () => {
+  let configurationReviews = 0;
+  const result = await runAgentWorkspaceCollaboration({
+    objective: "Inspect the local project",
+    configurationPayloadFn: async () => ({
+      objective: "Inspect the local project",
+      workspace_mode: "auto",
+      resolved_workspace_mode: "solo",
+      planning_source: "server_model",
+      participants: [{ participant_id: "coordinator", device_id: "local" }],
+      auto_configuration: { safe_to_skip_confirmation: true, requires_explicit_confirmation: false },
+    }),
+    onConfigurationConfirmation: async () => {
+      configurationReviews += 1;
+      return "leave";
+    },
+    requestFn: async () => {
+      throw new Error("a Run must not be created before required confirmation");
+    },
+  });
+  assert.equal(configurationReviews, 1);
+  assert.equal(result.run.state, "configuration_pending");
+});
+
 test("workspace lifecycle uses the target CLI server session and carries planner questions through the terminal callback", async () => {
   const paths = [];
   let receivedAnswer = null;

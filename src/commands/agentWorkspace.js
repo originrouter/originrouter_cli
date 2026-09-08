@@ -90,6 +90,9 @@ export function parseAgentWorkspaceArgs(argv = []) {
     objective.push(item);
     index += 1;
   }
+  if (forwarded.includes("--yes") && forwarded.includes("--review")) {
+    throw new Error("--yes and --review cannot be used together.");
+  }
   return {
     coordinator,
     mode,
@@ -1470,6 +1473,14 @@ function buildRuntimeRows(runtime, columns, maxRows, {
     } else {
       push("Final result", strong);
       pushIndented(report.summary, 2, completed ? strong : null);
+      const failureDetails = (report.failed_or_skipped_tasks || [])
+        .map((task) => String(task.result || "").trim())
+        .filter(Boolean);
+      for (const detail of [...new Set(failureDetails)].slice(0, 2)) {
+        for (const row of wrapDisplayText(detail, Math.max(1, width - 2))) {
+          pushIndented(row, 2, strong);
+        }
+      }
     }
   }
   // The title card belongs to the document, rather than to the permanent
@@ -1491,17 +1502,17 @@ function runtimeControls(runtime, columns) {
   // Keep the footer as an action legend only. Mode, Run state, and approval
   // live together in composerStatus(), so they are not repeated at both ends
   // of the composer dock.
-  let text = runtime.notice || "↑/↓ history · Enter queues next objective · Shift+drag selects text";
-  if (runtime.screenPaused) text = "screen frozen for copying · ctrl+t resumes updates";
+  let text = runtime.notice || "↑/↓ history · Enter queues next objective · Ctrl+T copy mode";
+  if (runtime.screenPaused) text = "screen frozen for copying · drag selects text · Ctrl+T resumes updates";
   const selectedActivityId = runtime.activityParticipantIds?.[runtime.activitySelection || 0];
   const selectedActivityExpanded = selectedActivityId
     && (runtime.expandedActivityParticipants || []).includes(selectedActivityId);
   if (selectedActivityId && !runtime.interaction) {
-    text = `↑/↓ history · Ctrl+O ${selectedActivityExpanded ? "collapses" : "expands"} Agent · Shift+drag selects text`;
+    text = `↑/↓ history · Ctrl+O ${selectedActivityExpanded ? "collapses" : "expands"} Agent · Ctrl+T copy mode`;
   }
   if (runtime.autoFollow === false) {
     const unseen = Number(runtime.unseenActivityCount || 0);
-    text = `${unseen ? `${unseen} new event${unseen === 1 ? "" : "s"} · ` : ""}↑/↓ history · PgDn latest · Ctrl+O details · Shift+drag selects text`;
+    text = `${unseen ? `${unseen} new event${unseen === 1 ? "" : "s"} · ` : ""}↑/↓ history · PgDn latest · Ctrl+O details · Ctrl+T copy mode`;
   }
   if (runtime.queuedObjective) text = "next objective queued · ctrl+c interrupts · ← agents";
   if (runtime.phase === "needs_setup") text = runtime.setup?.workspaces?.length && runtime.setupMode !== "path"
@@ -2163,20 +2174,29 @@ function supportsAppScreen(output) {
 
 function enterWorkspaceApp(output) {
   if (!supportsAppScreen(output)) return () => {};
-  // Receive SGR wheel events so scrolling stays inside the rendered document,
-  // rather than exposing the terminal's alternate-screen history. Terminals
-  // conventionally reserve Shift+drag for native text selection while mouse
-  // tracking is active.
+  // Mouse tracking is required for reliable in-app wheel scrolling. It does
+  // capture normal drag selection, so Ctrl+T temporarily disables tracking
+  // while freezing the screen for native terminal copy/selection.
   // Disable autowrap while the app owns the screen. Writing a full-width row
   // into the bottom-right cell can otherwise scroll the alternate buffer and
   // expose the shell's scrollback above the app.
   output.write("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?7l\x1b[?2004h\x1b[?25l\x1b[H\x1b[2J");
   let exited = false;
+  let mouseTracking = true;
+  const setMouseTracking = (enabled) => {
+    const next = Boolean(enabled);
+    if (next === mouseTracking || exited) return;
+    mouseTracking = next;
+    output.write(next ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l");
+  };
+  output.setOriginRouterMouseTracking = setMouseTracking;
   const exit = () => {
     if (exited) return;
+    setMouseTracking(false);
     exited = true;
     workspaceScreenCache.delete(output);
-    output.write("\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l");
+    output.write("\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l");
+    delete output.setOriginRouterMouseTracking;
   };
   process.once("exit", exit);
   const onSigterm = () => {
@@ -3784,6 +3804,16 @@ async function runWorkspaceObjective({
     }
     render(true);
   };
+  const onActiveExit = () => {
+    runtime.exitRequested = true;
+    runtime.detachRequested = true;
+    runtime.notice = runtime.runId
+      ? "Leaving OriginRouter · the collaboration Run will continue in the service"
+      : "Leaving OriginRouter";
+    controller.abort();
+    completedInputResolve?.("exit");
+    render(true);
+  };
   process.on("SIGINT", onActiveInterrupt);
   emitKeypressEvents(input);
   input.setRawMode(true);
@@ -3963,6 +3993,7 @@ async function runWorkspaceObjective({
     }
     if (key.ctrl && key.name === "t") {
       runtime.screenPaused = !runtime.screenPaused;
+      output.setOriginRouterMouseTracking?.(!runtime.screenPaused);
       runtime.notice = runtime.screenPaused ? "Screen frozen for copying" : "Screen updates resumed";
       render(true);
       return;
@@ -4062,6 +4093,14 @@ async function runWorkspaceObjective({
           return;
         }
         const commandName = activeCommand.command.name;
+        if (commandName === "exit") {
+          if (activeCommand.args.length) {
+            showNotice(`Usage: ${workspaceCommandUsage(activeCommand.command)}`, 2200);
+            return;
+          }
+          onActiveExit();
+          return;
+        }
         if (["status", "agents", "pause", "cancel"].includes(commandName)
           && activeCommand.args.length > 1) {
           showNotice(`Usage: ${workspaceCommandUsage(activeCommand.command)}`, 2200);
@@ -4394,9 +4433,7 @@ async function runWorkspaceObjective({
           runtime.snapshot = { run: { state: "completed" }, tasks: [], final_report: null };
           return runtime;
         }
-        const confirmation = forwarded.includes("--yes")
-          ? "always"
-          : forwarded.includes("--review") ? "never" : "safe";
+        const confirmation = forwarded.includes("--yes") ? "always_auto" : "required";
         const followerOptions = {
           signal: controller.signal,
           onUpdate: applyRuntimeUpdate,
@@ -4497,6 +4534,7 @@ async function runWorkspaceObjective({
         return runtime;
       } catch (error) {
         if (isInterrupted(error)) {
+          if (runtime.detachRequested) return runtime;
           runtime.phase = "interrupted";
           runtime.snapshot = runtime.snapshot || { run: { state: "cancelled" }, tasks: [] };
           return runtime;

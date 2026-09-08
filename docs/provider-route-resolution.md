@@ -11,7 +11,7 @@
 | Type | Transport | Endpoint prefix | Auth | Notes |
 |---|---|---|---|---|
 | `originrouter` | `originrouter-coding` | `/coding/...` | session-local auth proxy | Real model id. Fixed upstream `https://api.easytransnote.com`. |
-| `proxy` | `proxy` | `/v1/...` | LiteLLM-rendered; engine is `litellm` | Fixed alias per slot. |
+| `proxy` | `proxy` | `/v1/...` | Proxy-rendered; engine is `litellm` | Fixed alias per slot. |
 | `remote` | `remote` | `null` (the device resolves) | device grant | Off by default. 9.1+ real impl. |
 
 `litellm` is a CLI-input alias that persists as
@@ -69,7 +69,7 @@ gpt-5.4          (Codex main slot)
 
 These are the **only** model strings the proxy transport
 emits when the caller does not supply an explicit model. They
-map to whatever the LiteLLM profile + `providerRoutes.js`
+map to whatever the Proxy profile + `providerRoutes.js`
 configuration specifies at proxy-start time. The alias table is
 the same one used by `src/config/routes.js#ROUTE_DEFS`.
 
@@ -92,7 +92,7 @@ resolver returns:
 The `target` field tells the device which subsystem on the
 remote side should answer:
 
-- `target: "proxy"` — the device's local LiteLLM proxy.
+- `target: "proxy"` — the device's local Proxy.
 - `target: "agent"` — the device's local Claude / Codex
   agent runtime.
 

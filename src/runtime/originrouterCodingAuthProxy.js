@@ -3,7 +3,9 @@ import http from "node:http";
 
 import { ensureFreshAccessToken } from "./oauthTokenRefresher.js";
 import { OAUTH_RESOURCES, accessTokenFor } from "./authContract.js";
-import { DEFAULT_ORIGINROUTER_BASE_URL } from "../config/providerRoutes.js";
+import {
+  DEFAULT_ORIGINROUTER_BASE_URL,
+} from "../config/providerRoutes.js";
 
 const TOKEN_HEADROOM_MS = 120_000;
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
@@ -44,7 +46,7 @@ function allowedPath(rawUrl) {
   }
 }
 
-function forwardedHeaders(headers, token) {
+function forwardedHeaders(headers, token, runId = "") {
   const out = {};
   for (const [name, value] of Object.entries(headers)) {
     const lower = name.toLowerCase();
@@ -57,11 +59,13 @@ function forwardedHeaders(headers, token) {
       || lower === "proxy-authorization"
       || lower === "x-api-key"
       || lower === "accept-encoding"
+      || lower === "x-originrouter-collaboration-run"
     ) continue;
     if (value != null) out[name] = value;
   }
   out.Authorization = `Bearer ${token}`;
   out["Accept-Encoding"] = "identity";
+  if (runId) out["X-OriginRouter-Collaboration-Run"] = runId;
   return out;
 }
 
@@ -103,12 +107,14 @@ export class OriginRouterCodingAuthProxy {
   constructor({
     stateDir,
     upstreamBaseUrl = DEFAULT_ORIGINROUTER_BASE_URL,
+    runId = "",
     fetchFn = globalThis.fetch,
     ensureFreshAccessTokenFn = ensureFreshAccessToken,
     maxRequestBytes = MAX_REQUEST_BYTES,
   }) {
     this.stateDir = stateDir;
     this.upstreamBaseUrl = trimBaseUrl(upstreamBaseUrl);
+    this.runId = String(runId || "").trim();
     this.fetchFn = fetchFn;
     this.ensureFreshAccessTokenFn = ensureFreshAccessTokenFn;
     this.maxRequestBytes = maxRequestBytes;
@@ -185,7 +191,7 @@ export class OriginRouterCodingAuthProxy {
     const url = new URL(req.url, `${this.upstreamBaseUrl}/`);
     return this.fetchFn(url, {
       method: req.method,
-      headers: forwardedHeaders(req.headers, token),
+      headers: forwardedHeaders(req.headers, token, this.runId),
       body: body.length > 0 && req.method !== "GET" && req.method !== "HEAD" ? body : undefined,
       redirect: "manual",
       signal,
@@ -251,12 +257,17 @@ export class OriginRouterCodingAuthProxy {
 
 export async function protectOriginrouterCodingEnv(agent, providerResult, {
   stateDir,
+  runId = "",
   proxyFactory = (options) => new OriginRouterCodingAuthProxy(options),
 } = {}) {
   if (providerResult?.source !== "originrouter-coding") {
     return { providerResult, proxy: null };
   }
-  const proxy = proxyFactory({ stateDir, upstreamBaseUrl: DEFAULT_ORIGINROUTER_BASE_URL });
+  const proxy = proxyFactory({
+    stateDir,
+    upstreamBaseUrl: DEFAULT_ORIGINROUTER_BASE_URL,
+    runId,
+  });
   const status = await proxy.start();
   const localBase = `http://${status.host}:${status.port}`;
   const env = { ...providerResult.env };

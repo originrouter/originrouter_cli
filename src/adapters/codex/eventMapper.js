@@ -68,10 +68,14 @@ function mapCodexThreadItem(method, item = {}) {
     )];
   }
   if (item.type === "subAgentActivity") {
-    return [activity("subagent", "Codex subagent activity updated", "", {
+    const event = activity("subagent", "Codex subagent activity updated", "", {
       kind: item.kind,
       agent_thread_id: item.agentThreadId,
-    })];
+    });
+    event.agentId = safeText(item.agentThreadId, 195);
+    event.delegationId = safeText(item.agentThreadId, 195);
+    event.delegationDetected = true;
+    return [event];
   }
   if (item.type === "hookPrompt") {
     return [activity("hook_prompt", "Codex hook supplied additional context", "", {
@@ -235,7 +239,7 @@ export function mapCodexNotification(method, params = {}) {
   })];
 }
 
-export function mapCodexAppServerEvent(message) {
+function mapCodexAppServerEventInternal(message) {
   const type = message?.type;
   if (!type) return [];
 
@@ -327,15 +331,32 @@ export function mapCodexAppServerEvent(message) {
   }
 
   if (type === "task_started") {
-    return [{ type: "agent.task.started", provider: "codex", id: message.turn_id || message.id }];
+    return [{
+      type: "agent.task.started",
+      provider: "codex",
+      id: message.turn_id || message.id,
+    }];
   }
 
   if (type === "task_complete") {
-    return [{ type: "agent.task.complete", provider: "codex", id: message.turn_id || message.id, status: message.status || "complete" }];
+    const error = safeText(message.error?.message || message.error, 2048);
+    return [{
+      type: "agent.task.complete",
+      provider: "codex",
+      id: message.turn_id || message.id,
+      status: error ? "failed" : message.status || "complete",
+      ...(error ? { isError: true, error, message: error } : {}),
+      ...(message.code ? { code: safeText(message.code, 96) } : {}),
+    }];
   }
 
   if (type === "turn_aborted") {
-    return [{ type: "agent.task.aborted", provider: "codex", id: message.turn_id || message.id, error: message.error }];
+    return [{
+      type: "agent.task.aborted",
+      provider: "codex",
+      id: message.turn_id || message.id,
+      error: message.error,
+    }];
   }
 
   // Stage 8.1: app-server ready signal. Emitted by CodexAppServerClient
@@ -395,6 +416,35 @@ export function mapCodexAppServerEvent(message) {
   }
 
   return [{ type: "agent.raw", provider: "codex", event: message }];
+}
+
+// Preserve an explicitly supplied gateway response id without treating turn,
+// item, or local event ids as gateway ids.
+function gatewayResponseId(message) {
+  const candidates = [
+    message?.gateway_response_id,
+    message?.gatewayResponseId,
+    message?.response_id,
+    message?.responseId,
+    message?.response?.id,
+    message?.response?.response_id,
+    message?.result?.id,
+    message?.result?.response_id,
+    message?.params?.gateway_response_id,
+    message?.params?.gatewayResponseId,
+    message?.params?.response_id,
+    message?.params?.responseId,
+    message?.params?.response?.id,
+  ];
+  return candidates.find((value) => typeof value === "string" && value.trim()) || null;
+}
+
+export function mapCodexAppServerEvent(message) {
+  const events = mapCodexAppServerEventInternal(message);
+  const responseId = gatewayResponseId(message);
+  return responseId
+    ? events.map((event) => ({ ...event, gatewayResponseId: responseId }))
+    : events;
 }
 
 export function mapCodexApprovalRequest(request) {

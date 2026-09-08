@@ -710,6 +710,45 @@ test("createRuntimeEventReporter serializes events and deduplicates dual approva
   assert.equal(new Set(reported.map((item) => item.client_event_id)).size, 3);
 });
 
+test("runtime telemetry preserves gateway ids and measurable facts", async () => {
+  const queued = [];
+  const reporter = createRuntimeEventReporter({
+    sessionId: "session-facts",
+    agentType: "claude",
+    title: "Facts session",
+    telemetryQueue: {
+      enqueue(input, context) {
+        queued.push({ input, context });
+        return { inserted: true };
+      },
+    },
+  });
+
+  reporter.report("agent.event", {
+    event: {
+      type: "agent.task.completed",
+      provider: "claude",
+      gatewayResponseId: "msg_gateway_1",
+      durationMs: 1234,
+      amountMicros: 456,
+      currency: "USD",
+      costSource: "configured",
+      verificationPassed: true,
+      retryCount: 2,
+      metadata: { verification: "passed" },
+    },
+  });
+  await reporter.flush();
+
+  assert.equal(queued.length, 1);
+  assert.deepEqual(queued[0].input.gatewayResponseIds, ["msg_gateway_1"]);
+  assert.equal(queued[0].input.payload.duration_ms, 1234);
+  assert.equal(queued[0].input.payload.amount_micros, 456);
+  assert.equal(queued[0].input.payload.verification_passed, true);
+  assert.equal(queued[0].input.payload.task_completed, true);
+  assert.equal(queued[0].input.payload.retry_count, 2);
+});
+
 test("runtime reporter does not treat an empty session exit as a task result", async () => {
   const reported = [];
   const reporter = createRuntimeEventReporter({

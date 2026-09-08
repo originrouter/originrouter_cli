@@ -8,7 +8,7 @@ import { AiOperationReviewer } from "../src/runtime/aiOperationReviewer.js";
 import { writeCodingAuth } from "../src/persistence/codingAuth.js";
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
-const session = { sessionId: "ai-operation", cwd: "/workspace/app", agent: "claude" };
+const session = { sessionId: "ai-operation", runId: "acr_ai_operation", cwd: "/workspace/app", agent: "claude" };
 
 {
   const stateDir = mkdtempSync(join(tmpdir(), "originrouter-ai-audit-job-"));
@@ -22,17 +22,29 @@ const session = { sessionId: "ai-operation", cwd: "/workspace/app", agent: "clau
     accessTokens: { control: token("control"), ai: token("ai"), coding: token("coding"), relay: token("relay") },
   });
   let polls = 0;
+  const telemetry = [];
   const reviewer = new AiOperationReviewer({
     stateDir,
+    onTelemetry: (event, context) => telemetry.push({ event, context }),
     fetchFn: async (url) => {
       if (String(url).endsWith("/reviews")) return { ok: true, status: 202, json: async () => ({ data: { job_id: "aaj_1" } }) };
       polls += 1;
-      return { ok: true, status: 200, json: async () => ({ data: polls === 1 ? { state: "processing" } : { state: "completed", review: { record: true, risk: "high" } } }) };
+      return { ok: true, status: 200, json: async () => ({ data: polls === 1 ? { state: "processing" } : {
+        state: "completed",
+        model: "audit-operation-v1",
+        response_id: "resp_operation_1",
+        review: { record: true, risk: "high", confidence: 0.91 },
+      } }) };
     },
   });
   const review = await reviewer.review({ session, event: { callId: "job-test" }, analysis: { risk: "elevated" } });
   assert.equal(review.record, true);
   assert.equal(polls, 2);
+  assert.equal(telemetry.length, 1);
+  assert.equal(telemetry[0].event.model, "audit-operation-v1");
+  assert.equal(telemetry[0].event.responseId, "resp_operation_1");
+  assert.equal(telemetry[0].context.runId, "acr_ai_operation");
+  assert.match(telemetry[0].context.idempotencyKey, /job-test$/);
 }
 
 {

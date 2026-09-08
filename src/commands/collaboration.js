@@ -27,6 +27,24 @@ import {
 
 export const MAX_COLLABORATION_RECONNECT_ATTEMPTS = 5;
 
+// This controls only the user-facing Team/plan confirmation gates. It is
+// separate from Session Approval, which governs individual Agent actions.
+const CONFIRMATION_MODE_ALIASES = Object.freeze({
+  required: "required",
+  never: "required", // legacy: never auto-confirm
+  safe_auto: "safe_auto",
+  safe: "safe_auto", // legacy
+  always_auto: "always_auto",
+  always: "always_auto", // legacy
+});
+
+function normalizeConfirmationMode(value = "required") {
+  const normalized = String(value || "required").trim().toLowerCase();
+  const mode = CONFIRMATION_MODE_ALIASES[normalized];
+  if (!mode) throw new Error(`Unknown confirmation mode '${value}'. Use required, safe_auto, or always_auto.`);
+  return mode;
+}
+
 class CollaborationCliError extends Error {
   constructor(message, {
     exitCode = 1,
@@ -1808,7 +1826,7 @@ export async function resolveAgentWorkspaceSession(sessionId, {
 async function followAgentWorkspaceCollaboration({
   run,
   payload = {},
-  confirmation = "never",
+  confirmation = "required",
   signal,
   onUpdate = () => {},
   onPlanConfirmation = async () => "leave",
@@ -1899,8 +1917,10 @@ async function followAgentWorkspaceCollaboration({
     }
     if (state === "awaiting_confirmation" && !confirmationHandled) {
       confirmationHandled = true;
-      const safeToSkip = payload.auto_configuration?.safe_to_skip_confirmation === true;
-      const decision = confirmation === "always" || (confirmation === "safe" && safeToSkip)
+      const safeToSkip = payload.auto_configuration?.safe_to_skip_confirmation === true
+        && payload.auto_configuration?.requires_explicit_confirmation !== true;
+      const mode = normalizeConfirmationMode(confirmation);
+      const decision = mode === "always_auto" || (mode === "safe_auto" && safeToSkip)
         ? "confirm"
         : await onPlanConfirmation(snapshot);
       throwIfAborted(signal);
@@ -1937,7 +1957,7 @@ export async function retryAgentWorkspaceCollaboration(runId, {
   onUpdate({ type: "phase", phase: "planning", run });
   return followAgentWorkspaceCollaboration({
     run,
-    confirmation: "never",
+    confirmation: "required",
     signal,
     onUpdate,
     onPlanConfirmation,
@@ -1960,7 +1980,7 @@ export async function followExistingAgentWorkspaceCollaboration(runId, {
   if (!runId) throw new Error("A collaboration Run ID is required to follow an existing Run.");
   return followAgentWorkspaceCollaboration({
     run: { run_id: runId },
-    confirmation: "never",
+    confirmation: "required",
     signal,
     onUpdate,
     onPlanConfirmation,
@@ -1975,7 +1995,7 @@ export async function runAgentWorkspaceCollaboration({
   objective,
   workspaceMode = "auto",
   coordinator = "codex",
-  confirmation = "safe",
+  confirmation = "required",
   signal,
   onUpdate = () => {},
   onRunId = () => {},
@@ -2058,10 +2078,11 @@ export async function runAgentWorkspaceCollaboration({
   onUpdate({ type: "configuration", payload });
   const configurationSafe = payload.auto_configuration?.safe_to_skip_confirmation === true
     && payload.planning_source === "server_model";
+  const confirmationMode = normalizeConfirmationMode(confirmation);
   const needsConfigurationReview = presetConfiguration
     ? false
-    : confirmation === "never" || !configurationSafe;
-  if (confirmation !== "always" && needsConfigurationReview) {
+    : confirmationMode === "required" || !configurationSafe;
+  if (confirmationMode !== "always_auto" && needsConfigurationReview) {
     const decision = await onConfigurationConfirmation(payload);
     throwIfAborted(signal);
     if (decision !== "confirm") {
@@ -2118,8 +2139,8 @@ export async function runAgentWorkspaceCollaboration({
   });
 }
 
-async function confirmInteractively(run, args) {
-  if (has(args, "yes")) return { action: "confirm", feedback: "" };
+async function confirmInteractively(run, confirmationMode) {
+  if (confirmationMode === "always_auto") return { action: "confirm", feedback: "" };
   if (!input.isTTY || !output.isTTY) return { action: "leave", feedback: "" };
   const prompt = createInterface({ input, output });
   try {
@@ -2539,6 +2560,10 @@ async function handleCollaborationCommandImpl(args, options = {}) {
     return;
   }
   if (action === "create") {
+    if (has(args, "yes") && has(args, "review")) {
+      throw new Error("--yes and --review cannot be used together.");
+    }
+    const confirmationMode = has(args, "yes") ? "always_auto" : "required";
     const draftId = value(args, "draft");
     const initialDraft = draftId ? getCollaborationDraft(draftId) : null;
     if (draftId && !initialDraft) {
@@ -2573,8 +2598,7 @@ async function handleCollaborationCommandImpl(args, options = {}) {
         configurationId = configuration.configuration_id;
         payload = configuration.proposal;
         if (!json) printAutoConfiguration(payload);
-        const configurationConfirmationRequired = has(args, "review")
-          || (!workspaceMode && !payload.auto_configuration?.safe_to_skip_confirmation);
+        const configurationConfirmationRequired = confirmationMode !== "always_auto";
         if (configurationConfirmationRequired) {
           if (!prompt) {
             throw new Error("The generated configuration requires explicit interactive confirmation.");
@@ -2632,7 +2656,7 @@ async function handleCollaborationCommandImpl(args, options = {}) {
       return;
     }
     if (json) {
-      if (has(args, "yes") && !has(args, "review")) {
+      if (confirmationMode === "always_auto") {
         const confirmed = (await request(`/collaboration/local/runs/${encodeURIComponent(run.run_id)}/confirm`, { method: "POST", body: {}, signal: options.signal })).run;
         printRun(confirmed, { json: true });
       } else {
@@ -2642,7 +2666,7 @@ async function handleCollaborationCommandImpl(args, options = {}) {
       return;
     }
     printRun(run);
-    let decision = await confirmInteractively(run, args);
+    let decision = await confirmInteractively(run, confirmationMode);
     while (decision.action === "revise") {
       run = (await request(
         `/collaboration/local/runs/${encodeURIComponent(run.run_id)}/replan`,
@@ -2658,7 +2682,7 @@ async function handleCollaborationCommandImpl(args, options = {}) {
         return;
       }
       printRun(run);
-      decision = await confirmInteractively(run, args);
+      decision = await confirmInteractively(run, confirmationMode);
     }
     if (decision.action === "confirm") {
       const confirmed = (await request(`/collaboration/local/runs/${encodeURIComponent(run.run_id)}/confirm`, { method: "POST", body: {}, signal: options.signal })).run;

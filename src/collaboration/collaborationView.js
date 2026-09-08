@@ -154,6 +154,9 @@ export function buildFinalReport(run) {
   const tasks = (run?.tasks || []).filter((task) => task.task_key !== "__planner__");
   const completed = tasks.filter((task) => task.state === "completed");
   const incomplete = tasks.filter((task) => task.state !== "completed");
+  const failureReason = [...(run?.messages || [])].reverse().find((message) => (
+    message?.type === "task.failed" && text(message?.payload?.content, 2048)
+  ))?.payload?.content || "";
   const participants = Object.entries(run?.agents || {}).map(([participantId, agent]) => ({
     participant_id: participantId,
     display_name: agent.display_name || participantId,
@@ -179,7 +182,7 @@ export function buildFinalReport(run) {
       title: task.title,
       participant_id: task.participant_id,
       state: task.state,
-      result: task.result_summary || task.summary || "",
+      result: task.result_summary || task.summary || text(failureReason, 2048),
     })),
     participant_contributions: participants,
     verification_result: tasks.some((task) => task.kind === "verify")
