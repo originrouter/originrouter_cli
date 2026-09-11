@@ -17,7 +17,7 @@ import {
   willRouteRemoteCoding,
 } from "../config/claudeConfig.js";
 import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
-import { DEFAULT_DEVICE_ID, DEFAULT_EXECUTOR, DEFAULT_RELAY_URL } from "../constants.js";
+import { DEFAULT_DEVICE_ID, DEFAULT_EXECUTOR } from "../constants.js";
 import { createExecutor, normalizeExecutor } from "../executors/createExecutor.js";
 import {
   appendSessionStart,
@@ -42,6 +42,7 @@ import {
   relayModeDescription,
 } from "../relay/agentRelayPolicy.js";
 import { RelayClient } from "../relay/relayClient.js";
+import { resolveRelayEndpoint } from "../relay/relayEndpointSelector.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 import { createTelemetryPipeline } from "../telemetry/index.js";
 import { PendingInteractionRegistry } from "../runtime/pendingInteractionRegistry.js";
@@ -345,11 +346,11 @@ export async function runLocalAgentSession(agent, rawArgs) {
 
   const { options, passthrough } = extractOriginRouterOptions(rawArgs);
   const relayConfig = readLocalApiConfig();
-  const relayUrl =
+  const configuredRelayUrl =
     options.relay ||
     process.env.ORIGINROUTER_RELAY ||
-    relayConfig.relayUrl ||
-    DEFAULT_RELAY_URL;
+    relayConfig.relayUrl;
+  const { relayUrl } = await resolveRelayEndpoint({ configuredRelayUrl });
   const relayMode = normalizeAgentRelayMode(
     options.relayMode || relayConfig.relayMode,
     relayUrl,

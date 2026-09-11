@@ -110,18 +110,43 @@ assert.deepEqual(mapCodexNotification("item/completed", {
   type: "agent.thinking",
   provider: "codex",
   text: "Checked the route\nCompared the fallback",
+  eventId: "codex_item_reasoning-1_completed",
 }]);
 
 const codexPlanEvent = mapCodexNotification("turn/plan/updated", {
+  turnId: "turn-1",
   explanation: "Implement in two steps",
   plan: [
     { step: "Update the mapper", status: "inProgress" },
     { step: "Run tests", status: "pending" },
   ],
 })[0];
-assert.equal(codexPlanEvent.type, "agent.activity");
-assert.equal(codexPlanEvent.activity, "plan_progress");
-assert.equal(codexPlanEvent.metadata.plan.length, 2);
+assert.equal(codexPlanEvent.type, "plan.updated");
+assert.equal(codexPlanEvent.plan.length, 2);
+assert.equal(codexPlanEvent.lifecycleId, "turn-1");
+
+const codexSubagentStarted = mapCodexNotification("item/started", {
+  item: {
+    type: "subAgentActivity",
+    id: "activity-started",
+    kind: "started",
+    agentThreadId: "thread-worker-1",
+    agentPath: "/root/worker",
+  },
+})[0];
+const codexSubagentCompleted = mapCodexNotification("item/completed", {
+  item: {
+    type: "subAgentActivity",
+    id: "activity-completed",
+    kind: "completed",
+    agentThreadId: "thread-worker-1",
+    agentPath: "/root/worker",
+  },
+})[0];
+assert.equal(codexSubagentStarted.type, "agent.subagent.started");
+assert.equal(codexSubagentCompleted.type, "agent.subagent.completed");
+assert.equal(codexSubagentStarted.lifecycleId, "thread-worker-1");
+assert.equal(codexSubagentCompleted.lifecycleId, "thread-worker-1");
 
 const codexMcpEvent = mapCodexNotification("item/started", {
   item: {
@@ -140,11 +165,10 @@ assert.deepEqual(mapCodexNotification("item/agentMessage/delta", {
   delta: "duplicate partial text",
 }), []);
 
-const unknownCodexNotification = mapCodexNotification("future/privateNotification", {
+const unknownCodexNotifications = mapCodexNotification("future/privateNotification", {
   secret: "must not cross",
-})[0];
-assert.equal(unknownCodexNotification.activity, "notification");
-assert.equal(JSON.stringify(unknownCodexNotification).includes("must not cross"), false);
+});
+assert.deepEqual(unknownCodexNotifications, []);
 
 // Stage 8.4: codex.app_server.force_kill → agent.adapter.status state=force_killed
 assert.deepEqual(mapCodexAppServerEvent({
@@ -302,6 +326,7 @@ assert.deepEqual(mapClaudeHookEvent({
   type: "agent.activity",
   provider: "claude",
   activity: "context_compacted",
+  visibility: "status",
   summary: "Claude compacted the conversation context",
   detail: "",
   metadata: {
@@ -321,6 +346,11 @@ assert.deepEqual(mapClaudeHookEvent({
     action: "",
   },
 });
+
+assert.equal(mapClaudeHookEvent({
+  hook_event_name: "MessageDisplay",
+  message: "Already emitted as agent.text",
+}), null);
 
 assert.deepEqual(mapClaudeHookEvent({
   hook_event_name: "UserPromptSubmit",

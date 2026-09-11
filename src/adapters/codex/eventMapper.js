@@ -21,14 +21,22 @@ export function mapCodexAssistantText(value) {
   ];
 }
 
-function activity(activityType, summary, detail = "", metadata = {}) {
+function activity(
+  activityType,
+  summary,
+  detail = "",
+  metadata = {},
+  { visibility = "timeline", eventId } = {},
+) {
   return {
     type: "agent.activity",
     provider: "codex",
     activity: activityType,
+    visibility,
     summary: safeText(summary, 512),
     detail: safeText(detail, 4096),
     metadata: displaySafeToolInput(metadata),
+    ...(eventId ? { eventId } : {}),
   };
 }
 
@@ -45,33 +53,73 @@ function toolNameForItem(item) {
 
 function mapCodexThreadItem(method, item = {}) {
   const completed = method === "item/completed";
+  const lifecycleId = safeText(item.id, 195);
+  const lifecyclePhase = completed ? "completed" : "started";
   if (item.type === "reasoning") {
     if (!completed) return [];
     const summary = Array.isArray(item.summary) ? item.summary.join("\n") : "";
-    return summary ? [{ type: "agent.thinking", provider: "codex", text: safeText(summary, 16_384) }] : [];
+    return summary ? [{
+      type: "agent.thinking",
+      provider: "codex",
+      text: safeText(summary, 16_384),
+      eventId: lifecycleId ? `codex_item_${lifecycleId}_completed` : undefined,
+    }] : [];
   }
   if (item.type === "plan") {
-    return completed
-      ? [activity("plan", "Codex produced a plan", item.text)]
-      : [activity("plan", "Codex is preparing a plan")];
+    return [{
+      type: "plan.updated",
+      provider: "codex",
+      summary: completed ? "Codex produced a plan" : "Codex is preparing a plan",
+      detail: safeText(item.text, 16_384),
+      phase: completed ? "completed" : "started",
+      lifecycleId,
+      eventId: lifecycleId
+        ? `codex_item_${lifecycleId}_${lifecyclePhase}`
+        : undefined,
+    }];
   }
   if (item.type === "contextCompaction") {
     return [activity("context_compacted", completed
       ? "Codex compacted the conversation context"
-      : "Codex is compacting the conversation context")];
+      : "Codex is compacting the conversation context", "", {}, {
+      visibility: "status",
+      lifecycleId,
+      eventId: lifecycleId
+        ? `codex_item_${lifecycleId}_${lifecyclePhase}`
+        : undefined,
+    })];
   }
   if (item.type === "enteredReviewMode" || item.type === "exitedReviewMode") {
-    return [activity(
-      item.type === "enteredReviewMode" ? "review_started" : "review_completed",
-      item.type === "enteredReviewMode" ? "Codex entered review mode" : "Codex exited review mode",
-      item.review,
-    )];
+    return [{
+      type: item.type === "enteredReviewMode" ? "review.started" : "review.completed",
+      provider: "codex",
+      summary: item.type === "enteredReviewMode"
+        ? "Codex entered review mode"
+        : "Codex exited review mode",
+      detail: safeText(item.review, 16_384),
+      lifecycleId,
+      eventId: lifecycleId
+        ? `codex_item_${lifecycleId}_${lifecyclePhase}`
+        : undefined,
+    }];
   }
   if (item.type === "subAgentActivity") {
-    const event = activity("subagent", "Codex subagent activity updated", "", {
-      kind: item.kind,
-      agent_thread_id: item.agentThreadId,
-    });
+    const kind = safeText(item.kind || "updated", 32).toLowerCase();
+    const subagentLifecycleId = safeText(item.agentThreadId || item.id, 195);
+    const event = {
+      type: `agent.subagent.${kind}`,
+      provider: "codex",
+      summary: `Codex subagent ${kind}`,
+      lifecycleId: subagentLifecycleId,
+      eventId: lifecycleId
+        ? `codex_item_${lifecycleId}_${lifecyclePhase}`
+        : undefined,
+      metadata: displaySafeToolInput({
+        kind,
+        agent_thread_id: item.agentThreadId,
+        agent_path: item.agentPath,
+      }),
+    };
     event.agentId = safeText(item.agentThreadId, 195);
     event.delegationId = safeText(item.agentThreadId, 195);
     event.delegationDetected = true;
@@ -106,6 +154,7 @@ function mapCodexThreadItem(method, item = {}) {
           model: item.model,
           receiver_count: Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds.length : undefined,
         }),
+        eventId: lifecycleId ? `codex_item_${lifecycleId}_started` : undefined,
       }];
     }
     return [{
@@ -115,6 +164,7 @@ function mapCodexThreadItem(method, item = {}) {
       tool,
       content: safeText(item.error?.message || item.result || item.status || "completed", 4096),
       isError: item.success === false || ["failed", "declined", "error"].includes(String(item.status || "").toLowerCase()),
+      eventId: lifecycleId ? `codex_item_${lifecycleId}_completed` : undefined,
     }];
   }
   return [];
@@ -146,10 +196,23 @@ export function mapCodexNotification(method, params = {}) {
       step: safeText(step?.step, 1024),
       status: safeText(step?.status, 32),
     }));
-    return [activity("plan_progress", "Codex plan updated", params.explanation, { plan })];
+    return [{
+      type: "plan.updated",
+      provider: "codex",
+      summary: "Codex plan updated",
+      detail: safeText(params.explanation, 4096),
+      plan,
+      lifecycleId: safeText(params.turnId, 195),
+    }];
   }
   if (method === "thread/compacted") {
-    return [activity("context_compacted", "Codex compacted the conversation context")];
+    return [activity(
+      "context_compacted",
+      "Codex compacted the conversation context",
+      "",
+      {},
+      { visibility: "status" },
+    )];
   }
   if (method === "thread/status/changed") {
     const state = params.status?.type || params.status || "unknown";
@@ -169,7 +232,7 @@ export function mapCodexNotification(method, params = {}) {
       reasoning_effort: settings.reasoningEffort,
       service_tier: settings.serviceTier,
       collaboration_mode: settings.collaborationMode?.mode,
-    })];
+    }, { visibility: "diagnostic" })];
   }
   if (method === "hook/started" || method === "hook/completed") {
     const run = params.run || {};
@@ -180,11 +243,16 @@ export function mapCodexNotification(method, params = {}) {
       duration_ms: run.durationMs,
       execution_mode: run.executionMode,
       handler_type: run.handlerType,
+    }, {
+      visibility: "diagnostic",
+      eventId: run.id ? `codex_hook_${run.id}` : undefined,
     })];
   }
   if (method === "item/mcpToolCall/progress") {
     return [activity("tool_progress", "Codex MCP tool is running", params.message, {
       item_id: params.itemId,
+    }, {
+      eventId: params.itemId ? `codex_mcp_progress_${params.itemId}` : undefined,
     })];
   }
   if (method === "item/autoApprovalReview/started" || method === "item/autoApprovalReview/completed") {
@@ -193,20 +261,23 @@ export function mapCodexNotification(method, params = {}) {
       target_item_id: params.targetItemId,
       status: params.review?.status,
       risk_level: params.review?.riskLevel,
+    }, {
+      visibility: "diagnostic",
+      eventId: params.reviewId ? `codex_approval_review_${params.reviewId}` : undefined,
     })];
   }
   if (method === "model/rerouted") {
     return [activity("model_rerouted", "Codex switched models", safeText(params.reason, 1024), {
       from_model: params.fromModel,
       to_model: params.toModel,
-    })];
+    }, { visibility: "status" })];
   }
   if (method === "mcpServer/startupStatus/updated" || method === "mcpServer/oauthLogin/completed") {
     return [activity("mcp_status", "Codex MCP server status changed", safeText(params.error, 1024), {
       server: params.serverName || params.name,
       status: params.status,
       success: params.success,
-    })];
+    }, { visibility: "diagnostic" })];
   }
   if (method === "error" || method === "thread/realtime/error") {
     const error = params.error || params;
@@ -221,6 +292,9 @@ export function mapCodexNotification(method, params = {}) {
     return [activity("diff_updated", "Codex updated the current file diff", "", {
       turn_id: params.turnId,
       diff_bytes: Buffer.byteLength(String(params.diff || ""), "utf8"),
+    }, {
+      visibility: "diagnostic",
+      eventId: params.turnId ? `codex_diff_${params.turnId}` : undefined,
     })];
   }
   if (method === "thread/goal/updated" || method === "thread/goal/cleared") {
@@ -229,14 +303,33 @@ export function mapCodexNotification(method, params = {}) {
       tokens_used: params.goal?.tokensUsed,
       token_budget: params.goal?.tokenBudget,
       time_used_seconds: params.goal?.timeUsedSeconds,
-    })];
+    }, { visibility: "status" })];
   }
   if (method === "account/rateLimits/updated") {
-    return [activity("rate_limit", "Codex rate limit status changed")];
+    return [activity(
+      "rate_limit",
+      "Codex rate limit status changed",
+      "",
+      {},
+      { visibility: "diagnostic" },
+    )];
   }
-  return [activity("notification", `Codex notification: ${safeText(method, 128)}`, "", {
-    method: safeText(method, 128),
-  })];
+  // Preserve the upstream response boundary for usage/telemetry consumers.
+  // It is diagnostic-only and therefore never becomes a conversation row.
+  if (method === "response.completed") {
+    const response = params.response || params;
+    return [activity(
+      "gateway_response",
+      "Codex response completed",
+      "",
+      { response_id: response.id || response.response_id },
+      { visibility: "diagnostic" },
+    )];
+  }
+  // Unknown app-server notifications are forward-compatibility transport
+  // details, not user-visible conversation messages. New meaningful methods
+  // must be mapped explicitly above once their payload contract is known.
+  return [];
 }
 
 function mapCodexAppServerEventInternal(message) {

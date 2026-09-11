@@ -287,6 +287,17 @@ test("execution projection preserves provider reroutes and gateway response fact
   assert.deepEqual(normalized.gateway_response_ids, ["resp_gateway_1"]);
 });
 
+test("execution projection preserves lifecycle identity in payload and metadata", () => {
+  const projected = executionEventProjection({
+    type: "plan.updated",
+    lifecycleId: "turn-1",
+    summary: "Plan updated",
+  });
+
+  assert.equal(projected.payload.lifecycle_id, "turn-1");
+  assert.equal(projected.metadata.lifecycle_id, "turn-1");
+});
+
 test("terminal telemetry is rebuilt when a process dies after the state commit", () => {
   const stateDir = tempDir();
   const events = [];

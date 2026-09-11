@@ -175,7 +175,6 @@ const inputScreen = buildWorkspaceAppScreen({
   composerCursor: 4,
 });
 assert.match(inputScreen, /› draf▌t objective/);
-assert.match(inputScreen, /Tab completes · ↑\/↓ select · Enter submits · Esc hides · Ctrl\+C clears/);
 
 const commandCompletionScreen = buildWorkspaceAppScreen({
   coordinator: "codex",
@@ -205,7 +204,6 @@ assert.doesNotMatch(wrappedInputScreen, /originrouter-cli以及…/);
 assert.match(wrappedInputScreen, /我想分析一下我远程电脑的状态/);
 assert.match(wrappedInputScreen, /是否安装originrouter-cli/);
 assert.match(wrappedInputScreen, /▌/);
-assert.match(wrappedInputScreen, /Tab completes · ↑\/↓ select · Enter submits · Esc hides · Ctrl\+C clears/);
 
 const wrappedRuntimeInputScreen = buildWorkspaceAppScreen({
   coordinator: "codex",
@@ -599,7 +597,7 @@ await new Promise((resolve) => setImmediate(resolve));
 doubleExitTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" });
 doubleExitTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" });
 await doubleExitRun;
-assert.match(doubleExitTerminal.writes.join(""), /Press Ctrl\+C again to exit/);
+assert.match(doubleExitTerminal.writes.join(""), /Ctrl\+C again to exit/);
 
 const resizeTerminal = fakeTerminal(80, 24);
 const resizeRun = handleAgentWorkspaceCommand([], {
@@ -701,7 +699,7 @@ activeExitTerminal.input.emit("keypress", undefined, { name: "return" });
 await activeExitRun;
 assert.equal(activeExitStarted, true);
 assert.deepEqual(activeExitCancelledRuns, [], "/exit detaches without cancelling the active Run");
-assert.match(activeExitTerminal.writes.join(""), /collaboration Run will continue in the service/);
+assert.match(activeExitTerminal.writes.join(""), /Leaving OriginRouter/);
 
 const liveApprovalTerminal = fakeTerminal();
 const liveApprovalUpdates = [];
@@ -1309,7 +1307,7 @@ assert.equal(completedFollowupCalls[1].continuedFromRunId, "acr_completed_first"
 assert.deepEqual(completedFollowupCalls[1].presetConfiguration, continuedTeamConfiguration);
 assert.notEqual(completedFollowupCalls[1].presetConfiguration, continuedTeamConfiguration);
 assert.match(completedFollowupTerminal.writes.join(""), /Full first result remains visible/);
-assert.match(completedFollowupTerminal.writes.join(""), /Enter continues with this team/);
+assert.match(completedFollowupTerminal.writes.join(""), /Enter continue · \/new fresh/);
 
 const completedCtrlCTerminal = fakeTerminal();
 const completedCtrlCRun = handleAgentWorkspaceCommand([], {
@@ -1330,7 +1328,7 @@ completedCtrlCTerminal.input.emit("keypress", undefined, { name: "return" });
 setTimeout(() => completedCtrlCTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" }), 15);
 setTimeout(() => completedCtrlCTerminal.input.emit("keypress", undefined, { ctrl: true, name: "c" }), 30);
 await completedCtrlCRun;
-assert.match(completedCtrlCTerminal.writes.join(""), /Press Ctrl\+C again to exit/);
+assert.match(completedCtrlCTerminal.writes.join(""), /Ctrl\+C again to exit/);
 
 const completedResumeTerminal = fakeTerminal(100, 30);
 const completedResumeSessionIds = [];
@@ -1687,8 +1685,8 @@ const firstScrollScreen = buildWorkspaceAppScreen({
   rows: 16,
   runtime: scrollingHeaderRuntime,
 }).replace(/\x1b\[[0-9;]*m/g, "");
-assert.match(firstScrollScreen, /^OriginRouter · originrouter-cli/, "a Run keeps a lightweight workspace header");
-assert.match(firstScrollScreen, /new event.*↑\/↓ history.*PgDn latest/, "scroll controls appear while detached from the live tail");
+assert.match(firstScrollScreen, /OriginRouter · originrouter-cli/, "a Run keeps a lightweight workspace header");
+assert.match(firstScrollScreen, /↑\/↓ history.*PgDn latest/, "scroll controls appear while detached from the live tail");
 assert.equal(scrollRuntimeContent(scrollingHeaderRuntime, 1, 100), true);
 const laterScrollScreen = buildWorkspaceAppScreen({
   coordinator: "codex",
@@ -1698,7 +1696,7 @@ const laterScrollScreen = buildWorkspaceAppScreen({
   runtime: scrollingHeaderRuntime,
 }).replace(/\x1b\[[0-9;]*m/g, "");
 assert.match(laterScrollScreen, /OriginRouter · originrouter-cli/, "the workspace header stays fixed");
-assert.match(laterScrollScreen, /new event.*↑\/↓ history.*PgDn latest/, "scroll controls remain visible while detached");
+assert.doesNotMatch(laterScrollScreen, /↑\/↓ history.*PgDn latest/, "scroll controls hide again at the live tail");
 
 const scrollRuntime = {
   contentLineCount: 30,

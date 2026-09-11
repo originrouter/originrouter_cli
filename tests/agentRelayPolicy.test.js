@@ -46,6 +46,27 @@ test("official Relay uses authenticated cloud when signed in", async () => {
   assert.equal(plan.authToken, "or_at_relay");
 });
 
+test("every official latency-selected Relay alias retains cloud authentication", async () => {
+  const plan = await buildAgentRelayPlan({
+    stateDir: "/tmp/originrouter-relay-policy",
+    relayUrl: "https://app.originrouter.com",
+    fallbackDeviceId: "fallback-device",
+    mode: "auto",
+    ensureFreshAccessTokenFn: async () => ({
+      deviceId: "oauth-device",
+      accessTokens: {
+        relay: {
+          token: "or_at_relay",
+          expiresAt: Date.now() + 60_000,
+          scopes: ["relay.connect"],
+        },
+      },
+    }),
+  });
+  assert.equal(plan.enabled, true);
+  assert.equal(plan.authState, "on");
+});
+
 test("official Relay degrades to local-only when login is unavailable", async () => {
   const plan = await buildAgentRelayPlan({
     stateDir: "/tmp/originrouter-relay-policy",

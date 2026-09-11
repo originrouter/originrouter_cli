@@ -7,7 +7,6 @@ import {
   DEFAULT_DEVICE_ID,
   DEFAULT_EXECUTOR,
   DEFAULT_LOCAL_API_PORT,
-  DEFAULT_RELAY_URL,
   DEFAULT_REMOTE_SHARE_PROXY_PORT,
   VERSION,
 } from "../constants.js";
@@ -29,6 +28,7 @@ import {
   relayModeDescription,
 } from "../relay/agentRelayPolicy.js";
 import { RelayClient } from "../relay/relayClient.js";
+import { resolveRelayEndpoint } from "../relay/relayEndpointSelector.js";
 import { parseOptions } from "../utils/options.js";
 import { SessionManager } from "./sessionManager.js";
 import { agentDetailDefaultFromConfig } from "../runtime/agentDetailProfile.js";
@@ -163,11 +163,13 @@ export async function startDaemon(args) {
   const apiTokenFile =
     process.env.ORIGINROUTER_API_TOKEN_PATH || apiTokenPath(stateDir);
 
-  const relayUrl =
+  const configuredRelayUrl =
     options.relay ||
     process.env.ORIGINROUTER_RELAY ||
-    localApiConfig.relayUrl ||
-    DEFAULT_RELAY_URL;
+    localApiConfig.relayUrl;
+  const { relayUrl, source: relayEndpointSource } = await resolveRelayEndpoint({
+    configuredRelayUrl,
+  });
   const relayMode = normalizeAgentRelayMode(
     options.relayMode || localApiConfig.relayMode,
     relayUrl,
@@ -787,7 +789,7 @@ export async function startDaemon(args) {
   });
 
   console.log("[daemon] starting");
-  console.log(`[daemon] relay: ${relayUrl}`);
+  console.log(`[daemon] relay: ${relayUrl} (${relayEndpointSource})`);
   console.log(`[daemon] relay mode: ${relayMode}`);
   console.log(`[daemon] device: ${effectiveDeviceId}`);
   console.log(`[daemon] executor: ${executor}`);

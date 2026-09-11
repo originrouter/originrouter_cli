@@ -25,7 +25,7 @@ import {
   remoteCodingRouteTarget,
   willRouteRemoteCoding,
 } from "../config/claudeConfig.js";
-import { DEFAULT_DEVICE_ID, DEFAULT_RELAY_URL } from "../constants.js";
+import { DEFAULT_DEVICE_ID } from "../constants.js";
 import {
   appendSessionStart,
   patchSessionExit,
@@ -49,6 +49,7 @@ import {
   relayModeDescription,
 } from "../relay/agentRelayPolicy.js";
 import { RelayClient } from "../relay/relayClient.js";
+import { resolveRelayEndpoint } from "../relay/relayEndpointSelector.js";
 import { LocalAgentBridgeClient } from "../local/localAgentBridgeClient.js";
 import { createTelemetryPipeline } from "../telemetry/index.js";
 import { codexAgentGatewayConfigArgs } from "../mcp/agentGatewayConfig.js";
@@ -326,11 +327,11 @@ export async function runCodexAppServerSession(rawArgs) {
   }
 
   const relayConfig = readLocalApiConfig();
-  const relayUrl =
+  const configuredRelayUrl =
     options.relay ||
     process.env.ORIGINROUTER_RELAY ||
-    relayConfig.relayUrl ||
-    DEFAULT_RELAY_URL;
+    relayConfig.relayUrl;
+  const { relayUrl } = await resolveRelayEndpoint({ configuredRelayUrl });
   const relayMode = normalizeAgentRelayMode(
     options.relayMode || relayConfig.relayMode,
     relayUrl,

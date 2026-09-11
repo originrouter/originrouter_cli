@@ -511,6 +511,26 @@ function clampWorkspacePoint(output, point = {}) {
   };
 }
 
+function workspacePointHasText(output, point) {
+  const lines = workspaceScreenCache.get(output)?.lines || [];
+  const line = stripAnsi(lines[Math.max(0, point.y - 1)] || "");
+  if (!line) return false;
+  const visibleChars = [...line];
+  let column = 1;
+  for (const char of visibleChars) {
+    const charWidth = Math.max(1, promptDisplayWidth(char));
+    if (point.x >= column && point.x < column + charWidth) {
+      // Padding, frame rules, and the cursor marker are layout chrome, not
+      // selectable content. This also prevents a click on a separator from
+      // leaving a one-cell reverse-video block on screen.
+      return !/^\s$/.test(char) && !["─", "│", "╭", "╮", "╰", "╯", "›", "▌"].includes(char);
+    }
+    column += charWidth;
+    if (column > point.x) break;
+  }
+  return false;
+}
+
 function compareWorkspacePoints(left, right) {
   if (left.y !== right.y) return left.y - right.y;
   return left.x - right.x;
@@ -530,6 +550,23 @@ function displaySlice(value, startColumn, endColumn) {
     if (column > end) break;
   }
   return text;
+}
+
+function displaySelectionSegments(value, startColumn, endColumn) {
+  const start = Math.max(1, Number(startColumn) || 1);
+  const end = Math.max(start, Number(endColumn) || start);
+  const segments = { before: "", selected: "", after: "" };
+  let column = 1;
+  for (const char of stripAnsi(String(value || ""))) {
+    const width = Math.max(0, promptDisplayWidth(char));
+    const charStart = column;
+    const charEnd = width ? column + width - 1 : column;
+    if (charEnd < start) segments.before += char;
+    else if (charStart > end) segments.after += char;
+    else segments.selected += char;
+    if (width) column += width;
+  }
+  return segments;
 }
 
 export function workspaceSelectionText(lines, selection) {
@@ -552,14 +589,24 @@ function renderWorkspaceSelection(output, lines) {
   if (!selection?.anchor || !selection?.focus) return;
   let start = selection.anchor;
   let end = selection.focus;
-  if (compareWorkspacePoints(start, end) > 0) [start, end] = [end, start];
   for (let row = start.y; row <= end.y; row += 1) {
     const from = row === start.y ? start.x : 1;
     const to = row === end.y ? end.x : Number(output.columns) || 80;
-    const text = displaySlice(lines[row - 1] || "", from, to);
-    if (!text) continue;
-    output.write(`\x1b[${row};${from}H\x1b[7m${text}\x1b[27m`);
+    const segments = displaySelectionSegments(lines[row - 1] || "", from, to);
+    if (!segments.selected) continue;
+    output.write(
+      `\x1b[${row};1H\x1b[2K${segments.before}\x1b[7m${segments.selected}\x1b[27m${segments.after}`,
+    );
   }
+}
+
+function positionWorkspaceCursor(output, lines) {
+  const row = lines.findIndex((line) => stripAnsi(line).includes("▌"));
+  if (row < 0) return;
+  const plain = stripAnsi(lines[row]);
+  const cursorIndex = plain.indexOf("▌");
+  const column = Math.max(0, promptDisplayWidth(plain.slice(0, cursorIndex)));
+  cursorTo(output, column, row);
 }
 
 function copyWorkspaceSelection(text) {
@@ -584,6 +631,14 @@ function handleWorkspaceMouseKeypress({ output, state, text, key, runtime = null
   const selection = workspaceSelection(output);
   const point = clampWorkspacePoint(output, mouse);
   if (mouse.type === "press") {
+    // A click in the empty padding below/after the rendered content must not
+    // become a fake text anchor. Besides producing a misleading selection,
+    // that leaves Terminal.app's IME candidate window at the clicked column.
+    if (!workspacePointHasText(output, point)) {
+      clearWorkspaceSelection(output);
+      render?.(true);
+      return true;
+    }
     selection.anchor = point;
     selection.focus = point;
     selection.dragging = true;
@@ -1614,7 +1669,14 @@ function buildRuntimeRows(runtime, columns, maxRows, {
   // The title card belongs to the document, rather than to the permanent
   // chrome. This lets a new Run open at its natural first screen, while the
   // composer and its status remain anchored at the bottom of the terminal.
-  const documentRows = [...prefixRows, ...lines];
+  // A phase update can arrive from both the planner snapshot and the event
+  // stream. Collapse adjacent identical presentation rows so one transition
+  // cannot occupy two lines or push the composer/footer out of the viewport.
+  const documentRows = [];
+  for (const row of [...prefixRows, ...lines]) {
+    if (documentRows.at(-1) === row) continue;
+    documentRows.push(row);
+  }
   runtime.contentLineCount = documentRows.length;
   const visibleRows = Math.max(0, maxRows);
   runtime.contentVisibleRows = visibleRows;
@@ -1683,18 +1745,76 @@ function runtimeControls(runtime, columns) {
   if (runtime.interactionKind === "session_resume") {
     text = "↑/↓ selects · Enter restores · Esc returns to the Workspace prompt";
   }
+  // Detached history browsing always gets the scroll affordances, including
+  // after a Run has completed. Keep this contextual hint from being replaced
+  // by the terminal-result copy above.
+  if (runtime.autoFollow === false) {
+    const unseen = Number(runtime.unseenActivityCount || 0);
+    text = `${unseen ? `${unseen} new event${unseen === 1 ? "" : "s"} · ` : ""}↑/↓ history · PgDn latest · Ctrl+O details`;
+  }
   if (runtime.notice) text = runtime.notice;
   return padDisplayRight(muted(`  ${text}`), columns);
 }
 
+function footerLine(columns, left, right = "") {
+  const width = Math.max(1, Number(columns) || 1);
+  const contentWidth = Math.max(1, width - 2);
+  const leftText = String(left || "");
+  const rightText = String(right || "");
+  const gap = rightText ? 2 : 0;
+  const availableRight = Math.max(0, contentWidth - promptDisplayWidth(leftText) - gap);
+  const fittedRight = rightText ? fitDisplayText(rightText, availableRight) : "";
+  const gapText = fittedRight ? " ".repeat(Math.max(1, contentWidth - promptDisplayWidth(leftText) - promptDisplayWidth(fittedRight))) : "";
+  return `${muted(`  ${leftText}${gapText}${fittedRight}`)}`;
+}
+
+function idleFooter(columns, mode, sessionApproval, notice = "") {
+  const profile = sessionApproval?.profile || "guarded";
+  const policyId = sessionApproval?.policyId || "";
+  return footerLine(
+    columns,
+    `${workspaceModeDefinition(mode).label} · ${permissionLabel(profile, policyId)} approval`,
+    notice || "/mode · /help",
+  );
+}
+
+function runtimeFooterLine(runtime, columns) {
+  const profile = runtime?.sessionApprovalOverride?.profile
+    || runtime?.snapshot?.run?.supervisor_permission_profile
+    || runtime?.configuration?.supervisor_permission_profile
+    || "guarded";
+  const policyId = runtime?.sessionApprovalOverride?.policyId
+    || runtime?.snapshot?.run?.supervisor_policy_id
+    || runtime?.configuration?.supervisor_policy_id
+    || "";
+  const left = `${workspaceModeDefinition(runtime?.mode || "auto").label} · ${permissionLabel(profile, policyId)} approval`;
+  let notice = runtime?.notice || "";
+  if (/^Result preserved\b/i.test(notice)) notice = "Enter continue · /new fresh";
+  if (/^Press Ctrl\+C again to exit$/i.test(notice)) notice = "Ctrl+C again to exit";
+  if (notice) return footerLine(columns, left, notice);
+  return footerLine(
+    columns,
+    left,
+    runtimeControls(runtime, columns).replace(/\x1b\[[0-9;]*m/g, "").trim(),
+  );
+}
+
 function runtimeStatusVisible(runtime) {
   if (!runtime) return false;
-  if (runtime.interaction || runtime.notice || runtime.queuedObjective) return true;
+  // Notices are rendered in the Footer's transient right-hand slot. Keeping
+  // them out of the status row prevents messages such as the Ctrl+C exit hint
+  // from appearing twice.
+  if (runtime.queuedObjective) return true;
   const state = String(runtime.snapshot?.run?.state || "").toLowerCase();
   const phase = String(runtime.phase || "").toLowerCase();
-  return ["running", "in_progress", "planning", "executing", "reconnecting", "connection_paused"]
-    .includes(state) || ["running", "planning", "executing", "reconnecting", "connection_paused"]
-    .includes(phase);
+  if (["reconnecting", "connection_paused"].includes(phase)) return true;
+  if (["running", "in_progress", "executing"].includes(state)
+    || ["running", "executing"].includes(phase)) return true;
+  // Configuration/planning screens already render their phase (with the
+  // elapsed timer) in the document body. Repeating it above the composer
+  // creates two identical "Choosing the Agent team" rows.
+  if (runtime.interaction) return ["attention", "attention_reply", "paused", "reconnect"].includes(runtime.interactionKind);
+  return false;
 }
 
 function runtimeControlsVisible(runtime) {
@@ -1704,6 +1824,7 @@ function runtimeControlsVisible(runtime) {
       || runtime.notice
       || runtime.interaction
       || runtime.queuedObjective
+      || ["reconnecting", "connection_paused"].includes(runtime.phase)
       || runtime.snapshot?.run?.state === "awaiting_confirmation"
       || ["attention", "attention_reply", "paused", "reconnect"].includes(runtime.interactionKind),
   );
@@ -2153,7 +2274,11 @@ export function buildWorkspaceAppScreen({
   const compactHeader = runtime || terminalRows < 14 || terminalColumns < 56;
   const headerRows = compactHeader
     ? runtime
-      ? [appLine(strong(`OriginRouter · ${workspace}${runtime.runId ? ` · ${runtime.runId}` : ""}`), terminalColumns)]
+      ? [
+        titleLine(`OriginRouter · ${workspace}`, frameWidth),
+        appLine(runtime.runId ? `Run ${runtime.runId}` : "Workspace Session", contentWidth),
+        bottomLine(frameWidth),
+      ]
       : [
         titleLine("OriginRouter", frameWidth),
         appLine(`${workspace} · ${modeLabel} · Ready for an objective`, contentWidth),
@@ -2207,9 +2332,10 @@ export function buildWorkspaceAppScreen({
   const runtimeFooter = runtime && runtimeControlsVisible(runtime)
     ? runtimeControls(runtime, terminalColumns)
     : "";
+  const visibleRuntimeHeader = runtime && terminalRows >= 10 ? headerRows : [];
   const reservedRows = runtime
-    ? (runtimeStatus ? 1 : 0) + 1 + runtimeComposerBlock.split("\n").length
-      + (runtimeFooter ? 2 : 0)
+    ? visibleRuntimeHeader.length + (runtimeStatus ? 1 : 0) + 1 + runtimeComposerBlock.split("\n").length
+      + 2
     : normalComposerBlock
       ? 4 + normalComposerBlock.split("\n").length
       : 5;
@@ -2218,10 +2344,10 @@ export function buildWorkspaceAppScreen({
         runtime,
         terminalColumns,
         Math.max(0, terminalRows - reservedRows),
-        { focusedInteraction, prefixRows: headerRows },
+        { focusedInteraction, prefixRows: [] },
       )
     : [];
-  const screenRows = runtime ? contentRows : headerRows;
+  const screenRows = runtime ? [...visibleRuntimeHeader, ...contentRows] : headerRows;
   const separator = border("─".repeat(terminalColumns));
   const blankRows = Math.max(0, terminalRows - screenRows.length - reservedRows);
   const body = screenRows.length
@@ -2232,16 +2358,20 @@ export function buildWorkspaceAppScreen({
   }
   if (!runtime) {
     return [
-      `${body}${muted(`  ${composerNotice || `${modeLabel} · shift+tab approval · /mode changes team · /help`}`)}`,
-      separator,
+      `${body}${separator}`,
       normalComposerBlock,
       separator,
-      muted("  Tab completes · ↑/↓ select · Enter submits · Esc hides · Ctrl+C clears"),
+      idleFooter(terminalColumns, mode, sessionApproval, composerNotice),
     ].join("\n");
   }
   const composer = runtimeComposerBlock;
-  const runtimeRows = [`${body}${runtimeStatus}`, separator, composer];
-  if (runtimeFooter) runtimeRows.push(separator, runtimeFooter);
+  const runtimeRows = [
+    `${body}${runtimeStatus}`,
+    separator,
+    composer,
+    separator,
+    runtimeFooterLine(runtime, terminalColumns),
+  ];
   return runtimeRows.join("\n");
 }
 
@@ -2286,7 +2416,10 @@ function redrawWorkspaceApp(output, {
       output.write("\x1b[?2026l");
     }
   };
-  if (force || !previous || previous.columns !== output.columns || previous.rows !== output.rows) {
+  // Runtime frames may change their number of document rows as Planner and
+  // Agent phases arrive. Redraw the alternate screen atomically so a shorter
+  // phase cannot leave the previous phase text behind on an older row.
+  if (force || runtime || !previous || previous.columns !== output.columns || previous.rows !== output.rows) {
     writeFrame(() => {
       output.write("\x1b[2J\x1b[H");
       output.write(screen);
@@ -2308,7 +2441,10 @@ function redrawWorkspaceApp(output, {
     rows: output.rows,
     lines: nextLines,
   });
-  writeFrame(() => renderWorkspaceSelection(output, nextLines));
+  writeFrame(() => {
+    renderWorkspaceSelection(output, nextLines);
+    positionWorkspaceCursor(output, nextLines);
+  });
 }
 
 function supportsAppScreen(output) {

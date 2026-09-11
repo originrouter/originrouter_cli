@@ -154,25 +154,34 @@ export function mapCodexJsonLine(line, lineIndex = 0) {
       const action = payload.action || {};
       return [{
         ...base,
-        type: "agent.activity",
-        activity: "web_search",
+        type: "agent.tool_call.end",
+        tool: "WebSearch",
+        callId: payload.id || `web-search-${lineIndex}`,
         summary: action.type === "open_page"
           ? "Codex opened a web page"
           : action.type === "find_in_page"
             ? "Codex searched within a web page"
             : "Codex searched the web",
-        detail: String(action.query || action.pattern || action.url || "").slice(0, 4096),
-        metadata: { action: String(action.type || "search").slice(0, 32) },
+        input: displaySafeToolInput({
+          action: String(action.type || "search").slice(0, 32),
+          query: action.query,
+          pattern: action.pattern,
+          url: action.url,
+        }),
+        content: String(payload.status || "completed").slice(0, 128),
+        isError: payload.status === "failed",
         eventId: eventId(raw, lineIndex, "web-search"),
       }];
     }
     if (payload.type === "image_generation_call") {
       return [{
         ...base,
-        type: "agent.activity",
-        activity: "image_generation",
+        type: "agent.tool_call.end",
+        tool: "ImageGeneration",
+        callId: payload.id || `image-generation-${lineIndex}`,
         summary: "Codex image generation updated",
-        metadata: { status: String(payload.status || "").slice(0, 32) },
+        content: String(payload.status || "completed").slice(0, 32),
+        isError: payload.status === "failed",
         eventId: eventId(raw, lineIndex, "image-generation"),
       }];
     }

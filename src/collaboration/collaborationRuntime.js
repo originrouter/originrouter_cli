@@ -117,6 +117,7 @@ export function executionEventProjection(event = {}) {
     status: safeText(event.status, 32) || undefined,
     tool: safeText(event.tool || event.toolName || event.tool_name, 128) || undefined,
     call_id: safeText(event.callId || event.call_id, 191) || undefined,
+    lifecycle_id: safeText(event.lifecycleId || event.lifecycle_id, 195) || undefined,
     is_error: event.isError ?? event.is_error,
     duration_ms: event.durationMs ?? event.duration_ms,
     num_turns: event.numTurns ?? event.num_turns,
@@ -165,6 +166,11 @@ export function executionEventProjection(event = {}) {
     type,
     summary,
     detail,
+    visibility: ["summary", "detail", "diagnostic", "audit_only"].includes(
+      event.visibility,
+    )
+      ? event.visibility
+      : undefined,
     payload: type.startsWith("agent.interaction.") ? {
       ...projectedPayload,
       interaction_id: safeText(event.interactionId || event.callId, 191),
@@ -209,6 +215,9 @@ export function executionEventProjection(event = {}) {
     },
     metadata: {
       ...(activity ? { activity } : {}),
+      ...(safeText(event.lifecycleId || event.lifecycle_id, 195)
+        ? { lifecycle_id: safeText(event.lifecycleId || event.lifecycle_id, 195) }
+        : {}),
       ...(safeText(event.kind, 64) ? { kind: safeText(event.kind, 64) } : {}),
       ...(safeText(event.status, 32) ? { status: safeText(event.status, 32) } : {}),
       ...(safeText(event.toolName ?? event.tool_name, 128)

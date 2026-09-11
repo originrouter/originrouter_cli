@@ -1,4 +1,4 @@
-import { DEFAULT_RELAY_URL } from "../constants.js";
+import { DEFAULT_RELAY_URL, OFFICIAL_RELAY_URLS } from "../constants.js";
 import {
   buildRelayClientOptions,
   isRelayAuthOn,
@@ -36,7 +36,9 @@ export function normalizeAgentRelayMode(value, relayUrl = DEFAULT_RELAY_URL) {
 }
 
 export function isOfficialRelayUrl(relayUrl) {
-  return normalizedUrl(relayUrl) === normalizedUrl(DEFAULT_RELAY_URL);
+  return OFFICIAL_RELAY_URLS.some(
+    (candidate) => normalizedUrl(relayUrl) === normalizedUrl(candidate),
+  );
 }
 
 export async function buildAgentRelayPlan({

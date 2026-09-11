@@ -27,7 +27,6 @@ const DISPLAY_HOOK_EVENTS = [
   "InstructionsLoaded",
   "CwdChanged",
   "FileChanged",
-  "MessageDisplay",
   "PermissionDenied",
   "Setup",
   "UserPromptSubmit",

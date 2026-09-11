@@ -102,6 +102,12 @@ function schemaContainsSecret(value) {
 export function mapClaudeHookEvent(payload = {}) {
   const eventName = safeText(payload.hook_event_name || payload.hookEventName, 64);
   if (!eventName) return null;
+  // MessageDisplay is a presentation hook that can transform or hide an
+  // assistant message immediately before Claude Code paints it. The actual
+  // assistant content is already emitted through the transcript/SDK stream,
+  // so projecting this hook as a second conversation event creates one
+  // meaningless "Claude displayed a message" row per rendered response.
+  if (eventName === "MessageDisplay") return null;
   if (eventName === "Stop") {
     return {
       type: "agent.task.complete",
@@ -125,10 +131,35 @@ export function mapClaudeHookEvent(payload = {}) {
       id: safeText(payload.prompt_id || payload.uuid || payload.session_id, 128),
     };
   }
+  if (eventName === "SubagentStart" || eventName === "SubagentStop") {
+    const lifecycleId = safeText(
+      payload.task_id || payload.agent_id || payload.tool_use_id,
+      195,
+    );
+    const phase = eventName === "SubagentStart" ? "started" : "completed";
+    return {
+      type: `agent.subagent.${phase}`,
+      provider: "claude",
+      summary: phase === "started"
+        ? "Claude started a subagent"
+        : "Claude subagent completed",
+      lifecycleId,
+      taskId: safeText(payload.task_id, 195),
+      agentId: safeText(payload.agent_id, 195),
+      parentAgentId: safeText(payload.parent_agent_id, 195),
+      delegationId: lifecycleId,
+      delegationDetected: true,
+      ...(lifecycleId
+        ? { eventId: `claude_subagent_${lifecycleId}_${phase}` }
+        : {}),
+      metadata: {
+        agent_type: safeText(payload.agent_type, 128),
+        task_subject: safeText(payload.task_subject || payload.subject, 512),
+      },
+    };
+  }
   const activity = ({
     SessionEnd: "session_end",
-    SubagentStart: "subagent_started",
-    SubagentStop: "subagent_stopped",
     PreCompact: "context_compacting",
     PostCompact: "context_compacted",
     Notification: "notification",
@@ -141,7 +172,6 @@ export function mapClaudeHookEvent(payload = {}) {
     InstructionsLoaded: "instructions_loaded",
     CwdChanged: "cwd_changed",
     FileChanged: "file_changed",
-    MessageDisplay: "message_displayed",
     PermissionDenied: "permission_denied",
     Setup: "setup",
     UserPromptExpansion: "user_prompt_expanded",
@@ -150,8 +180,6 @@ export function mapClaudeHookEvent(payload = {}) {
   if (!activity) return null;
   const summary = ({
     SessionEnd: "Claude session is ending",
-    SubagentStart: "Claude started a subagent",
-    SubagentStop: "Claude subagent stopped",
     PreCompact: "Claude is compacting context",
     PostCompact: "Claude compacted the conversation context",
     Notification: safeText(payload.message || payload.text, 512) || "Claude notification",
@@ -164,16 +192,40 @@ export function mapClaudeHookEvent(payload = {}) {
     InstructionsLoaded: "Claude loaded instructions",
     CwdChanged: "Claude working directory changed",
     FileChanged: "Claude observed a file change",
-    MessageDisplay: safeText(payload.message || payload.text, 512) || "Claude displayed a message",
     PermissionDenied: "Claude denied a permission request",
     Setup: "Claude session setup updated",
     UserPromptExpansion: "Claude expanded a user prompt",
     ElicitationResult: `Claude MCP input ${safeText(payload.action, 32) || "completed"}`,
   })[eventName];
+  const hookIdentity = safeText(
+    payload.uuid
+      || payload.message_id
+      || payload.tool_use_id
+      || payload.task_id
+      || payload.agent_id,
+    128,
+  );
   return {
     type: "agent.activity",
     provider: "claude",
     activity,
+    visibility: ["PreCompact", "PostCompact"].includes(eventName)
+      ? "status"
+      : [
+          "Notification",
+          "ConfigChange",
+          "InstructionsLoaded",
+          "CwdChanged",
+          "FileChanged",
+          "Setup",
+          "UserPromptExpansion",
+          "ElicitationResult",
+        ].includes(eventName)
+        ? "diagnostic"
+        : "timeline",
+    ...(hookIdentity
+      ? { eventId: `claude_hook_${eventName}_${hookIdentity}` }
+      : {}),
     ...((eventName === "SubagentStart" || eventName === "SubagentStop")
       ? {
           taskId: safeText(payload.task_id, 195),

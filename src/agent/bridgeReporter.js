@@ -281,6 +281,12 @@ function displaySummaryForAgentEvent(event) {
   if (type === "agent.tool_call.start") return tool ? `Started ${tool}` : "Tool started";
   if (type === "agent.tool_call.end") return tool ? `Finished ${tool}` : "Tool finished";
   if (type === "agent.adapter.status") return "Agent runtime status changed";
+  if (type === "plan.updated") return "Execution plan updated";
+  if (type === "review.started") return "Review started";
+  if (type === "review.completed") return "Review completed";
+  if (type.startsWith("agent.subagent.")) {
+    return compactText(event?.summary, 512) || "Subagent status updated";
+  }
   if (type === "agent.activity") {
     return compactText(event?.summary || event?.message || event?.activity, 512) || "Agent activity updated";
   }
@@ -338,6 +344,10 @@ function projectRuntimeEvent({ eventType, event, summary, riskLevel }) {
       summary: compactText(summary, 512) || "Agent update",
       currentStep: compactText(summary, 255) || "Running",
     };
+  }
+
+  if (["diagnostic", "status", "internal", "audit_only"].includes(event?.visibility)) {
+    return null;
   }
 
   const rawNestedType = safeText(event?.type, 64);
@@ -448,6 +458,13 @@ function projectRuntimeEvent({ eventType, event, summary, riskLevel }) {
     "agent.task.failed",
     "agent.adapter.status",
     "agent.activity",
+    "plan.updated",
+    "review.started",
+    "review.completed",
+    "agent.subagent.started",
+    "agent.subagent.interacted",
+    "agent.subagent.interrupted",
+    "agent.subagent.completed",
   ]);
   if (!displaySafeEventTypes.has(nestedType)) return null;
 
@@ -657,6 +674,7 @@ export function createRuntimeEventReporter({
           status: rawEvent?.status || payload.status,
           type: rawEvent?.type || eventType,
           activity: rawEvent?.activity,
+          visibility: rawEvent?.visibility,
           metadata: rawEvent?.metadata,
           tool: rawEvent?.tool,
           call_id: rawEvent?.callId || rawEvent?.call_id,

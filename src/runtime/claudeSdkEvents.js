@@ -13,11 +13,19 @@ function messageEventId(message, role, blockIndex = 0) {
   return sourceId ? `claude_${String(sourceId).slice(0, 80)}_${role}_${blockIndex}` : undefined;
 }
 
-function activity(message, activityType, summary, detail = "", metadata = {}) {
+function activity(
+  message,
+  activityType,
+  summary,
+  detail = "",
+  metadata = {},
+  visibility = "timeline",
+) {
   return {
     type: "agent.activity",
     provider: "claude",
     activity: activityType,
+    visibility,
     summary: safeText(summary, 512),
     detail: safeText(detail, 4096),
     metadata: safeMetadata(metadata),
@@ -81,7 +89,7 @@ export function mapClaudeSdkMessage(message) {
       plugins: (message.plugins || []).slice(0, 64).map((plugin) => ({
         name: safeText(plugin?.name, 128),
       })),
-    }));
+    }, "diagnostic"));
   }
 
   if (message.type === "assistant") {
@@ -245,7 +253,7 @@ export function mapClaudeSdkMessage(message) {
       pre_tokens: message.compact_metadata?.pre_tokens,
       post_tokens: message.compact_metadata?.post_tokens,
       duration_ms: message.compact_metadata?.duration_ms,
-    }));
+    }, "status"));
   }
 
   if (message.type === "system" && ["hook_started", "hook_progress", "hook_response"].includes(message.subtype)) {
@@ -265,6 +273,7 @@ export function mapClaudeSdkMessage(message) {
         outcome: message.outcome,
         exit_code: message.exit_code,
       },
+      "diagnostic",
     );
     background.taskId = safeText(message.task_id, 195);
     background.agentId = safeText(message.agent_id, 195);
@@ -344,21 +353,21 @@ export function mapClaudeSdkMessage(message) {
       mode: message.mode,
       count: message.memories?.length || 0,
       scopes,
-    }));
+    }, "diagnostic"));
   }
 
   if (message.type === "system" && message.subtype === "plugin_install") {
     events.push(activity(message, "plugin_install", `Claude plugin install ${message.status}`, message.error, {
       status: message.status,
       name: message.name,
-    }));
+    }, "diagnostic"));
   }
 
   if (message.type === "system" && message.subtype === "commands_changed") {
     events.push(activity(message, "commands_changed", "Claude command list changed", "", {
       count: message.commands?.length || 0,
       commands: (message.commands || []).slice(0, 64).map((command) => safeText(command?.name || command, 128)),
-    }));
+    }, "diagnostic"));
   }
 
   if (message.type === "system" && message.subtype === "files_persisted") {
@@ -378,7 +387,7 @@ export function mapClaudeSdkMessage(message) {
       key: message.key,
       priority: message.priority,
       timeout_ms: message.timeout_ms,
-    }));
+    }, "diagnostic"));
   }
 
   if (message.type === "system" && message.subtype === "local_command_output") {
@@ -392,14 +401,21 @@ export function mapClaudeSdkMessage(message) {
   }
 
   if (message.type === "prompt_suggestion") {
-    events.push(activity(message, "prompt_suggestion", "Claude suggested a follow-up prompt", message.suggestion));
+    events.push(activity(
+      message,
+      "prompt_suggestion",
+      "Claude suggested a follow-up prompt",
+      message.suggestion,
+      {},
+      "diagnostic",
+    ));
   }
 
   if (message.type === "system" && message.subtype === "elicitation_complete") {
     events.push(activity(message, "elicitation_complete", "MCP input request completed", "", {
       mcp_server_name: message.mcp_server_name,
       elicitation_id: message.elicitation_id,
-    }));
+    }, "diagnostic"));
   }
 
   if (message.type === "system" && message.subtype === "mirror_error") {

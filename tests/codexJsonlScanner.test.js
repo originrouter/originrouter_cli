@@ -52,7 +52,7 @@ assert.deepEqual(
     "agent.activity",
     "agent.activity",
     "agent.thinking",
-    "agent.activity",
+    "agent.tool_call.end",
   ],
 );
 
@@ -108,7 +108,7 @@ assert.deepEqual(
     "agent.activity",
     "agent.activity",
     "agent.thinking",
-    "agent.activity",
+    "agent.tool_call.end",
   ],
 );
 const liveAssistant = mapCodexJsonLine(JSON.stringify(lines[3]), 3)[0];

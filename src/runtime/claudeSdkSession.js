@@ -18,7 +18,7 @@ import {
 import { buildAgentProviderEnv } from "../config/claudeConfig.js";
 import { createTelemetryPipeline } from "../telemetry/index.js";
 import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
-import { DEFAULT_DEVICE_ID, DEFAULT_RELAY_URL } from "../constants.js";
+import { DEFAULT_DEVICE_ID } from "../constants.js";
 import {
   readLocalProxySnapshot,
   staticProxyStatusFn,
@@ -35,6 +35,7 @@ import {
   relayModeDescription,
 } from "../relay/agentRelayPolicy.js";
 import { RelayClient } from "../relay/relayClient.js";
+import { resolveRelayEndpoint } from "../relay/relayEndpointSelector.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 import { LocalAgentBridgeClient } from "../local/localAgentBridgeClient.js";
 import { agentGatewayMcpConfig } from "../mcp/agentGatewayConfig.js";
@@ -311,11 +312,11 @@ export async function runClaudeSdkSession(rawArgs) {
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
   const options = extractOriginRouterOptions(rawArgs);
   const relayConfig = readLocalApiConfig();
-  const relayUrl =
+  const configuredRelayUrl =
     options.relay ||
     process.env.ORIGINROUTER_RELAY ||
-    relayConfig.relayUrl ||
-    DEFAULT_RELAY_URL;
+    relayConfig.relayUrl;
+  const { relayUrl } = await resolveRelayEndpoint({ configuredRelayUrl });
   const relayMode = normalizeAgentRelayMode(
     options.relayMode || relayConfig.relayMode,
     relayUrl,
