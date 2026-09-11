@@ -1,4 +1,4 @@
-export const VERSION = "0.2.2";
+export const VERSION = "0.3.0";
 export const DEFAULT_RELAY_URL = "https://app.easytransnote.com";
 // Public control-plane aliases backed by the same OriginRouter service.
 // Keep this list deliberately small and code-owned: callers must never probe

@@ -120,7 +120,7 @@ try {
 
   const startupDir = join(root, "startup");
   writeUpdateState(startupDir, {
-    latest_version: "0.2.3",
+    latest_version: "0.3.1",
     last_checked_at: checkedAt.toISOString(),
   });
   const dismissed = await handleStartupUpdate({
@@ -130,11 +130,11 @@ try {
     promptFn: async () => "dismiss",
   });
   assert.equal(dismissed.continue, true);
-  assert.equal(readUpdateState(startupDir).dismissed_version, "0.2.3");
+  assert.equal(readUpdateState(startupDir).dismissed_version, "0.3.1");
 
   const failedStartupDir = join(root, "failed-startup");
   writeUpdateState(failedStartupDir, {
-    latest_version: "0.2.3",
+    latest_version: "0.3.1",
     last_checked_at: checkedAt.toISOString(),
   });
   const originalLog = console.log;
@@ -156,7 +156,7 @@ try {
 
   const installDir = join(root, "install");
   writeUpdateState(installDir, {
-    latest_version: "0.2.3",
+    latest_version: "0.3.1",
     last_checked_at: checkedAt.toISOString(),
   });
   const oldHome = process.env.ORIGINROUTER_HOME;
@@ -170,7 +170,7 @@ try {
     installContext: { ...npmContext, writable: true },
     forceCheck: false,
     serviceInstalledFn: () => false,
-    readInstalledVersionFn: () => "0.2.3",
+    readInstalledVersionFn: () => "0.3.1",
     spawnFn: (command, args) => {
       spawned = { command, args };
       const child = new EventEmitter();
@@ -181,7 +181,7 @@ try {
   });
   assert.equal(result.updated, true);
   assert.equal(spawned.command, "npm");
-  assert.deepEqual(spawned.args, ["install", "--global", "@originrouter/cli@0.2.3"]);
+  assert.deepEqual(spawned.args, ["install", "--global", "@originrouter/cli@0.3.1"]);
   assert.equal(result.restart_required, true);
   assert.equal(result.status.restart_required, true);
   assert.equal(result.status.update_available, false);
@@ -244,7 +244,7 @@ try {
 
   const mismatchDir = join(root, "mismatch");
   writeUpdateState(mismatchDir, {
-    latest_version: "0.2.3",
+    latest_version: "0.3.1",
     last_checked_at: checkedAt.toISOString(),
   });
   await assert.rejects(
@@ -267,7 +267,7 @@ try {
 
   const permissionDir = join(root, "permission");
   writeUpdateState(permissionDir, {
-    latest_version: "0.2.3",
+    latest_version: "0.3.1",
     last_checked_at: checkedAt.toISOString(),
   });
   await assert.rejects(

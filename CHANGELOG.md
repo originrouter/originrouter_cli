@@ -5,6 +5,46 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ## Unreleased
 
+## 0.3.0 - 2026-09-11
+
+### Added
+
+- Added guided cross-platform setup for Claude Code, Codex, the OriginRouter
+  background service, managed Python, and the Local Proxy runtime.
+- Added shell completion installation and removal for Bash, Zsh, Fish, and
+  PowerShell.
+- Added collaboration protocol v2 with explicit delegation boundaries, task
+  lifecycle tracking, planner metadata, remote assignment support, and safer
+  confirmation modes.
+- Added automatic selection of the fastest healthy official Relay endpoint
+  while preserving explicit Relay configuration.
+
+### Changed
+
+- Redesigned the Agent Workspace header, footer, history navigation, text
+  selection, cursor placement, and screen redraw behavior.
+- Normalized Claude and Codex events for plans, reviews, subagents, tool calls,
+  lifecycle tracking, and visibility levels.
+- Improved Local Proxy installation verification, recovery of broken
+  environments, and Windows path handling.
+- Refreshed installation guidance, architecture documentation, CLI help, and
+  release assets.
+- Expanded regression coverage across adapters, collaboration, setup, Relay
+  selection, and Workspace interactions.
+- Collaboration confirmation now defaults to `required`; use `--yes` for
+  explicit always-auto confirmation.
+
+### Fixed
+
+- Prevented Claude `MessageDisplay` hooks from creating duplicate conversation
+  entries.
+- Prevented clean session exits and runtime diagnostics from being reported as
+  duplicate task outcomes.
+- Preserved real task failures and completions for user-facing notifications.
+- Mapped Codex web-search and image-generation events to structured tool-call
+  results.
+- Improved handling of interrupted tasks and remote Agent execution states.
+
 ## 0.2.2 - 2026-08-24
 
 ### Added
