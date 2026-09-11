@@ -310,7 +310,7 @@ try {
     assert.deepEqual(body.remoteShare.catalog, []);
     assert.equal(body.compatibility.revision, 2);
     assert.equal(body.compatibility.automatic_updates, true);
-    assert.equal(body.updates.current_version, "0.2.2");
+    assert.equal(body.updates.current_version, "0.3.0");
     assert.equal(body.updates.mode, "prompt");
   }
 
@@ -318,7 +318,7 @@ try {
   {
     const { status, body } = await getJson("/updates/status");
     assert.equal(status, 200);
-    assert.equal(body.current_version, "0.2.2");
+    assert.equal(body.current_version, "0.3.0");
     assert.equal(body.mode, "prompt");
   }
 
