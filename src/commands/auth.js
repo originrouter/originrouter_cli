@@ -184,17 +184,9 @@ export async function handleLogin(args, {
       ? cliDeviceDisplayName(requestedDeviceName)
       : undefined,
   });
-  const storedBeforeLogin = readDeviceE2eeIdentity(stateDir);
-  const matchingStoredIdentity = storedBeforeLogin
-    && storedBeforeLogin.public_identity.device_id === device.deviceId
-    ? storedBeforeLogin
-    : null;
-  const enrollmentIdentity = matchingStoredIdentity ??
-    createDeviceE2eeIdentityCandidate(stateDir, {
-      deviceId: device.deviceId,
-      epoch: 1,
-    });
-  const candidateNeedsCommit = matchingStoredIdentity == null;
+  let enrollmentIdentity = null;
+  let enrollmentScope = null;
+  let candidateNeedsCommit = false;
   const deviceNeedsCommit = installedDevice == null;
   try {
     const credential = await loginWithDeviceFlow({
@@ -205,9 +197,22 @@ export async function handleLogin(args, {
         (requestedDeviceName && cliDeviceDisplayName(requestedDeviceName)) ||
         device.displayName ||
         defaultDeviceDisplayName(),
-      e2eeIdentity: enrollmentIdentity.public_identity,
-      signEnrollmentChallenge: (challenge) =>
-        signDeviceE2eeEnrollment(enrollmentIdentity, challenge),
+      e2eeIdentity: async (accountScope) => {
+        enrollmentScope = accountScope;
+        const stored = readDeviceE2eeIdentity(stateDir, { accountScope });
+        const matching = stored && stored.public_identity.device_id === device.deviceId
+          ? stored
+          : null;
+        enrollmentIdentity = matching || createDeviceE2eeIdentityCandidate(stateDir, {
+          deviceId: device.deviceId,
+          epoch: 1,
+          accountScope,
+        });
+        candidateNeedsCommit = matching == null;
+        return enrollmentIdentity;
+      },
+      signEnrollmentChallenge: (challenge, _accountScope, identity) =>
+        signDeviceE2eeEnrollment(identity || enrollmentIdentity, challenge),
       noBrowser: args.includes("--no-browser"),
       fetchFn,
     });
@@ -216,10 +221,10 @@ export async function handleLogin(args, {
       updateDeviceDisplayName(requestedDeviceName, stateDir);
     }
     if (candidateNeedsCommit) {
-      commitDeviceE2eeIdentity(stateDir, enrollmentIdentity);
+      commitDeviceE2eeIdentity(stateDir, enrollmentIdentity, { accountScope: enrollmentScope });
     }
     persistOAuthCredential({ stateDir, credential });
-    const e2ee = readDeviceE2eeIdentity(stateDir);
+    const e2ee = readDeviceE2eeIdentity(stateDir, { accountScope: credential.accountScope || enrollmentScope });
     let registered = null;
     let registrationError = null;
     try {
@@ -255,10 +260,10 @@ export async function handleLogin(args, {
     }
   } catch (error) {
     if (error?.code === "device_flow_denied") {
-      invalidateDeviceE2eeIdentity(stateDir);
+      invalidateDeviceE2eeIdentity(stateDir, { accountScope: enrollmentScope });
       invalidateDevice(stateDir);
     } else {
-      discardDeviceE2eeIdentityCandidate(stateDir);
+      discardDeviceE2eeIdentityCandidate(stateDir, { accountScope: enrollmentScope });
       discardDeviceCandidate(stateDir);
     }
     formatCliError(error);
@@ -277,7 +282,7 @@ export async function handleLogout(args = [], {
   }
   if (args.includes("--remove-device")) {
     const device = readDevice();
-    const identity = readDeviceE2eeIdentity(stateDir);
+    const identity = readDeviceE2eeIdentity(stateDir, { accountScope: stored.accountScope });
     if (!device || !identity) {
       reportCliError("This device identity is incomplete.", {
         next: "Run `originrouter logout` to clear the local session, then sign in again.",
@@ -296,7 +301,7 @@ export async function handleLogout(args = [], {
       discardPendingTelemetryForSession(stateDir, stored.sessionId);
       clearCodingAuth(stateDir);
       resetCloudRoutesFn();
-      invalidateDeviceE2eeIdentity(stateDir);
+      invalidateDeviceE2eeIdentity(stateDir, { accountScope: stored.accountScope });
       invalidateDevice(stateDir);
       console.log("Signed out and removed this device from the account.");
       console.log("A later sign-in will register it as a new device.");

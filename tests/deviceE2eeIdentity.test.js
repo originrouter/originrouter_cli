@@ -113,6 +113,23 @@ try {
   assert.equal(reset.public_identity.key_version, 1);
   assert.equal(reset.public_identity.previous_key_id, null);
   assert.notEqual(reset.public_identity.key_id, stored.public_identity.key_id);
+
+  const accountA = ensureDeviceE2eeIdentity(stateDir, {
+    deviceId: "cli-test",
+    accountScope: "sha256:account-a",
+  });
+  const accountB = ensureDeviceE2eeIdentity(stateDir, {
+    deviceId: "cli-test",
+    accountScope: "sha256:account-b",
+  });
+  assert.notEqual(accountA.public_identity.key_id, accountB.public_identity.key_id);
+  assert.equal(
+    ensureDeviceE2eeIdentity(stateDir, {
+      deviceId: "cli-test",
+      accountScope: "sha256:account-a",
+    }).public_identity.key_id,
+    accountA.public_identity.key_id,
+  );
 } finally {
   rmSync(stateDir, { recursive: true, force: true });
 }

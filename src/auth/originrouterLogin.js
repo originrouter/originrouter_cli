@@ -5,6 +5,7 @@ import { KEY_KIND, KEY_SOURCE } from "../runtime/authContract.js";
 import {
   AuthClientError,
   bindDeviceE2eeIdentity,
+  getDeviceAuthorizationStatus,
   pollDeviceToken,
   refreshOAuthToken,
   requestDeviceCode,
@@ -71,6 +72,7 @@ async function completeBundle({
   control,
   deviceId,
   deviceName,
+  accountScope,
   fetchFn,
 }) {
   const tokenEndpoint = `${suretyBaseUrl.replace(/\/+$/, "")}/api/oauth/token`;
@@ -89,6 +91,7 @@ async function completeBundle({
       source: KEY_SOURCE.ORIGINROUTER_CLI,
       deviceId,
       deviceName: deviceName || deviceId,
+      accountScope,
       sessionId: control.session_id,
       refreshToken: rotatedRefreshToken(control),
       refreshExpiresAt:
@@ -139,6 +142,7 @@ async function completeBundle({
     source: KEY_SOURCE.ORIGINROUTER_CLI,
     deviceId,
     deviceName: deviceName || deviceId,
+    accountScope,
     sessionId: memory.session_id || relay.session_id || control.session_id,
     refreshToken,
     refreshExpiresAt: Date.now() + Number(memory.refresh_expires_in || 2592000) * 1000,
@@ -190,17 +194,6 @@ export async function loginWithDeviceFlow({
       || !issued.enrollment_challenge?.startsWith("or_ch_")) {
     throw new AuthClientError({ code: "device_code_invalid_response" });
   }
-  const bindingSignature = await signEnrollmentChallenge(
-    issued.enrollment_challenge,
-  );
-  await bindDeviceE2eeIdentity({
-    suretyBaseUrl,
-    deviceCode: issued.device_code,
-    enrollmentChallenge: issued.enrollment_challenge,
-    identity: e2eeIdentity,
-    bindingSignature,
-    fetchFn,
-  });
   const verificationUriComplete = verificationUrlFor({
     loginBaseUrl,
     userCode: issued.user_code,
@@ -209,6 +202,49 @@ export async function loginWithDeviceFlow({
   printFn(`!   ${verificationUriComplete}`);
   printFn(`! Your code: ${issued.user_code}`);
   if (!noBrowser) await openBrowserFn(verificationUriComplete);
+
+  let accountScope = null;
+  if (typeof e2eeIdentity === "function") {
+    const scopeDeadline = Date.now() + Math.min(timeoutMs, Number(issued.expires_in || 600) * 1000);
+    while (Date.now() < scopeDeadline) {
+      try {
+        const status = await getDeviceAuthorizationStatus({
+          suretyBaseUrl,
+          deviceCode: issued.device_code,
+          fetchFn,
+        });
+        if (typeof status?.account_scope === "string" && status.account_scope) {
+          accountScope = status.account_scope;
+          break;
+        }
+      } catch {
+        // Keep waiting through transient authority failures.
+      }
+      await sleepFn(Math.max(1000, initialIntervalMs));
+    }
+    if (!accountScope) throw new AuthClientError({ code: "device_account_scope_timeout" });
+  } else {
+    // Backward-compatible API mode for embedders that already resolved an
+    // identity. The CLI login command always uses the scoped callback above.
+    accountScope = "legacy";
+  }
+
+  const resolvedIdentity = typeof e2eeIdentity === "function"
+    ? await e2eeIdentity(accountScope)
+    : e2eeIdentity;
+  const resolvedSigner = typeof signEnrollmentChallenge === "function"
+    ? (challenge) => signEnrollmentChallenge(challenge, accountScope, resolvedIdentity)
+    : signEnrollmentChallenge;
+
+  const bindingSignature = await resolvedSigner(issued.enrollment_challenge);
+  await bindDeviceE2eeIdentity({
+    suretyBaseUrl,
+    deviceCode: issued.device_code,
+    enrollmentChallenge: issued.enrollment_challenge,
+    identity: resolvedIdentity.public_identity || resolvedIdentity,
+    bindingSignature,
+    fetchFn,
+  });
 
   const deadline = Date.now() + Math.min(timeoutMs, Number(issued.expires_in || 600) * 1000);
   let intervalMs = Number(issued.interval || initialIntervalMs / 1000) * 1000;
@@ -226,6 +262,7 @@ export async function loginWithDeviceFlow({
         control,
         deviceId,
         deviceName,
+        accountScope,
         fetchFn,
       });
       printFn("✓ Authorization received.");

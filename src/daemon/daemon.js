@@ -55,6 +55,7 @@ import {
   readDeviceE2eeIdentity,
   resetDeviceE2eeIdentityForEpoch,
 } from "../crypto/deviceE2eeIdentity.js";
+import { readCodingAuth } from "../persistence/codingAuth.js";
 import {
   getCliDeviceE2eeDirectory,
   getCliDeviceE2eeStatus,
@@ -194,6 +195,7 @@ export async function startDaemon(args) {
   // background loop below; when `originrouter login` writes fresh credentials,
   // the next loop iteration picks them up and connects the remote bridge.
   let effectiveDeviceId = device.deviceId;
+  let accountScope = readCodingAuth(stateDir)?.accountScope;
   let relayAuthState = "pending";
   let relayAuthError = null;
   const relayClient = new RelayClient({
@@ -201,7 +203,7 @@ export async function startDaemon(args) {
     deviceId: effectiveDeviceId,
     authToken: null,
   });
-  let deviceE2eeEpoch = readDeviceE2eeIdentity(stateDir)?.public_identity?.epoch || 1;
+  let deviceE2eeEpoch = readDeviceE2eeIdentity(stateDir, { accountScope })?.public_identity?.epoch || 1;
   try {
     const credential = await ensureFreshAccessToken({ stateDir });
     const accessToken = credential?.accessTokens?.control?.token;
@@ -213,12 +215,13 @@ export async function startDaemon(args) {
       deviceE2eeEpoch = Number(status?.policy?.epoch || deviceE2eeEpoch);
     }
   } catch {}
-  const storedDeviceE2eeIdentity = readDeviceE2eeIdentity(stateDir);
+  const storedDeviceE2eeIdentity = readDeviceE2eeIdentity(stateDir, { accountScope });
   let deviceE2eeIdentity;
   if (!storedDeviceE2eeIdentity) {
     deviceE2eeIdentity = ensureDeviceE2eeIdentity(stateDir, {
       deviceId: effectiveDeviceId,
       epoch: deviceE2eeEpoch,
+      accountScope,
     });
   } else if (
     storedDeviceE2eeIdentity.public_identity.device_id !== effectiveDeviceId
@@ -227,6 +230,7 @@ export async function startDaemon(args) {
     deviceE2eeIdentity = resetDeviceE2eeIdentityForEpoch(stateDir, {
       deviceId: effectiveDeviceId,
       epoch: deviceE2eeEpoch,
+      accountScope,
     });
   } else {
     deviceE2eeIdentity = storedDeviceE2eeIdentity;
@@ -234,7 +238,7 @@ export async function startDaemon(args) {
   const deviceE2eeRelay = new DeviceE2eeRelayTransport({
     relayClient,
     localIdentity: deviceE2eeIdentity,
-    localIdentityProvider: () => readDeviceE2eeIdentity(stateDir),
+    localIdentityProvider: () => readDeviceE2eeIdentity(stateDir, { accountScope }),
     stateDir,
     controlBaseUrl: relayUrl,
     credentialProvider: () => ensureFreshAccessToken({ stateDir }),
@@ -242,7 +246,7 @@ export async function startDaemon(args) {
   const deviceE2eeLocalGateway = new DeviceE2eeLocalGateway({
     stateDir,
     localIdentity: deviceE2eeIdentity,
-    localIdentityProvider: () => readDeviceE2eeIdentity(stateDir),
+    localIdentityProvider: () => readDeviceE2eeIdentity(stateDir, { accountScope }),
     apiTokenPath: apiTokenFile,
   });
   const operationReviewer = new AiOperationReviewer({ stateDir });
@@ -681,29 +685,36 @@ export async function startDaemon(args) {
     return identity;
   };
   const currentDeviceE2eeIdentity = ({ deviceId, epoch } = {}) => {
-    const stored = readDeviceE2eeIdentity(stateDir);
+    const stored = readDeviceE2eeIdentity(stateDir, { accountScope });
     if (!stored) {
       return activateDeviceE2eeIdentity(ensureDeviceE2eeIdentity(stateDir, {
         deviceId: deviceId || effectiveDeviceId,
         epoch: epoch || 1,
+        accountScope,
       }), "identity initialized");
     }
     if (deviceId && stored.public_identity.device_id !== deviceId) {
       return activateDeviceE2eeIdentity(resetDeviceE2eeIdentityForEpoch(stateDir, {
         deviceId,
         epoch: epoch || stored.public_identity.epoch,
+        accountScope,
       }), "authenticated device changed");
     }
     if (epoch && stored.public_identity.epoch !== epoch) {
       return activateDeviceE2eeIdentity(resetDeviceE2eeIdentityForEpoch(stateDir, {
         deviceId: deviceId || stored.public_identity.device_id,
         epoch,
+        accountScope,
       }), "account epoch changed");
     }
     return activateDeviceE2eeIdentity(stored, "identity file changed");
   };
   const syncDeviceE2eeIdentity = async ({ deviceId = effectiveDeviceId } = {}) => {
     const credential = await ensureFreshAccessToken({ stateDir });
+    if (credential?.accountScope && credential.accountScope !== accountScope) {
+      accountScope = credential.accountScope;
+      registeredDeviceE2eeKeyId = null;
+    }
     const accessToken = credential?.accessTokens?.control?.token;
     if (!accessToken) return;
     const authenticatedDeviceId = credential.deviceId || deviceId;

@@ -121,6 +121,21 @@ export async function bindDeviceE2eeIdentity({
   );
 }
 
+export async function getDeviceAuthorizationStatus({
+  suretyBaseUrl,
+  deviceCode,
+  fetchFn = globalThis.fetch,
+}) {
+  return requestForm(
+    `${base(suretyBaseUrl)}/api/oauth/device/status`,
+    [
+      ["client_id", "originrouter_cli"],
+      ["device_code", deviceCode],
+    ],
+    { fetchFn },
+  );
+}
+
 export async function refreshOAuthToken({
   tokenEndpoint,
   refreshToken,

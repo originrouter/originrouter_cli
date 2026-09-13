@@ -25,12 +25,27 @@ const REMOVAL_DOMAIN = "originrouter/device-removal/v2\n";
 const LOCAL_AUTH_DOMAIN = "originrouter/local-e2ee-device-auth/v1\n";
 const FILE_MODE = 0o600;
 
-function identityPath(stateDir) {
-  return join(stateDir, "device-e2ee-v2.json");
+function scopeSegment(accountScope) {
+  if (accountScope == null || accountScope === "") return null;
+  const value = String(accountScope);
+  if (!/^[A-Za-z0-9:_-]{8,128}$/.test(value)) {
+    throw new Error("invalid device E2EE account scope");
+  }
+  return value;
 }
 
-function pendingIdentityPath(stateDir) {
-  return join(stateDir, "device-e2ee-v2.pending.json");
+function identityPath(stateDir, accountScope) {
+  const scope = scopeSegment(accountScope);
+  return scope
+    ? join(stateDir, "accounts", scope, "device-e2ee-v2.json")
+    : join(stateDir, "device-e2ee-v2.json");
+}
+
+function pendingIdentityPath(stateDir, accountScope) {
+  const scope = scopeSegment(accountScope);
+  return scope
+    ? join(stateDir, "accounts", scope, "device-e2ee-v2.pending.json")
+    : join(stateDir, "device-e2ee-v2.pending.json");
 }
 
 function canonicalValue(value) {
@@ -148,8 +163,8 @@ function generateIdentity({ deviceId, epoch, keyVersion, previous = null, now = 
   };
 }
 
-export function readDeviceE2eeIdentity(stateDir) {
-  const path = identityPath(stateDir);
+export function readDeviceE2eeIdentity(stateDir, { accountScope } = {}) {
+  const path = identityPath(stateDir, accountScope);
   if (!existsSync(path)) return null;
   const parsed = JSON.parse(readFileSync(path, "utf8"));
   if (parsed?.public_identity?.protocol !== DEVICE_E2EE_PROTOCOL) {
@@ -158,8 +173,8 @@ export function readDeviceE2eeIdentity(stateDir) {
   return parsed;
 }
 
-export function ensureDeviceE2eeIdentity(stateDir, { deviceId, epoch = 1 } = {}) {
-  const existing = readDeviceE2eeIdentity(stateDir);
+export function ensureDeviceE2eeIdentity(stateDir, { deviceId, epoch = 1, accountScope } = {}) {
+  const existing = readDeviceE2eeIdentity(stateDir, { accountScope });
   if (existing) {
     if (existing.public_identity.device_id !== deviceId) {
       throw new Error("stored device E2EE identity belongs to another device");
@@ -170,7 +185,7 @@ export function ensureDeviceE2eeIdentity(stateDir, { deviceId, epoch = 1 } = {})
     return existing;
   }
   const created = generateIdentity({ deviceId, epoch, keyVersion: 1 });
-  writePrivate(identityPath(stateDir), created);
+  writePrivate(identityPath(stateDir, accountScope), created);
   return created;
 }
 
@@ -179,9 +194,9 @@ export function ensureDeviceE2eeIdentity(stateDir, { deviceId, epoch = 1 } = {})
 // confirmation have both completed.
 export function createDeviceE2eeIdentityCandidate(
   stateDir,
-  { deviceId, epoch = 1 } = {},
+  { deviceId, epoch = 1, accountScope } = {},
 ) {
-  const pendingPath = pendingIdentityPath(stateDir);
+  const pendingPath = pendingIdentityPath(stateDir, accountScope);
   if (existsSync(pendingPath)) {
     // A candidate is scoped to one login attempt. A later invocation treats
     // it exactly like no local login key and starts with fresh key material.
@@ -195,11 +210,11 @@ export function createDeviceE2eeIdentityCandidate(
   return candidate;
 }
 
-export function commitDeviceE2eeIdentity(stateDir, candidate) {
+export function commitDeviceE2eeIdentity(stateDir, candidate, { accountScope } = {}) {
   if (!candidate?.public_identity || !verifyDeviceE2eeIdentity(candidate.public_identity)) {
     throw new Error("invalid device E2EE identity candidate");
   }
-  const pendingPath = pendingIdentityPath(stateDir);
+  const pendingPath = pendingIdentityPath(stateDir, accountScope);
   const pending = existsSync(pendingPath)
     ? JSON.parse(readFileSync(pendingPath, "utf8"))
     : null;
@@ -208,24 +223,24 @@ export function commitDeviceE2eeIdentity(stateDir, candidate) {
     throw new Error("pending device E2EE identity does not match");
   }
   const verified = { ...candidate, verification_status: "verified" };
-  writePrivate(identityPath(stateDir), verified);
+  writePrivate(identityPath(stateDir, accountScope), verified);
   unlinkSync(pendingPath);
   return verified;
 }
 
-export function discardDeviceE2eeIdentityCandidate(stateDir) {
-  const path = pendingIdentityPath(stateDir);
+export function discardDeviceE2eeIdentityCandidate(stateDir, { accountScope } = {}) {
+  const path = pendingIdentityPath(stateDir, accountScope);
   if (existsSync(path)) unlinkSync(path);
 }
 
-export function invalidateDeviceE2eeIdentity(stateDir) {
-  for (const path of [identityPath(stateDir), pendingIdentityPath(stateDir)]) {
+export function invalidateDeviceE2eeIdentity(stateDir, { accountScope } = {}) {
+  for (const path of [identityPath(stateDir, accountScope), pendingIdentityPath(stateDir, accountScope)]) {
     if (existsSync(path)) unlinkSync(path);
   }
 }
 
-export function prepareDeviceE2eeRotation(stateDir, { deviceId, now = new Date() } = {}) {
-  const previous = readDeviceE2eeIdentity(stateDir);
+export function prepareDeviceE2eeRotation(stateDir, { deviceId, now = new Date(), accountScope } = {}) {
+  const previous = readDeviceE2eeIdentity(stateDir, { accountScope });
   if (!previous) throw new Error("device E2EE identity is not initialized");
   if (previous.public_identity.device_id !== deviceId) {
     throw new Error("stored device E2EE identity belongs to another device");
@@ -241,7 +256,7 @@ export function prepareDeviceE2eeRotation(stateDir, { deviceId, now = new Date()
     previous,
     next,
     commit() {
-      writePrivate(identityPath(stateDir), next);
+      writePrivate(identityPath(stateDir, accountScope), next);
       return next;
     },
   };
@@ -338,7 +353,7 @@ export function signCurrentDeviceRemoval(identity, { now = new Date() } = {}) {
 
 export function resetDeviceE2eeIdentityForEpoch(
   stateDir,
-  { deviceId, epoch, now = new Date() } = {},
+  { deviceId, epoch, now = new Date(), accountScope } = {},
 ) {
   if (!Number.isSafeInteger(epoch) || epoch <= 0) {
     throw new Error("invalid device E2EE account epoch");
@@ -349,7 +364,7 @@ export function resetDeviceE2eeIdentityForEpoch(
     keyVersion: 1,
     now,
   });
-  writePrivate(identityPath(stateDir), created);
+  writePrivate(identityPath(stateDir, accountScope), created);
   return created;
 }
 
@@ -395,6 +410,6 @@ export function verifyDeviceE2eeRotation(previous, next) {
   );
 }
 
-export function deviceE2eeIdentityPath(stateDir) {
-  return identityPath(stateDir);
+export function deviceE2eeIdentityPath(stateDir, { accountScope } = {}) {
+  return identityPath(stateDir, accountScope);
 }

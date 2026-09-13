@@ -5,6 +5,7 @@ import {
 } from "../crypto/deviceE2eeIdentity.js";
 import { DEFAULT_ORIGINROUTER_CONTROL_BASE_URL } from "../config/providerRoutes.js";
 import { ensureDevice, ensureStateDir } from "../persistence/state.js";
+import { readCodingAuth } from "../persistence/codingAuth.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import {
   getCliDeviceE2eeStatus,
@@ -31,7 +32,8 @@ async function credential(stateDir) {
 async function status() {
   const stateDir = ensureStateDir();
   const device = ensureDevice();
-  const local = readDeviceE2eeIdentity(stateDir);
+  const accountScope = readCodingAuth(stateDir)?.accountScope;
+  const local = readDeviceE2eeIdentity(stateDir, { accountScope });
   if (!local) {
     console.log("Device encryption identity: not initialized");
     console.log("Run `originrouter login` to initialize and register it.");
@@ -60,10 +62,12 @@ async function status() {
 async function rotate() {
   const stateDir = ensureStateDir();
   const device = ensureDevice();
-  ensureDeviceE2eeIdentity(stateDir, { deviceId: device.deviceId });
   const auth = await credential(stateDir);
+  const accountScope = auth.accountScope;
+  ensureDeviceE2eeIdentity(stateDir, { deviceId: device.deviceId, accountScope });
   const prepared = prepareDeviceE2eeRotation(stateDir, {
     deviceId: device.deviceId,
+    accountScope,
   });
   const registered = await registerCliDeviceE2eeIdentity({
     controlBaseUrl: controlBaseUrl(),
