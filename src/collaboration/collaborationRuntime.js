@@ -3008,7 +3008,7 @@ export class CollaborationRuntime {
     void this.syncRun(runId);
   }
 
-  async syncRun(runId, { reconciliationId = "" } = {}) {
+  async syncRun(runId, { syncMode = "realtime" } = {}) {
     if (!this.relayClient) return false;
     const run = this.store.getRun(runId, { includeMessages: false });
     if (!run) return false;
@@ -3041,10 +3041,12 @@ export class CollaborationRuntime {
         counters: run.counters,
         createdAt: Math.floor(new Date(run.created_at).getTime() / 1000),
         finishedAt: run.finished_at ? Math.floor(new Date(run.finished_at).getTime() / 1000) : null,
+        syncMode: syncMode === "reconciliation" ? "reconciliation" : "realtime",
       };
-      const reconcileSuffix = safeText(reconciliationId, 32);
       await this.sendRemoteDurable("collaboration.run.project", payload, {
-        outboxId: `projection:${compactId(run.run_id, 105)}:${Math.max(0, Number(run.revision || 0))}${reconcileSuffix ? `:${reconcileSuffix}` : ""}`,
+        // Projection identity is stable across reconnects.  A reconciliation
+        // pass must not manufacture a new outbox item for every connection.
+        outboxId: `projection:${compactId(run.run_id, 105)}:${Math.max(0, Number(run.revision || 0))}`,
       });
       return true;
     } catch {
@@ -3075,7 +3077,11 @@ export class CollaborationRuntime {
 
   async syncRunDirectory({ pageSize = 50 } = {}) {
     const normalizedSize = Math.max(1, Math.min(50, Number(pageSize) || 50));
-    const reconciliationId = `reconcile-${Date.now().toString(36)}`;
+    if (typeof this.store.autoArchiveRuns === "function") {
+      this.store.autoArchiveRuns({ maxAgeDays: 7 });
+    }
+    const terminalStates = new Set(["completed", "failed", "cancelled", "expired"]);
+    const terminalCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
     let page = 1;
     let synced = 0;
     let failed = 0;
@@ -3087,7 +3093,13 @@ export class CollaborationRuntime {
         includeArchived: false,
       });
       for (const run of current.runs) {
-        if (await this.syncRun(run.run_id, { reconciliationId })) synced += 1;
+        const terminal = terminalStates.has(String(run.state || ""));
+        const activityAt = Date.parse(run.updated_at || run.finished_at || "");
+        // Active/attention Runs are always reconciled. Terminal Runs are only
+        // needed for the recent window; older history is handled by archive
+        // retention and should never wake notifications on reconnect.
+        if (terminal && Number.isFinite(activityAt) && activityAt < terminalCutoff) continue;
+        if (await this.syncRun(run.run_id, { syncMode: "reconciliation" })) synced += 1;
         else failed += 1;
       }
       if (page >= current.total_pages) break;

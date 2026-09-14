@@ -523,11 +523,16 @@ projectionRuntime.sendRemoteDurable = async (type, payload, { outboxId } = {}) =
 };
 assert.equal(await projectionRuntime.syncRun("run-projection"), true);
 assert.equal(projectionPayload.workspaceSessionId, "workspace-session-projection");
+assert.equal(projectionPayload.syncMode, "realtime");
 assert.equal(projectionPayload.continuedFromRunId, "run-projection-previous");
 assert.equal(projectionPayload.teamRevision, 3);
 assert.equal(projectionPayload.sessionContinuation, true);
 assert.equal(projectionPayload.targetDeviceId, "__originrouter_server__");
 assert.match(projectionOutboxId, /^projection:run-projection:/);
+
+await projectionRuntime.syncRun("run-projection", { syncMode: "reconciliation" });
+assert.equal(projectionPayload.syncMode, "reconciliation");
+assert.equal(projectionOutboxId, "projection:run-projection:0");
 
 projectionRuntime.relayClient = {
   async send() {

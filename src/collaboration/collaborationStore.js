@@ -1732,6 +1732,31 @@ export class CollaborationStore {
     return this.getRun(run.run_id);
   }
 
+  autoArchiveRuns({ maxAgeDays = 7 } = {}) {
+    const ageDays = Math.max(1, Number(maxAgeDays) || 7);
+    const cutoff = Date.now() - ageDays * 24 * 60 * 60 * 1000;
+    const candidates = this.db.prepare(`
+      SELECT run_id, updated_at, finished_at
+      FROM collaboration_runs
+      WHERE archived_at IS NULL
+        AND state IN ('completed','failed','cancelled','expired')
+    `).all();
+    const archivedAt = iso(this.now());
+    const update = this.db.prepare(
+      "UPDATE collaboration_runs SET archived_at = ? WHERE run_id = ? AND archived_at IS NULL",
+    );
+    let count = 0;
+    const transaction = this.db.transaction(() => {
+      for (const candidate of candidates) {
+        const activity = Date.parse(candidate.updated_at || candidate.finished_at || "");
+        if (!Number.isFinite(activity) || activity > cutoff) continue;
+        count += update.run(archivedAt, candidate.run_id).changes;
+      }
+    });
+    transaction();
+    return count;
+  }
+
   deleteRun(runId) {
     const run = this.getRun(runId, { includeMessages: false });
     if (!run) return false;
