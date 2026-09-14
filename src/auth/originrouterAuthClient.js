@@ -59,6 +59,31 @@ async function requestForm(url, entries, { timeoutMs = DEFAULT_TIMEOUT_MS, fetch
   }
 }
 
+async function requestJson(url, value, { timeoutMs = DEFAULT_TIMEOUT_MS, fetchFn = globalThis.fetch } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchFn(url, {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify(value),
+      signal: controller.signal,
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch {}
+    if (!response.ok) {
+      const code = payload?.code || payload?.error || "oauth_request_failed";
+      throw new AuthClientError({ status: response.status, code, message: payload?.msg || payload?.error_description || code });
+    }
+    return payload?.data || payload;
+  } catch (error) {
+    if (error instanceof AuthClientError) throw error;
+    throw new AuthClientError({ code: "oauth_unavailable" });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function requestDeviceCode({
   suretyBaseUrl,
   deviceId,
@@ -132,6 +157,18 @@ export async function getDeviceAuthorizationStatus({
       ["client_id", "originrouter_cli"],
       ["device_code", deviceCode],
     ],
+    { fetchFn },
+  );
+}
+
+export async function getDeviceRecoveryInfo({
+  controlBaseUrl,
+  deviceCode,
+  fetchFn = globalThis.fetch,
+}) {
+  return requestJson(
+    `${base(controlBaseUrl)}/auth/v1/device/recovery-info`,
+    { device_code: deviceCode },
     { fetchFn },
   );
 }

@@ -192,20 +192,30 @@ export async function handleLogin(args, {
     const credential = await loginWithDeviceFlow({
       suretyBaseUrl,
       loginBaseUrl,
+      controlBaseUrl:
+        process.env.ORIGINROUTER_CONTROL_BASE_URL ||
+        DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
       deviceId: device.deviceId,
       deviceName:
         (requestedDeviceName && cliDeviceDisplayName(requestedDeviceName)) ||
         device.displayName ||
         defaultDeviceDisplayName(),
-      e2eeIdentity: async (accountScope) => {
+      e2eeIdentity: async (accountScope, { recoveryInfo } = {}) => {
         enrollmentScope = accountScope;
         const stored = readDeviceE2eeIdentity(stateDir, { accountScope });
-        const matching = stored && stored.public_identity.device_id === device.deviceId
+        const matching = stored
+          && stored.public_identity.device_id === device.deviceId
+          && (!recoveryInfo?.epoch || Number(stored.public_identity.epoch) === Number(recoveryInfo.epoch))
           ? stored
+          : null;
+        const recovery = recoveryInfo?.recovery_required && recoveryInfo.previous_key_id
+          ? recoveryInfo
           : null;
         enrollmentIdentity = matching || createDeviceE2eeIdentityCandidate(stateDir, {
           deviceId: device.deviceId,
-          epoch: 1,
+          epoch: Number(recoveryInfo?.epoch || 1),
+          keyVersion: recovery ? Number(recovery.previous_key_version) + 1 : 1,
+          previousKeyId: recovery?.previous_key_id || null,
           accountScope,
         });
         candidateNeedsCommit = matching == null;
@@ -260,8 +270,12 @@ export async function handleLogin(args, {
     }
   } catch (error) {
     if (error?.code === "device_flow_denied") {
-      invalidateDeviceE2eeIdentity(stateDir, { accountScope: enrollmentScope });
-      invalidateDevice(stateDir);
+      // A denied authorization is account/request scoped. Never delete the
+      // installed account key or installation-wide device.json here: the
+      // user may simply have pressed Cancel, and other accounts may still
+      // rely on the same stable device identity.
+      discardDeviceE2eeIdentityCandidate(stateDir, { accountScope: enrollmentScope });
+      discardDeviceCandidate(stateDir);
     } else {
       discardDeviceE2eeIdentityCandidate(stateDir, { accountScope: enrollmentScope });
       discardDeviceCandidate(stateDir);

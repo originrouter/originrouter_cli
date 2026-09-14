@@ -157,8 +157,8 @@ function _fromCode(code, message) {
     case "device_flow_denied":
       return {
         headline: "Sign-in was not approved.",
-        detail: "This device's saved security credential was cleared.",
-        next: "Run `originrouter login` again to create a new device credential.",
+        detail: "The authorization request was denied; this installation's device identity was preserved.",
+        next: "Run `originrouter login` again when you are ready to approve the request.",
       };
     case "device_revoked":
     case "device_identity_revoked":

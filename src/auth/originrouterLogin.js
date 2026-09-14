@@ -5,6 +5,7 @@ import { KEY_KIND, KEY_SOURCE } from "../runtime/authContract.js";
 import {
   AuthClientError,
   bindDeviceE2eeIdentity,
+  getDeviceRecoveryInfo,
   getDeviceAuthorizationStatus,
   pollDeviceToken,
   refreshOAuthToken,
@@ -165,6 +166,7 @@ function sleep(ms) {
 export async function loginWithDeviceFlow({
   suretyBaseUrl,
   loginBaseUrl,
+  controlBaseUrl,
   deviceId,
   deviceName,
   e2eeIdentity,
@@ -230,7 +232,24 @@ export async function loginWithDeviceFlow({
   }
 
   const resolvedIdentity = typeof e2eeIdentity === "function"
-    ? await e2eeIdentity(accountScope)
+    ? await e2eeIdentity(accountScope, {
+      recoveryInfo: controlBaseUrl
+        ? await (async () => {
+          try {
+            return await getDeviceRecoveryInfo({
+              controlBaseUrl,
+              deviceCode: issued.device_code,
+              fetchFn,
+            });
+          } catch {
+            // Recovery metadata is an additive capability. Keep ordinary
+            // first-time sign-in available during transient server rollout;
+            // a lost-key attempt will be rejected safely and can retry.
+            return null;
+          }
+        })()
+        : null,
+    })
     : e2eeIdentity;
   const resolvedSigner = typeof signEnrollmentChallenge === "function"
     ? (challenge) => signEnrollmentChallenge(challenge, accountScope, resolvedIdentity)

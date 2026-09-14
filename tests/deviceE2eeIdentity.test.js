@@ -130,6 +130,27 @@ try {
     }).public_identity.key_id,
     accountA.public_identity.key_id,
   );
+
+  const recovery = createDeviceE2eeIdentityCandidate(stateDir, {
+    deviceId: "cli-test",
+    epoch: 2,
+    keyVersion: 5,
+    previousKeyId: "sha256:server-head",
+    accountScope: "sha256:recovery-account",
+  });
+  assert.equal(recovery.public_identity.device_id, "cli-test");
+  assert.equal(recovery.public_identity.key_version, 5);
+  assert.equal(recovery.public_identity.previous_key_id, "sha256:server-head");
+  assert.equal("previous_key_signature" in recovery.public_identity, false);
+  assert.equal(verifyDeviceE2eeIdentity(recovery.public_identity), true);
+  const resumedRecovery = createDeviceE2eeIdentityCandidate(stateDir, {
+    deviceId: "cli-test",
+    epoch: 2,
+    keyVersion: 5,
+    previousKeyId: "sha256:server-head",
+    accountScope: "sha256:recovery-account",
+  });
+  assert.equal(resumedRecovery.public_identity.key_id, recovery.public_identity.key_id);
 } finally {
   rmSync(stateDir, { recursive: true, force: true });
 }

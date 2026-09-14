@@ -202,6 +202,71 @@ test("Device Flow accepts an atomic multi-resource token bundle", async () => {
   assert.equal(credential.accessTokens.memory.token, "or_at_memory_bundle");
 });
 
+test("Device Flow resolves server key recovery metadata before binding", async () => {
+  let callbackContext = null;
+  const fetchFn = async (url, init) => {
+    const target = String(url);
+    if (target.endsWith("/api/oauth/device/code")) {
+      return oauthResponse(200, {
+        device_code: "or_dc_recovery",
+        user_code: "RCVR-0001",
+        expires_in: 600,
+        interval: 1,
+        enrollment_challenge: "or_ch_test",
+      });
+    }
+    if (target.endsWith("/api/oauth/device/status")) {
+      return oauthResponse(200, { account_scope: "sha256:account-recovery" });
+    }
+    if (target.endsWith("/auth/v1/device/recovery-info")) {
+      assert.deepEqual(JSON.parse(init.body), { device_code: "or_dc_recovery" });
+      return oauthResponse(200, { code: 1, data: {
+        recovery_required: true,
+        epoch: 2,
+        previous_key_id: "sha256:old-head",
+        previous_key_version: 3,
+      } });
+    }
+    if (target.endsWith("/api/oauth/device/bind")) {
+      return oauthResponse(200, { bound: true });
+    }
+    return oauthResponse(200, {
+      access_token: "or_at_control_bundle",
+      refresh_token: "or_rt_bundle",
+      session_id: "or_ses_bundle",
+      expires_in: 600,
+      refresh_expires_in: 2_592_000,
+      scope: "control.read",
+      access_tokens: Object.fromEntries(
+        ["control", "ai", "coding", "relay", "memory"].map((name) => [
+          `originrouter.${name}`,
+          { access_token: `or_at_${name}_bundle`, expires_in: 600, scope: "scope" },
+        ]),
+      ),
+    });
+  };
+
+  await loginWithDeviceFlow({
+    suretyBaseUrl: "https://surety.example.test",
+    loginBaseUrl: "https://originrouter.example.test",
+    controlBaseUrl: "https://control.example.test",
+    deviceId: "device-cli-stable",
+    e2eeIdentity: async (accountScope, context) => {
+      callbackContext = { accountScope, ...context };
+      return { public_identity: enrollmentIdentity };
+    },
+    signEnrollmentChallenge,
+    noBrowser: true,
+    sleepFn: async () => {},
+    printFn: () => {},
+    fetchFn,
+  });
+
+  assert.equal(callbackContext.accountScope, "sha256:account-recovery");
+  assert.equal(callbackContext.recoveryInfo.previous_key_id, "sha256:old-head");
+  assert.equal(callbackContext.recoveryInfo.previous_key_version, 3);
+});
+
 test("Device Flow maps denial to a stable client error", async () => {
   let call = 0;
   await assert.rejects(

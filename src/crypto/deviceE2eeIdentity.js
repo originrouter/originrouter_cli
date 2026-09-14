@@ -121,7 +121,7 @@ function writePrivate(path, value) {
   chmodSync(path, FILE_MODE);
 }
 
-function generateIdentity({ deviceId, epoch, keyVersion, previous = null, now = new Date() }) {
+function generateIdentity({ deviceId, epoch, keyVersion, previous = null, now = new Date(), signPrevious = true }) {
   const signing = generateKeyPairSync("ed25519");
   const agreement = generateKeyPairSync("x25519");
   const signingPrivateJwk = exportJwk(signing.privateKey);
@@ -140,7 +140,7 @@ function generateIdentity({ deviceId, epoch, keyVersion, previous = null, now = 
     created_at: now.toISOString(),
   };
   base.key_id = keyId(base);
-  if (previous) {
+  if (previous && signPrevious) {
     const transition = { ...keyMaterial(base), key_id: base.key_id };
     base.previous_key_signature = sign(
       null,
@@ -194,16 +194,38 @@ export function ensureDeviceE2eeIdentity(stateDir, { deviceId, epoch = 1, accoun
 // confirmation have both completed.
 export function createDeviceE2eeIdentityCandidate(
   stateDir,
-  { deviceId, epoch = 1, accountScope } = {},
+  { deviceId, epoch = 1, keyVersion = 1, previousKeyId = null, accountScope } = {},
 ) {
   const pendingPath = pendingIdentityPath(stateDir, accountScope);
   if (existsSync(pendingPath)) {
-    // A candidate is scoped to one login attempt. A later invocation treats
-    // it exactly like no local login key and starts with fresh key material.
+    try {
+      const existing = JSON.parse(readFileSync(pendingPath, "utf8"));
+      const publicIdentity = existing?.public_identity;
+      if (
+        existing?.verification_status === "invalid"
+        && publicIdentity?.device_id === String(deviceId)
+        && Number(publicIdentity?.epoch) === Number(epoch)
+        && Number(publicIdentity?.key_version) === Number(keyVersion)
+        && (publicIdentity?.previous_key_id || null) === (previousKeyId || null)
+        && verifyDeviceE2eeIdentity(publicIdentity)
+      ) {
+        return existing;
+      }
+    } catch {
+      // Replace malformed or incompatible pending material below.
+    }
     unlinkSync(pendingPath);
   }
   const candidate = {
-    ...generateIdentity({ deviceId, epoch, keyVersion: 1 }),
+    ...generateIdentity({
+      deviceId,
+      epoch,
+      keyVersion: Number(keyVersion),
+      previous: previousKeyId
+        ? { public_identity: { key_id: String(previousKeyId) } }
+        : null,
+      signPrevious: false,
+    }),
     verification_status: "invalid",
   };
   writePrivate(pendingPath, candidate);
