@@ -17,7 +17,14 @@ import {
   MANAGED_PYTHON_VERSION,
 } from "../runtime/managedPython.js";
 
-const AGENT_INSTALLERS = Object.freeze({
+const CODEX_INSTALLER_ENV = Object.freeze({
+  // The Codex installer otherwise offers to launch `codex` after installing.
+  // OriginRouter owns the outer setup flow, so dependency installation must
+  // never transfer control to an interactive agent session.
+  CODEX_NON_INTERACTIVE: "1",
+});
+
+export const AGENT_INSTALLERS = Object.freeze({
   claude: {
     label: "Claude Code",
     checks: ["claude", "--version"],
@@ -28,9 +35,9 @@ const AGENT_INSTALLERS = Object.freeze({
   codex: {
     label: "Codex",
     checks: ["codex", "--version"],
-    darwin: { kind: "brew", args: ["install", "--cask", "codex"], display: "brew install --cask codex" },
-    linux: { kind: "script", command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh", display: "curl -fsSL https://chatgpt.com/codex/install.sh | sh" },
-    win32: { kind: "powershell", args: ["-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", "irm https://chatgpt.com/codex/install.ps1 | iex"], display: "irm https://chatgpt.com/codex/install.ps1 | iex" },
+    darwin: { kind: "brew", args: ["install", "--cask", "codex"], display: "brew install --cask codex", env: CODEX_INSTALLER_ENV },
+    linux: { kind: "script", command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh", display: "curl -fsSL https://chatgpt.com/codex/install.sh | sh", env: CODEX_INSTALLER_ENV },
+    win32: { kind: "powershell", args: ["-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", "irm https://chatgpt.com/codex/install.ps1 | iex"], display: "irm https://chatgpt.com/codex/install.ps1 | iex", env: CODEX_INSTALLER_ENV },
   },
 });
 
@@ -40,18 +47,29 @@ async function commandAvailable(command) {
 }
 
 async function runInstaller(installer) {
+  const env = installerEnvironment(installer);
   if (installer.kind === "brew") {
-    return runProcess("brew", installer.args);
+    return runProcess("brew", installer.args, { env });
   }
   if (installer.kind === "powershell") {
-    return runProcess("powershell.exe", installer.args);
+    return runProcess("powershell.exe", installer.args, { env });
   }
-  return runProcess("bash", ["-lc", installer.command]);
+  // `curl | bash` exits with the LAST command's status: if curl fails (403,
+  // DNS, …) the receiving bash gets empty input and still exits 0, silently
+  // swallowing the failure. pipefail propagates curl's status instead.
+  return runProcess("bash", ["-lc", `set -o pipefail; ${installer.command}`], { env });
 }
 
-function runProcess(command, args) {
+export function installerEnvironment(installer, baseEnv = process.env) {
+  return {
+    ...baseEnv,
+    ...(installer.env || {}),
+  };
+}
+
+function runProcess(command, args, { env = process.env } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: "inherit", shell: false });
+    const child = spawn(command, args, { stdio: "inherit", shell: false, env });
     child.once("error", (error) => resolve({ ok: false, error }));
     child.once("exit", (code, signal) => resolve({ ok: code === 0, code, signal }));
   });
@@ -217,6 +235,12 @@ export async function handleSetupCommand(args = []) {
         const result = await runInstaller(installer);
         if (!result.ok) {
           console.error(`✗ ${AGENT_INSTALLERS[agent].label} installation failed.`);
+          if (agent === "claude" && installer.kind === "script") {
+            console.error("  The download from claude.ai may have been blocked: Anthropic refuses");
+            console.error("  requests from some regions and data-center IP ranges (HTTP 403).");
+            console.error("  Install Claude Code from a supported network or a proxy, or run this");
+            console.error("  setup again on a machine where https://claude.ai/install.sh is reachable.");
+          }
           process.exitCode = 1;
           continue;
         }
