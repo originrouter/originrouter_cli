@@ -239,12 +239,36 @@ export async function handleSetupCommand(args = []) {
     }
 
     if (installService && !dryRun) {
+      console.log("\nInstalling OriginRouter background service...");
       try {
         await handleServiceCommand(["install"]);
         await handleServiceCommand(["start"]);
         console.log("✓ OriginRouter background service is running.");
       } catch (error) {
         console.error(`✗ Background service setup failed: ${error.message || error}`);
+        // Best-effort diagnostics so users can paste actionable context.
+        try {
+          const { execFileSync } = await import("node:child_process");
+          for (const [cmd, args] of [
+            ["systemctl", ["--user", "status", "originrouter.service", "--no-pager", "-l"]],
+            ["journalctl", ["--user", "-u", "originrouter.service", "-n", "20", "--no-pager"]],
+          ]) {
+            try {
+              const output = execFileSync(cmd, args, {
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "pipe"],
+                timeout: 10_000,
+              });
+              if (output?.trim()) console.error(`\n--- ${cmd} ${args.slice(0, 3).join(" ")} ---\n${output.trim()}`);
+            } catch (diagError) {
+              const diagOutput = [diagError?.stdout, diagError?.stderr].filter(Boolean).join("\n");
+              if (diagOutput.trim()) console.error(`\n--- ${cmd} ---\n${diagOutput.trim()}`);
+            }
+          }
+        } catch {
+          // Diagnostics are best-effort only.
+        }
+        console.error("\nYou can retry the service step later with `originrouter service install && originrouter service start`.");
         process.exitCode = 1;
       }
     }

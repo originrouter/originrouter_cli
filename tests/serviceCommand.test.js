@@ -61,6 +61,10 @@ const common = {
   const unit = buildSystemdUnit(common);
   assert.match(unit, /ExecStart="\/usr\/local\/bin\/node" "\/opt\/originrouter\/bin\/originrouter\.js" daemon/);
   assert.match(unit, /Environment="PATH=\/usr\/local\/bin:/);
+  // systemd does not parse quotes on WorkingDirectory=; a quoted value is read
+  // literally and rejected as "path is not absolute".
+  assert.match(unit, /WorkingDirectory=\//);
+  assert.doesNotMatch(unit, /WorkingDirectory="/);
   assert.match(unit, /Restart=on-failure/);
   assert.match(unit, /RestartSec=5/);
   assert.match(unit, /WantedBy=default\.target/);

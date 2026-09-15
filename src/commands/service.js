@@ -147,7 +147,7 @@ ExecStart=${systemdQuote(nodePath)} ${systemdQuote(cliPath)} daemon
 Environment=${systemdQuote(`PATH=${environmentPath}`)}
 Restart=on-failure
 RestartSec=5
-WorkingDirectory=${systemdQuote(homedir())}
+WorkingDirectory=${homedir()}
 StandardOutput=append:${stdoutPath}
 StandardError=append:${stderrPath}
 
@@ -219,7 +219,20 @@ function run(cmd, args, { dryRun = false } = {}) {
     console.log(`$ ${[cmd, ...args].join(" ")}`);
     return "";
   }
-  return execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    return execFileSync(cmd, args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 15_000,
+    });
+  } catch (error) {
+    if (error?.signal === "SIGTERM") {
+      throw new Error(
+        `\`${cmd} ${args.join(" ")}\` timed out after 15s. If this machine has no usable systemd user session, run \`originrouter service uninstall\` or reinstall with the service step disabled.`
+      );
+    }
+    throw error;
+  }
 }
 
 function tryRun(cmd, args, { dryRun = false } = {}) {
@@ -352,6 +365,22 @@ function installService({ dryRun = false } = {}) {
   }
 
   if (currentPlatform === "linux") {
+    // Validate the unit before registering it so a bad directive is reported
+    // with the offending line instead of a generic start failure later.
+    if (tryRun("systemd-analyze", ["--version"])) {
+      let verifyOutput = "";
+      try {
+        verifyOutput = run("systemd-analyze", ["--user", "verify", paths.configPath], { dryRun });
+      } catch (error) {
+        // Non-zero exit means verification found problems; the details are in
+        // stdout/stderr. Anything else (timeout, missing command) is skipped.
+        verifyOutput = [error?.stdout, error?.stderr].filter(Boolean).join("\n");
+        if (!verifyOutput) throw error;
+      }
+      if (verifyOutput.trim()) {
+        throw new Error(`The generated systemd unit failed validation:\n${verifyOutput.trim()}`);
+      }
+    }
     run("systemctl", ["--user", "daemon-reload"], { dryRun });
     run("systemctl", ["--user", "enable", SYSTEMD_UNIT], { dryRun });
     console.log(`${dryRun ? "Would install" : "Installed"} systemd user service: ${paths.configPath}`);
