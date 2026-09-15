@@ -55,26 +55,102 @@ if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; th
   exit 1
 fi
 
-if ! command -v node >/dev/null 2>&1; then
-  echo "OriginRouter requires Node.js 22 or later (the Node.js installer includes npm)." >&2
-  echo "Install Node.js from https://nodejs.org/en/download and run this command again." >&2
+NODE_MIN_MAJOR=22
+NODESOURCE_MAJOR=22
+
+# Privilege helper: on a root session run directly; otherwise require sudo.
+priv_prefix() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    echo ""
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    echo "sudo"
+  else
+    return 1
+  fi
+}
+
+install_node_runtime() {
+  local pkg_manager=""
+  if command -v apt-get >/dev/null 2>&1; then
+    pkg_manager="apt"
+  elif command -v dnf >/dev/null 2>&1; then
+    pkg_manager="dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    pkg_manager="yum"
+  elif command -v apk >/dev/null 2>&1; then
+    pkg_manager="apk"
+  fi
+
+  case "$pkg_manager" in
+    apt)
+      echo "==> Installing Node.js ${NODESOURCE_MAJOR} LTS from NodeSource (requires root privileges)"
+      curl -fsSL "https://deb.nodesource.com/setup_${NODESOURCE_MAJOR}.x" | bash - || return 1
+      local prefix
+      prefix="$(priv_prefix)" || return 1
+      $prefix apt-get install -y nodejs || return 1
+      ;;
+    dnf|yum)
+      echo "==> Installing Node.js ${NODESOURCE_MAJOR} LTS from NodeSource (requires root privileges)"
+      curl -fsSL "https://rpm.nodesource.com/setup_${NODESOURCE_MAJOR}.x" | bash - || return 1
+      local prefix
+      prefix="$(priv_prefix)" || return 1
+      $prefix "$pkg_manager" install -y nodejs || return 1
+      ;;
+    apk)
+      echo "==> Installing Node.js via apk (requires root privileges)"
+      local prefix
+      prefix="$(priv_prefix)" || return 1
+      $prefix apk add --no-cache nodejs npm || return 1
+      ;;
+    *)
+      echo "Could not install Node.js automatically on this system." >&2
+      echo "Install Node.js ${NODE_MIN_MAJOR} or later from https://nodejs.org/en/download, then run this command again." >&2
+      return 1
+      ;;
+  esac
+}
+
+ensure_node_runtime() {
+  if command -v node >/dev/null 2>&1; then
+    NODE_VERSION="$(node --version 2>/dev/null || true)"
+    NODE_MAJOR="${NODE_VERSION#v}"
+    NODE_MAJOR="${NODE_MAJOR%%.*}"
+    if [[ "$NODE_MAJOR" =~ ^[0-9]+$ && "$NODE_MAJOR" -ge "$NODE_MIN_MAJOR" ]] \
+      && command -v npm >/dev/null 2>&1 && npm --version >/dev/null 2>&1; then
+      return 0
+    fi
+    echo "==> Node.js ${NODE_MIN_MAJOR}+ with npm is required; detected ${NODE_VERSION:-no usable installation}." >&2
+  else
+    echo "==> Node.js was not found on this system." >&2
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "curl is required to install Node.js automatically. Install curl and Node.js ${NODE_MIN_MAJOR}+, then run this command again." >&2
+    return 1
+  fi
+
+  install_node_runtime || {
+    echo "Automatic Node.js installation failed. Install Node.js ${NODE_MIN_MAJOR}+ manually from https://nodejs.org/en/download and run this command again." >&2
+    return 1
+  }
+  hash -r
+
+  NODE_VERSION="$(node --version 2>/dev/null || true)"
+  NODE_MAJOR="${NODE_VERSION#v}"
+  NODE_MAJOR="${NODE_MAJOR%%.*}"
+  if [[ ! "$NODE_MAJOR" =~ ^[0-9]+$ || "$NODE_MAJOR" -lt "$NODE_MIN_MAJOR" ]] \
+    || ! command -v npm >/dev/null 2>&1 || ! npm --version >/dev/null 2>&1; then
+    echo "Node.js installation did not produce a usable Node.js ${NODE_MIN_MAJOR}+ with npm." >&2
+    echo "Install Node.js manually from https://nodejs.org/en/download and run this command again." >&2
+    return 1
+  fi
+}
+
+if ! ensure_node_runtime; then
   exit 1
 fi
 
 NODE_VERSION="$(node --version 2>/dev/null || true)"
-NODE_MAJOR="${NODE_VERSION#v}"
-NODE_MAJOR="${NODE_MAJOR%%.*}"
-if [[ ! "$NODE_MAJOR" =~ ^[0-9]+$ || "$NODE_MAJOR" -lt 22 ]]; then
-  echo "OriginRouter requires Node.js 22 or later; detected ${NODE_VERSION:-an unknown version}." >&2
-  echo "Update Node.js from https://nodejs.org/en/download and run this command again." >&2
-  exit 1
-fi
-
-if ! command -v npm >/dev/null 2>&1 || ! npm --version >/dev/null 2>&1; then
-  echo "npm is required but is not available." >&2
-  echo "Install the current Node.js release from https://nodejs.org/en/download and run this command again." >&2
-  exit 1
-fi
 
 mkdir -p "$(dirname "$LOCK_DIR")"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
