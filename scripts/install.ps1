@@ -21,24 +21,89 @@ function Stop-WithNodeGuidance([string]$Message) {
     exit 1
 }
 
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    Stop-WithNodeGuidance "OriginRouter requires Node.js 22 or later."
+function Test-NodeUsable {
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if ($null -eq $node) { return $false }
+    $versionText = (& node --version).Trim()
+    $majorText = $versionText.TrimStart("v").Split(".")[0]
+    $major = 0
+    if (-not [int]::TryParse($majorText, [ref]$major) -or $major -lt $MinimumNodeMajor) { return $false }
+    if ($null -eq (Get-Command npm -ErrorAction SilentlyContinue)) { return $false }
+    & npm --version *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Update-SessionPathFromRegistry {
+    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = "$machinePath;$userPath"
+}
+
+function Test-Elevated {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Install-NodeViaWinget {
+    if ($null -eq (Get-Command winget -ErrorAction SilentlyContinue)) { return $false }
+    Write-Output "==> Installing Node.js 22 LTS via winget (Windows may show an elevation prompt)"
+    & winget install --id OpenJS.NodeJS.LTS --exact --silent --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) { return $false }
+    Update-SessionPathFromRegistry
+    return $true
+}
+
+function Install-NodeViaUserZip {
+    Write-Output "==> Installing a user-level Node.js 22 runtime under $env:LOCALAPPDATA (no elevation required)"
+    $entry = $null
+    try {
+        $versions = Invoke-RestMethod "https://nodejs.org/dist/index.json" -TimeoutSec 30
+        $entry = $versions | Where-Object { $_.version -like "v$MinimumNodeMajor.*" } | Select-Object -First 1
+    } catch {
+        return $false
+    }
+    if ($null -eq $entry) { return $false }
+    $version = $entry.version.TrimStart("v")
+    $zipName = "node-$($entry.version)-win-x64.zip"
+    $zipUrl = "https://nodejs.org/dist/v$version/$zipName"
+    $installRoot = Join-Path $env:LOCALAPPDATA "OriginRouter"
+    $binDir = Join-Path $installRoot "node-$($entry.version)-win-x64"
+    try {
+        if (-not (Test-Path -LiteralPath (Join-Path $binDir "node.exe"))) {
+            $zipPath = Join-Path $env:TEMP $zipName
+            Invoke-WebRequest $zipUrl -OutFile $zipPath -TimeoutSec 600
+            Expand-Archive $zipPath -DestinationPath $installRoot -Force
+            Remove-Item $zipPath -Force
+        }
+    } catch {
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $binDir "node.exe"))) { return $false }
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if (($null -eq $userPath) -or (-not $userPath.Split(";").Contains($binDir))) {
+        [Environment]::SetEnvironmentVariable("Path", "$userPath;$binDir", "User")
+    }
+    $env:Path = "$binDir;$env:Path"
+    return $true
+}
+
+if (-not (Test-NodeUsable)) {
+    Write-Output "==> Node.js $MinimumNodeMajor or later with npm was not found."
+    $installed = $false
+    if (Test-Elevated) {
+        $installed = Install-NodeViaWinget
+        if (-not $installed) { $installed = Install-NodeViaUserZip }
+    } else {
+        $installed = Install-NodeViaUserZip
+        if (-not $installed) { $installed = Install-NodeViaWinget }
+    }
+    if (-not $installed -or -not (Test-NodeUsable)) {
+        Stop-WithNodeGuidance "Automatic Node.js installation failed."
+    }
 }
 
 $nodeVersionText = (& node --version).Trim()
-$nodeMajorText = $nodeVersionText.TrimStart("v").Split(".")[0]
-$nodeMajor = 0
-if (-not [int]::TryParse($nodeMajorText, [ref]$nodeMajor) -or $nodeMajor -lt $MinimumNodeMajor) {
-    Stop-WithNodeGuidance "OriginRouter requires Node.js 22 or later; detected $nodeVersionText."
-}
-
-if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
-    Stop-WithNodeGuidance "npm is required but is not available."
-}
-& npm --version *> $null
-if ($LASTEXITCODE -ne 0) {
-    Stop-WithNodeGuidance "npm is installed but is not working."
-}
 
 $mutex = New-Object System.Threading.Mutex($false, "Local\OriginRouterInstaller")
 if (-not $mutex.WaitOne(0)) {
