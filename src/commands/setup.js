@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { platform } from "node:os";
+import os from "node:os";
+import path from "node:path";
 import {
   detectCliAvailability,
   runCapture,
@@ -17,37 +19,37 @@ import {
   MANAGED_PYTHON_VERSION,
 } from "../runtime/managedPython.js";
 
-const CODEX_INSTALLER_ENV = Object.freeze({
-  // The Codex installer otherwise offers to launch `codex` after installing.
-  // OriginRouter owns the outer setup flow, so dependency installation must
-  // never transfer control to an interactive agent session.
-  CODEX_NON_INTERACTIVE: "1",
+const NPM_INSTALLER_ENV = Object.freeze({
+  // npm installs must remain part of OriginRouter's setup flow. These options
+  // disable npm's own prompts and update notifier without relying on a user
+  // to answer an inner installer prompt.
+  NPM_CONFIG_YES: "true",
+  NPM_CONFIG_UPDATE_NOTIFIER: "false",
 });
 
 export const AGENT_INSTALLERS = Object.freeze({
   claude: {
     label: "Claude Code",
     checks: ["claude", "--version"],
-    darwin: { kind: "brew", args: ["install", "--cask", "claude-code"], display: "brew install --cask claude-code" },
-    linux: { kind: "script", command: "curl -fsSL https://claude.ai/install.sh | bash", display: "curl -fsSL https://claude.ai/install.sh | bash" },
-    win32: { kind: "powershell", args: ["-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", "irm https://claude.ai/install.ps1 | iex"], display: "irm https://claude.ai/install.ps1 | iex" },
+    darwin: { kind: "npm", packageName: "@anthropic-ai/claude-code", display: "npm install --global @anthropic-ai/claude-code", env: NPM_INSTALLER_ENV },
+    linux: { kind: "npm", packageName: "@anthropic-ai/claude-code", display: "npm install --global @anthropic-ai/claude-code", env: NPM_INSTALLER_ENV },
+    win32: { kind: "npm", packageName: "@anthropic-ai/claude-code", display: "npm install --global @anthropic-ai/claude-code", env: NPM_INSTALLER_ENV },
   },
   codex: {
     label: "Codex",
     checks: ["codex", "--version"],
-    darwin: { kind: "brew", args: ["install", "--cask", "codex"], display: "brew install --cask codex", env: CODEX_INSTALLER_ENV },
-    linux: { kind: "script", command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh", display: "curl -fsSL https://chatgpt.com/codex/install.sh | sh", env: CODEX_INSTALLER_ENV },
-    win32: { kind: "powershell", args: ["-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", "irm https://chatgpt.com/codex/install.ps1 | iex"], display: "irm https://chatgpt.com/codex/install.ps1 | iex", env: CODEX_INSTALLER_ENV },
+    darwin: { kind: "npm", packageName: "@openai/codex", display: "npm install --global @openai/codex", env: NPM_INSTALLER_ENV },
+    linux: { kind: "npm", packageName: "@openai/codex", display: "npm install --global @openai/codex", env: NPM_INSTALLER_ENV },
+    win32: { kind: "npm", packageName: "@openai/codex", display: "npm install --global @openai/codex", env: NPM_INSTALLER_ENV },
   },
 });
 
-async function commandAvailable(command) {
-  const result = await runCapture(command, ["--version"], { timeoutMs: 2500 });
-  return result.ok;
-}
-
 async function runInstaller(installer) {
   const env = installerEnvironment(installer);
+  if (installer.kind === "npm") {
+    const command = process.platform === "win32" ? "npm.cmd" : "npm";
+    return runProcess(command, ["install", "--global", installer.packageName], { env });
+  }
   if (installer.kind === "brew") {
     return runProcess("brew", installer.args, { env });
   }
@@ -75,6 +77,35 @@ function runProcess(command, args, { env = process.env } = {}) {
   });
 }
 
+/**
+ * Make binaries installed by npm or a user-level installer visible to this
+ * process immediately. Updating a shell profile cannot update the parent
+ * shell that launched `originrouter setup`, so verification must refresh the
+ * child process environment itself.
+ */
+export async function refreshAgentPath({ env = process.env, platformName = process.platform } = {}) {
+  const separator = platformName === "win32" ? ";" : ":";
+  const candidates = [];
+  const npmCommand = platformName === "win32" ? "npm.cmd" : "npm";
+  const npmPrefix = await runCapture(npmCommand, ["prefix", "--global"], { timeoutMs: 5000 });
+  if (npmPrefix.ok) {
+    const prefix = npmPrefix.output.split("\n").map((line) => line.trim()).find(Boolean);
+    if (prefix) candidates.push(platformName === "win32" ? prefix : path.join(prefix, "bin"));
+  }
+
+  const home = env.HOME || env.USERPROFILE || os.homedir();
+  if (home) {
+    candidates.push(path.join(home, ".local", "bin"));
+    candidates.push(path.join(home, ".npm-global", "bin"));
+  }
+  if (platformName === "win32" && env.APPDATA) candidates.push(path.join(env.APPDATA, "npm"));
+
+  const existing = String(env.PATH || "").split(separator).filter(Boolean);
+  const merged = [...candidates, ...existing].filter((value, index, values) => values.indexOf(value) === index);
+  env.PATH = merged.join(separator);
+  return merged;
+}
+
 async function ask(rl, question, defaultValue = true) {
   const suffix = defaultValue ? " [Y/n] " : " [y/N] ";
   const answer = (await rl.question(`${question}${suffix}`)).trim().toLowerCase();
@@ -82,13 +113,11 @@ async function ask(rl, question, defaultValue = true) {
   return answer === "y" || answer === "yes";
 }
 
-function installerFor(agent, currentPlatform, { hasBrew = false, hasCurl = false } = {}) {
+function installerFor(agent, currentPlatform) {
   const definition = AGENT_INSTALLERS[agent];
   if (currentPlatform === "darwin") {
-    if (hasBrew) return definition.darwin;
-    return hasCurl ? definition.linux : null;
+    return definition.darwin || definition.linux;
   }
-  if (currentPlatform === "linux" && !hasCurl) return null;
   return definition[currentPlatform] || null;
 }
 
@@ -104,6 +133,7 @@ async function installProxyRuntime(pythonCommand) {
 }
 
 export async function verifySetupEnvironment({ includeProxy = true } = {}) {
+  await refreshAgentPath();
   const stateDir = ensureStateDir();
   const serviceInstalled = isServiceInstalled();
   const proxy = new ProxyManager({ stateDir });
@@ -163,8 +193,7 @@ export async function handleSetupCommand(args = []) {
   }
 
   const currentPlatform = platform();
-  const hasBrew = currentPlatform === "darwin" && await commandAvailable("brew");
-  const hasCurl = await commandAvailable("curl");
+  await refreshAgentPath();
   if (verifyOnly) {
     printSetupVerification(await verifySetupEnvironment({ includeProxy: !skipProxy }));
     return;
@@ -198,7 +227,7 @@ export async function handleSetupCommand(args = []) {
     const plan = [];
     if (installAgents) {
       for (const agent of missing) {
-        const installer = installerFor(agent, currentPlatform, { hasBrew, hasCurl });
+        const installer = installerFor(agent, currentPlatform);
         if (installer) plan.push(`${AGENT_INSTALLERS[agent].label}: ${installer.display}`);
         else plan.push(`${AGENT_INSTALLERS[agent].label}: no supported installer for this platform`);
       }
@@ -225,7 +254,7 @@ export async function handleSetupCommand(args = []) {
 
     if (installAgents && !dryRun) {
       for (const agent of missing) {
-        const installer = installerFor(agent, currentPlatform, { hasBrew, hasCurl });
+        const installer = installerFor(agent, currentPlatform);
         if (!installer) {
           console.error(`\n✗ ${AGENT_INSTALLERS[agent].label}: no supported installer for ${currentPlatform}.`);
           process.exitCode = 1;
@@ -235,18 +264,18 @@ export async function handleSetupCommand(args = []) {
         const result = await runInstaller(installer);
         if (!result.ok) {
           console.error(`✗ ${AGENT_INSTALLERS[agent].label} installation failed.`);
-          if (agent === "claude" && installer.kind === "script") {
-            console.error("  The download from claude.ai may have been blocked: Anthropic refuses");
-            console.error("  requests from some regions and data-center IP ranges (HTTP 403).");
-            console.error("  Install Claude Code from a supported network or a proxy, or run this");
-            console.error("  setup again on a machine where https://claude.ai/install.sh is reachable.");
+          if (installer.kind === "npm") {
+            console.error(`  npm package: ${installer.packageName}`);
+            if (result.error?.message) console.error(`  ${result.error.message}`);
           }
           process.exitCode = 1;
           continue;
         }
+        await refreshAgentPath();
         const check = await detectCliAvailability(agent);
         if (!check.available) {
-          console.error(`✗ ${AGENT_INSTALLERS[agent].label} installed but is not available on PATH. Restart the terminal and rerun setup.`);
+          console.error(`✗ ${AGENT_INSTALLERS[agent].label} was installed, but its command is not available on PATH.`);
+          console.error("  The setup process refreshed npm and user-level bin directories; open a new terminal and rerun setup if needed.");
           process.exitCode = 1;
         } else if (agent === "codex") {
           const appServer = await runCapture("codex", ["app-server", "--help"], { timeoutMs: 4000 });

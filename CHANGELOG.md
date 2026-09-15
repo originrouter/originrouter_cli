@@ -5,6 +5,20 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ## Unreleased
 
+## 0.3.3 - 2026-09-15
+
+### Changed
+
+- Claude Code and Codex setup dependencies are now installed through npm on
+  macOS, Linux, and Windows using their official packages.
+- Setup refreshes npm and user-level binary paths before verification, so a
+  newly installed agent is available without restarting the terminal.
+
+### Fixed
+
+- Removed nested Claude and Codex installer flows that could fail behind
+  data-center network restrictions or prompt to launch an Agent during setup.
+
 ## 0.3.1 - 2026-09-15
 
 ### Added

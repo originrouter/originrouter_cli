@@ -216,11 +216,42 @@ if [[ "$DRY_RUN" == true ]]; then
   exit 0
 fi
 
+run_npm_install_with_progress() {
+  local log_file="$1"
+  shift
+  local npm_pid started_at elapsed latest_line exit_code=0
+
+  : >"$log_file"
+  npm "$@" >"$log_file" 2>&1 &
+  npm_pid=$!
+  started_at=$SECONDS
+
+  while kill -0 "$npm_pid" 2>/dev/null; do
+    elapsed=$((SECONDS - started_at))
+    latest_line="$(tail -n 1 "$log_file" 2>/dev/null | tr -d '\r' | sed $'s/\\033\\[[0-9;]*[[:alpha:]]//g' | cut -c1-120)"
+    if [[ -n "$latest_line" ]]; then
+      printf '\r==> Installing %s (%02dm%02ds) — %s\033[K' \
+        "$PACKAGE_SPEC" "$((elapsed / 60))" "$((elapsed % 60))" "$latest_line"
+    else
+      printf '\r==> Installing %s (%02dm%02ds) — waiting for npm\033[K' \
+        "$PACKAGE_SPEC" "$((elapsed / 60))" "$((elapsed % 60))"
+    fi
+    sleep 1
+  done
+
+  wait "$npm_pid" || exit_code=$?
+  printf '\r\033[K'
+  return "$exit_code"
+}
+
 install_cli_from_npm() {
-  local install_log
-  if install_log="$(npm install --global "$PACKAGE_SPEC" 2>&1)"; then
+  local install_log install_log_file
+  install_log_file="$(mktemp "${TMPDIR:-/tmp}/originrouter-npm-install.XXXXXX.log")"
+  if run_npm_install_with_progress "$install_log_file" install --global "$PACKAGE_SPEC"; then
+    rm -f "$install_log_file"
     return 0
   fi
+  install_log="$(<"$install_log_file")"
   # EACCES on the global prefix means the system-wide Node directory is not
   # writable by this user. Switch to a user-level Node via nvm and retry;
   # never use sudo to work around permissions.
@@ -233,6 +264,7 @@ install_cli_from_npm() {
     fi
   fi
   echo "$install_log" >&2
+  echo "npm installation log saved at: $install_log_file" >&2
   echo "OriginRouter CLI installation failed." >&2
   echo "Verify that the npm global directory is writable and that the npm registry is reachable." >&2
   echo "The installer does not use sudo or change npm permissions automatically." >&2
