@@ -216,10 +216,30 @@ if [[ "$DRY_RUN" == true ]]; then
   exit 0
 fi
 
-if ! npm install --global "$PACKAGE_SPEC"; then
+install_cli_from_npm() {
+  local install_log
+  if install_log="$(npm install --global "$PACKAGE_SPEC" 2>&1)"; then
+    return 0
+  fi
+  # EACCES on the global prefix means the system-wide Node directory is not
+  # writable by this user. Switch to a user-level Node via nvm and retry;
+  # never use sudo to work around permissions.
+  if [[ "$install_log" == *"EACCES"* || "$install_log" == *"permission denied"* ]] \
+    && command -v nvm >/dev/null 2>&1; then
+    echo "==> The npm global directory is not writable by this user; switching to user-level Node via nvm."
+    nvm use "${NODE_MIN_MAJOR}" >/dev/null 2>&1 || nvm install "${NODE_MIN_MAJOR}" || return 1
+    if npm install --global "$PACKAGE_SPEC"; then
+      return 0
+    fi
+  fi
+  echo "$install_log" >&2
   echo "OriginRouter CLI installation failed." >&2
   echo "Verify that the npm global directory is writable and that the npm registry is reachable." >&2
   echo "The installer does not use sudo or change npm permissions automatically." >&2
+  return 1
+}
+
+if ! install_cli_from_npm; then
   exit 1
 fi
 
