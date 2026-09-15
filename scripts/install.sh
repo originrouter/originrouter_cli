@@ -69,6 +69,16 @@ priv_prefix() {
   fi
 }
 
+install_node_via_nvm() {
+  echo "==> Installing Node.js ${NODE_MIN_MAJOR} via nvm (installs to your home directory, no sudo required)"
+  curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash || return 1
+  export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+  # shellcheck disable=SC1091
+  [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" || return 1
+  nvm install "${NODE_MIN_MAJOR}" || return 1
+  nvm use "${NODE_MIN_MAJOR}" || return 1
+}
+
 install_node_runtime() {
   local pkg_manager=""
   if command -v apt-get >/dev/null 2>&1; then
@@ -82,30 +92,35 @@ install_node_runtime() {
   fi
 
   case "$pkg_manager" in
-    apt)
-      echo "==> Installing Node.js ${NODESOURCE_MAJOR} LTS from NodeSource (requires root privileges)"
-      curl -fsSL "https://deb.nodesource.com/setup_${NODESOURCE_MAJOR}.x" | bash - || return 1
-      local prefix
-      prefix="$(priv_prefix)" || return 1
-      $prefix apt-get install -y nodejs || return 1
-      ;;
-    dnf|yum)
-      echo "==> Installing Node.js ${NODESOURCE_MAJOR} LTS from NodeSource (requires root privileges)"
-      curl -fsSL "https://rpm.nodesource.com/setup_${NODESOURCE_MAJOR}.x" | bash - || return 1
-      local prefix
-      prefix="$(priv_prefix)" || return 1
-      $prefix "$pkg_manager" install -y nodejs || return 1
-      ;;
-    apk)
-      echo "==> Installing Node.js via apk (requires root privileges)"
-      local prefix
-      prefix="$(priv_prefix)" || return 1
-      $prefix apk add --no-cache nodejs npm || return 1
+    apt|dnf|yum|apk)
+      if prefix="$(priv_prefix)"; then
+        case "$pkg_manager" in
+          apt)
+            echo "==> Installing Node.js ${NODESOURCE_MAJOR} LTS from NodeSource (system-wide)"
+            curl -fsSL "https://deb.nodesource.com/setup_${NODESOURCE_MAJOR}.x" | bash - || return 1
+            $prefix apt-get install -y nodejs || return 1
+            ;;
+          dnf|yum)
+            echo "==> Installing Node.js ${NODESOURCE_MAJOR} LTS from NodeSource (system-wide)"
+            curl -fsSL "https://rpm.nodesource.com/setup_${NODESOURCE_MAJOR}.x" | bash - || return 1
+            $prefix "$pkg_manager" install -y nodejs || return 1
+            ;;
+          apk)
+            echo "==> Installing Node.js via apk (system-wide)"
+            $prefix apk add --no-cache nodejs npm || return 1
+            ;;
+        esac
+        return 0
+      fi
+      echo "==> No root privileges available; falling back to nvm (user directory)."
+      install_node_via_nvm
       ;;
     *)
-      echo "Could not install Node.js automatically on this system." >&2
-      echo "Install Node.js ${NODE_MIN_MAJOR} or later from https://nodejs.org/en/download, then run this command again." >&2
-      return 1
+      install_node_via_nvm || {
+        echo "Could not install Node.js automatically on this system." >&2
+        echo "Install Node.js ${NODE_MIN_MAJOR} or later from https://nodejs.org/en/download, then run this command again." >&2
+        return 1
+      }
       ;;
   esac
 }
