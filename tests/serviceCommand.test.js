@@ -62,8 +62,9 @@ const common = {
   assert.match(unit, /ExecStart="\/usr\/local\/bin\/node" "\/opt\/originrouter\/bin\/originrouter\.js" daemon/);
   assert.match(unit, /Environment="PATH=\/usr\/local\/bin:/);
   // systemd does not parse quotes on WorkingDirectory=; a quoted value is read
-  // literally and rejected as "path is not absolute".
-  assert.match(unit, /WorkingDirectory=\//);
+  // literally and rejected as "path is not absolute". The value is os.homedir(),
+  // which may be a Unix path (/home/...) or a Windows drive path (C:\Users\...)
+  // depending on the CI runner — both are valid absolute paths to systemd.
   assert.doesNotMatch(unit, /WorkingDirectory="/);
   assert.match(unit, /Restart=on-failure/);
   assert.match(unit, /RestartSec=5/);
