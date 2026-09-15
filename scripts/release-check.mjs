@@ -26,7 +26,13 @@ assert.equal(pkg.publishConfig?.access, "public");
 assert.equal(pkg.name, "@originrouter/cli", "the public npm package name must be @originrouter/cli");
 assert.equal(pkg.bin?.originrouter, "bin/originrouter.js");
 assert.equal(pkg.bin?.or, "bin/originrouter.js");
-assert(constants.includes(`VERSION = "${pkg.version}"`), "src/constants.js VERSION must match package.json");
+// src/constants.js derives VERSION from package.json at runtime, so no
+// static version match is required here. Guard against regressions to a
+// hardcoded literal instead.
+assert(
+  !/^export const VERSION = "/m.test(constants),
+  "src/constants.js must derive VERSION from package.json, not hardcode it",
+);
 
 await access(new URL("../LICENSE", import.meta.url));
 await access(new URL("../NOTICE", import.meta.url));

@@ -1,4 +1,10 @@
-export const VERSION = "0.3.0";
+// The CLI version has a single source of truth: package.json. Derive it here
+// so a release only ever bumps one file.
+import { createRequire } from "node:module";
+
+const pkg = createRequire(import.meta.url)("../package.json");
+
+export const VERSION = pkg.version;
 export const DEFAULT_RELAY_URL = "https://app.easytransnote.com";
 // Public control-plane aliases backed by the same OriginRouter service.
 // Keep this list deliberately small and code-owned: callers must never probe

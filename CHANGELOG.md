@@ -5,6 +5,33 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ## Unreleased
 
+## 0.3.1 - 2026-09-15
+
+### Added
+
+- The install script now installs Node.js 22 automatically when it is missing
+  or outdated: system package managers (NodeSource for apt/dnf/yum, apk) when
+  root or passwordless sudo is available, otherwise nvm into the user's home
+  directory with no sudo at all.
+- An npm global installation that fails with permission errors now retries
+  under a user-level Node from nvm instead of aborting.
+- Background service installation now validates the generated systemd unit
+  with `systemd-analyze --user verify` before registering it, so a bad
+  directive is reported with the offending line.
+- Service setup failures now attach `systemctl --user status` and
+  `journalctl` diagnostics to the reported error.
+
+### Fixed
+
+- Removed quotes from the systemd unit's `WorkingDirectory=` value; systemd
+  reads the value literally, and the quoted path was rejected as
+  "not absolute", preventing the service from starting.
+- Service management commands now time out after 15 seconds instead of
+  hanging forever when no systemd user session is available.
+- Preserved the CLI device identity during key recovery.
+- Stabilized collaboration reconciliation projections and archived stale
+  runs.
+
 ## 0.3.0 - 2026-09-11
 
 ### Added

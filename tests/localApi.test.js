@@ -5,7 +5,7 @@
 // relay.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startLocalApi, projectSession } from "../src/local/localApi.js";
@@ -17,6 +17,11 @@ import { LocalAuditStore } from "../src/persistence/localAuditStore.js";
 import { AgentCatalog } from "../src/persistence/agentCatalog.js";
 import { ProxyRequestStore } from "../src/persistence/proxyRequestStore.js";
 import { saveApprovalPolicy } from "../src/runtime/approvalPolicyStore.js";
+
+// Version comes from package.json so this test never needs a bump on release.
+const CLI_VERSION = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+).version;
 
 const home = mkdtempSync(join(tmpdir(), "originrouter-localapi-test-"));
 process.env.ORIGINROUTER_HOME = home;
@@ -310,7 +315,7 @@ try {
     assert.deepEqual(body.remoteShare.catalog, []);
     assert.equal(body.compatibility.revision, 2);
     assert.equal(body.compatibility.automatic_updates, true);
-    assert.equal(body.updates.current_version, "0.3.0");
+    assert.equal(body.updates.current_version, CLI_VERSION);
     assert.equal(body.updates.mode, "prompt");
   }
 
@@ -318,7 +323,7 @@ try {
   {
     const { status, body } = await getJson("/updates/status");
     assert.equal(status, 200);
-    assert.equal(body.current_version, "0.3.0");
+    assert.equal(body.current_version, CLI_VERSION);
     assert.equal(body.mode, "prompt");
   }
 
