@@ -3,7 +3,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { getCompletionCandidates, installCompletion, uninstallCompletion } from "../src/commands/completion.js";
+import {
+  completionActivationCommand,
+  getCompletionCandidates,
+  installCompletion,
+  uninstallCompletion,
+} from "../src/commands/completion.js";
 
 assert(getCompletionCandidates([""]).includes("provider"));
 assert.deepEqual(getCompletionCandidates(["pro"]), ["provider", "proxy"]);
@@ -19,6 +24,9 @@ assert(getCompletionCandidates(["-"]).includes("--mode"));
 assert.deepEqual(getCompletionCandidates(["--coordinator", "c"]), ["claude", "codex"]);
 assert(getCompletionCandidates(["--mode", "p"]).includes("plan-build-verify"));
 assert(getCompletionCandidates(["remote", "workspace", "r"]).includes("request"));
+assert.equal(completionActivationCommand("bash", "/root/.bashrc"), "source '/root/.bashrc'");
+assert.equal(completionActivationCommand("zsh", "/Users/test user/.zshrc"), "source '/Users/test user/.zshrc'");
+assert.equal(completionActivationCommand("powershell", "C:\\Users\\Test\\profile.ps1"), ". 'C:\\Users\\Test\\profile.ps1'");
 
 const home = mkdtempSync(join(tmpdir(), "originrouter-completion-"));
 try {

@@ -247,6 +247,23 @@ export function installCompletion(shell = detectShell(), { env = process.env, pl
   return { ...target, changed: true, repaired: state === "damaged" };
 }
 
+function quotePosixShellPath(file) {
+  return `'${String(file).replaceAll("'", `'\\''`)}'`;
+}
+
+export function completionActivationCommand(shell, file) {
+  if (shell === "powershell") return `. '${String(file).replaceAll("'", "''")}'`;
+  if (["bash", "zsh", "fish"].includes(shell)) return `source ${quotePosixShellPath(file)}`;
+  return null;
+}
+
+export function printCompletionActivationHint(shell, file) {
+  const command = completionActivationCommand(shell, file);
+  if (!command) return;
+  console.log("  Completion is saved for future terminals.");
+  console.log(`  To enable it in this terminal now, run: ${command}`);
+}
+
 export function uninstallCompletion(shell = detectShell(), { env = process.env, platformName = process.platform, dryRun = false } = {}) {
   const target = completionTarget(shell, { env, platformName });
   if (!fs.existsSync(target.file)) return { ...target, changed: false, reason: "not-installed" };
@@ -279,6 +296,7 @@ export function handleCompletionCommand(args = []) {
   else if (result.reason === "not-managed") console.log("The completion target is not managed by OriginRouter: " + result.file);
   else if (result.dryRun) console.log((action === "install" ? "Would configure " : "Would remove ") + shell + " completion: " + result.file);
   else console.log((action === "install" ? "Configured " : "Removed ") + shell + " completion: " + result.file);
+  if (action === "install" && !result.dryRun) printCompletionActivationHint(shell, result.file);
 }
 
 export function printCompletion(shell) {

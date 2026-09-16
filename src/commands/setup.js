@@ -12,7 +12,7 @@ import { handleServiceCommand, isServiceInstalled, waitForLocalApiReady } from "
 import { ProxyManager } from "../proxy/manager.js";
 import { ensureStateDir } from "../persistence/state.js";
 import { isInstalled as isProxyInstalled, LITELLM_VERSION } from "../proxy/litellm.js";
-import { detectShell, installCompletion } from "./completion.js";
+import { detectShell, installCompletion, printCompletionActivationHint } from "./completion.js";
 import {
   ensureManagedPython,
   managedPythonStatus,
@@ -353,6 +353,7 @@ export async function handleSetupCommand(args = []) {
           console.log(result.changed
             ? `✓ Shell completion configured for ${shell}.`
             : `✓ Shell completion is already configured for ${shell}.`);
+          printCompletionActivationHint(shell, result.file);
         } catch (error) {
           console.error(`✗ Shell completion setup failed: ${error.message || error}`);
           process.exitCode = 1;

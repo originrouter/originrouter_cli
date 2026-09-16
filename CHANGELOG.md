@@ -13,6 +13,9 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
   macOS, Linux, and Windows using their official packages.
 - Setup refreshes npm and user-level binary paths before verification, so a
   newly installed agent is available without restarting the terminal.
+- Shell completion setup now prints the exact command needed to activate
+  completion in the current terminal while keeping it enabled for future
+  terminals.
 
 ### Fixed
 
