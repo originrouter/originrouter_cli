@@ -130,4 +130,3 @@ export function getDiagnostics(store, runId) {
       database_integrity: store.db.pragma("quick_check", { simple: true }),
     };
   }
-
