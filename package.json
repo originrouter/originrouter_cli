@@ -48,7 +48,7 @@
     "access": "public"
   },
   "scripts": {
-    "pretest": "npm run test:completion && npm run test:setup && npm run test:update && node --test ./tests/collaborationConfigurationPlanner.test.js ./tests/cliArgs.test.js ./tests/agentWorkspaceRunSummary.test.js",
+    "pretest": "npm run test:completion && npm run test:setup && npm run test:update && node --test ./tests/collaborationConfigurationPlanner.test.js ./tests/cliArgs.test.js ./tests/agentWorkspaceRunSummary.test.js ./tests/agentWorkspaceTerminalText.test.js",
     "postinstall": "node ./scripts/fix-node-pty-permissions.cjs",
     "generate:approval-policy-registry": "node ./scripts/generate-approval-policy-registry.mjs",
     "check:approval-policy-registry": "node ./scripts/generate-approval-policy-registry.mjs --check",
