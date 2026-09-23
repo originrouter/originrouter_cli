@@ -93,35 +93,19 @@ import {
   sendError,
   sendOk,
 } from "./localApiHttp.js";
+import {
+  flattenCollaborationSnapshot,
+  placeholderProxyStatus,
+  projectRoutesForApi,
+  projectSession,
+} from "./localApiProjections.js";
+
+export { projectSession } from "./localApiProjections.js";
 
 // Exported so CLI subcommands (e.g. `local api set-host`) can apply
 // the same gating as the runtime auth layer. Keep the set in lock-
 // step with the bind-address check in `startLocalApi` above.
 export const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"]);
-
-function flattenCollaborationSnapshot(snapshot) {
-  if (!snapshot) return null;
-  return {
-    ...snapshot.run,
-    schema_version: snapshot.schema_version,
-    revision: snapshot.revision,
-    last_sequence: snapshot.last_sequence,
-    plan: snapshot.plan,
-    tasks: snapshot.tasks,
-    agents: Object.fromEntries(
-      (snapshot.participants || []).map((participant) => [
-        participant.participant_id,
-        participant,
-      ]),
-    ),
-    attention: snapshot.attention,
-    artifacts: snapshot.artifacts,
-    budget: snapshot.budget,
-    usage: snapshot.usage,
-    final_report: snapshot.final_report,
-    capabilities: snapshot.capabilities,
-  };
-}
 
 // Bearer-token regex: case-insensitive 64 hex chars.
 const BEARER_RE = /^Bearer\s+([a-f0-9]{64})$/i;
@@ -134,17 +118,6 @@ const LOG_TAIL_DEFAULT_LINES = 200;
 // Hard-coded placeholder for proxy status. Stage 4 will swap this for a real
 // LiteLLM process probe. Keeping it as an injected function (not a module-level
 // constant) so tests can override.
-function placeholderProxyStatus() {
-  return {
-    state: "not-installed",
-    port: null,
-    version: null,
-    pid: null,
-    currentProvider: null,
-    note: "LiteLLM proxy control lands in Stage 4.",
-  };
-}
-
 // ---------- Lifecycle ----------
 
 export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathOpt, allowLan = false } = {}) {
@@ -2063,17 +2036,6 @@ async function snapshotProxyForApi(ctx) {
   };
 }
 
-function projectRoutesForApi(routes, agent = "claude") {
-  // Project every slot defined for the agent, with missing slots becoming
-  // null. Older agents (Claude) return { main, small }; Codex returns
-  // just { main } because that's all ROUTE_DEFS.codex.slots contains.
-  const def = ROUTE_DEFS[agent];
-  const slots = def ? def.slots : ["main", "small"];
-  const out = {};
-  for (const slot of slots) out[slot] = (routes && routes[slot]) || null;
-  return out;
-}
-
 function handleRoutesList(ctx, res) {
   const config = ctx.configProvider();
   // Stage 8.0: walk all configured agents. Aliases use the canonical
@@ -2198,22 +2160,4 @@ async function handleRouteClear(ctx, res, agent, slot) {
     routes: { [agent]: projectRoutesForApi(result.routes[agent], agent) },
     proxy: result.proxy,
   });
-}
-
-// ---------- Projection ----------
-
-// JSON-safe view of an internal session. Strips adapter/executor instances,
-// scanTimer handles, and other non-serializable fields.
-export function projectSession(session) {
-  return {
-    sessionId: session.id || session.sessionId,
-    agent: session.agent,
-    command: session.command,
-    args: session.args,
-    status: session.status,
-    cwd: session.cwd,
-    pid: session.pid,
-    executor: session.executorKind,
-    startedAt: session.startedAt || session.createdAt,
-  };
 }
