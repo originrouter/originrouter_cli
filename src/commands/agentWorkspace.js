@@ -1,5 +1,4 @@
 import { cwd, stdin as defaultInput, stdout as defaultOutput } from "node:process";
-import { spawn } from "node:child_process";
 import {
   clearScreenDown,
   cursorTo,
@@ -26,6 +25,7 @@ import {
   workspaceModeDefinition,
   workspaceModeSummary,
 } from "../collaboration/workspaceModes.js";
+import { parseAgentWorkspaceArgs } from "./agentWorkspace/args.js";
 import { projectCollaborationActivity } from "../collaboration/activityPresentation.js";
 import {
   compactRunState,
@@ -34,9 +34,6 @@ import {
 } from "./agentWorkspace/runSummary.js";
 import {
   centerDisplayText,
-  compareWorkspacePoints,
-  displaySelectionSegments,
-  displaySlice,
   fitDisplayText,
   padDisplayRight,
   promptDisplayWidth,
@@ -50,6 +47,17 @@ import {
   pastedKeyText,
   pruneComposerPastes,
 } from "./agentWorkspace/composerPastes.js";
+import {
+  clearWorkspaceSelection,
+  consumeWorkspaceMouseKeypress,
+  handleWorkspaceMouseKeypress,
+  positionWorkspaceCursor,
+  renderWorkspaceSelectionFrame,
+  scrollRuntimeContent,
+  workspaceScreenCache,
+  workspaceSelectionCache,
+  workspaceSelectionText,
+} from "./agentWorkspace/terminalSelection.js";
 import {
   completeWorkspaceCommandInput,
   findWorkspaceCommand,
@@ -113,75 +121,14 @@ import {
 } from "./agentWorkspace/panels.js";
 
 export { workspaceInteractionSurface } from "./agentWorkspace/interactionState.js";
+export {
+  consumeWorkspaceMouseKeypress,
+  scrollRuntimeContent,
+  workspaceSelectionText,
+} from "./agentWorkspace/terminalSelection.js";
 
-const FORWARDED_FLAGS = new Set([
-  "--detach",
-  "--json",
-  "--no-wait",
-  "--plain",
-  "--raw",
-  "--review",
-  "--verbose",
-  "--yes",
-]);
+export { parseAgentWorkspaceArgs } from "./agentWorkspace/args.js";
 
-function optionValue(argv, index, option) {
-  const item = String(argv[index]);
-  if (item.startsWith(`${option}=`)) return { value: item.slice(option.length + 1), consumed: 1 };
-  if (index + 1 >= argv.length) throw new Error(`${option} requires a value.`);
-  return { value: String(argv[index + 1]), consumed: 2 };
-}
-
-export function parseAgentWorkspaceArgs(argv = []) {
-  const objective = [];
-  const forwarded = [];
-  let coordinator = "codex";
-  let mode = "auto";
-  for (let index = 0; index < argv.length;) {
-    const item = String(argv[index]);
-    if (item === "-c" || item === "--coordinator" || item.startsWith("--coordinator=")) {
-      const parsed = item === "-c"
-        ? optionValue(argv, index, "-c")
-        : optionValue(argv, index, "--coordinator");
-      coordinator = normalizeCoordinator(parsed.value);
-      index += parsed.consumed;
-      continue;
-    }
-    if (item === "-m" || item === "--mode" || item === "--team" || item.startsWith("--mode=") || item.startsWith("--team=")) {
-      const option = item === "-m" ? "-m" : item.startsWith("--team") ? "--team" : "--mode";
-      const parsed = optionValue(argv, index, option);
-      mode = normalizeWorkspaceMode(parsed.value);
-      index += parsed.consumed;
-      continue;
-    }
-    if (item === "--timeout" || item.startsWith("--timeout=")) {
-      const parsed = optionValue(argv, index, "--timeout");
-      forwarded.push("--timeout", parsed.value);
-      index += parsed.consumed;
-      continue;
-    }
-    if (FORWARDED_FLAGS.has(item)) {
-      forwarded.push(item);
-      index += 1;
-      continue;
-    }
-    if (item.startsWith("-")) throw new Error(`Unknown Agent Workspace option '${item}'.`);
-    objective.push(item);
-    index += 1;
-  }
-  if (forwarded.includes("--yes") && forwarded.includes("--review")) {
-    throw new Error("--yes and --review cannot be used together.");
-  }
-  return {
-    coordinator,
-    mode,
-    objective: objective.join(" ").trim(),
-    forwarded,
-  };
-}
-
-const workspaceScreenCache = new WeakMap();
-const workspaceSelectionCache = new WeakMap();
 const TERMINAL_WORKSPACE_RUN_STATES = new Set(["completed", "failed", "cancelled", "expired"]);
 
 // Coalesce background state changes into one terminal frame. Input-driven
@@ -240,197 +187,6 @@ function reviewScrollDirection(text, key = {}, { arrows = false } = {}) {
   if (arrows && key.name === "up") return -1;
   if (arrows && key.name === "down") return 1;
   return 0;
-}
-
-// SGR mouse reports can arrive as a single keypress or as several fragments.
-// Keeping this parser independent from the UI lets every Workspace surface
-// share the same pointer semantics.
-export function consumeWorkspaceMouseKeypress(state, text, key = {}) {
-  const sequence = String(key.sequence || text || "");
-  let buffer = String(state?.mouseSequenceBuffer || "");
-  if (!buffer) {
-    if (!sequence.startsWith("\x1b[<")) return { handled: false };
-    buffer = sequence;
-  } else {
-    buffer += sequence;
-  }
-  if (buffer.length > 64) {
-    state.mouseSequenceBuffer = "";
-    return { handled: true };
-  }
-  if (!/[mM]$/.test(buffer)) {
-    state.mouseSequenceBuffer = buffer;
-    return { handled: true };
-  }
-  state.mouseSequenceBuffer = "";
-  const match = /^\x1b\[<(\d+);(\d+);(\d+)([mM])$/.exec(buffer);
-  if (!match) return { handled: true };
-  const code = Number(match[1]);
-  const x = Number(match[2]);
-  const y = Number(match[3]);
-  if (code === 64 || code === 65) {
-    return { handled: true, type: "wheel", direction: code === 64 ? -1 : 1, x, y };
-  }
-  const button = code & 3;
-  const motion = (code & 32) !== 0;
-  if (match[4] === "m") return { handled: true, type: "release", button, x, y };
-  if (motion) return { handled: true, type: "move", button, x, y };
-  return { handled: true, type: "press", button, x, y };
-}
-
-function workspaceSelection(output) {
-  let selection = workspaceSelectionCache.get(output);
-  if (!selection) {
-    selection = { anchor: null, focus: null, dragging: false };
-    workspaceSelectionCache.set(output, selection);
-  }
-  return selection;
-}
-
-function clearWorkspaceSelection(output) {
-  const selection = workspaceSelectionCache.get(output);
-  if (!selection) return;
-  selection.anchor = null;
-  selection.focus = null;
-  selection.dragging = false;
-}
-
-function clampWorkspacePoint(output, point = {}) {
-  return {
-    x: Math.max(1, Math.min(Number(output.columns) || 80, Number(point.x) || 1)),
-    y: Math.max(1, Math.min(Number(output.rows) || 24, Number(point.y) || 1)),
-  };
-}
-
-function workspacePointHasText(output, point) {
-  const lines = workspaceScreenCache.get(output)?.lines || [];
-  const line = stripAnsi(lines[Math.max(0, point.y - 1)] || "");
-  if (!line) return false;
-  const visibleChars = [...line];
-  let column = 1;
-  for (const char of visibleChars) {
-    const charWidth = Math.max(1, promptDisplayWidth(char));
-    if (point.x >= column && point.x < column + charWidth) {
-      // Padding, frame rules, and the cursor marker are layout chrome, not
-      // selectable content. This also prevents a click on a separator from
-      // leaving a one-cell reverse-video block on screen.
-      return !/^\s$/.test(char) && !["─", "│", "╭", "╮", "╰", "╯", "›", "▌"].includes(char);
-    }
-    column += charWidth;
-    if (column > point.x) break;
-  }
-  return false;
-}
-
-export function workspaceSelectionText(lines, selection) {
-  if (!selection?.anchor || !selection?.focus) return "";
-  let start = selection.anchor;
-  let end = selection.focus;
-  if (compareWorkspacePoints(start, end) > 0) [start, end] = [end, start];
-  const rows = [];
-  for (let row = start.y; row <= end.y; row += 1) {
-    const line = lines[row - 1] || "";
-    const from = row === start.y ? start.x : 1;
-    const to = row === end.y ? end.x : Number.MAX_SAFE_INTEGER;
-    rows.push(displaySlice(line, from, to).replace(/[ \t]+$/g, ""));
-  }
-  return rows.join("\n").replace(/[\n\s]+$/g, "");
-}
-
-function renderWorkspaceSelection(output, lines) {
-  const selection = workspaceSelectionCache.get(output);
-  if (!selection?.anchor || !selection?.focus) return;
-  let start = selection.anchor;
-  let end = selection.focus;
-  for (let row = start.y; row <= end.y; row += 1) {
-    const from = row === start.y ? start.x : 1;
-    const to = row === end.y ? end.x : Number(output.columns) || 80;
-    const segments = displaySelectionSegments(lines[row - 1] || "", from, to);
-    if (!segments.selected) continue;
-    output.write(
-      `\x1b[${row};1H\x1b[2K${segments.before}\x1b[7m${segments.selected}\x1b[27m${segments.after}`,
-    );
-  }
-}
-
-function positionWorkspaceCursor(output, lines) {
-  const row = lines.findIndex((line) => stripAnsi(line).includes("▌"));
-  if (row < 0) return;
-  const plain = stripAnsi(lines[row]);
-  const cursorIndex = plain.indexOf("▌");
-  const column = Math.max(0, promptDisplayWidth(plain.slice(0, cursorIndex)));
-  cursorTo(output, column, row);
-}
-
-function copyWorkspaceSelection(text) {
-  if (!text) return;
-  if (process.platform === "darwin") {
-    const child = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-    child.on("error", () => {});
-    child.stdin.end(text);
-  }
-}
-
-function handleWorkspaceMouseKeypress({ output, state, text, key, runtime = null, render }) {
-  const mouse = consumeWorkspaceMouseKeypress(state, text, key);
-  if (!mouse.handled) return false;
-  if (mouse.type === "wheel") {
-    clearWorkspaceSelection(output);
-    if (runtime && mouse.direction) scrollRuntimeContent(runtime, mouse.direction, 3);
-    render?.(true);
-    return true;
-  }
-  if (mouse.button !== 0) return true;
-  const selection = workspaceSelection(output);
-  const point = clampWorkspacePoint(output, mouse);
-  if (mouse.type === "press") {
-    // A click in the empty padding below/after the rendered content must not
-    // become a fake text anchor. Besides producing a misleading selection,
-    // that leaves Terminal.app's IME candidate window at the clicked column.
-    if (!workspacePointHasText(output, point)) {
-      clearWorkspaceSelection(output);
-      render?.(true);
-      return true;
-    }
-    selection.anchor = point;
-    selection.focus = point;
-    selection.dragging = true;
-    render?.(true);
-    return true;
-  }
-  if (mouse.type === "move" && selection.dragging) {
-    selection.focus = point;
-    render?.(true);
-    return true;
-  }
-  if (mouse.type === "release" && selection.dragging) {
-    selection.focus = point;
-    selection.dragging = false;
-    const copied = workspaceSelectionText(workspaceScreenCache.get(output)?.lines || [], selection);
-    copyWorkspaceSelection(copied);
-    render?.(true);
-  }
-  return true;
-}
-
-export function scrollRuntimeContent(runtime, direction, pageSize = 6) {
-  if (!direction) return false;
-  const maxOffset = Math.max(
-    0,
-    Number(runtime.contentLineCount || 0) - Number(runtime.contentVisibleRows || 0),
-  );
-  const current = runtime.autoFollow === false
-    ? Number(runtime.scrollOffset || 0)
-    : maxOffset;
-  const nextOffset = Math.max(0, Math.min(
-    maxOffset,
-    current + direction * pageSize,
-  ));
-  if (nextOffset === current && runtime.autoFollow === (nextOffset >= maxOffset)) return false;
-  runtime.scrollOffset = nextOffset;
-  runtime.autoFollow = nextOffset >= maxOffset;
-  if (runtime.autoFollow) runtime.unseenActivityCount = 0;
-  return true;
 }
 
 function toggleSelectedActivity(runtime) {
@@ -1699,7 +1455,7 @@ function redrawWorkspaceApp(output, {
     lines: nextLines,
   });
   writeFrame(() => {
-    renderWorkspaceSelection(output, nextLines);
+    renderWorkspaceSelectionFrame(output, nextLines);
     positionWorkspaceCursor(output, nextLines);
   });
 }
