@@ -29,6 +29,11 @@ import {
 import { projectCollaborationActivity } from "../collaboration/activityPresentation.js";
 import { listApprovalPolicies } from "../runtime/approvalPolicyStore.js";
 import {
+  compactRunState,
+  recentWorkspaceSessions,
+  runLabel,
+} from "./agentWorkspace/runSummary.js";
+import {
   completeWorkspaceCommandInput,
   findWorkspaceCommand,
   parseWorkspaceCommand,
@@ -238,22 +243,6 @@ function commandHelpPanel(commandName = "") {
   };
 }
 
-function compactRunState(run = {}) {
-  const tasks = Array.isArray(run.tasks) ? run.tasks.filter((task) => task.task_key !== "__planner__") : [];
-  const complete = tasks.filter((task) => task.state === "completed").length;
-  const attention = Array.isArray(run.attention)
-    ? run.attention.filter((item) => item.status === "pending").length
-    : 0;
-  const progress = tasks.length ? `${complete}/${tasks.length} tasks` : "no tasks yet";
-  return `${run.state || "unknown"} · ${progress}${attention ? ` · ${attention} needs attention` : ""}`;
-}
-
-function runLabel(run = {}) {
-  return String(run.objective || run.plan?.title || run.run_id || "Agent collaboration")
-    .replace(/\s+/g, " ")
-    .slice(0, 140);
-}
-
 function workspaceStatusPanel({ coordinator, mode, sessionApproval, lastRun = null }) {
   const lines = [
     `Mode: ${workspaceModeDefinition(mode).label}`,
@@ -287,15 +276,6 @@ function workspaceRunsPanel({ category, runs = [], total = 0 }) {
   if (total > runs.length) lines.push(`Showing ${runs.length} of ${total} Runs.`);
   lines.push("Use /attach <run-id> to follow a Run, or /resume <session-id> to restore its Session.");
   return { title: `${category[0].toUpperCase()}${category.slice(1)} Runs`, lines };
-}
-
-function recentWorkspaceSessions(runs = []) {
-  const sessions = new Map();
-  for (const run of runs) {
-    const sessionId = String(run?.workspace_session_id || run?.workspaceSessionId || "").trim();
-    if (sessionId && !sessions.has(sessionId)) sessions.set(sessionId, run);
-  }
-  return [...sessions.entries()].map(([sessionId, run]) => ({ sessionId, run }));
 }
 
 function workspaceAgentsPanel(run = {}) {
