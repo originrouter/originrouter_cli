@@ -5,6 +5,60 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ## Unreleased
 
+## 0.4.0 - 2026-09-23
+
+### Added
+
+- Added account-scoped persistence with an active-account selector and
+  isolated configuration, credentials, sessions, collaboration state, agent
+  catalogs, budgets, audits, telemetry, and proxy state.
+- Added one-time migration of legacy root-level account data after the account
+  is identified from a verified credential.
+- Added installation-scoped device E2EE identity management, including
+  migration from older account-scoped identity files.
+- Added secure local App pairing with short-lived, one-time pairing tickets,
+  encrypted credential delivery, replay protection, origin checks, and rate
+  limiting through `originrouter local api pair`.
+
+### Changed
+
+- Device identity keys now remain stable across account switches; account
+  policy/session changes no longer manufacture a new installation identity.
+- The daemon now detects account and authentication-session changes and
+  restarts cleanly so all stores, sessions, and relay connections use the new
+  account context.
+- Local API port selection is persisted and automatically moves above the
+  default port when it is already occupied.
+- Refactored Agent Workspace, Local API, Collaboration, Bridge, Daemon, Agent
+  Catalog, local sessions, and Codex app-server code into focused modules.
+- Extracted shared CLI argument parsing, command output, help, transport,
+  error handling, projections, schemas, and primitive layers from previously
+  monolithic files.
+
+### Fixed
+
+- Prevented account data, credentials, routes, history, and local runtime
+  state from leaking across users or accounts on the same installation.
+- Improved device identity recovery and trust-directory refresh behavior for
+  local and remote control flows.
+
+### Quality
+
+- Added focused regression coverage for account isolation, storage migration,
+  device identity migration, local pairing, CLI helpers, Workspace
+  projections, and Collaboration projections.
+- Full regression suite, CLI smoke tests, release metadata checks, and npm
+  packaging checks pass.
+
+### Upgrade notes
+
+- Existing `0.3.3` installations are migrated lazily after a verified account
+  credential is found. Legacy account data is retained and moved into its
+  account namespace; it is not deleted.
+- No manual migration command is required, but users should allow the first
+  post-upgrade login/daemon start to complete before launching concurrent
+  sessions.
+
 ## 0.3.3 - 2026-09-15
 
 ### Changed
