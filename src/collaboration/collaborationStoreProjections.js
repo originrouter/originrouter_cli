@@ -94,4 +94,3 @@ export function publicAttention(row) {
     derived: false,
   };
 }
-
