@@ -4,17 +4,12 @@ import { createInterface } from "node:readline/promises";
 import { ensureStateDir } from "../persistence/state.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import { accessTokenFor, OAUTH_RESOURCES } from "../runtime/authContract.js";
+import {
+  hasOption as has,
+  optionValue,
+} from "./shared/cliArgs.js";
 
 const DEFAULT_MEMORY_BASE_URL = "https://memory.easytransnote.com";
-
-function optionValue(args, name) {
-  const index = args.indexOf(name);
-  return index >= 0 ? args[index + 1] : undefined;
-}
-
-function has(args, name) {
-  return args.includes(`--${name}`);
-}
 
 function positionalQuery(args) {
   const parts = [];

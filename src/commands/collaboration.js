@@ -24,6 +24,11 @@ import {
   normalizeWorkspaceMode,
   workspaceModeDefinition,
 } from "../collaboration/workspaceModes.js";
+import {
+  hasOption as has,
+  optionValue as value,
+  optionValues as values,
+} from "./shared/cliArgs.js";
 
 export const MAX_COLLABORATION_RECONNECT_ATTEMPTS = 5;
 
@@ -91,23 +96,6 @@ function collaborationErrorDetails(status, reason) {
     };
   }
   return { exitCode: 1 };
-}
-
-function values(args, name) {
-  const out = [];
-  for (let index = 0; index < args.length; index += 1) {
-    if (args[index] === `--${name}` && index + 1 < args.length) out.push(args[index + 1]);
-    else if (args[index].startsWith(`--${name}=`)) out.push(args[index].slice(name.length + 3));
-  }
-  return out;
-}
-
-function value(args, name) {
-  return values(args, name).at(-1);
-}
-
-function has(args, name) {
-  return args.includes(`--${name}`);
 }
 
 function localApi() {

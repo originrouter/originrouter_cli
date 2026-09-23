@@ -86,6 +86,7 @@ import {
   handleUpdateCommand,
 } from "./commands/update.js";
 import { setUpdateMode, updateModeFromConfig } from "./update/settings.js";
+import { parseOptionArgs } from "./commands/shared/cliArgs.js";
 import {
   rollbackCompatibilityPack,
 } from "./compatibility/patchStore.js";
@@ -450,28 +451,6 @@ function runCommand(command, args) {
     }
     process.exitCode = code ?? 0;
   });
-}
-
-function parseOptionArgs(args, { booleanFlags = [] } = {}) {
-  const options = {};
-  const booleans = new Set(booleanFlags);
-  for (let index = 0; index < args.length; index += 1) {
-    const key = args[index];
-    if (!key.startsWith("--")) {
-      throw new Error(`Unexpected argument: ${key}`);
-    }
-    const value = args[index + 1];
-    if (!value || value.startsWith("--")) {
-      if (booleans.has(key)) {
-        options[key] = true;
-        continue;
-      }
-      throw new Error(`Missing value for ${key}`);
-    }
-    options[key] = value;
-    index += 1;
-  }
-  return options;
 }
 
 function printClaudeConfig(config) {

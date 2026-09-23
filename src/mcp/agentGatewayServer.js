@@ -6,13 +6,7 @@ import { z } from "zod";
 
 import { readApiToken } from "../persistence/authToken.js";
 import { ensureStateDir, readDaemonState } from "../persistence/state.js";
-
-function value(args, name) {
-  const index = args.indexOf(name);
-  if (index >= 0 && index + 1 < args.length) return String(args[index + 1] || "");
-  const prefix = `${name}=`;
-  return String(args.find((item) => item.startsWith(prefix)) || "").slice(prefix.length);
-}
+import { optionValue } from "../commands/shared/cliArgs.js";
 
 function localApi() {
   const stateDir = ensureStateDir();
@@ -70,7 +64,7 @@ async function toolResult(operation) {
 }
 
 export async function runAgentGatewayMcpServer(args = process.argv.slice(2)) {
-  const sessionId = value(args, "--originrouter-session").trim();
+  const sessionId = String(optionValue(args, "--originrouter-session") || "").trim();
   if (!sessionId) throw new Error("--originrouter-session is required");
 
   const server = new McpServer({
