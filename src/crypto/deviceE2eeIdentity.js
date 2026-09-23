@@ -10,6 +10,7 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   unlinkSync,
@@ -18,6 +19,9 @@ import {
 import { join } from "node:path";
 
 export const DEVICE_E2EE_PROTOCOL = "originrouter-device-e2ee-v2";
+// Compatibility field only. The key pair is installation-scoped; account
+// policy epochs must never rotate or replace it.
+export const DEVICE_E2EE_IDENTITY_EPOCH = 1;
 const IDENTITY_DOMAIN = "originrouter/device-identity/v2\n";
 const ROTATION_DOMAIN = "originrouter/device-key-rotation/v2\n";
 const ENROLLMENT_DOMAIN = "originrouter/device-login/v2\n";
@@ -35,17 +39,43 @@ function scopeSegment(accountScope) {
 }
 
 function identityPath(stateDir, accountScope) {
-  const scope = scopeSegment(accountScope);
-  return scope
-    ? join(stateDir, "accounts", scope, "device-e2ee-v2.json")
-    : join(stateDir, "device-e2ee-v2.json");
+  // Device E2EE identity is installation-scoped, not account-scoped. Keep
+  // the argument for source compatibility while all new material lives at
+  // the stable device path.
+  return join(stateDir, "device-e2ee-v2.json");
 }
 
 function pendingIdentityPath(stateDir, accountScope) {
+  return join(stateDir, "device-e2ee-v2.pending.json");
+}
+
+function legacyIdentityPath(stateDir, accountScope) {
   const scope = scopeSegment(accountScope);
-  return scope
-    ? join(stateDir, "accounts", scope, "device-e2ee-v2.pending.json")
-    : join(stateDir, "device-e2ee-v2.pending.json");
+  return scope ? join(stateDir, "accounts", scope, "device-e2ee-v2.json") : null;
+}
+
+function legacyPendingIdentityPath(stateDir, accountScope) {
+  const scope = scopeSegment(accountScope);
+  return scope ? join(stateDir, "accounts", scope, "device-e2ee-v2.pending.json") : null;
+}
+
+function anyLegacyIdentityPath(stateDir) {
+  const accountsDir = join(stateDir, "accounts");
+  if (!existsSync(accountsDir)) return null;
+  let entries;
+  try {
+    entries = readdirSync(accountsDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+  } catch {
+    return null;
+  }
+  for (const scope of entries) {
+    const candidate = join(accountsDir, scope, "device-e2ee-v2.json");
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
 }
 
 function canonicalValue(value) {
@@ -130,7 +160,7 @@ function generateIdentity({ deviceId, epoch, keyVersion, previous = null, now = 
     protocol: DEVICE_E2EE_PROTOCOL,
     device_id: String(deviceId),
     source: "originrouter_cli",
-    epoch: Number(epoch),
+    epoch: DEVICE_E2EE_IDENTITY_EPOCH,
     key_version: Number(keyVersion),
     signing_algorithm: "Ed25519",
     signing_public_key: publicValue(exportJwk(signing.publicKey)),
@@ -165,12 +195,59 @@ function generateIdentity({ deviceId, epoch, keyVersion, previous = null, now = 
 
 export function readDeviceE2eeIdentity(stateDir, { accountScope } = {}) {
   const path = identityPath(stateDir, accountScope);
-  if (!existsSync(path)) return null;
-  const parsed = JSON.parse(readFileSync(path, "utf8"));
+  let source = path;
+  if (!existsSync(source)) {
+    // One-time migration for clients that stored an account-scoped identity
+    // before device identities became installation-scoped. The first active
+    // account promotes its identity to the stable device path; subsequent
+    // account switches reuse that exact key pair.
+    const scopedLegacy = legacyIdentityPath(stateDir, accountScope);
+    source = (scopedLegacy && existsSync(scopedLegacy) ? scopedLegacy : null)
+      || anyLegacyIdentityPath(stateDir)
+      || path;
+    if (!existsSync(source)) return null;
+  }
+  const parsed = JSON.parse(readFileSync(source, "utf8"));
   if (parsed?.public_identity?.protocol !== DEVICE_E2EE_PROTOCOL) {
     throw new Error("unsupported stored device E2EE identity");
   }
+  if (source !== path) writePrivate(path, parsed);
   return parsed;
+}
+
+export function readDeviceE2eeIdentityCandidate(stateDir, { accountScope } = {}) {
+  const path = pendingIdentityPath(stateDir, accountScope);
+  let source = path;
+  if (!existsSync(source)) {
+    source = legacyPendingIdentityPath(stateDir, accountScope) || path;
+    if (!existsSync(source)) return null;
+  }
+  const parsed = JSON.parse(readFileSync(source, "utf8"));
+  if (parsed?.verification_status !== "invalid"
+      || !isUsableDeviceE2eeIdentity(parsed)) {
+    throw new Error("invalid pending device E2EE identity");
+  }
+  if (source !== path) writePrivate(path, parsed);
+  return parsed;
+}
+
+export function isUsableDeviceE2eeIdentity(identity) {
+  const publicIdentity = identity?.public_identity;
+  if (!verifyDeviceE2eeIdentity(publicIdentity)) return false;
+  try {
+    const signingPublic = exportJwk(createPublicKey(createPrivateKey({
+      key: identity.signing_private_jwk,
+      format: "jwk",
+    })));
+    const agreementPublic = exportJwk(createPublicKey(createPrivateKey({
+      key: identity.agreement_private_jwk,
+      format: "jwk",
+    })));
+    return signingPublic.x === publicIdentity.signing_public_key
+      && agreementPublic.x === publicIdentity.agreement_public_key;
+  } catch {
+    return false;
+  }
 }
 
 export function ensureDeviceE2eeIdentity(stateDir, { deviceId, epoch = 1, accountScope } = {}) {
@@ -179,12 +256,11 @@ export function ensureDeviceE2eeIdentity(stateDir, { deviceId, epoch = 1, accoun
     if (existing.public_identity.device_id !== deviceId) {
       throw new Error("stored device E2EE identity belongs to another device");
     }
-    if (existing.public_identity.epoch !== epoch) {
-      throw new Error("stored device E2EE identity belongs to another account epoch");
-    }
+    // The identity is installation-scoped. Account policy epochs do not
+    // replace the local private key when the user switches accounts.
     return existing;
   }
-  const created = generateIdentity({ deviceId, epoch, keyVersion: 1 });
+  const created = generateIdentity({ deviceId, epoch: DEVICE_E2EE_IDENTITY_EPOCH, keyVersion: 1 });
   writePrivate(identityPath(stateDir, accountScope), created);
   return created;
 }
@@ -204,10 +280,10 @@ export function createDeviceE2eeIdentityCandidate(
       if (
         existing?.verification_status === "invalid"
         && publicIdentity?.device_id === String(deviceId)
-        && Number(publicIdentity?.epoch) === Number(epoch)
+        && Number(publicIdentity?.epoch) === DEVICE_E2EE_IDENTITY_EPOCH
         && Number(publicIdentity?.key_version) === Number(keyVersion)
         && (publicIdentity?.previous_key_id || null) === (previousKeyId || null)
-        && verifyDeviceE2eeIdentity(publicIdentity)
+        && isUsableDeviceE2eeIdentity(existing)
       ) {
         return existing;
       }
@@ -219,7 +295,7 @@ export function createDeviceE2eeIdentityCandidate(
   const candidate = {
     ...generateIdentity({
       deviceId,
-      epoch,
+      epoch: DEVICE_E2EE_IDENTITY_EPOCH,
       keyVersion: Number(keyVersion),
       previous: previousKeyId
         ? { public_identity: { key_id: String(previousKeyId) } }
@@ -233,7 +309,7 @@ export function createDeviceE2eeIdentityCandidate(
 }
 
 export function commitDeviceE2eeIdentity(stateDir, candidate, { accountScope } = {}) {
-  if (!candidate?.public_identity || !verifyDeviceE2eeIdentity(candidate.public_identity)) {
+  if (!isUsableDeviceE2eeIdentity(candidate)) {
     throw new Error("invalid device E2EE identity candidate");
   }
   const pendingPath = pendingIdentityPath(stateDir, accountScope);
@@ -351,14 +427,16 @@ export function verifyDeviceE2eeLocalChallenge(identity, challenge, signature) {
   }
 }
 
-export function signCurrentDeviceRemoval(identity, { now = new Date() } = {}) {
+export function signCurrentDeviceRemoval(identity, { now = new Date(), accountEpoch } = {}) {
   const publicIdentity = identity?.public_identity;
   if (!publicIdentity || !verifyDeviceE2eeIdentity(publicIdentity)) {
     throw new Error("invalid device E2EE identity");
   }
   const value = {
     action: "remove_current_device",
-    account_epoch: publicIdentity.epoch,
+    account_epoch: Number.isSafeInteger(accountEpoch) && accountEpoch > 0
+      ? accountEpoch
+      : publicIdentity.epoch,
     device_id: publicIdentity.device_id,
     key_id: publicIdentity.key_id,
     created_at: now.toISOString(),
@@ -380,14 +458,22 @@ export function resetDeviceE2eeIdentityForEpoch(
   if (!Number.isSafeInteger(epoch) || epoch <= 0) {
     throw new Error("invalid device E2EE account epoch");
   }
-  const created = generateIdentity({
+  // Account policy epoch resets revoke account bindings/login trust only.
+  // They must never manufacture a new installation key. Keep this exported
+  // compatibility helper side-effect free for an existing installation;
+  // callers that truly replace a damaged key must use the explicit recovery
+  // candidate flow or a deliberate key rotation.
+  const existing = readDeviceE2eeIdentity(stateDir, { accountScope });
+  if (existing) {
+    if (existing.public_identity.device_id !== String(deviceId)) {
+      throw new Error("stored device E2EE identity belongs to another device");
+    }
+    return existing;
+  }
+  return ensureDeviceE2eeIdentity(stateDir, {
     deviceId,
-    epoch,
-    keyVersion: 1,
-    now,
+    accountScope,
   });
-  writePrivate(identityPath(stateDir, accountScope), created);
-  return created;
 }
 
 export function verifyDeviceE2eeIdentity(record) {

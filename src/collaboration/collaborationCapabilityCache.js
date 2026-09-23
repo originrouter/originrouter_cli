@@ -9,12 +9,13 @@ import {
 import { join } from "node:path";
 
 import { ensureStateDir } from "../persistence/state.js";
+import { activeAccountStateDir } from "../persistence/accounts.js";
 
 const SCHEMA_VERSION = 1;
 const MAX_DEVICES = 64;
 
 function cachePath(stateDir) {
-  return join(stateDir, "collaboration-capabilities.json");
+  return join(activeAccountStateDir(stateDir), "collaboration-capabilities.json");
 }
 
 function cleanText(value, maxLength = 512) {

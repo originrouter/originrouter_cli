@@ -193,6 +193,7 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
     agentCatalog: ctx.agentCatalog || null,
     managedAgentSupervisor: ctx.managedAgentSupervisor || null,
     deviceE2eeLocalGateway: ctx.deviceE2eeLocalGateway || null,
+    localPairingManager: ctx.localPairingManager || null,
     externalAgentRegistry:
       ctx.externalAgentRegistry ||
       new ExternalAgentRegistry({ catalog: ctx.agentCatalog || null }),
@@ -314,7 +315,11 @@ function requireAuth(req, ctx) {
   if (DEV_INSECURE) return { ok: true };
   const url = req.url || "/";
   const path = url.split("?")[0];
-  if (["/local/e2ee/session", "/local/e2ee/messages"].includes(path)) {
+  if ([
+    "/local/e2ee/session",
+    "/local/e2ee/messages",
+    "/local/pair/redeem",
+  ].includes(path)) {
     return { ok: true };
   }
   const publicRead = (req.method === "GET" || req.method === "HEAD")
@@ -417,6 +422,59 @@ async function dispatch(ctx, req, res) {
         authRequired: true,
         tokenFile: ctx.apiTokenPath,
       });
+    }
+    if (req.method === "POST" && pathname === "/local/pair/tickets") {
+      if (!ctx.localPairingManager) {
+        return sendError(res, 503, "local pairing is unavailable", {
+          reason: "pairing_unavailable",
+        });
+      }
+      const rawHost = String(ctx.bindAddress || "127.0.0.1");
+      const host = rawHost === "0.0.0.0" || rawHost === "::"
+        ? "127.0.0.1"
+        : rawHost;
+      try {
+        return sendOk(res, ctx.localPairingManager.issue({
+          endpoint: `http://${httpHost(host)}:${req.socket.localPort}`,
+        }));
+      } catch (error) {
+        return sendError(res, Number(error.status || 400), error.message, {
+          reason: error.code || "pair_issue_failed",
+        });
+      }
+    }
+    if (req.method === "POST" && pathname === "/local/pair/redeem") {
+      if (!ctx.localPairingManager) {
+        return sendError(res, 503, "local pairing is unavailable", {
+          reason: "pairing_unavailable",
+        });
+      }
+      // Native clients do not send Origin. Refusing browser-originated calls
+      // keeps arbitrary pages from probing the short-lived pairing surface.
+      if (req.headers.origin) {
+        return sendError(res, 403, "browser pairing requests are not allowed", {
+          reason: "pair_browser_origin_rejected",
+        });
+      }
+      const body = await readJsonBody(req, 16 * 1024)
+        .catch((error) => ({ __error: error.message }));
+      if (body.__error) {
+        return sendError(res, 400, body.__error, {
+          reason: "pair_request_invalid",
+        });
+      }
+      try {
+        return sendOk(res, ctx.localPairingManager.redeem({
+          ticket: body.ticket,
+          appEphemeralPublicKey: body.app_ephemeral_public_key,
+          requestNonce: body.request_nonce,
+          sourceAddress: req.socket.remoteAddress,
+        }));
+      } catch (error) {
+        return sendError(res, Number(error.status || 400), error.message, {
+          reason: error.code || "pair_redeem_failed",
+        });
+      }
     }
     if (req.method === "GET" && pathname === "/local/e2ee/challenge") {
       if (!ctx.deviceE2eeLocalGateway) {
@@ -1084,6 +1142,20 @@ async function dispatch(ctx, req, res) {
       const conversation = ctx.agentCatalog.setConversationArchived(
         conversationId,
         catalogArchiveMatch[2] === "archive",
+      );
+      if (!conversation) return sendError(res, 404, "agent conversation not found");
+      return sendOk(res, { conversation });
+    }
+    const catalogRenameMatch = pathname.match(
+      /^\/agent\/catalog\/conversations\/([^/]+)\/rename$/,
+    );
+    if (req.method === "PUT" && catalogRenameMatch) {
+      if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      const conversation = ctx.agentCatalog.renameConversation(
+        decodeURIComponent(catalogRenameMatch[1]),
+        body.title,
       );
       if (!conversation) return sendError(res, 404, "agent conversation not found");
       return sendOk(res, { conversation });

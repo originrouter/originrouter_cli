@@ -9,6 +9,7 @@ import {
 } from "../adapters/codex/appServerClient.js";
 import { mapCodexAppServerEvent } from "../adapters/codex/eventMapper.js";
 import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
+import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
 import {
   findCodexTranscript,
   readCodexConversationHistory,
@@ -417,6 +418,7 @@ export async function runCodexAppServerSession(rawArgs) {
     agentType: "codex",
     title: sessionTitle,
     deviceName: device.displayName || device.host,
+    workspaceDisplayPath: workspaceDisplayPath(cwd),
     stateDir,
     telemetryQueue: telemetry.queue,
     telemetryUploader: telemetry.uploader,
@@ -491,6 +493,8 @@ export async function runCodexAppServerSession(rawArgs) {
         status,
         workspaceId: options.workspaceId,
         workspaceName: basename(cwd),
+        workspacePath: cwd,
+        workspaceDisplayPath: workspaceDisplayPath(cwd),
         runtime: "codex-app-server",
         provider: providerResult.provider?.name,
         model,

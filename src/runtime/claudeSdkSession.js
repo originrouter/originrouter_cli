@@ -18,6 +18,7 @@ import {
 import { buildAgentProviderEnv } from "../config/claudeConfig.js";
 import { createTelemetryPipeline } from "../telemetry/index.js";
 import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
+import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
 import { DEFAULT_DEVICE_ID } from "../constants.js";
 import {
   readLocalProxySnapshot,
@@ -377,6 +378,7 @@ export async function runClaudeSdkSession(rawArgs) {
     agentType: "claude",
     title: sessionTitle,
     deviceName: device.displayName || device.host,
+    workspaceDisplayPath: workspaceDisplayPath(cwd),
     stateDir,
     telemetryQueue: telemetry.queue,
     telemetryUploader: telemetry.uploader,
@@ -453,6 +455,8 @@ export async function runClaudeSdkSession(rawArgs) {
         status,
         workspaceId: options.workspaceId,
         workspaceName: basename(cwd),
+        workspacePath: cwd,
+        workspaceDisplayPath: workspaceDisplayPath(cwd),
         runtime: "claude-sdk",
         provider: providerResult.provider?.name,
         model,

@@ -79,8 +79,8 @@ export class CodexAdapter extends TerminalAdapter {
     const launchModel = this.routedModel || CODEX_MAIN_ALIAS;
     if (!userProvidedModel(args)) {
       // routes.codex.main is the source of truth. Proxy routes resolve to the
-      // fixed gpt-5.4 alias; direct OriginRouter and remote routes resolve to
-      // their actual configured model id.
+      // fixed OriginRouter alias; direct OriginRouter and remote routes
+      // resolve to their actual configured model id.
       args = ["--model", launchModel, ...args];
     } else {
       process.stderr.write(

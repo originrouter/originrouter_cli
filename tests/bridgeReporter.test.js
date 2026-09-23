@@ -33,6 +33,20 @@ test("buildRuntimeEventEnvelope normalizes and truncates strings", () => {
   assert.equal(payload.summary.length, 512);
 });
 
+test("runtime events carry only the CLI-computed workspace display path", () => {
+  const payload = buildRuntimeEventEnvelope({
+    sessionId: "s1",
+    agentType: "claude",
+    title: "Claude session",
+    deviceName: "Mac Studio",
+    workspaceDisplayPath: "~/Desktop/originrouter_app",
+    eventType: "agent.ready",
+  });
+
+  assert.equal(payload.workspace_display_path, "~/Desktop/originrouter_app");
+  assert.equal("workspace_path" in payload, false);
+});
+
 test("buildAgentConversationMetadata excludes transcript prompt command and path data", () => {
   const payload = buildAgentConversationMetadata({
     conversationId: "conversation-1",
@@ -42,6 +56,7 @@ test("buildAgentConversationMetadata excludes transcript prompt command and path
     status: "running",
     workspaceId: "workspace-1",
     workspaceName: "originrouter_app",
+    workspaceDisplayPath: "~/Desktop/originrouter_app",
     runtime: "codex-app-server",
     provider: "originrouter-cloud",
     model: "gpt-codex",
@@ -60,6 +75,7 @@ test("buildAgentConversationMetadata excludes transcript prompt command and path
   assert.equal(payload.conversation_id, "conversation-1");
   assert.equal(payload.native_session_id, "thread-1");
   assert.equal(payload.workspace_name, "originrouter_app");
+  assert.equal(payload.workspace_display_path, "~/Desktop/originrouter_app");
   assert.equal("transcript_path" in payload, false);
   assert.equal("workspace_path" in payload, false);
   assert.equal("prompt" in payload, false);

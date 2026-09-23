@@ -9,6 +9,7 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 
 import { ensureStateDir } from "./state.js";
+import { activeAccountStateDir } from "./accounts.js";
 import { analyzeRuntimeOperation } from "../runtime/operationRisk.js";
 
 const MAX_LINE_BYTES = 64 * 1024;
@@ -296,7 +297,8 @@ export class LocalAuditStore {
     now = () => Date.now(),
     operationReviewer = null,
   } = {}) {
-    this.root = path.join(stateDir, "audit", "sessions");
+    this.stateDir = activeAccountStateDir(stateDir);
+    this.root = path.join(this.stateDir, "audit", "sessions");
     this.now = now;
     this.sessionState = new Map();
     this.pendingChanges = new Map();

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 
 import { ensureStateDir } from "./state.js";
+import { activeAccountStateDir } from "./accounts.js";
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
@@ -79,8 +80,8 @@ export class ProxyRequestStore {
     maxRecords = DEFAULT_MAX_RECORDS,
     retentionDays = DEFAULT_RETENTION_DAYS,
   } = {}) {
-    this.stateDir = stateDir;
-    this.dbPath = dbPath || join(stateDir, "proxy-requests.sqlite3");
+    this.stateDir = activeAccountStateDir(stateDir);
+    this.dbPath = dbPath || join(this.stateDir, "proxy-requests.sqlite3");
     this.now = now;
     this.maxRecords = Math.max(100, Number(maxRecords) || DEFAULT_MAX_RECORDS);
     this.retentionDays = Math.max(1, Number(retentionDays) || DEFAULT_RETENTION_DAYS);

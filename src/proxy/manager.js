@@ -35,11 +35,13 @@ import {
 import {
   ROUTE_AGENTS,
   ROUTE_DEFS,
+  aliasesForRoute,
   effectiveAgentRoutes,
   getAllRoutes,
   hashRoutes,
 } from "../config/routes.js";
 import { readConfig, readProxyState, writeProxyState, clearProxyState } from "../persistence/state.js";
+import { activeAccountStateDir, readActiveAccountScope } from "../persistence/accounts.js";
 import { buildCompatibilityRouteMap } from "../compatibility/routeMap.js";
 
 // The public port is opened only after the child Gateway has started and
@@ -77,19 +79,26 @@ export class ProxyManager {
   }
 
   _readState() {
-    return readProxyState(this.stateKey);
+    return readProxyState(this.stateKey, this.stateDir);
   }
 
   _writeState(state) {
-    return writeProxyState(state, this.stateKey);
+    return writeProxyState({
+      ...state,
+      accountScope: readActiveAccountScope(this.stateDir),
+    }, this.stateKey, this.stateDir);
   }
 
   _clearState() {
-    return clearProxyState(this.stateKey);
+    return clearProxyState(this.stateKey, this.stateDir);
   }
 
   _configDir() {
-    return join(this.stateDir, `${this.stateKey}.state.d`);
+    return join(activeAccountStateDir(this.stateDir), `${this.stateKey}.state.d`);
+  }
+
+  _logDir() {
+    return join(activeAccountStateDir(this.stateDir), "logs");
   }
 
   _logPrefix() {
@@ -328,7 +337,7 @@ export class ProxyManager {
     }
 
     // Capture stdout/stderr to a per-proxy log file so failures are inspectable.
-    const logDir = join(this.stateDir, "logs");
+    const logDir = this._logDir();
     mkdirSync(logDir, { recursive: true });
     const logPath = join(logDir, `${this._logPrefix()}-${Date.now()}.log`);
     const outFd = openSync(logPath, "a", 0o600);
@@ -478,7 +487,7 @@ export class ProxyManager {
         return { ok: false, error: `proxy host must be 127.0.0.1 (got ${PROXY_HOST})` };
       }
 
-      const logDir = join(this.stateDir, "logs");
+      const logDir = this._logDir();
       mkdirSync(logDir, { recursive: true });
       const logPath = join(logDir, `${this._logPrefix()}-${Date.now()}.log`);
       const outFd = openSync(logPath, "a", 0o600);
@@ -531,7 +540,7 @@ export class ProxyManager {
       for (const agent of ROUTE_AGENTS) {
         const eff = effectiveAgentRoutes(agent, allRoutes[agent] || {});
         for (const slot of ROUTE_DEFS[agent].slots) {
-          if (eff[slot]) aliases.push(ROUTE_DEFS[agent].aliases[slot]);
+          if (eff[slot]) aliases.push(...aliasesForRoute(agent, slot));
         }
       }
 

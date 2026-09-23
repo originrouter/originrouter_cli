@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
 
 import { readClaudeConversationHistory } from "../runtime/claudeConversationHistory.js";
 import { readCodexConversationHistory } from "../adapters/codex/jsonlScanner.js";
@@ -478,15 +479,19 @@ export class ExternalAgentRegistry {
 
   project(session) {
     const status = this.publicStatus(session);
+    const conversation = this.catalog?.getConversation?.(session.conversationId);
     return {
       session_id: session.sessionId,
       conversation_id: session.conversationId,
       native_session_id: session.nativeSessionId,
       agent_type: session.agent,
-      title: session.title,
+      title: conversation?.title || session.title,
+      summary: conversation?.summary || "",
       status,
       device_id: session.deviceId,
       device_name: session.deviceName,
+      workspace_path: session.cwd,
+      workspace_display_path: conversation?.workspace_display_path || workspaceDisplayPath(session.cwd),
       current_step: status === "waiting_approval"
         ? "Waiting for approval"
         : status === "waiting_input"

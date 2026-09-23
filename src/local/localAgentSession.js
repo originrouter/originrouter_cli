@@ -11,6 +11,7 @@ import {
   updateAgentActivitySnapshot,
 } from "../agent/bridgeReporter.js";
 import { createAdapter } from "../adapters/createAdapter.js";
+import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
 import {
   buildAgentProviderEnv,
   remoteCodingRouteTarget,
@@ -524,6 +525,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     agentType: agent,
     title: `${agent} session`,
     deviceName: device.displayName || device.host,
+    workspaceDisplayPath: workspaceDisplayPath(cwd),
     stateDir: ensureStateDir(),
     telemetryQueue: telemetry.queue,
     telemetryUploader: telemetry.uploader,
@@ -945,6 +947,8 @@ export async function runLocalAgentSession(agent, rawArgs) {
       status,
       workspaceId: options.workspaceId,
       workspaceName: basename(cwd),
+      workspacePath: cwd,
+      workspaceDisplayPath: workspaceDisplayPath(cwd),
       runtime: runtime || "native-pty",
       provider: resolvedProvider?.name,
       model: resolvedProvider?.model,

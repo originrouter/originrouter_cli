@@ -12,6 +12,7 @@ import {
 import path from "node:path";
 
 import { ensureStateDir } from "../persistence/state.js";
+import { activeAccountStateDir } from "../persistence/accounts.js";
 import {
   approvalPolicyRevision,
   compileApprovalPolicy,
@@ -21,7 +22,7 @@ import {
 const POLICY_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 export function approvalPolicyDirectory(stateDir = ensureStateDir()) {
-  return path.join(stateDir, "policies");
+  return path.join(activeAccountStateDir(stateDir), "policies");
 }
 
 function safePolicyId(value) {

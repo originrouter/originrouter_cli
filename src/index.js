@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { join } from "node:path";
 import { startDaemon } from "./daemon/daemon.js";
 import {
   CLAUDE_CONFIG_KEYS,
@@ -217,7 +218,8 @@ Model routes:
   originrouter remote share status|start|stop|restart [--providers <name[,name...]>] [--port <p>]
   originrouter remote workspace list|authorize <path>
   originrouter remote workspace request <path> --device <device-id>
-  Aliases are fixed: originrouter-claude-model, originrouter-claude-fast-model, and gpt-5.4.
+  Aliases are fixed: originrouter-claude-model, originrouter-claude-fast-model,
+                     and originrouter-codex-model.
 
 Proxy runtime:
   originrouter proxy install [--version <v>]      default version 1.83.0
@@ -373,7 +375,7 @@ Models and routing:
   update                 Check for and install OriginRouter CLI updates
 
   Route aliases: originrouter-claude-model, originrouter-claude-fast-model,
-                 and gpt-5.4
+                 and originrouter-codex-model
 
 Sessions and control:
   sessions | devices     Inspect local sessions or authorized devices
@@ -1859,14 +1861,14 @@ function handleLocalConfigCommand(args) {
   throw new Error("Usage: originrouter local config show|set");
 }
 
-// Stage L: `local api status | set-host | set-port`.
+// Stage L: `local api status | pair | set-host | set-port`.
 //
 // `local config` keeps its existing show/set semantics; the new `api`
 // subnamespace groups status / set-host / set-port for users who
 // reach Proxy Control from the App and need to copy / rotate the
 // daemon bearer key on demand. We never echo the token value —
 // `tokenSet: yes|no` only.
-function handleLocalApiCommand(args) {
+async function handleLocalApiCommand(args) {
   const stateDir = ensureStateDir();
   const [sub, ...rest] = args;
   if (!sub || sub === "status") {
@@ -1939,7 +1941,47 @@ function handleLocalApiCommand(args) {
     }
     return;
   }
-  throw new Error("Usage: originrouter local api status|set-host <addr>|set-port <int>");
+  if (sub === "pair" || sub === "connect") {
+    const pairing = await remoteLocalRequest("/local/pair/tickets", {
+      method: "POST",
+      body: {},
+    });
+    const pairingLine = String(pairing?.pairing_line || "").trim();
+    const expiresAt = String(pairing?.expires_at || "").trim();
+    if (!pairingLine.startsWith("ORIGINROUTER_LOCAL_PAIR_V1:") || !expiresAt) {
+      throw new Error("OriginRouter service returned invalid pairing details.");
+    }
+    const credentialFiles = {
+      access_key: join(stateDir, "local-api.token"),
+      device_identity: join(stateDir, "device.json"),
+      active_endpoint: join(stateDir, "daemon.state.json"),
+    };
+    if (args.includes("--json")) {
+      console.log(JSON.stringify({
+        version: 1,
+        pairing_line: pairingLine,
+        expires_at: expiresAt,
+        credential_files: credentialFiles,
+      }, null, 2));
+      return;
+    }
+    console.log("OriginRouter App pairing");
+    console.log("For safety, the access key is not printed or embedded in the pairing line.");
+    console.log("This pairing request expires in 5 minutes and can be used by one App only.");
+    console.log("They are stored locally at:");
+    console.log(`Access key:      ${credentialFiles.access_key}`);
+    console.log(`Device identity: ${credentialFiles.device_identity}`);
+    console.log(`Active endpoint: ${credentialFiles.active_endpoint}`);
+    console.log("");
+    console.log("Copy the pairing line below and paste it into Add direct address > CLI pairing:");
+    console.log(pairingLine);
+    console.log("");
+    console.log("The pairing line grants short-lived access to retrieve the key. Keep it private.");
+    return;
+  }
+  throw new Error(
+    "Usage: originrouter local api status|pair|set-host <addr>|set-port <int>",
+  );
 }
 
 // `addProvider` / `applyProviderUpdate` from providers.js own validation.
@@ -2415,13 +2457,13 @@ export async function main(argv) {
       return;
     }
     if (sub === "api") {
-      handleLocalApiCommand(args.slice(1));
+      await handleLocalApiCommand(args.slice(1));
       return;
     }
     throw new Error(
       "Usage: originrouter local {key|token} show|rotate | " +
       "originrouter local config show|set | " +
-      "originrouter local api status|set-host <addr>|set-port <int>",
+      "originrouter local api status|pair|set-host <addr>|set-port <int>",
     );
   }
 

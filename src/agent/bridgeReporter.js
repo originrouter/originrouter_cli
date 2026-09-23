@@ -542,6 +542,7 @@ export function buildRuntimeEventEnvelope({
   agentType,
   title,
   deviceName,
+  workspaceDisplayPath,
   eventType,
   event = null,
   riskLevel = null,
@@ -556,6 +557,9 @@ export function buildRuntimeEventEnvelope({
     agent_type: safeText(agentType, 32),
     title: safeText(title, 191),
     device_name: safeText(deviceName, 191),
+    ...(safeText(workspaceDisplayPath, 4096)
+      ? { workspace_display_path: safeText(workspaceDisplayPath, 4096) }
+      : {}),
     event_type: safeText(projected.eventType, 64),
     status: safeText(projected.status, 32),
     summary: compactText(projected.summary, 512),
@@ -578,6 +582,7 @@ export function createRuntimeEventReporter({
   agentType,
   title,
   deviceName,
+  workspaceDisplayPath = "",
   stateDir = getStateDir(),
   reportRuntimeEventFn = reportRuntimeEvent,
   telemetryQueue = null,
@@ -616,6 +621,7 @@ export function createRuntimeEventReporter({
       agentType,
       title,
       deviceName,
+      workspaceDisplayPath,
       eventType,
       event: eventType === "agent.event" ? extra.event : extra,
       riskLevel: extra.riskLevel,
@@ -856,6 +862,10 @@ export function buildAgentConversationMetadata(payload = {}) {
     status: safeText(payload.status, 32) || "running",
     workspace_id: safeText(payload.workspaceId || payload.workspace_id, 96),
     workspace_name: safeText(payload.workspaceName || payload.workspace_name, 191),
+    workspace_display_path: safeText(
+      payload.workspaceDisplayPath || payload.workspace_display_path,
+      4096,
+    ),
     runtime: safeText(payload.runtime, 64),
     provider: safeText(payload.provider, 191),
     model: safeText(payload.model, 191),
@@ -903,7 +913,19 @@ export async function reportAgentConversationMetadata(payload, {
         signal: controller.signal,
       },
     );
-    let resp = await send(body);
+    let resp;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        resp = await send(body);
+      } catch (error) {
+        if (attempt === 2) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+        continue;
+      }
+      const retryable = resp.status === 408 || resp.status === 429 || resp.status >= 500;
+      if (resp.ok || !retryable || attempt === 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
     let legacyFallback = false;
     if (
       resp.status === 422

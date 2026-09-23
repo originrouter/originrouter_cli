@@ -4,6 +4,7 @@ import {
 } from "./providers.js";
 import {
   CODEX_MAIN_ALIAS,
+  LEGACY_CODEX_MAIN_ALIAS,
   MAIN_ALIAS,
   SMALL_ALIAS,
   assertAgentRouteConsistency,
@@ -486,10 +487,19 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
       && probe.mode === "route"
       && proxyHash === currentHash;
     if (hashMatches) {
+      // A proxy started by an older CLI may still advertise only the
+      // historical gpt-5.4 alias. Prefer the new namespaced alias, but keep
+      // that already-running proxy usable until it is regenerated.
+      const advertisedAliases = Array.isArray(probe.aliases) ? probe.aliases : [];
+      const codexProxyAlias = advertisedAliases.includes(CODEX_MAIN_ALIAS)
+        ? CODEX_MAIN_ALIAS
+        : advertisedAliases.includes(LEGACY_CODEX_MAIN_ALIAS)
+          ? LEGACY_CODEX_MAIN_ALIAS
+          : CODEX_MAIN_ALIAS;
       const env = {
         OPENAI_BASE_URL: `http://${probe.host || "127.0.0.1"}:${probe.port}/v1`,
         OPENAI_API_KEY: NOOP_OPENAI_API_KEY,
-        OPENAI_MODEL: CODEX_MAIN_ALIAS,
+        OPENAI_MODEL: codexProxyAlias,
       };
       return {
         env,

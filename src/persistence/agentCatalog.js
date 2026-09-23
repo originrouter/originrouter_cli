@@ -7,16 +7,18 @@ import {
   statSync,
 } from "node:fs";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
+import { homedir } from "node:os";
 
 import Database from "better-sqlite3";
 
 import { ensureStateDir } from "./state.js";
+import { activeAccountStateDir } from "./accounts.js";
 import {
   preflightUnattendedWorkspaceAuthorization,
   requireUnattendedWorkspace,
 } from "../runtime/unattendedWorkspaceReadiness.js";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
 
@@ -38,6 +40,27 @@ function canonicalPath(value) {
   } catch {
     return absolute;
   }
+}
+
+// Keep the canonical path intact for identity and launch/recovery. This is
+// presentation-only and intentionally collapses *only this device's* home,
+// never an arbitrary /Users/<name> or /home/<name> prefix.
+export function workspaceDisplayPath(value) {
+  const path = safeText(value, 4096);
+  if (!path || path === "~" || path.startsWith("~/")) return path;
+  const home = canonicalPath(homedir());
+  const candidate = canonicalPath(path);
+  if (!home || !candidate) return path;
+  const insensitive = process.platform === "win32";
+  const same = (left, right) => insensitive
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+  if (same(candidate, home)) return "~";
+  const homePrefix = home.endsWith(sep) ? home : `${home}${sep}`;
+  const startsWithinHome = insensitive
+    ? candidate.toLowerCase().startsWith(homePrefix.toLowerCase())
+    : candidate.startsWith(homePrefix);
+  return startsWithinHome ? `~${candidate.slice(home.length)}` : path;
 }
 
 function repositoryRoot(cwd) {
@@ -140,6 +163,7 @@ function publicConversation(row) {
     agent_type: row.agent_type,
     native_session_id: row.native_session_id || "",
     title: row.title,
+    title_is_custom: Boolean(row.title_is_custom),
     summary: row.summary || "",
     first_prompt_preview: row.first_prompt_preview || "",
     last_message_preview: row.last_message_preview || "",
@@ -147,6 +171,7 @@ function publicConversation(row) {
     workspace_id: row.workspace_id || "",
     workspace_name: row.workspace_name || "",
     workspace_path: row.workspace_path || "",
+    workspace_display_path: workspaceDisplayPath(row.workspace_path),
     repo_root: row.repo_root || "",
     device_id: row.device_id || "",
     runtime: row.runtime || "",
@@ -166,8 +191,8 @@ function publicConversation(row) {
 
 export class AgentCatalog {
   constructor({ stateDir = ensureStateDir(), dbPath = null, now = () => new Date() } = {}) {
-    this.stateDir = stateDir;
-    this.dbPath = dbPath || join(stateDir, "agent-catalog.sqlite3");
+    this.stateDir = activeAccountStateDir(stateDir);
+    this.dbPath = dbPath || join(this.stateDir, "agent-catalog.sqlite3");
     this.now = now;
     this.db = new Database(this.dbPath);
     this.db.pragma("journal_mode = WAL");
@@ -204,6 +229,7 @@ export class AgentCatalog {
         agent_type TEXT NOT NULL,
         native_session_id TEXT NOT NULL DEFAULT '',
         title TEXT NOT NULL,
+        title_is_custom INTEGER NOT NULL DEFAULT 0,
         summary TEXT NOT NULL DEFAULT '',
         first_prompt_preview TEXT NOT NULL DEFAULT '',
         last_message_preview TEXT NOT NULL DEFAULT '',
@@ -277,6 +303,9 @@ export class AgentCatalog {
     );
     if (!conversationColumns.has("restored_at")) {
       this.db.exec("ALTER TABLE agent_conversations ADD COLUMN restored_at TEXT");
+    }
+    if (!conversationColumns.has("title_is_custom")) {
+      this.db.exec("ALTER TABLE agent_conversations ADD COLUMN title_is_custom INTEGER NOT NULL DEFAULT 0");
     }
     const workspaceColumns = new Set(
       this.db.prepare("PRAGMA table_info(agent_workspaces)").all()
@@ -415,7 +444,11 @@ export class AgentCatalog {
       ? stableId("agent_run", requestedRunId, sessionId)
       : requestedRunId;
     const agent = safeText(payload.agent || payload.agentType, 32) || "unknown";
-    const title = safeText(payload.title, 256) || `${agent} session`;
+    const defaultTitle = `${agent} session`;
+    const requestedTitle = safeText(payload.title, 256);
+    const title = requestedTitle || defaultTitle;
+    const titleIsCustom = payload.titleIsCustom === true
+      || (requestedTitle && requestedTitle.toLowerCase() !== defaultTitle.toLowerCase());
     const deviceId = safeText(payload.deviceId, 191);
     const cwd = canonicalPath(payload.cwd);
     const workspaceId = cwd
@@ -454,14 +487,20 @@ export class AgentCatalog {
 
       this.db.prepare(`
         INSERT INTO agent_conversations(
-          conversation_id, agent_type, native_session_id, title, summary,
+          conversation_id, agent_type, native_session_id, title, title_is_custom, summary,
           first_prompt_preview, last_message_preview, workspace_id,
           transcript_locator, created_at, last_activity_at, archived_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(conversation_id) DO UPDATE SET
           agent_type = CASE WHEN excluded.agent_type <> 'unknown' THEN excluded.agent_type ELSE agent_conversations.agent_type END,
           native_session_id = CASE WHEN excluded.native_session_id <> '' THEN excluded.native_session_id ELSE agent_conversations.native_session_id END,
-          title = CASE WHEN excluded.title <> '' THEN excluded.title ELSE agent_conversations.title END,
+          title = CASE
+            WHEN excluded.title_is_custom = 1 THEN excluded.title
+            WHEN agent_conversations.title_is_custom = 1 THEN agent_conversations.title
+            WHEN excluded.title <> '' THEN excluded.title
+            ELSE agent_conversations.title
+          END,
+          title_is_custom = MAX(agent_conversations.title_is_custom, excluded.title_is_custom),
           summary = CASE WHEN excluded.summary <> '' THEN excluded.summary ELSE agent_conversations.summary END,
           first_prompt_preview = CASE WHEN excluded.first_prompt_preview <> '' THEN excluded.first_prompt_preview ELSE agent_conversations.first_prompt_preview END,
           last_message_preview = CASE WHEN excluded.last_message_preview <> '' THEN excluded.last_message_preview ELSE agent_conversations.last_message_preview END,
@@ -474,6 +513,7 @@ export class AgentCatalog {
         agent,
         safeText(payload.nativeSessionId, 191),
         title,
+        titleIsCustom ? 1 : 0,
         safeText(payload.summary, 4096),
         safeText(payload.firstPromptPreview, 1024),
         safeText(payload.lastMessagePreview, 1024),
@@ -841,6 +881,19 @@ export class AgentCatalog {
       archivedAt: archived ? now : null,
       restoredAt: archived ? null : now,
     });
+    return result.changes > 0 ? this.getConversation(id) : null;
+  }
+
+  renameConversation(conversationId, title) {
+    const id = safeText(conversationId, 96);
+    const nextTitle = safeText(title, 256);
+    if (!id) throw new Error("conversationId is required");
+    if (!nextTitle) throw new Error("title is required");
+    const result = this.db.prepare(`
+      UPDATE agent_conversations
+      SET title = ?, title_is_custom = 1, last_activity_at = ?
+      WHERE conversation_id = ?
+    `).run(nextTitle, iso(this.now()), id);
     return result.changes > 0 ? this.getConversation(id) : null;
   }
 

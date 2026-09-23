@@ -11,13 +11,14 @@
 //   - the /coding prefix on originrouter
 //   - the bare /v1 prefix on proxy
 //   - the proxy alias table (originrouter-claude-model,
-//     originrouter-claude-fast-model, gpt-5.4)
+//     originrouter-claude-fast-model, originrouter-codex-model)
 //   - the default originrouter base URL
 //
 // It does NOT exchange or refresh OAuth credentials, or perform
 // retries. Those are 9.1+ concerns.
 
 import { PROVIDER_TYPE } from "./providers.js";
+import { CODEX_MAIN_ALIAS } from "./routes.js";
 
 // Stage 9.0: endpoints ALWAYS include the routing prefix.
 // originrouter uses "/coding/..." because the official API is
@@ -46,7 +47,7 @@ const PROXY_ENDPOINTS = Object.freeze({
 const ALIASES = Object.freeze({
   "claude":      "originrouter-claude-model",
   "claude-fast": "originrouter-claude-fast-model",
-  "codex":       "gpt-5.4",
+  "codex":       CODEX_MAIN_ALIAS,
 });
 
 // Official OriginRouter Coding API gateway. All /coding/v1/messages,

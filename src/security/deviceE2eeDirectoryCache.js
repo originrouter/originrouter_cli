@@ -183,7 +183,6 @@ function verifyDirectory(directory) {
   const keyIds = new Map();
   const identities = sortedIdentities(directory);
   for (const identity of identities) {
-    if (identity.epoch !== epoch) throw new Error("directory identity epoch mismatch");
     const encoded = canonicalJson(publicIdentityRecord(identity));
     if (keyIds.has(identity.key_id) && keyIds.get(identity.key_id) !== encoded) {
       throw new Error("directory key id collision");
@@ -195,13 +194,30 @@ function verifyDirectory(directory) {
           || !verifyDeviceE2eeIdentity(identity)) {
         throw new Error("invalid initial directory identity");
       }
-    } else if (!verifyDeviceE2eeRotation(previous, identity)) {
+    } else if (!verifyDeviceE2eeRotation(previous, identity)
+        && !verifyRecoveryTransition(previous, identity)) {
       throw new Error("invalid directory key rotation");
     }
     heads.set(identity.device_id, identity);
   }
   verifyTrustProofs(directory.policy, identities);
   return { policy: directory.policy, identities };
+}
+
+// Account-key recovery is the one intentional break in the signed rotation
+// chain.  The previous private key is unavailable, so the server accepts a
+// self-signed replacement after an authenticated recovery flow and revokes
+// the old head.  Once that replacement exists, all subsequent rotations must
+// again carry a previous-key signature and are checked by
+// verifyDeviceE2eeRotation above.
+function verifyRecoveryTransition(previous, next) {
+  return previous?.trust_status === "revoked"
+    && next?.device_id === previous.device_id
+    && next?.source === previous.source
+    && Number(next?.key_version) === Number(previous.key_version) + 1
+    && next?.previous_key_id === previous.key_id
+    && !next?.previous_key_signature
+    && verifyDeviceE2eeIdentity(next);
 }
 
 function verifyPinnedHistory(previous, next) {

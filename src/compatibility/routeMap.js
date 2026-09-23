@@ -1,5 +1,10 @@
 import { enabledProviderModelEntries, remoteShareModelEntries } from "../config/providerModels.js";
-import { ROUTE_AGENTS, resolveAgentRoutes, routeProviderForRead } from "../config/routes.js";
+import {
+  ROUTE_AGENTS,
+  aliasesForRoute,
+  resolveAgentRoutes,
+  routeProviderForRead,
+} from "../config/routes.js";
 
 const OPENAI_PROVIDER_IDS = new Set(["openai", "azure"]);
 
@@ -53,11 +58,13 @@ export function buildCompatibilityRouteMap({
       const resolved = resolveAgentRoutes(config, agent);
       for (const entry of Object.values(resolved)) {
         if (!entry?.providerRecord) continue;
-        aliases[entry.alias] = {
-          ...routeEntry(entry.provider, entry.providerRecord, entry.model),
-          runtime: agent,
-          slot: entry.slot,
-        };
+        for (const alias of aliasesForRoute(agent, entry.slot)) {
+          aliases[alias] = {
+            ...routeEntry(entry.provider, entry.providerRecord, entry.model),
+            runtime: agent,
+            slot: entry.slot,
+          };
+        }
       }
     }
   }

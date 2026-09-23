@@ -10,12 +10,13 @@ import {
 import { join } from "node:path";
 
 import { ensureStateDir } from "../persistence/state.js";
+import { activeAccountStateDir } from "../persistence/accounts.js";
 
 const SCHEMA_VERSION = 1;
 const MAX_DRAFTS = 20;
 
 function draftPath(stateDir) {
-  return join(stateDir, "collaboration-drafts.json");
+  return join(activeAccountStateDir(stateDir), "collaboration-drafts.json");
 }
 
 function readDocument(stateDir) {

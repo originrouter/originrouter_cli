@@ -1,6 +1,8 @@
 import { reportAgentConversationMetadata } from "./bridgeReporter.js";
 
-const SYNC_META_KEY = "agent_activity_cloud_sync_v1";
+// Bump the cursor namespace when the projected metadata contract changes so
+// existing conversations are replayed once and receive workspace_display_path.
+const SYNC_META_KEY = "agent_activity_cloud_sync_v3";
 const PAGE_SIZE = 200;
 
 function safeText(value, maxLength = 4096) {
@@ -38,7 +40,10 @@ function hasRecallContent(conversation) {
   return Boolean(
     safeText(conversation?.summary)
     || safeText(conversation?.first_prompt_preview)
-    || safeText(conversation?.last_message_preview),
+    || safeText(conversation?.last_message_preview)
+    // Workspace display paths are also user-visible catalog metadata. They
+    // must backfill even for sessions that have no safe prompt/summary text.
+    || safeText(conversation?.workspace_display_path),
   );
 }
 
@@ -54,6 +59,10 @@ export function agentActivityMetadataFromCatalog(conversation = {}) {
     status: safeText(conversation.status, 32) || "stopped",
     workspaceId: safeText(conversation.workspace_id, 96),
     workspaceName: safeText(conversation.workspace_name, 191),
+    // This is the CLI-computed presentation path (home shortened only on the
+    // source device). Keep it separate from workspaceName so the App never
+    // has to guess whether a basename is a path.
+    workspaceDisplayPath: safeText(conversation.workspace_display_path, 4096),
     runtime: safeText(conversation.runtime, 64),
     provider: safeText(conversation.provider, 191),
     model: safeText(conversation.model, 191),

@@ -51,8 +51,7 @@ function signedEnvelope(envelope) {
 }
 
 function validatePeers(local, peer) {
-  if (local.public_identity.device_id === peer.device_id
-      || local.public_identity.epoch !== peer.epoch) {
+  if (local.public_identity.device_id === peer.device_id) {
     throw new Error("invalid E2EE session peers");
   }
 }
@@ -140,7 +139,7 @@ export class DeviceE2eeSession {
       targetDeviceId: peer.device_id,
       sourceKeyId: local.public_identity.key_id,
       targetKeyId: peer.key_id,
-      epoch: peer.epoch,
+      epoch: local.public_identity.epoch,
       sessionId,
       ephemeralPublicKey,
     });
@@ -161,7 +160,7 @@ export class DeviceE2eeSession {
         || firstEnvelope.target_device_id !== local.public_identity.device_id
         || firstEnvelope.sender_key_id !== peer.key_id
         || firstEnvelope.recipient_key_id !== local.public_identity.key_id
-        || firstEnvelope.epoch !== local.public_identity.epoch) {
+        || firstEnvelope.epoch !== peer.epoch) {
       throw new Error("invalid first E2EE envelope");
     }
     verifyEnvelope(firstEnvelope, peer);
@@ -247,7 +246,7 @@ export class DeviceE2eeSession {
         || envelope.target_device_id !== this.local.public_identity.device_id
         || envelope.sender_key_id !== this.peer.key_id
         || envelope.recipient_key_id !== this.local.public_identity.key_id
-        || envelope.epoch !== this.local.public_identity.epoch) {
+        || envelope.epoch !== this.peer.epoch) {
       throw new Error("E2EE envelope session mismatch");
     }
     const expectedDirection = this.initiator ? "response" : "request";

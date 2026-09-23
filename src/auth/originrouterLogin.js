@@ -5,8 +5,8 @@ import { KEY_KIND, KEY_SOURCE } from "../runtime/authContract.js";
 import {
   AuthClientError,
   bindDeviceE2eeIdentity,
-  getDeviceRecoveryInfo,
   getDeviceAuthorizationStatus,
+  getDeviceRecoveryInfo,
   pollDeviceToken,
   refreshOAuthToken,
   requestDeviceCode,
@@ -231,25 +231,26 @@ export async function loginWithDeviceFlow({
     accountScope = "legacy";
   }
 
+  // Recovery metadata is advisory continuity information only. The identity
+  // itself is installation-scoped and is never generated per account. Keep
+  // this call for older integrations and for genuine damaged-key recovery;
+  // a healthy identity simply ignores the result.
+  let recoveryInfo = null;
+  if (typeof e2eeIdentity === "function" && controlBaseUrl) {
+    try {
+      recoveryInfo = await getDeviceRecoveryInfo({
+        controlBaseUrl,
+        deviceCode: issued.device_code,
+        fetchFn,
+      });
+    } catch {
+      // The login flow must remain usable when the optional control-plane
+      // metadata endpoint is unavailable.
+    }
+  }
+
   const resolvedIdentity = typeof e2eeIdentity === "function"
-    ? await e2eeIdentity(accountScope, {
-      recoveryInfo: controlBaseUrl
-        ? await (async () => {
-          try {
-            return await getDeviceRecoveryInfo({
-              controlBaseUrl,
-              deviceCode: issued.device_code,
-              fetchFn,
-            });
-          } catch {
-            // Recovery metadata is an additive capability. Keep ordinary
-            // first-time sign-in available during transient server rollout;
-            // a lost-key attempt will be rejected safely and can retry.
-            return null;
-          }
-        })()
-        : null,
-    })
+    ? await e2eeIdentity(accountScope, { recoveryInfo })
     : e2eeIdentity;
   const resolvedSigner = typeof signEnrollmentChallenge === "function"
     ? (challenge) => signEnrollmentChallenge(challenge, accountScope, resolvedIdentity)

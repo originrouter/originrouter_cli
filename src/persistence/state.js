@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { VERSION } from "../constants.js";
 import { migrateLegacyConfig } from "../config/migration.js";
+import { activeAccountStateDir } from "./accounts.js";
 
 export function getStateDir() {
   return process.env.ORIGINROUTER_HOME || join(homedir(), ".originrouter");
@@ -272,34 +273,36 @@ export function writeLocalApiConfig(config) {
   return next;
 }
 
-function proxyStatePath(stateKey = "proxy") {
+function proxyStatePath(stateKey = "proxy", stateDir = ensureStateDir()) {
   const safeKey = String(stateKey || "proxy").replace(/[^a-z0-9_-]/gi, "-");
-  return join(ensureStateDir(), `${safeKey}.state.json`);
+  return join(stateDir, `${safeKey}.state.json`);
 }
 
-export function writeProxyState(state, stateKey = "proxy") {
-  writeJson(proxyStatePath(stateKey), {
+export function writeProxyState(state, stateKey = "proxy", stateDir = ensureStateDir()) {
+  writeJson(proxyStatePath(stateKey, stateDir), {
     version: VERSION,
     updatedAt: new Date().toISOString(),
     ...state,
   });
 }
 
-export function readProxyState(stateKey = "proxy") {
-  return readJson(proxyStatePath(stateKey)) || null;
+export function readProxyState(stateKey = "proxy", stateDir = ensureStateDir()) {
+  return readJson(proxyStatePath(stateKey, stateDir)) || null;
 }
 
-export function clearProxyState(stateKey = "proxy") {
+export function clearProxyState(stateKey = "proxy", stateDir = ensureStateDir()) {
   // Removes the proxy.state.json file if present. Used by `proxy stop` and
   // by the manager when a started process is found to be already dead.
-  const path = proxyStatePath(stateKey);
+  const path = proxyStatePath(stateKey, stateDir);
   if (existsSync(path)) {
     try { unlinkSync(path); } catch {}
   }
 }
 
 export function readConfig() {
-  const raw = readJson(join(ensureStateDir(), "config.json")) || {};
+  const stateDir = ensureStateDir();
+  const scopedStateDir = activeAccountStateDir(stateDir);
+  const raw = readJson(join(scopedStateDir, "config.json")) || {};
   const migrated = migrateLegacyConfig(raw);
   // Self-healing write-back: first read after Stage 1 lands rewrites the file
   // with `providers.default-claude` + `currentProvider.claude`. migrateLegacyConfig
@@ -310,7 +313,10 @@ export function readConfig() {
 }
 
 export function writeConfig(config) {
-  writePrivateJson(join(ensureStateDir(), "config.json"), {
+  const stateDir = ensureStateDir();
+  const scopedStateDir = activeAccountStateDir(stateDir);
+  mkdirSync(scopedStateDir, { recursive: true, mode: 0o700 });
+  writePrivateJson(join(scopedStateDir, "config.json"), {
     version: VERSION,
     updatedAt: new Date().toISOString(),
     ...config,

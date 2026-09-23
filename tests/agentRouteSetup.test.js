@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -11,6 +14,7 @@ import {
   recommendedCloudRouteModels,
   resetCloudRoutesOnLogout,
 } from "../src/commands/agentRouteSetup.js";
+import { accountStateDir, activateAccount } from "../src/persistence/accounts.js";
 
 const MODELS = [
   { id: "claude-opus-5", name: "Claude Opus 5", origin: "Anthropic" },
@@ -79,6 +83,31 @@ test("default Cloud routes are seeded only while config.json is absent", () => {
     writeConfigFn: () => { throw new Error("existing config must not be overwritten"); },
   });
   assert.deepEqual(existing, { status: "existing" });
+});
+
+test("default Cloud routes preserve an existing active-account config", (t) => {
+  const stateDir = mkdtempSync(join(tmpdir(), "originrouter-account-routes-"));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const accountScope = "outer-account-a";
+  activateAccount(stateDir, accountScope);
+  const scopedStateDir = accountStateDir(stateDir, accountScope);
+  writeFileSync(join(scopedStateDir, "config.json"), JSON.stringify({
+    routes: {
+      claude: {
+        main: { provider: "originrouter-cloud", model: "deepseek-v4-flash" },
+        small: { provider: "originrouter-cloud", model: "deepseek-v4-flash" },
+      },
+    },
+  }));
+
+  const result = initializeDefaultCloudRoutes({
+    stateDir,
+    writeConfigFn: () => {
+      throw new Error("active-account config must not be overwritten");
+    },
+  });
+
+  assert.deepEqual(result, { status: "existing" });
 });
 
 test("logout removes only OriginRouter Cloud routes and preserves private Providers", () => {

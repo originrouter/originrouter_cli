@@ -46,6 +46,18 @@ export async function getCliDeviceE2eeDirectory(options) {
   return request("/cli/v1/device-e2ee/directory", options);
 }
 
+export async function createCliTrustUpgradeRequest(options) {
+  return request("/cli/v1/device-e2ee/pending/upgrade", {
+    ...options,
+    method: "POST",
+    body: options.body || {},
+  });
+}
+
+export async function getCliTrustUpgradeStatus(requestId, options) {
+  return request(`/cli/v1/device-e2ee/pending/${encodeURIComponent(requestId)}`, options);
+}
+
 export async function removeCurrentCliDevice(options) {
   const data = await request("/cli/v1/device-e2ee/self/remove", {
     ...options,

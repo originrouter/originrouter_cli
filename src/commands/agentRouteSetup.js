@@ -10,6 +10,7 @@ import {
   getAgentRoutes,
   replaceAgentRoutes,
 } from "../config/routes.js";
+import { activeAccountStateDir } from "../persistence/accounts.js";
 import { readConfig, writeConfig } from "../persistence/state.js";
 import { loadCloudModels } from "./routeSources.js";
 
@@ -152,9 +153,20 @@ export function initializeDefaultCloudRoutes({
   stateDir,
   existsFn = existsSync,
   writeConfigFn = writeConfig,
+  activeAccountStateDirFn = activeAccountStateDir,
 } = {}) {
   if (!stateDir) throw new Error("stateDir is required to initialize default Agent routes");
-  if (existsFn(join(stateDir, "config.json"))) return { status: "existing" };
+  // Route configuration is account-scoped after login. Checking only the
+  // root ~/.originrouter/config.json makes every CLI invocation look like a
+  // fresh installation and overwrites the active account's saved routes with
+  // bundled defaults. Resolve the same account directory used by
+  // readConfig()/writeConfig() before deciding whether initialization is
+  // required. Before login, activeAccountStateDir() naturally resolves to the
+  // root state directory, preserving first-install behaviour.
+  const configStateDir = activeAccountStateDirFn(stateDir);
+  if (existsFn(join(configStateDir, "config.json"))) {
+    return { status: "existing" };
+  }
   const result = applyDefaultCloudRoutes();
   writeConfigFn(result.config);
   return { status: "initialized", ...result };

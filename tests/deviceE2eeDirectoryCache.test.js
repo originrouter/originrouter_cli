@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   canonicalJson,
+  createDeviceE2eeIdentityCandidate,
   ensureDeviceE2eeIdentity,
   prepareDeviceE2eeRotation,
 } from "../src/crypto/deviceE2eeIdentity.js";
@@ -50,6 +51,39 @@ storeDeviceE2eeDirectoryCache(cacheDir, {
 assert.throws(
   () => storeDeviceE2eeDirectoryCache(cacheDir, firstDirectory),
   /removed or changed/,
+);
+
+// A lost-key recovery is intentionally self-signed: the server has already
+// authenticated the recovery flow and revoked the old head, so the new key
+// cannot carry a signature from the unavailable private key. The directory
+// verifier must accept exactly this transition while continuing to reject the
+// same shape from a trusted (non-revoked) predecessor.
+const recoveryIdentityDir = join(root, "recovery-identity");
+const recoveryCacheDir = join(root, "recovery-cache");
+const recoveryFirst = ensureDeviceE2eeIdentity(recoveryIdentityDir, {
+  deviceId: "recovery-device",
+});
+const recoveryCandidate = createDeviceE2eeIdentityCandidate(recoveryIdentityDir, {
+  deviceId: "recovery-device",
+  keyVersion: 2,
+  previousKeyId: recoveryFirst.public_identity.key_id,
+});
+storeDeviceE2eeDirectoryCache(recoveryCacheDir, {
+  policy,
+  identities: [
+    { ...recoveryFirst.public_identity, trust_status: "revoked" },
+    { ...recoveryCandidate.public_identity, trust_status: "trusted" },
+  ],
+});
+assert.throws(
+  () => storeDeviceE2eeDirectoryCache(join(root, "bad-recovery-cache"), {
+    policy,
+    identities: [
+      { ...recoveryFirst.public_identity, trust_status: "trusted" },
+      { ...recoveryCandidate.public_identity, trust_status: "trusted" },
+    ],
+  }),
+  /invalid directory key rotation/,
 );
 
 const vector = JSON.parse(readFileSync(

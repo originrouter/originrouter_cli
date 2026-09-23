@@ -10,6 +10,7 @@ import {
 } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { activeAccountStateDir } from "../persistence/accounts.js";
 
 export const REMOTE_CODING_E2EE_PROTOCOL = "e2ee-v1";
 
@@ -68,7 +69,10 @@ export function ensureRemoteCodingIdentity(stateDir) {
 }
 
 export function verifyAndPinRemotePublicKey(stateDir, deviceId, publicKey) {
-  const path = peerKeysPath(stateDir);
+  // Remote target trust is account-owned. The local X25519 identity remains
+  // installation-scoped, but a user's trusted remote-device set must never be
+  // inherited by another account on the same installation.
+  const path = peerKeysPath(activeAccountStateDir(stateDir));
   let peers = {};
   if (existsSync(path)) {
     try { peers = JSON.parse(readFileSync(path, "utf8")) || {}; } catch { peers = {}; }

@@ -602,7 +602,7 @@ try {
     assert.equal(body.routes.codex.main.provider, "deepseek");
     assert.equal(body.aliases.main, undefined);
     assert.equal(body.aliases.small, undefined);
-    assert.equal(body.aliases.codex.main, "gpt-5.4");
+    assert.equal(body.aliases.codex.main, "originrouter-codex-model");
     assert.equal(body.aliases.claude.main, "originrouter-claude-model");
   }
   {

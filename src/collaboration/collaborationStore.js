@@ -5,6 +5,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 
 import { ensureStateDir } from "../persistence/state.js";
+import { activeAccountStateDir } from "../persistence/accounts.js";
 import { redactDisplayText, redactDisplayValue } from "../security/displayRedaction.js";
 import { ADAPTIVE_TEMPLATE_ID, normalizeParticipants } from "./adaptivePlan.js";
 import {
@@ -259,8 +260,8 @@ export class CollaborationStore {
     telemetryUploader = null,
     telemetryContextProvider = null,
   } = {}) {
-    this.stateDir = stateDir;
-    this.dbPath = dbPath || join(stateDir, "collaboration.sqlite3");
+    this.stateDir = activeAccountStateDir(stateDir);
+    this.dbPath = dbPath || join(this.stateDir, "collaboration.sqlite3");
     this.now = now;
     this.telemetryQueue = telemetryQueue;
     this.telemetryUploader = telemetryUploader;

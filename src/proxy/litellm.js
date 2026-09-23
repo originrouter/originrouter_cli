@@ -13,6 +13,7 @@ import { join } from "node:path";
 import {
   ROUTE_AGENTS,
   ROUTE_DEFS,
+  aliasesForRoute,
   effectiveAgentRoutes,
   routeProviderForRead,
 } from "../config/routes.js";
@@ -317,7 +318,6 @@ export function renderLitellmRoutesConfigYaml(allRoutes, providers) {
   for (const agent of ROUTE_AGENTS) {
     const agentRoutes = (allRoutes || {})[agent] || {};
     const eff = effectiveAgentRoutes(agent, agentRoutes);
-    const aliases = ROUTE_DEFS[agent].aliases;
     for (const slot of ROUTE_DEFS[agent].slots) {
       const entry = eff[slot];
       if (!entry) continue;
@@ -339,41 +339,44 @@ export function renderLitellmRoutesConfigYaml(allRoutes, providers) {
       const profile = getLitellmProfile(provider.litellmProvider);
       const prefix = prefixFor(profile.id);
 
-      if (emittedAliases.has(aliases[slot])) continue;
-      emittedAliases.add(aliases[slot]);
-      lines.push(`  - model_name: ${esc(aliases[slot])}`);
-      lines.push("    litellm_params:");
-      lines.push(`      model: ${prefix}/${esc(entry.model)}`);
+      const routeAliases = aliasesForRoute(agent, slot);
+      if (routeAliases.some((alias) => emittedAliases.has(alias))) continue;
+      for (const alias of routeAliases) {
+        emittedAliases.add(alias);
+        lines.push(`  - model_name: ${esc(alias)}`);
+        lines.push("    litellm_params:");
+        lines.push(`      model: ${prefix}/${esc(entry.model)}`);
 
-      // Stage 7.7: iterate the catalog's litellmParams[] in declared order;
-      // look up values via the field's camelCase `key`. Blank optional fields
-      // are omitted (omitIfBlank: true is the default; required: true throws
-      // here for the few fields that have no env fallback). Env-ref strings
-      // pass through verbatim. UI-only keys (inlineCreds, etc.) never reach
-      // this loop because they are not in profile.litellmParams.
-      for (const litellmKey of paramsFor(profile.id)) {
-        const field = profile.fields.find((f) => f.litellmParam === litellmKey);
-        if (!field) continue;
-        const v = provider[field.key];
-        if (v == null || v === "") {
-          if (field.required) {
-            throw new Error(`provider '${entry.provider}' missing required field '${field.key}'`);
+        // Stage 7.7: iterate the catalog's litellmParams[] in declared order;
+        // look up values via the field's camelCase `key`. Blank optional fields
+        // are omitted (omitIfBlank: true is the default; required: true throws
+        // here for the few fields that have no env fallback). Env-ref strings
+        // pass through verbatim. UI-only keys (inlineCreds, etc.) never reach
+        // this loop because they are not in profile.litellmParams.
+        for (const litellmKey of paramsFor(profile.id)) {
+          const field = profile.fields.find((f) => f.litellmParam === litellmKey);
+          if (!field) continue;
+          const v = provider[field.key];
+          if (v == null || v === "") {
+            if (field.required) {
+              throw new Error(`provider '${entry.provider}' missing required field '${field.key}'`);
+            }
+            continue;
           }
-          continue;
+          if (typeof v !== "string") continue;
+          if (v.includes("\n") || v.includes("\0")) {
+            throw new Error(`provider '${entry.provider}' field '${field.key}' contains forbidden character`);
+          }
+          if (v.startsWith("os.environ/") && !ENV_REF_RE.test(v)) {
+            throw new Error(
+              `provider '${entry.provider}' field '${field.key}' has malformed env reference '${v}' ` +
+              `(expected os.environ/VAR_NAME matching ${ENV_REF_RE.source})`,
+            );
+          }
+          lines.push(`      ${litellmKey}: "${esc(v)}"`);
         }
-        if (typeof v !== "string") continue;
-        if (v.includes("\n") || v.includes("\0")) {
-          throw new Error(`provider '${entry.provider}' field '${field.key}' contains forbidden character`);
-        }
-        if (v.startsWith("os.environ/") && !ENV_REF_RE.test(v)) {
-          throw new Error(
-            `provider '${entry.provider}' field '${field.key}' has malformed env reference '${v}' ` +
-            `(expected os.environ/VAR_NAME matching ${ENV_REF_RE.source})`,
-          );
-        }
-        lines.push(`      ${litellmKey}: "${esc(v)}"`);
+        emittedAny = true;
       }
-      emittedAny = true;
     }
   }
 

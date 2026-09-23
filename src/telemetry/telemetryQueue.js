@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 
 import { ensureStateDir } from "../persistence/state.js";
 import { readCodingAuth } from "../persistence/codingAuth.js";
+import { activeAccountStateDir } from "../persistence/accounts.js";
 
 const MAX_PAYLOAD_BYTES = 64 * 1024;
 const MAX_GATEWAY_IDS = 16;
@@ -225,8 +226,8 @@ export function normalizeTelemetryEvent(input = {}, context = {}) {
 
 export class TelemetryQueue {
   constructor({ stateDir = ensureStateDir(), dbPath = null, now = () => Date.now() } = {}) {
-    this.stateDir = stateDir;
-    this.dbPath = dbPath || join(stateDir, "telemetry.sqlite3");
+    this.stateDir = activeAccountStateDir(stateDir);
+    this.dbPath = dbPath || join(this.stateDir, "telemetry.sqlite3");
     this.now = now;
     this.db = new Database(this.dbPath);
     this.db.pragma("journal_mode = WAL");

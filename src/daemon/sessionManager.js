@@ -312,26 +312,37 @@ export class SessionManager {
   async handleLocalControlEvent(payload) {
     const compatibilityMatch = String(payload.type || "").match(/^local_control\.compatibility\.(check|update|rollback)$/);
     if (compatibilityMatch) {
-      await this.runCompatibilityAction(compatibilityMatch[1], String(payload.operation_id || `compat-${Date.now()}`));
-      return;
+      const result = await this.runCompatibilityAction(
+        compatibilityMatch[1],
+        String(payload.operation_id || `compat-${Date.now()}`),
+      );
+      return {
+        action: `compatibility.${compatibilityMatch[1]}`,
+        persisted: result?.ok === true,
+        error: result?.error || "",
+      };
     }
     if (payload.type === "local_control.compatibility.patch.set") {
-      await this.setCompatibilityPatchEnabled(
+      const result = await this.setCompatibilityPatchEnabled(
         payload.patch_id,
         payload.enabled === true,
         String(payload.operation_id || `compat-${Date.now()}`),
       );
-      return;
+      return {
+        action: "compatibility.patch.set",
+        persisted: result?.ok === true,
+        error: result?.error || "",
+      };
     }
     if (payload.type === "local_control.litellm.start") {
       const result = await this.startRouteModeProxy(payload.port);
       if (!result?.ok) throw new Error(result?.error || "agent proxy start failed");
-      return;
+      return { action: "litellm.start", persisted: true };
     }
     if (payload.type === "local_control.litellm.restart") {
       const result = await this.restartRouteModeProxy();
       if (!result?.ok) throw new Error(result?.error || "agent proxy restart failed");
-      return;
+      return { action: "litellm.restart", persisted: true };
     }
     if (payload.type === "local_control.remote_share.start") {
       if (!this.remoteShareProxyManager) throw new Error("remote share proxy manager unavailable");
@@ -351,7 +362,14 @@ export class SessionManager {
           e2eePolicy: "required",
         },
       });
-      return;
+      const saved = readConfig()?.remoteShare || {};
+      if (
+        saved.enabled !== true
+        || JSON.stringify(saved.providers || []) !== JSON.stringify(payload.providers || [])
+      ) {
+        throw new Error("remote share settings did not persist");
+      }
+      return { action: "remote_share.start", persisted: true };
     }
     if (payload.type === "local_control.remote_share.stop") {
       if (!this.remoteShareProxyManager) throw new Error("remote share proxy manager unavailable");
@@ -365,7 +383,10 @@ export class SessionManager {
           enabled: false,
         },
       });
-      return;
+      if (readConfig()?.remoteShare?.enabled !== false) {
+        throw new Error("remote share stop setting did not persist");
+      }
+      return { action: "remote_share.stop", persisted: true };
     }
     if (payload.type === "local_control.remote_share.restart") {
       if (!this.remoteShareProxyManager) throw new Error("remote share proxy manager unavailable");
@@ -385,7 +406,14 @@ export class SessionManager {
           e2eePolicy: "required",
         },
       });
-      return;
+      const saved = readConfig()?.remoteShare || {};
+      if (
+        saved.enabled !== true
+        || JSON.stringify(saved.providers || []) !== JSON.stringify(payload.providers || [])
+      ) {
+        throw new Error("remote share settings did not persist");
+      }
+      return { action: "remote_share.restart", persisted: true };
     }
     if (payload.type === "local_control.routes.replace") {
       const agent = String(payload.agent || "");
@@ -396,39 +424,109 @@ export class SessionManager {
         payload.routes && typeof payload.routes === "object" ? payload.routes : {},
       );
       writeConfig(next);
+      const persisted = readConfig()?.routes?.[agent] || {};
+      for (const [slot, requested] of Object.entries(payload.routes || {})) {
+        const actual = persisted[slot];
+        if (requested == null) {
+          if (actual != null) throw new Error(`route ${agent}.${slot} was not cleared`);
+          continue;
+        }
+        if (
+          actual?.provider !== requested.provider
+          || (requested.model != null
+            && String(actual?.model || "") !== String(requested.model))
+        ) {
+          throw new Error(`route ${agent}.${slot} did not persist`);
+        }
+      }
       await this.restartRouteModeProxyIfRunning();
       await this.onLocalControlChanged?.();
-      return;
+      return { action: "routes.replace", persisted: true };
     }
     if (payload.type === "local_control.route.set") {
       const provider = String(payload.provider || "").trim();
-      if (!provider) return;
+      if (!provider) throw new Error("route provider is required");
+      const agent = String(payload.agent || "");
+      const slot = String(payload.slot || "");
       const config = readConfig();
-      const next = setRoute(config, String(payload.agent || ""), String(payload.slot || ""), {
+      const next = setRoute(config, agent, slot, {
         provider,
         model: payload.model || undefined,
       });
       writeConfig(next);
+      const actual = readConfig()?.routes?.[agent]?.[slot];
+      if (
+        actual?.provider !== provider
+        || (payload.model != null
+          && String(actual?.model || "") !== String(payload.model))
+      ) {
+        throw new Error(`route ${agent}.${slot} did not persist`);
+      }
       await this.restartRouteModeProxyIfRunning();
       await this.onLocalControlChanged?.();
-      return;
+      return { action: "route.set", persisted: true };
     }
     if (payload.type === "local_control.route.clear") {
+      const agent = String(payload.agent || "");
+      const slot = String(payload.slot || "");
       const config = readConfig();
-      const next = clearRoute(config, String(payload.agent || ""), String(payload.slot || ""));
+      const next = clearRoute(config, agent, slot);
       writeConfig(next);
+      if (readConfig()?.routes?.[agent]?.[slot] != null) {
+        throw new Error(`route ${agent}.${slot} was not cleared`);
+      }
       await this.restartRouteModeProxyIfRunning();
       await this.onLocalControlChanged?.();
-      return;
+      return { action: "route.clear", persisted: true };
     }
     if (payload.type === "local_control.agent_detail.set") {
       writeConfig(setAgentDetailDefault(readConfig(), payload.profile));
-      return;
+      const actual = readConfig()?.agent?.detailProfile;
+      if (actual !== payload.profile) throw new Error("agent detail profile did not persist");
+      return { action: "agent_detail.set", persisted: true };
     }
     if (payload.type === "local_control.agent_budgets.set") {
       if (!this.agentBudgetStore) throw new Error("Agent budget store unavailable");
-      this.agentBudgetStore.setPolicies(payload.budgets || {});
+      const persisted = this.agentBudgetStore.setPolicies(payload.budgets || {});
+      if (!persisted || typeof persisted !== "object") {
+        throw new Error("Agent budget policies did not persist");
+      }
       await this.onLocalControlChanged?.();
+      return { action: "agent_budgets.set", persisted: true };
+    }
+    throw new Error(`unsupported local-control command: ${String(payload.type || "")}`);
+  }
+
+  async handleLocalControlEventWithResult(payload) {
+    const operationId = String(payload.operation_id || "").trim();
+    try {
+      const details = await this.handleLocalControlEvent(payload);
+      if (!operationId) return details;
+      await this.relayClient.send("local_control.result", {
+        operation_id: operationId,
+        target_device_id: this.deviceId,
+        command_type: String(payload.type || ""),
+        state: details?.persisted === false ? "failed" : "succeeded",
+        persisted: details?.persisted === true,
+        ...(details?.error ? { error: String(details.error).slice(0, 512) } : {}),
+      });
+      return details;
+    } catch (error) {
+      if (operationId) {
+        try {
+          await this.relayClient.send("local_control.result", {
+            operation_id: operationId,
+            target_device_id: this.deviceId,
+            command_type: String(payload.type || ""),
+            state: "failed",
+            persisted: false,
+            error: String(error?.message || error).slice(0, 512),
+          });
+        } catch (sendError) {
+          console.error(`[local-control] failed to report result: ${sendError.message || String(sendError)}`);
+        }
+      }
+      throw error;
     }
   }
 
@@ -1031,10 +1129,11 @@ export class SessionManager {
     }
 
     if (typeof payload.type === "string" && payload.type.startsWith("local_control.")) {
-      this.handleLocalControlEvent(payload).catch((error) => {
+      if (payload.type === "local_control.result") return false;
+      this.handleLocalControlEventWithResult(payload).catch((error) => {
         console.error(`[local-control] ${error.message || String(error)}`);
       });
-      return;
+      return true;
     }
 
     const session = this.sessions.get(payload.sessionId);

@@ -1,12 +1,13 @@
 import { appendFileSync, chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { ensureStateDir, getStateDir } from "./state.js";
+import { ensureStateDir } from "./state.js";
+import { activeAccountStateDir } from "./accounts.js";
 
 const SESSION_LOG_FILE = "sessions.jsonl";
 
 function sessionLogPath() {
-  ensureStateDir();
-  return join(getStateDir(), SESSION_LOG_FILE);
+  const stateDir = ensureStateDir();
+  return join(activeAccountStateDir(stateDir), SESSION_LOG_FILE);
 }
 
 function ensureFile(path) {

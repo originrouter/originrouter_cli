@@ -12,8 +12,9 @@ import {
   commitDeviceE2eeIdentity,
   createDeviceE2eeIdentityCandidate,
   discardDeviceE2eeIdentityCandidate,
-  invalidateDeviceE2eeIdentity,
+  isUsableDeviceE2eeIdentity,
   readDeviceE2eeIdentity,
+  readDeviceE2eeIdentityCandidate,
   signCurrentDeviceRemoval,
   signDeviceE2eeEnrollment,
 } from "../crypto/deviceE2eeIdentity.js";
@@ -32,7 +33,6 @@ import {
   commitDeviceCandidate,
   createDeviceCandidate,
   discardDeviceCandidate,
-  invalidateDevice,
   cliDeviceDisplayName,
   defaultDeviceDisplayName,
   ensureStateDir,
@@ -42,7 +42,6 @@ import {
 } from "../persistence/state.js";
 import { formatCliError, reportCliError } from "../runtime/cliErrors.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
-import { resetCloudRoutesOnLogout } from "./agentRouteSetup.js";
 import { TelemetryQueue } from "../telemetry/telemetryQueue.js";
 
 function discardPendingTelemetryForSession(stateDir, sessionId) {
@@ -187,6 +186,7 @@ export async function handleLogin(args, {
   let enrollmentIdentity = null;
   let enrollmentScope = null;
   let candidateNeedsCommit = false;
+  let recoveryCandidatePending = false;
   const deviceNeedsCommit = installedDevice == null;
   try {
     const credential = await loginWithDeviceFlow({
@@ -200,25 +200,57 @@ export async function handleLogin(args, {
         (requestedDeviceName && cliDeviceDisplayName(requestedDeviceName)) ||
         device.displayName ||
         defaultDeviceDisplayName(),
-      e2eeIdentity: async (accountScope, { recoveryInfo } = {}) => {
+      e2eeIdentity: async (accountScope, context = {}) => {
         enrollmentScope = accountScope;
-        const stored = readDeviceE2eeIdentity(stateDir, { accountScope });
+        let stored = null;
+        let pending = null;
+        try {
+          const candidate = readDeviceE2eeIdentity(stateDir, { accountScope });
+          stored = isUsableDeviceE2eeIdentity(candidate) ? candidate : null;
+        } catch {
+          // Malformed or incomplete private material is handled like a lost
+          // key. Keep the file until a replacement is accepted and committed.
+        }
+        try {
+          pending = readDeviceE2eeIdentityCandidate(stateDir, { accountScope });
+        } catch {
+          // Candidate creation below replaces malformed pending material using
+          // the continuity metadata returned by the server.
+        }
         const matching = stored
           && stored.public_identity.device_id === device.deviceId
-          && (!recoveryInfo?.epoch || Number(stored.public_identity.epoch) === Number(recoveryInfo.epoch))
           ? stored
           : null;
-        const recovery = recoveryInfo?.recovery_required && recoveryInfo.previous_key_id
-          ? recoveryInfo
+        const pendingUsable = pending
+          && pending.public_identity.device_id === device.deviceId
+          ? pending
           : null;
-        enrollmentIdentity = matching || createDeviceE2eeIdentityCandidate(stateDir, {
-          deviceId: device.deviceId,
-          epoch: Number(recoveryInfo?.epoch || 1),
-          keyVersion: recovery ? Number(recovery.previous_key_version) + 1 : 1,
-          previousKeyId: recovery?.previous_key_id || null,
-          accountScope,
-        });
-        candidateNeedsCommit = matching == null;
+        const recoveryInfo = context?.recoveryInfo?.data || context?.recoveryInfo || null;
+        const recoveryRequired = Boolean(
+          recoveryInfo?.recovery_required &&
+          recoveryInfo?.previous_key_id &&
+          Number(recoveryInfo?.previous_key_version) > 0,
+        );
+        if (pendingUsable) {
+          enrollmentIdentity = pendingUsable;
+        } else if (matching) {
+          enrollmentIdentity = matching;
+        } else if (recoveryRequired) {
+          enrollmentIdentity = createDeviceE2eeIdentityCandidate(stateDir, {
+            deviceId: device.deviceId,
+            accountScope,
+            keyVersion: Number(recoveryInfo.previous_key_version) + 1,
+            previousKeyId: recoveryInfo.previous_key_id,
+          });
+        } else {
+          enrollmentIdentity = createDeviceE2eeIdentityCandidate(stateDir, {
+            deviceId: device.deviceId,
+            accountScope,
+          });
+        }
+        candidateNeedsCommit = pendingUsable != null || matching == null;
+        recoveryCandidatePending =
+          pendingUsable?.recovery_candidate === true || recoveryRequired;
         return enrollmentIdentity;
       },
       signEnrollmentChallenge: (challenge, _accountScope, identity) =>
@@ -276,7 +308,7 @@ export async function handleLogin(args, {
       // rely on the same stable device identity.
       discardDeviceE2eeIdentityCandidate(stateDir, { accountScope: enrollmentScope });
       discardDeviceCandidate(stateDir);
-    } else {
+    } else if (!recoveryCandidatePending) {
       discardDeviceE2eeIdentityCandidate(stateDir, { accountScope: enrollmentScope });
       discardDeviceCandidate(stateDir);
     }
@@ -284,13 +316,10 @@ export async function handleLogin(args, {
   }
 }
 
-export async function handleLogout(args = [], {
-  resetCloudRoutesFn = resetCloudRoutesOnLogout,
-} = {}) {
+export async function handleLogout(args = []) {
   const stateDir = ensureStateDir();
   const stored = readCodingAuth(stateDir);
   if (!stored) {
-    resetCloudRoutesFn();
     console.log("Not logged in.");
     return;
   }
@@ -305,20 +334,34 @@ export async function handleLogout(args = [], {
     }
     try {
       const fresh = await ensureFreshAccessToken({ stateDir });
+      const controlBaseUrl =
+        process.env.ORIGINROUTER_CONTROL_BASE_URL ||
+        DEFAULT_ORIGINROUTER_CONTROL_BASE_URL;
+      let accountEpoch;
+      try {
+        const status = await getCliDeviceE2eeStatus({
+          controlBaseUrl,
+          accessToken: fresh.accessTokens.control.token,
+        });
+        accountEpoch = Number(status?.policy?.epoch);
+      } catch {
+        // The signed removal still carries the stable identity epoch when the
+        // status endpoint is temporarily unavailable; the server accepts the
+        // legacy value for compatibility.
+      }
       await removeCurrentCliDevice({
-        controlBaseUrl:
-          process.env.ORIGINROUTER_CONTROL_BASE_URL ||
-          DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
+        controlBaseUrl,
         accessToken: fresh.accessTokens.control.token,
-        signedRemoval: signCurrentDeviceRemoval(identity),
+        signedRemoval: signCurrentDeviceRemoval(identity, { accountEpoch }),
       });
       discardPendingTelemetryForSession(stateDir, stored.sessionId);
       clearCodingAuth(stateDir);
-      resetCloudRoutesFn();
-      invalidateDeviceE2eeIdentity(stateDir, { accountScope: stored.accountScope });
-      invalidateDevice(stateDir);
+      // --remove-device revokes this account's binding/session only. Keep both
+      // the installation-scoped private key and the stable installation device
+      // id for a later account login. A separate explicit reset command is
+      // required to destroy the device identity.
       console.log("Signed out and removed this device from the account.");
-      console.log("A later sign-in will register it as a new device.");
+      console.log("A later sign-in will re-register this installation.");
     } catch (error) {
       formatCliError(error);
     }
@@ -350,8 +393,9 @@ export async function handleLogout(args = [], {
   }
   discardPendingTelemetryForSession(stateDir, stored.sessionId);
   clearCodingAuth(stateDir);
-  resetCloudRoutesFn();
-  console.log("Logged out. This device remains trusted for a later sign-in.");
+  console.log(
+    "Logged out. This device remains trusted and this account's local routes are preserved for a later sign-in.",
+  );
 }
 
 function handleAuthStatus() {

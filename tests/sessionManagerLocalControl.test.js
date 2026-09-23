@@ -182,6 +182,82 @@ test("SessionManager starts route-mode proxy for local-control litellm start", a
   assert.deepEqual(starts, [{ mode: "route", port: 40123 }]);
 });
 
+test("SessionManager reports a durable local-control route result", async () => {
+  const prevHome = process.env.ORIGINROUTER_HOME;
+  const home = mkdtempSync(join(tmpdir(), "originrouter-local-control-result-test-"));
+  process.env.ORIGINROUTER_HOME = home;
+  const sent = [];
+  try {
+    writeConfig({ providers: PROVIDERS });
+    const manager = new SessionManager({
+      relayClient: {
+        async send(type, payload) {
+          sent.push({ type, payload });
+          return { ok: true, accepted: true };
+        },
+      },
+      deviceId: "device-test",
+      defaultExecutor: "fake",
+    });
+
+    await manager.handleLocalControlEventWithResult({
+      type: "local_control.route.set",
+      operation_id: "lco-test-1",
+      agent: "claude",
+      slot: "main",
+      provider: "deepseek",
+      model: "deepseek-chat",
+    });
+
+    assert.deepEqual(readConfig().routes.claude.main, {
+      provider: "deepseek",
+      model: "deepseek-chat",
+    });
+    assert.deepEqual(sent, [{
+      type: "local_control.result",
+      payload: {
+        operation_id: "lco-test-1",
+        target_device_id: "device-test",
+        command_type: "local_control.route.set",
+        state: "succeeded",
+        persisted: true,
+      },
+    }]);
+  } finally {
+    if (prevHome === undefined) delete process.env.ORIGINROUTER_HOME;
+    else process.env.ORIGINROUTER_HOME = prevHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager reports local-control execution failures", async () => {
+  const sent = [];
+  const manager = new SessionManager({
+    relayClient: {
+      async send(type, payload) {
+        sent.push({ type, payload });
+        return { ok: true, accepted: true };
+      },
+    },
+    deviceId: "device-test",
+    defaultExecutor: "fake",
+  });
+
+  await assert.rejects(
+    () => manager.handleLocalControlEventWithResult({
+      type: "local_control.litellm.start",
+      operation_id: "lco-test-2",
+      port: 40123,
+    }),
+    /proxy_manager_unavailable/,
+  );
+  assert.equal(sent[0].type, "local_control.result");
+  assert.equal(sent[0].payload.operation_id, "lco-test-2");
+  assert.equal(sent[0].payload.state, "failed");
+  assert.equal(sent[0].payload.persisted, false);
+  assert.match(sent[0].payload.error, /proxy_manager_unavailable/);
+});
+
 test("SessionManager reports the final compatibility operation result", async () => {
   const home = mkdtempSync(join(tmpdir(), "originrouter-compatibility-control-test-"));
   let snapshotReports = 0;

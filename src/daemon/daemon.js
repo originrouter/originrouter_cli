@@ -12,14 +12,20 @@ import {
 } from "../constants.js";
 import { startLocalApi } from "../local/localApi.js";
 import { DeviceE2eeLocalGateway } from "../local/deviceE2eeLocalGateway.js";
+import { LocalPairingManager } from "../local/localPairing.js";
 import { normalizeExecutor } from "../executors/createExecutor.js";
 import { ProxyManager } from "../proxy/manager.js";
-import { apiTokenPath, ensureApiToken } from "../persistence/authToken.js";
+import {
+  apiTokenPath,
+  ensureApiToken,
+  readApiToken,
+} from "../persistence/authToken.js";
 import {
   ensureDevice,
   ensureStateDir,
   readConfig,
   readLocalApiConfig,
+  writeLocalApiConfig,
   writeDaemonState,
 } from "../persistence/state.js";
 import {
@@ -53,12 +59,10 @@ import { ensureRemoteCodingIdentity } from "../crypto/remoteCodingE2ee.js";
 import {
   ensureDeviceE2eeIdentity,
   readDeviceE2eeIdentity,
-  resetDeviceE2eeIdentityForEpoch,
 } from "../crypto/deviceE2eeIdentity.js";
 import { readCodingAuth } from "../persistence/codingAuth.js";
 import {
   getCliDeviceE2eeDirectory,
-  getCliDeviceE2eeStatus,
   registerCliDeviceE2eeIdentity,
 } from "../security/deviceE2eeClient.js";
 import { storeDeviceE2eeDirectoryCache } from "../security/deviceE2eeDirectoryCache.js";
@@ -195,7 +199,9 @@ export async function startDaemon(args) {
   // background loop below; when `originrouter login` writes fresh credentials,
   // the next loop iteration picks them up and connects the remote bridge.
   let effectiveDeviceId = device.deviceId;
-  let accountScope = readCodingAuth(stateDir)?.accountScope;
+  const initialCredential = readCodingAuth(stateDir);
+  let accountScope = initialCredential?.accountScope;
+  let sessionId = initialCredential?.sessionId;
   let relayAuthState = "pending";
   let relayAuthError = null;
   const relayClient = new RelayClient({
@@ -203,33 +209,20 @@ export async function startDaemon(args) {
     deviceId: effectiveDeviceId,
     authToken: null,
   });
-  let deviceE2eeEpoch = readDeviceE2eeIdentity(stateDir, { accountScope })?.public_identity?.epoch || 1;
-  try {
-    const credential = await ensureFreshAccessToken({ stateDir });
-    const accessToken = credential?.accessTokens?.control?.token;
-    if (accessToken) {
-      const status = await getCliDeviceE2eeStatus({
-        controlBaseUrl: relayUrl,
-        accessToken,
-      });
-      deviceE2eeEpoch = Number(status?.policy?.epoch || deviceE2eeEpoch);
-    }
-  } catch {}
   const storedDeviceE2eeIdentity = readDeviceE2eeIdentity(stateDir, { accountScope });
   let deviceE2eeIdentity;
   if (!storedDeviceE2eeIdentity) {
     deviceE2eeIdentity = ensureDeviceE2eeIdentity(stateDir, {
       deviceId: effectiveDeviceId,
-      epoch: deviceE2eeEpoch,
       accountScope,
     });
   } else if (
     storedDeviceE2eeIdentity.public_identity.device_id !== effectiveDeviceId
-    || storedDeviceE2eeIdentity.public_identity.epoch !== deviceE2eeEpoch
   ) {
-    deviceE2eeIdentity = resetDeviceE2eeIdentityForEpoch(stateDir, {
+    // A daemon/device-id change is an explicit installation identity change;
+    // account policy epochs are deliberately ignored here.
+    deviceE2eeIdentity = ensureDeviceE2eeIdentity(stateDir, {
       deviceId: effectiveDeviceId,
-      epoch: deviceE2eeEpoch,
       accountScope,
     });
   } else {
@@ -248,6 +241,11 @@ export async function startDaemon(args) {
     localIdentity: deviceE2eeIdentity,
     localIdentityProvider: () => readDeviceE2eeIdentity(stateDir, { accountScope }),
     apiTokenPath: apiTokenFile,
+  });
+  const localPairingManager = new LocalPairingManager({
+    identityProvider: () => readDeviceE2eeIdentity(stateDir, { accountScope }),
+    accessTokenProvider: () => readApiToken(stateDir),
+    deviceNameProvider: () => device.displayName,
   });
   const operationReviewer = new AiOperationReviewer({ stateDir });
   const auditStore = new LocalAuditStore({
@@ -464,6 +462,7 @@ export async function startDaemon(args) {
     managedAgentSupervisor,
     externalAgentRegistry,
     deviceE2eeLocalGateway,
+    localPairingManager,
     configProvider: () => readConfig(),
     startedAt,
     pid: process.pid,
@@ -517,26 +516,44 @@ export async function startDaemon(args) {
       allowLan: allowLanControl,
     });
   } catch (err) {
-    if (
+    const canAutoSelectPort =
       options.localPort == null &&
-      configuredLocalPort == null &&
-      requestedLocalPort === DEFAULT_LOCAL_API_PORT &&
-      err?.code === "EADDRINUSE"
-    ) {
-      console.warn(
-        `[daemon] local API port ${DEFAULT_LOCAL_API_PORT} is busy; retrying with an OS-assigned port`,
-      );
-      localApi = await startLocalApi(localApiCtx, {
-        port: 0,
-        apiTokenPath: apiTokenFile,
-        allowLan: allowLanControl,
-      });
-    } else {
-      throw err;
+      process.env.ORIGINROUTER_LOCAL_PORT == null &&
+      err?.code === "EADDRINUSE";
+    if (!canAutoSelectPort) throw err;
+
+    // Multiple OS users may install OriginRouter on the same host. Keep the
+    // familiar 7437 default, then choose and persist the first free port
+    // above it instead of using an ephemeral port that changes every boot.
+    let lastError = err;
+    for (let port = requestedLocalPort + 1; port <= 65535; port += 1) {
+      try {
+        localApi = await startLocalApi(localApiCtx, {
+          port,
+          apiTokenPath: apiTokenFile,
+          allowLan: allowLanControl,
+        });
+        console.warn(
+          `[daemon] local API port ${requestedLocalPort} is busy; using ${port}`,
+        );
+        break;
+      } catch (candidateError) {
+        lastError = candidateError;
+        if (candidateError?.code !== "EADDRINUSE") throw candidateError;
+      }
     }
+    if (!localApi) throw lastError;
   }
   // Patch the bound port onto the live ctx so /local/status reports it.
   localApiCtx.localApiPort = localApi.port;
+  // Persist the actual bound endpoint so App pairing and the next daemon
+  // restart use the same stable port. Explicit CLI/env overrides remain
+  // authoritative for the current run but are still reflected in state.
+  writeLocalApiConfig({
+    port: localApi.port,
+    bindAddress,
+    allowLan: allowLanControl,
+  });
   void collaborationRuntime.recover().catch((error) => {
     console.error(`[daemon] collaboration recovery: ${error.message}`);
   });
@@ -552,6 +569,7 @@ export async function startDaemon(args) {
   let heartbeatTimer = null;
   let agentActivitySyncTimer = null;
   let deviceE2eeRefreshTimer = null;
+  let authContextTimer = null;
   let compatibilityUpdateTimer = null;
   const shutdown = async (signal) => {
     if (shuttingDown) return;
@@ -560,6 +578,7 @@ export async function startDaemon(args) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (agentActivitySyncTimer) clearInterval(agentActivitySyncTimer);
     if (deviceE2eeRefreshTimer) clearInterval(deviceE2eeRefreshTimer);
+    if (authContextTimer) clearInterval(authContextTimer);
     if (compatibilityUpdateTimer) clearInterval(compatibilityUpdateTimer);
     try {
       await sessionManager.shutdown(signal);
@@ -611,6 +630,24 @@ export async function startDaemon(args) {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGHUP", () => shutdown("SIGHUP"));
+
+  // Re-login for the same account keeps accountScope unchanged, but replaces
+  // the OAuth session and the session-scoped E2EE cache. Restart the daemon so
+  // its WebSocket, stores, and credentials cannot remain bound to the old
+  // session. A supervised service will launch the replacement automatically.
+  authContextTimer = setInterval(() => {
+    if (shuttingDown) return;
+    const credential = readCodingAuth(stateDir);
+    const nextAccountScope = credential?.accountScope;
+    const nextSessionId = credential?.sessionId;
+    if (
+      nextAccountScope !== accountScope ||
+      nextSessionId !== sessionId
+    ) {
+      void shutdown("AUTH_CONTEXT_CHANGED");
+    }
+  }, 5_000);
+  authContextTimer.unref?.();
 
   const localApiState = () => ({
     relayMode,
@@ -684,48 +721,43 @@ export async function startDaemon(args) {
     }
     return identity;
   };
-  const currentDeviceE2eeIdentity = ({ deviceId, epoch } = {}) => {
+  const currentDeviceE2eeIdentity = ({ deviceId } = {}) => {
     const stored = readDeviceE2eeIdentity(stateDir, { accountScope });
     if (!stored) {
       return activateDeviceE2eeIdentity(ensureDeviceE2eeIdentity(stateDir, {
         deviceId: deviceId || effectiveDeviceId,
-        epoch: epoch || 1,
         accountScope,
       }), "identity initialized");
     }
     if (deviceId && stored.public_identity.device_id !== deviceId) {
-      return activateDeviceE2eeIdentity(resetDeviceE2eeIdentityForEpoch(stateDir, {
-        deviceId,
-        epoch: epoch || stored.public_identity.epoch,
-        accountScope,
-      }), "authenticated device changed");
-    }
-    if (epoch && stored.public_identity.epoch !== epoch) {
-      return activateDeviceE2eeIdentity(resetDeviceE2eeIdentityForEpoch(stateDir, {
-        deviceId: deviceId || stored.public_identity.device_id,
-        epoch,
-        accountScope,
-      }), "account epoch changed");
+      // The daemon's stable install device id should not drift. Do not reset
+      // the E2EE key merely because an account/session reports another id;
+      // authentication code handles device-id migration explicitly.
+      throw new Error("authenticated device id does not match local installation");
     }
     return activateDeviceE2eeIdentity(stored, "identity file changed");
   };
   const syncDeviceE2eeIdentity = async ({ deviceId = effectiveDeviceId } = {}) => {
     const credential = await ensureFreshAccessToken({ stateDir });
-    if (credential?.accountScope && credential.accountScope !== accountScope) {
-      accountScope = credential.accountScope;
+    const nextAccountScope = credential?.accountScope || null;
+    if (nextAccountScope !== accountScope) {
+      const previousAccountScope = accountScope;
+      accountScope = nextAccountScope;
       registeredDeviceE2eeKeyId = null;
+      // The daemon owns account-scoped SQLite stores and session managers that
+      // are opened at startup. Continuing in-process after login/logout would
+      // keep those handles pointed at the previous account. Exit cleanly so
+      // launchd/systemd (or the user) starts a fresh daemon for the new scope.
+      console.warn(
+        `[daemon] account context changed (${previousAccountScope || "none"} -> ${nextAccountScope || "none"}); restarting local state`,
+      );
+      void shutdown("ACCOUNT_CHANGED");
+      return;
     }
     const accessToken = credential?.accessTokens?.control?.token;
     if (!accessToken) return;
     const authenticatedDeviceId = credential.deviceId || deviceId;
-    const status = await getCliDeviceE2eeStatus({
-      controlBaseUrl: relayUrl,
-      accessToken,
-    });
-    const identity = currentDeviceE2eeIdentity({
-      deviceId: authenticatedDeviceId,
-      epoch: Number(status?.policy?.epoch || deviceE2eeIdentity.public_identity.epoch),
-    });
+    const identity = currentDeviceE2eeIdentity({deviceId: authenticatedDeviceId});
     const keyId = identity.public_identity.key_id;
     if (registeredDeviceE2eeKeyId !== keyId) {
       const registered = await registerCliDeviceE2eeIdentity({
@@ -753,7 +785,7 @@ export async function startDaemon(args) {
   heartbeatTimer = setInterval(() => {
     if (!relayConnected) return;
     reportLocalControlHeartbeat().catch(() => {});
-  }, 20_000);
+  }, 60_000);
   heartbeatTimer.unref?.();
   agentActivitySyncTimer = setInterval(() => {
     if (!relayConnected) return;
@@ -866,6 +898,14 @@ export async function startDaemon(args) {
 
   for (;;) {
     try {
+      const liveAccountScope = readCodingAuth(stateDir)?.accountScope || null;
+      if (liveAccountScope !== accountScope) {
+        console.warn(
+          `[daemon] account context changed (${accountScope || "none"} -> ${liveAccountScope || "none"}); restarting local state`,
+        );
+        await shutdown("ACCOUNT_CHANGED");
+        return;
+      }
       const relayOptionsResult = await tryBuildRelayClientOptions({
         stateDir,
         relayUrl,
@@ -923,11 +963,13 @@ export async function startDaemon(args) {
               "device.policy.changed",
               "account.epoch.changed",
             ].includes(routed.type)) {
-              if (routed.type === "account.epoch.changed") {
-                await syncDeviceE2eeIdentity();
-              } else {
-                await deviceE2eeRelay.refreshDirectory({ clearSessions: true });
-              }
+              // Refresh the authenticated CLI directory for every trust/key
+              // event, not just epoch changes. Local E2EE authorization reads
+              // this same cache; leaving it stale after an App rotation makes
+              // the daemon reject the current App key even when the server
+              // already marks it trusted.
+              await syncDeviceE2eeIdentity();
+              await deviceE2eeRelay.refreshDirectory({ clearSessions: true });
               deviceE2eeLocalGateway.clearTrustSessions();
               return;
             }

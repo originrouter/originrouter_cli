@@ -4,6 +4,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 
 import { ensureStateDir } from "../persistence/state.js";
+import { activeAccountStateDir } from "../persistence/accounts.js";
 
 const AGENTS = new Set(["claude", "codex"]);
 const ENFORCEMENT = new Set(["block", "warn"]);
@@ -61,7 +62,8 @@ function publicPolicy(row) {
 export class AgentBudgetStore {
   constructor({ stateDir = ensureStateDir(), now = () => new Date() } = {}) {
     this.now = now;
-    this.dbPath = join(stateDir, "agent-budgets.sqlite3");
+    this.stateDir = activeAccountStateDir(stateDir);
+    this.dbPath = join(this.stateDir, "agent-budgets.sqlite3");
     this.db = new Database(this.dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
@@ -229,4 +231,3 @@ export class AgentBudgetStore {
     };
   }
 }
-

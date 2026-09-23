@@ -33,6 +33,7 @@ function conversation(id, activityAt, overrides = {}) {
     workspace_id: "workspace-1",
     workspace_name: "originrouter-cli",
     workspace_path: "/private/project",
+    workspace_display_path: "~/Desktop/originrouter-cli",
     transcript_locator: "/private/transcript.jsonl",
     runtime: "native-pty",
     created_at: "2026-06-01T00:00:00.000Z",
@@ -48,6 +49,7 @@ test("Agent Activity catalog sync backfills display-safe records once", async ()
     conversation("empty", "2026-06-30T00:00:00.000Z", {
       first_prompt_preview: "",
       last_message_preview: "",
+      workspace_display_path: "",
     }),
   ]);
   const reported = [];
@@ -68,6 +70,7 @@ test("Agent Activity catalog sync backfills display-safe records once", async ()
   });
   assert.deepEqual(reported.map((item) => item.conversationId), ["older", "newer"]);
   assert.equal("workspacePath" in reported[0], false);
+  assert.equal(reported[0].workspaceDisplayPath, "~/Desktop/originrouter-cli");
   assert.equal("transcriptPath" in reported[0], false);
 
   const second = await syncAgentActivityCatalog({
@@ -116,6 +119,7 @@ test("Agent Activity catalog projection excludes local-only locators", () => {
     conversation("safe", "2026-07-01T00:00:00.000Z"),
   );
   assert.equal(projected.workspaceName, "originrouter-cli");
+  assert.equal(projected.workspaceDisplayPath, "~/Desktop/originrouter-cli");
   assert.equal("workspacePath" in projected, false);
   assert.equal("transcriptLocator" in projected, false);
 });
