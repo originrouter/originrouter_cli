@@ -19,6 +19,14 @@ import { handleServiceCommand } from "./service.js";
 import { ensureStateDir } from "../persistence/state.js";
 import { redactDisplayText, redactDisplayValue } from "../security/displayRedaction.js";
 import {
+  amountMicrosOption,
+  normalizeConfirmationMode,
+  parseParticipant,
+  participantAssignments,
+  positiveIntegerOption,
+  roleHints,
+} from "./collaborationArgs.js";
+import {
   normalizeCoordinator,
   normalizeWorkspaceMode,
 } from "../collaboration/workspaceModes.js";
@@ -52,87 +60,6 @@ export const MAX_COLLABORATION_RECONNECT_ATTEMPTS = 5;
 
 // This controls only the user-facing Team/plan confirmation gates. It is
 // separate from Session Approval, which governs individual Agent actions.
-const CONFIRMATION_MODE_ALIASES = Object.freeze({
-  required: "required",
-  never: "required", // legacy: never auto-confirm
-  safe_auto: "safe_auto",
-  safe: "safe_auto", // legacy
-  always_auto: "always_auto",
-  always: "always_auto", // legacy
-});
-
-function normalizeConfirmationMode(value = "required") {
-  const normalized = String(value || "required").trim().toLowerCase();
-  const mode = CONFIRMATION_MODE_ALIASES[normalized];
-  if (!mode) throw new Error(`Unknown confirmation mode '${value}'. Use required, safe_auto, or always_auto.`);
-  return mode;
-}
-
-function parseParticipant(raw) {
-  const parts = String(raw || "").split(":");
-  const participantId = parts.shift()?.trim();
-  const runtime = parts.shift()?.trim();
-  const deviceId = parts.shift()?.trim();
-  const workspaceId = parts.join(":").trim();
-  if (!participantId || !runtime || !deviceId) {
-    throw new Error("--participant must use id:runtime:device:workspace, for example builder:claude:local:/project");
-  }
-  return {
-    participant_id: participantId,
-    runtime,
-    device_id: deviceId,
-    workspace_id: workspaceId || cwd(),
-  };
-}
-
-function roleHints(args) {
-  const result = new Map();
-  for (const raw of values(args, "role")) {
-    const index = raw.indexOf("=");
-    if (index <= 0) throw new Error("--role must use participant_id=natural language responsibility");
-    result.set(raw.slice(0, index).trim(), raw.slice(index + 1).trim());
-  }
-  return result;
-}
-
-function participantAssignments(args, name, usage) {
-  const result = new Map();
-  for (const raw of values(args, name)) {
-    const index = String(raw).indexOf("=");
-    if (index <= 0 || index === String(raw).length - 1) throw new Error(usage);
-    result.set(String(raw).slice(0, index).trim(), String(raw).slice(index + 1).trim());
-  }
-  return result;
-}
-
-function positiveIntegerOption(raw, name, { max = Number.MAX_SAFE_INTEGER } = {}) {
-  if (raw == null) return null;
-  const parsed = Number(raw);
-  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > max) {
-    throw new Error(`--${name} must be a positive integer${Number.isFinite(max) ? ` no greater than ${max}` : ""}.`);
-  }
-  return parsed;
-}
-
-function amountMicrosOption(args) {
-  const micros = value(args, "amount-limit-micros");
-  const amount = value(args, "amount-limit");
-  if (micros != null && amount != null) {
-    throw new Error("Use either --amount-limit or --amount-limit-micros, not both.");
-  }
-  if (micros != null) return positiveIntegerOption(micros, "amount-limit-micros");
-  if (amount == null) return null;
-  const parsed = Number(amount);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error("--amount-limit must be a positive decimal amount.");
-  }
-  const converted = Math.round(parsed * 1_000_000);
-  if (!Number.isSafeInteger(converted) || converted <= 0) {
-    throw new Error("--amount-limit is outside the supported range.");
-  }
-  return converted;
-}
-
 export function createPayload(args) {
   const specPath = value(args, "spec");
   if (specPath) {
