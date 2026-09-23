@@ -101,6 +101,8 @@ import {
   handleRemoteShareStatus,
   remoteShareProviders,
 } from "./localApiRemoteShare.js";
+import { handleSessionControl } from "./localApiSessionControl.js";
+import { handleProxyControl } from "./localApiProxyControl.js";
 
 export { projectSession } from "./localApiProjections.js";
 
@@ -1554,109 +1556,4 @@ function handleProxyRequests(ctx, res, url) {
   } catch (error) {
     return sendError(res, 400, error?.message || "invalid request query");
   }
-}
-
-// ---------- Write handler (single dispatch over the 3 session actions) ----------
-
-async function handleSessionControl(ctx, res, sessionId, action, body) {
-  if (!ctx.sessionManager) {
-    return sendError(res, 503, "session manager not available");
-  }
-  if (!ctx.sessionManager.sessions.has(sessionId)) {
-    return sendError(res, 404, `unknown session '${sessionId}'`);
-  }
-
-  let payload;
-  if (action === "input") {
-    if (typeof body.data !== "string") {
-      return sendError(res, 400, "body.data must be a string");
-    }
-    payload = { type: "terminal.input", sessionId, data: body.data };
-  } else if (action === "interrupt") {
-    payload = { type: "terminal.interrupt", sessionId };
-  } else if (action === "permission") {
-    if (!body.callId || typeof body.callId !== "string") {
-      return sendError(res, 400, "body.callId is required");
-    }
-    if (!body.decision || typeof body.decision !== "string") {
-      return sendError(res, 400, "body.decision is required");
-    }
-    payload = {
-      type: "agent.permission.resolve",
-      sessionId,
-      callId: body.callId,
-      decision: body.decision,
-      data: body.data,
-    };
-  } else if (action === "interaction") {
-    // Stage 8.9: agent.interaction.resolve route. Accepts
-    // interactionId + decision (required) and forwards the new
-    // envelope into the local session. The legacy /permission
-    // route above stays unchanged.
-    if (!body.interactionId || typeof body.interactionId !== "string") {
-      return sendError(res, 400, "body.interactionId is required");
-    }
-    if (!body.decision || typeof body.decision !== "string") {
-      return sendError(res, 400, "body.decision is required");
-    }
-    payload = {
-      type: "agent.interaction.resolve",
-      sessionId,
-      interactionId: body.interactionId,
-      // Belt-and-suspenders: callers may pass callId too, but
-      // interactionId is the canonical field for the new envelope.
-      callId: body.callId || body.interactionId,
-      decision: body.decision,
-      value: body.value,
-      data: body.data,
-      reason: body.reason,
-    };
-  } else {
-    return sendError(res, 400, `unknown action '${action}'`);
-  }
-
-  try {
-    ctx.sessionManager.handleEvent(payload);
-  } catch (err) {
-    return sendError(res, 500, err.message || "handleEvent threw");
-  }
-  return sendOk(res, { sessionId, action });
-}
-
-// ---------- Proxy write handlers (start | stop | restart) ----------
-
-async function handleProxyControl(ctx, res, action, body) {
-  if (action === "stop") {
-    if (typeof ctx.stopProxy !== "function") {
-      return sendError(res, 503, "proxy manager not wired into daemon");
-    }
-    const result = await ctx.stopProxy();
-    if (!result.ok) return sendError(res, 500, result.error || "stop failed");
-    return sendOk(res, result);
-  }
-  // Stage 7.5: start/restart default to routes mode. Passing a provider is
-  // still accepted as a debug/provider-mode escape hatch.
-  const provider = typeof body.provider === "string" && body.provider ? body.provider : null;
-  let port = Number.parseInt(body.port, 10);
-  if (action === "restart" && !Number.isFinite(port)) {
-    try {
-      const status = await ctx.getProxyStatus();
-      const currentPort = Number.parseInt(status?.port, 10);
-      if (status?.state === "running" && Number.isFinite(currentPort)) {
-        port = currentPort;
-      }
-    } catch {}
-  }
-  if (!Number.isFinite(port) || port < 1024 || port > 65535) {
-    return sendError(res, 400, `body.port must be an integer in [1024, 65535]`);
-  }
-  const fn = action === "start" ? ctx.startProxy : ctx.restartProxy;
-  if (typeof fn !== "function") {
-    return sendError(res, 503, `proxy ${action} not wired into daemon`);
-  }
-  const result = await fn(provider
-    ? { mode: "provider", provider, port }
-    : { mode: "route", port });
-  if (!result.ok) return sendError(res, 409, result.error || `${action} failed`);
-  return sendOk(res, result);
 }
