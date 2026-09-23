@@ -18,7 +18,6 @@
 // same process as the session manager.
 
 import http from "node:http";
-import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import {
   ROUTE_AGENTS,
@@ -27,10 +26,7 @@ import { LITELLM_PROVIDERS } from "../proxy/litellmCatalog.js";
 import { assessRegisteredWorkspaceForUnattended } from "../runtime/unattendedWorkspaceReadiness.js";
 import { discoverProviderModels } from "../proxy/modelDiscovery.js";
 import { probeProviderModel } from "../proxy/modelProbe.js";
-import {
-  remoteShareModelEntries,
-} from "../config/providerModels.js";
-import { getStateDir, readConfig, readProxyState, writeConfig } from "../persistence/state.js";
+import { getStateDir, readConfig, writeConfig } from "../persistence/state.js";
 import { DEFAULT_RELAY_URL } from "../constants.js";
 import { cachedUpdateStatus } from "../update/checker.js";
 import { detectInstallContext } from "../update/installContext.js";
@@ -99,10 +95,14 @@ import {
 import {
   handleRemoteShareControl,
   handleRemoteShareStatus,
-  remoteShareProviders,
 } from "./localApiRemoteShare.js";
 import { handleSessionControl } from "./localApiSessionControl.js";
 import { handleProxyControl } from "./localApiProxyControl.js";
+import {
+  handleLocalStatus,
+  handleProxyLogs,
+  handleProxyRequests,
+} from "./localApiReadHandlers.js";
 
 export { projectSession } from "./localApiProjections.js";
 
@@ -115,10 +115,6 @@ export const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1
 const BEARER_RE = /^Bearer\s+([a-f0-9]{64})$/i;
 // Hard cap on the log-tail response body so a runaway proxy log doesn't OOM
 // the local API process.
-const LOG_TAIL_MAX_BYTES = 1_048_576; // 1 MiB
-const LOG_TAIL_MAX_LINES = 2000;
-const LOG_TAIL_DEFAULT_LINES = 200;
-
 // Hard-coded placeholder for proxy status. Stage 4 will swap this for a real
 // LiteLLM process probe. Keeping it as an injected function (not a module-level
 // constant) so tests can override.
@@ -1425,135 +1421,5 @@ async function dispatch(ctx, req, res) {
   } catch (err) {
     console.error(`[local-api] ${err.stack || err.message}`);
     return sendError(res, 500, err.message || "internal error");
-  }
-}
-
-// ---------- Read handlers ----------
-
-async function handleLocalStatus(ctx) {
-  const startedAt = ctx.startedAt;
-  const uptimeSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1000));
-  return {
-    daemon: {
-      pid: ctx.pid,
-      version: ctx.version,
-      deviceId: ctx.deviceId,
-      startedAt,
-      uptimeSeconds,
-      port: ctx.localApiPort,
-      bindAddress: ctx.bindAddress,
-      baseUrl: `http://${httpHost(ctx.bindAddress)}:${ctx.localApiPort}`,
-      authMode: "bearer",
-      lanEnabled: !ctx.isLoopback,
-    },
-    relay: {
-      url: ctx.relayUrl,
-      connected: ctx.relayConnected(),
-      authState: typeof ctx.relayAuthState === "function" ? ctx.relayAuthState() : undefined,
-      authError: typeof ctx.relayAuthError === "function" ? ctx.relayAuthError() : undefined,
-    },
-    e2ee: ctx.deviceE2eeLocalGateway?.identityStatus(ctx.deviceId),
-    // Independent runtimes: agent routes and explicitly shared remote access.
-    proxy: await ctx.getProxyStatus(),
-    remoteShare: await handleRemoteShareStatusPayload(ctx),
-    agentDetail: {
-      profile: agentDetailDefaultFromConfig(readConfig()),
-      availableProfiles: AGENT_DETAIL_PROFILES,
-    },
-    compatibility: ctx.sessionManager?.compatibilityStatus?.(),
-    updates: cachedUpdateStatus({
-      stateDir: ctx.stateDir || getStateDir(),
-      config: readConfig(),
-      installContext: detectInstallContext(),
-    }),
-  };
-}
-
-async function handleRemoteShareStatusPayload(ctx) {
-  const config = readConfig();
-  const configured = config.remoteShare || {};
-  const status = await ctx.getRemoteShareProxyStatus();
-  const providerNames = Array.isArray(status.currentProviders) && status.currentProviders.length > 0
-    ? status.currentProviders
-    : configured.providers || [];
-  const catalog = remoteShareProviders(config, providerNames)
-    .flatMap((provider) => remoteShareModelEntries(provider))
-    .map(({ provider, model, sourceProvider, pricing }) => ({
-      provider,
-      model,
-      sourceProvider,
-      pricing,
-    }));
-  return {
-    ...status,
-    enabled: configured.enabled === true,
-    providers: providerNames,
-    catalog,
-    e2eePolicy: "required",
-    e2eeSupported: true,
-  };
-}
-
-// ---------- Stage 6: proxy log tail ----------
-
-function handleProxyLogs(ctx, res, url) {
-  // ?tail=N — default 200, max 2000. 1 MiB cap on the read.
-  const tailParam = url.searchParams.get("tail");
-  let tail = LOG_TAIL_DEFAULT_LINES;
-  if (tailParam != null) {
-    const n = Number.parseInt(tailParam, 10);
-    if (!Number.isFinite(n) || n < 1) {
-      return sendError(res, 400, "tail must be a positive integer");
-    }
-    tail = Math.min(n, LOG_TAIL_MAX_LINES);
-  }
-  const state = readProxyState();
-  if (!state || !state.logPath) {
-    return sendError(res, 404, "no proxy log path recorded; is the proxy running?");
-  }
-  const logPath = state.logPath;
-  let st;
-  try { st = statSync(logPath); }
-  catch (err) { return sendError(res, 500, `cannot stat log: ${err.message}`); }
-  if (!st.isFile()) return sendError(res, 404, "log path is not a regular file");
-
-  let text;
-  try {
-    // Cap at 1 MiB: if the file is larger, read only the last 1 MiB.
-    const size = Math.min(st.size, LOG_TAIL_MAX_BYTES);
-    const start = st.size - size;
-    const buf = Buffer.alloc(size);
-    const fd = openSync(logPath, "r");
-    try { readSync(fd, buf, 0, size, start); }
-    finally { closeSync(fd); }
-    text = buf.toString("utf8");
-  } catch (err) {
-    return sendError(res, 500, `cannot read log: ${err.message}`);
-  }
-  const lines = text.split("\n");
-  // If we truncated, drop the partial first line.
-  if (st.size > LOG_TAIL_MAX_BYTES) lines.shift();
-  const tailLines = lines.slice(-tail);
-  return sendOk(res, { path: logPath, lines: tailLines.length, content: tailLines.join("\n") });
-}
-
-function handleProxyRequests(ctx, res, url) {
-  const rawLimit = url.searchParams.get("limit");
-  if (rawLimit != null && !/^\d+$/.test(rawLimit)) {
-    return sendError(res, 400, "limit must be a positive integer");
-  }
-  const limit = rawLimit == null ? undefined : Number(rawLimit);
-  if (limit != null && limit < 1) {
-    return sendError(res, 400, "limit must be a positive integer");
-  }
-  try {
-    return sendOk(res, ctx.proxyRequestStore.listPage({
-      limit,
-      cursor: url.searchParams.get("cursor"),
-      status: url.searchParams.get("status") || "",
-      query: url.searchParams.get("q") || "",
-    }));
-  } catch (error) {
-    return sendError(res, 400, error?.message || "invalid request query");
   }
 }
