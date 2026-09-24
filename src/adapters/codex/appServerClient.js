@@ -39,6 +39,22 @@ function meetsCodexAppServerGate(semver) {
   return semver.minor >= CODEX_MIN_MINOR;
 }
 
+export function buildCodexModelProviderConfigArgs(modelProvider) {
+  if (!modelProvider?.id || !modelProvider?.baseUrl) return [];
+  const id = String(modelProvider.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+  const config = [
+    ["model_provider", id],
+    [`model_providers.${id}.name`, modelProvider.name || "OriginRouter Proxy"],
+    [`model_providers.${id}.base_url`, modelProvider.baseUrl],
+    [`model_providers.${id}.env_key`, modelProvider.envKey || "OPENAI_API_KEY"],
+    [`model_providers.${id}.wire_api`, modelProvider.wireApi || "responses"],
+  ];
+  return config.flatMap(([key, value]) => [
+    "-c",
+    `${key}=${JSON.stringify(String(value))}`,
+  ]);
+}
+
 export async function isCodexAppServerAvailable() {
   const version = await runCapture("codex", ["--version"]);
   if (!version.ok) return false;
@@ -123,19 +139,7 @@ export class CodexAppServerClient {
     this.disconnecting = false;
     this.childExited = false;
     const args = ["app-server"];
-    if (modelProvider?.id && modelProvider?.baseUrl) {
-      const id = String(modelProvider.id).replace(/[^a-zA-Z0-9_-]/g, "_");
-      const config = [
-        ["model_provider", id],
-        [`model_providers.${id}.name`, modelProvider.name || "OriginRouter Proxy"],
-        [`model_providers.${id}.base_url`, modelProvider.baseUrl],
-        [`model_providers.${id}.env_key`, modelProvider.envKey || "OPENAI_API_KEY"],
-        [`model_providers.${id}.wire_api`, modelProvider.wireApi || "responses"],
-      ];
-      for (const [key, value] of config) {
-        args.push("-c", `${key}=${JSON.stringify(String(value))}`);
-      }
-    }
+    args.push(...buildCodexModelProviderConfigArgs(modelProvider));
     for (const [key, value] of Array.isArray(configArgs) ? configArgs : []) {
       if (!key || value == null) continue;
       args.push("-c", `${String(key)}=${String(value)}`);

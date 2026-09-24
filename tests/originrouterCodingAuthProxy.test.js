@@ -116,6 +116,7 @@ test("coding auth proxy forwards all supported routes with a managed token", asy
   await proxy.start();
   try {
     for (const path of [
+      "/coding/v1/models",
       "/coding/v1/messages",
       "/coding/v1/chat/completions",
       "/coding/v1/responses",
@@ -124,6 +125,7 @@ test("coding auth proxy forwards all supported routes with a managed token", asy
       assert.equal(response.status, 200);
     }
     assert.deepEqual(calls.map((call) => call.url), [
+      "https://api.easytransnote.com/coding/v1/models",
       "https://api.easytransnote.com/coding/v1/messages",
       "https://api.easytransnote.com/coding/v1/chat/completions",
       "https://api.easytransnote.com/coding/v1/responses",
@@ -133,6 +135,44 @@ test("coding auth proxy forwards all supported routes with a managed token", asy
       assert.equal(call.options.headers["x-api-key"], undefined);
       assert.ok(!JSON.stringify(call.options.headers).includes(proxy.localToken));
     }
+  } finally {
+    await proxy.stop();
+  }
+});
+
+test("coding auth proxy adapts the OpenAI model list for Codex metadata", async () => {
+  const proxy = new OriginRouterCodingAuthProxy({
+    stateDir: "/tmp/originrouter-test",
+    ensureFreshAccessTokenFn: async () => credential("or_at_models"),
+    fetchFn: async () => new Response(JSON.stringify({
+      object: "list",
+      data: [{ id: "grok-4.6", object: "model", name: "Grok 4.6" }],
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }),
+  });
+  await proxy.start();
+  try {
+    const response = await localRequest(proxy, "/coding/v1/models?client_version=0.155.1", {
+      method: "GET",
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      models: [{
+        slug: "grok-4.6",
+        display_name: "Grok 4.6",
+        base_instructions: "",
+        supported_reasoning_levels: [],
+        shell_type: "shell_command",
+        visibility: "list",
+        supported_in_api: true,
+        priority: 0,
+        support_verbosity: false,
+        truncation_policy: { mode: "bytes", limit: 10000 },
+        experimental_supported_tools: [],
+      }],
+    });
   } finally {
     await proxy.stop();
   }

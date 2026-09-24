@@ -10,6 +10,7 @@ import {
 const TOKEN_HEADROOM_MS = 120_000;
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const ALLOWED_PATH_PREFIXES = Object.freeze([
+  "/coding/v1/models",
   "/coding/v1/messages",
   "/coding/v1/chat/completions",
   "/coding/v1/responses",
@@ -101,6 +102,54 @@ function sendJson(res, status, body) {
     "Cache-Control": "no-store",
   });
   res.end(JSON.stringify(body));
+}
+
+function isModelsPath(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl || "/", "http://127.0.0.1");
+    return parsed.pathname === "/coding/v1/models";
+  } catch {
+    return false;
+  }
+}
+
+function codexModelInfo(model) {
+  const slug = typeof model?.id === "string" ? model.id.trim() : "";
+  if (!slug) return null;
+  return {
+    slug,
+    display_name: typeof model.name === "string" && model.name.trim()
+      ? model.name.trim()
+      : slug,
+    base_instructions: "",
+    supported_reasoning_levels: [],
+    shell_type: "shell_command",
+    visibility: "list",
+    supported_in_api: true,
+    priority: 0,
+    support_verbosity: false,
+    truncation_policy: { mode: "bytes", limit: 10000 },
+    experimental_supported_tools: [],
+  };
+}
+
+async function normalizeCodexModelsResponse(req, response) {
+  if (!isModelsPath(req.url) || !response.ok) return response;
+  const body = await response.text();
+  let payload;
+  try { payload = JSON.parse(body); } catch { return new Response(body, response); }
+  if (Array.isArray(payload?.models) || !Array.isArray(payload?.data)) {
+    return new Response(body, response);
+  }
+  const models = payload.data.map(codexModelInfo).filter(Boolean);
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  headers.delete("content-encoding");
+  return new Response(JSON.stringify({ models }), {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 export class OriginRouterCodingAuthProxy {
@@ -246,6 +295,7 @@ export class OriginRouterCodingAuthProxy {
         token = refreshed;
         upstream = await this._fetchUpstream(req, body, token, controller.signal);
       }
+      upstream = await normalizeCodexModelsResponse(req, upstream);
       this._observeGatewayResponseIds(upstream.headers);
       res.writeHead(upstream.status, responseHeaders(upstream.headers));
       if (!upstream.body) {

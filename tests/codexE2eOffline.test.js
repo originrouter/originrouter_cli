@@ -226,6 +226,29 @@ try {
     assert.equal(launch.env.OPENAI_MODEL, "gpt-5.6-sol");
   }
 
+  // ---- 10c. Routed native Codex selects an API-key model provider ----
+  {
+    const adapter = new CodexAdapter({ args: [] });
+    adapter.setRoutedModel("grok-4.6");
+    adapter.setModelProvider({
+      id: "originrouter_proxy",
+      name: "OriginRouter Proxy",
+      baseUrl: "http://127.0.0.1:40123/coding/v1",
+      envKey: "OPENAI_API_KEY",
+      wireApi: "responses",
+    });
+    const launch = adapter.buildLaunch();
+    assert.deepEqual(launch.args.slice(0, 12), [
+      "-c", "model_provider=\"originrouter_proxy\"",
+      "-c", "model_providers.originrouter_proxy.name=\"OriginRouter Proxy\"",
+      "-c", "model_providers.originrouter_proxy.base_url=\"http://127.0.0.1:40123/coding/v1\"",
+      "-c", "model_providers.originrouter_proxy.env_key=\"OPENAI_API_KEY\"",
+      "-c", "model_providers.originrouter_proxy.wire_api=\"responses\"",
+      "--model", "grok-4.6",
+    ]);
+    assert.equal(launch.env.OPENAI_MODEL, "grok-4.6");
+  }
+
   // ---- 11. CodexAdapter buildLaunch: --model X (pass-through + warning) ----
   for (const userArgs of [
     ["--model", "gpt-4"],

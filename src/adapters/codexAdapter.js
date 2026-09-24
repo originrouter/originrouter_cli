@@ -1,5 +1,8 @@
 import { TerminalAdapter } from "./terminalAdapter.js";
-import { CodexAppServerClient } from "./codex/appServerClient.js";
+import {
+  buildCodexModelProviderConfigArgs,
+  CodexAppServerClient,
+} from "./codex/appServerClient.js";
 import { mapCodexAppServerEvent, mapCodexApprovalRequest } from "./codex/eventMapper.js";
 import { CODEX_MAIN_ALIAS } from "../config/routes.js";
 import { CodexJsonlScanner, readCodexConversationHistory } from "./codex/jsonlScanner.js";
@@ -42,11 +45,16 @@ export class CodexAdapter extends TerminalAdapter {
     this.scanner = new CodexJsonlScanner({ cwd, startedAt: this.startedAt });
     this.nativeConfig = Boolean(nativeConfig);
     this.routedModel = null;
+    this.modelProvider = null;
   }
 
   setRoutedModel(model) {
     const value = String(model || "").trim();
     this.routedModel = value || null;
+  }
+
+  setModelProvider(modelProvider) {
+    this.modelProvider = modelProvider?.baseUrl ? { ...modelProvider } : null;
   }
 
   describe() {
@@ -76,17 +84,19 @@ export class CodexAdapter extends TerminalAdapter {
         env: {},
       };
     }
+    const providerArgs = buildCodexModelProviderConfigArgs(this.modelProvider);
     const launchModel = this.routedModel || CODEX_MAIN_ALIAS;
     if (!userProvidedModel(args)) {
       // routes.codex.main is the source of truth. Proxy routes resolve to the
       // fixed OriginRouter alias; direct OriginRouter and remote routes
       // resolve to their actual configured model id.
-      args = ["--model", launchModel, ...args];
+      args = [...providerArgs, "--model", launchModel, ...args];
     } else {
       process.stderr.write(
         "warning: --model passed on the command line; it bypasses routes.codex.main.\n" +
         "Use `originrouter route set codex.main --provider <name> --model <model>` instead.\n",
       );
+      args = [...providerArgs, ...args];
     }
     return {
       command: "codex",

@@ -206,6 +206,15 @@ export async function runLocalAgentSession(agent, rawArgs) {
   if (typeof adapter.setRoutedModel === "function") {
     adapter.setRoutedModel(providerEnv.OPENAI_MODEL);
   }
+  if (typeof adapter.setModelProvider === "function") {
+    adapter.setModelProvider(providerEnv.OPENAI_BASE_URL ? {
+      id: "originrouter_proxy",
+      name: "OriginRouter Proxy",
+      baseUrl: providerEnv.OPENAI_BASE_URL,
+      envKey: "OPENAI_API_KEY",
+      wireApi: "responses",
+    } : null);
+  }
   const baseEnv = { ...process.env, ...providerEnv };
   let exited = false;
   let finalizing = false;
