@@ -69,6 +69,32 @@ test("valid stored login is authoritatively refreshed and reused", () => withSta
   assert.equal(readCodingAuth(stateDir).refreshToken, "or_rt_refreshed");
 }));
 
+test("auth verification refreshes every resource used by remote control", () => withState(async (stateDir) => {
+  writeCodingAuth(stateDir, credential());
+  const resources = [];
+  const result = await verifyStoredLogin({
+    stateDir,
+    fetchFn: async (_url, options) => {
+      resources.push(new URLSearchParams(options.body).get("resource"));
+      return response(200, {
+        access_token: `or_at_refreshed_${resources.length}`,
+        refresh_token: `or_rt_refreshed_${resources.length}`,
+        expires_in: 600,
+        refresh_expires_in: 2592000,
+        scope: "remote.control",
+      });
+    },
+  });
+  assert.equal(result.state, "active");
+  assert.deepEqual(resources, [
+    "originrouter.control",
+    "originrouter.ai",
+    "originrouter.coding",
+    "originrouter.relay",
+    "originrouter.memory",
+  ]);
+}));
+
 test("terminal Surety rejection clears the stored login", () => withState(async (stateDir) => {
   writeCodingAuth(stateDir, credential());
   const result = await inspectStoredLogin({

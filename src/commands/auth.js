@@ -42,6 +42,7 @@ import {
 } from "../persistence/state.js";
 import { formatCliError, reportCliError } from "../runtime/cliErrors.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
+import { OAUTH_RESOURCES } from "../runtime/authContract.js";
 import { TelemetryQueue } from "../telemetry/telemetryQueue.js";
 
 function discardPendingTelemetryForSession(stateDir, sessionId) {
@@ -129,11 +130,18 @@ export async function verifyStoredLogin({
   const stored = readCodingAuth(stateDir);
   if (!stored) return { state: "missing", credential: null };
   try {
-    const credential = await ensureFreshAccessToken({
-      stateDir,
-      forceRefresh: true,
-      fetchFn,
-    });
+    // Verify every resource token. The daemon's remote-device path uses the
+    // relay resource, so refreshing only the control token can report a
+    // successful login while the relay remains expired and unusable.
+    let credential = stored;
+    for (const resource of Object.values(OAUTH_RESOURCES)) {
+      credential = await ensureFreshAccessToken({
+        stateDir,
+        resource,
+        forceRefresh: true,
+        fetchFn,
+      });
+    }
     return { state: "active", credential };
   } catch (error) {
     return {
