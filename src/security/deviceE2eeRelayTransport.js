@@ -59,6 +59,8 @@ export const PROTECTED_DEVICE_MESSAGE_TYPES = new Set([
   "collaboration.mcp.response",
 ]);
 
+const ROUTE_SUBSCRIBER_TTL_MS = 2 * 60 * 1000;
+
 function text(value) {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -126,6 +128,12 @@ export class DeviceE2eeRelayTransport {
     this.credentialProvider = credentialProvider;
     this.sessions = new Map();
     this.routes = new Map();
+    // A route key historically pointed at one E2EE session. Keep that
+    // compatibility lookup for request/response traffic, but retain all
+    // recently subscribed control sessions so live agent events can be
+    // delivered to more than one authorized App device without one device
+    // silently evicting another.
+    this.routeSubscribers = new Map();
     this.sendTails = new Map();
     this.inboundTail = Promise.resolve();
   }
@@ -262,6 +270,35 @@ export class DeviceE2eeRelayTransport {
     return true;
   }
 
+  _rememberSubscribers(keys, sessionId) {
+    const now = Date.now();
+    for (const key of keys) {
+      if (!key) continue;
+      let subscribers = this.routeSubscribers.get(key);
+      if (!subscribers) {
+        subscribers = new Map();
+        this.routeSubscribers.set(key, subscribers);
+      }
+      subscribers.set(sessionId, now);
+    }
+  }
+
+  _subscriberSessions(routeKey) {
+    const subscribers = this.routeSubscribers.get(text(routeKey));
+    if (!subscribers) return [];
+    const cutoff = Date.now() - ROUTE_SUBSCRIBER_TTL_MS;
+    const sessions = [];
+    for (const [sessionId, lastSeenAt] of subscribers) {
+      if (lastSeenAt < cutoff || !this.sessions.has(sessionId)) {
+        subscribers.delete(sessionId);
+        continue;
+      }
+      sessions.push(this.sessions.get(sessionId));
+    }
+    if (subscribers.size === 0) this.routeSubscribers.delete(text(routeKey));
+    return sessions.filter(Boolean);
+  }
+
   handleInbound(envelope) {
     const operation = this.inboundTail.then(() =>
       this._handleInboundSerial(envelope));
@@ -293,12 +330,27 @@ export class DeviceE2eeRelayTransport {
       this.sessions.set(envelope.session_id, session);
     }
     const payload = { ...opened.payload, type: opened.type };
-    for (const key of routeKeys(payload, envelope.routing)) {
+    const keys = routeKeys(payload, envelope.routing);
+    for (const key of keys) {
       this.routes.delete(key);
       this.routes.set(key, session.sessionId);
     }
+    if (payload.type === "agent.control.subscribe") {
+      this._rememberSubscribers(keys, session.sessionId);
+    }
     this._pruneRoutes();
-    return payload;
+    // Keep the origin metadata internal to the daemon. It is deliberately
+    // non-wire and is removed by callers that forward business payloads.
+    return Object.defineProperties(payload, {
+      __originrouterSourceDeviceId: {
+        value: session.peer?.device_id || envelope.source_device_id || "",
+        enumerable: false,
+      },
+      __originrouterE2eeSessionId: {
+        value: session.sessionId,
+        enumerable: false,
+      },
+    });
   }
 
   _pruneSessions() {
@@ -324,6 +376,15 @@ export class DeviceE2eeRelayTransport {
   _pruneRoutes() {
     for (const [key, sessionId] of this.routes) {
       if (!this.sessions.has(sessionId)) this.routes.delete(key);
+    }
+    for (const [key, subscribers] of this.routeSubscribers) {
+      for (const [sessionId, lastSeenAt] of subscribers) {
+        if (!this.sessions.has(sessionId) ||
+            lastSeenAt < Date.now() - ROUTE_SUBSCRIBER_TTL_MS) {
+          subscribers.delete(sessionId);
+        }
+      }
+      if (subscribers.size === 0) this.routeSubscribers.delete(key);
     }
     while (this.routes.size > 8192) {
       const oldest = this.routes.keys().next().value;
@@ -382,6 +443,10 @@ export class DeviceE2eeRelayTransport {
       error.code = "DEVICE_E2EE_SESSION_REQUIRED";
       throw error;
     }
+    return this._sendOnSession(session, type, wirePayload);
+  }
+
+  async _sendOnSession(session, type, wirePayload) {
     const previous = this.sendTails.get(session.sessionId) || Promise.resolve();
     const operation = previous.then(async () => {
       const cache = await this._ensureDirectoryFresh();
@@ -421,6 +486,40 @@ export class DeviceE2eeRelayTransport {
     });
   }
 
+  /**
+   * Forward a live event to every recently subscribed App for a session.
+   * Request/response traffic continues to use send(), which intentionally
+   * follows the latest route. A failed subscriber is discarded while healthy
+   * subscribers still receive the event.
+   */
+  async sendBroadcast(type, payload = {}, { routeKey } = {}) {
+    const key = text(routeKey) || text(payload.sessionId) || text(payload.session_id);
+    const sessions = this._subscriberSessions(key);
+    if (sessions.length <= 1) return this.send(type, payload);
+    const wirePayload = withoutUndefined(payload);
+    const results = await Promise.allSettled(
+      sessions.map((session) => this._sendOnSession(session, type, wirePayload)),
+    );
+    let accepted = false;
+    let reason = "";
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        const delivery = result.value?.data || result.value || {};
+        if (delivery.accepted !== false) accepted = true;
+        else reason ||= delivery.reason || "relay_rejected";
+      } else {
+        reason ||= result.reason?.code || result.reason?.message || "relay_error";
+        const session = sessions[index];
+        if (session) {
+          for (const subscribers of this.routeSubscribers.values()) {
+            subscribers.delete(session.sessionId);
+          }
+        }
+      }
+    });
+    return { accepted, reason };
+  }
+
   rejectsPlaintext(payload) {
     return payload?.protocol !== "e2ee-v2"
       && PROTECTED_DEVICE_MESSAGE_TYPES.has(payload?.type);
@@ -429,6 +528,7 @@ export class DeviceE2eeRelayTransport {
   clearSessions() {
     this.sessions.clear();
     this.routes.clear();
+    this.routeSubscribers.clear();
     this.sendTails.clear();
   }
 }

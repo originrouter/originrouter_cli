@@ -15,6 +15,7 @@ import { DeviceE2eeRelayTransport } from "../src/security/deviceE2eeRelayTranspo
 
 const root = mkdtempSync(join(tmpdir(), "originrouter-e2ee-relay-"));
 const app = ensureDeviceE2eeIdentity(join(root, "app"), { deviceId: "app-device" });
+const app2 = ensureDeviceE2eeIdentity(join(root, "app-2"), { deviceId: "app-device-2" });
 const cli = ensureDeviceE2eeIdentity(join(root, "cli"), { deviceId: "cli-device" });
 const stateDir = join(root, "state");
 const credential = {
@@ -25,6 +26,7 @@ const cachedDirectory = storeDeviceE2eeDirectoryCache(stateDir, {
   policy: { epoch: 1, new_device_approval_required: false },
   identities: [
     { ...app.public_identity, trust_status: "trusted" },
+    { ...app2.public_identity, trust_status: "trusted" },
     { ...cli.public_identity, trust_status: "trusted" },
   ],
 }, { namespace: credential.sessionId });
@@ -53,15 +55,34 @@ const subscribe = appSession.seal("agent.control.subscribe", {
 const clear = await transport.handleInbound(subscribe);
 assert.equal(clear.type, "agent.control.subscribe");
 
-await transport.send("agent.stream.event", {
+const app2Session = DeviceE2eeSession.initiate({
+  local: app2,
+  peer: cli.public_identity,
+  sessionId: "e2s_relay_test_app_2",
+});
+const clearSecondSubscription = await transport.handleInbound(app2Session.seal(
+  "agent.control.subscribe",
+  { requestId: "subscribe-2", sessionIds: ["agent-session-1"] },
+  { routing: {
+    session_id: "agent-session-1",
+    request_id: "subscribe-2",
+    directory_head: deviceE2eeDirectoryHead(cachedDirectory),
+  } },
+));
+assert.equal(clearSecondSubscription.type, "agent.control.subscribe");
+
+await transport.sendBroadcast("agent.stream.event", {
   sessionId: "agent-session-1",
   event: { text: "secret stream" },
-});
-assert.equal(sent.length, 1);
+}, { routeKey: "agent-session-1" });
+assert.equal(sent.length, 2);
 assert.equal(sent[0].protocol, "e2ee-v2");
+assert.equal(sent[1].protocol, "e2ee-v2");
 assert.equal(JSON.stringify(sent[0]).includes("secret stream"), false);
 const opened = appSession.open(sent[0]);
 assert.equal(opened.payload.event.text, "secret stream");
+const openedForSecondApp = app2Session.open(sent[1]);
+assert.equal(openedForSecondApp.payload.event.text, "secret stream");
 
 await transport.send("collaboration.control.response", {
   sessionId: "agent-session-1",
@@ -72,7 +93,7 @@ await transport.send("collaboration.control.response", {
     values: ["present", undefined, { absent: undefined, retained: "nested" }],
   },
 });
-const sanitized = appSession.open(sent.at(-1)).payload.data;
+const sanitized = app2Session.open(sent.at(-1)).payload.data;
 assert.equal("absent" in sanitized, false);
 assert.deepEqual(sanitized.nested, { retained: true });
 assert.deepEqual(sanitized.values, ["present", null, { retained: "nested" }]);

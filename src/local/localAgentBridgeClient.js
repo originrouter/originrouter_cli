@@ -47,6 +47,12 @@ export class LocalAgentBridgeClient {
     this.pollingCommands = false;
     this.pollTimer = null;
     this.heartbeatTimer = null;
+    // Events are produced by the terminal independently of the daemon's
+    // availability. Keep a small in-memory outbox so a short daemon restart
+    // cannot make a permission/interaction event disappear permanently.
+    this.pendingEvents = [];
+    this.flushingEvents = false;
+    this.maxPendingEvents = 256;
     this.closed = false;
   }
 
@@ -87,6 +93,7 @@ export class LocalAgentBridgeClient {
         this.sessionMetadata,
       );
       this.setEndpoint(endpoint);
+      void this.flushEvents();
       return true;
     } catch {
       this.setEndpoint(null);
@@ -116,22 +123,41 @@ export class LocalAgentBridgeClient {
 
   async sendEvent(event) {
     if (this.closed) return false;
-    if (!(await this.connect())) {
-      this.auditStore.appendEvent(this.sessionMetadata, event);
-      return false;
+    this.pendingEvents.push(event);
+    if (this.pendingEvents.length > this.maxPendingEvents) {
+      const dropped = this.pendingEvents.shift();
+      // The audit chain remains the durable fallback for events that cannot
+      // be delivered before the bounded outbox fills up.
+      if (dropped) this.auditStore.appendEvent(this.sessionMetadata, dropped);
     }
+    return this.flushEvents();
+  }
+
+  async flushEvents() {
+    if (this.closed || this.flushingEvents) return this.pendingEvents.length === 0;
+    this.flushingEvents = true;
+    let delivered = true;
     try {
-      await request(
-        this.endpoint,
-        "POST",
-        `/agent/local/sessions/${encodeURIComponent(this.sessionId)}/events`,
-        { event },
-      );
-      return true;
-    } catch {
-      this.auditStore.appendEvent(this.sessionMetadata, event);
-      this.setEndpoint(null);
-      return false;
+      if (!(await this.connect())) return false;
+      while (this.pendingEvents.length > 0 && this.endpoint && !this.closed) {
+        const event = this.pendingEvents[0];
+        try {
+          await request(
+            this.endpoint,
+            "POST",
+            `/agent/local/sessions/${encodeURIComponent(this.sessionId)}/events`,
+            { event },
+          );
+          this.pendingEvents.shift();
+        } catch {
+          delivered = false;
+          this.setEndpoint(null);
+          break;
+        }
+      }
+      return delivered && this.pendingEvents.length === 0;
+    } finally {
+      this.flushingEvents = false;
     }
   }
 
@@ -179,6 +205,9 @@ export class LocalAgentBridgeClient {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     const endpoint = this.endpoint;
     this.setEndpoint(null);
+    for (const event of this.pendingEvents.splice(0)) {
+      this.auditStore.appendEvent(this.sessionMetadata, event);
+    }
     if (!endpoint) return;
     try {
       await request(

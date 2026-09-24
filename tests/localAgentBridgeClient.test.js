@@ -80,3 +80,37 @@ test("conversation metadata survives a daemon outage for reconnect", async () =>
     "/tmp/new-conversation.jsonl",
   );
 });
+
+test("event outbox replays an interaction after a short daemon outage", async () => {
+  const originalFetch = globalThis.fetch;
+  const endpoint = { baseUrl: "http://127.0.0.1:7437", token: "test" };
+  let attempts = 0;
+  const delivered = [];
+  globalThis.fetch = async (_url, options) => {
+    attempts += 1;
+    if (attempts === 1) throw new Error("daemon restarting");
+    delivered.push(JSON.parse(options.body).event);
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+  try {
+    const client = new LocalAgentBridgeClient({
+      stateDir: "/tmp/originrouter-local-bridge-outbox-test",
+      sessionId: "session-outbox",
+    });
+    client.endpoint = endpoint;
+    assert.equal(await client.sendEvent({
+      type: "agent.interaction.requested",
+      interactionId: "permission-1",
+    }), false);
+    assert.equal(client.pendingEvents.length, 1);
+    client.endpoint = endpoint;
+    assert.equal(await client.flushEvents(), true);
+    assert.deepEqual(delivered, [{
+      type: "agent.interaction.requested",
+      interactionId: "permission-1",
+    }]);
+    await client.close();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

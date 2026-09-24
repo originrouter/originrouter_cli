@@ -103,15 +103,18 @@ export class ExternalAgentRelayRouter {
     ).slice(0, 191);
     const route = targetDeviceId ? { targetDeviceId } : {};
 
+    const send = typeof this.relayClient.sendBroadcast === "function"
+      ? (type, payload) => this.relayClient.sendBroadcast(type, payload, { routeKey: sessionId })
+      : (type, payload) => this.relayClient.send(type, payload);
     if (DIRECT_APP_EVENT_TYPES.has(event.type)) {
-      await this.relayClient.send(
+      await send(
         event.type,
         withoutUndefined({ ...event, sessionId, ...route }),
       );
       return true;
     }
     const { sessionId: _eventSessionId, ...eventWithoutSessionId } = event;
-    await this.relayClient.send("agent.stream.event", {
+    await send("agent.stream.event", {
       sessionId,
       ...route,
       event: withoutUndefined(eventWithoutSessionId),
