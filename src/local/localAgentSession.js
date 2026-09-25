@@ -85,6 +85,7 @@ export {
   buildModeStatusEvent,
   extractOriginRouterOptions,
   handleRemoteEvent,
+  normalizePtyInteraction,
 } from "./agentSessionPrimitives.js";
 
 // Fallback mode vocabularies for terminal adapters that do not expose their

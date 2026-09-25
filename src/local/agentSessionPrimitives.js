@@ -134,12 +134,36 @@ function normalizePtyInteraction(event, sessionId) {
     event?.input && typeof event.input === "object" ? event.input : {};
   const toolInput = displaySafeToolInput(rawToolInput);
   const { input: _rawInput, raw: _rawEvent, ...displaySafeEvent } = event || {};
+  const eventPayload =
+    event?.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
+      ? event.payload
+      : null;
+  // The canonical interaction contract mirrors legacy `input` in
+  // `payload.tool_input` so the App can render a permission card. Re-apply
+  // the PTY display-safety boundary here because adapters may have produced
+  // that payload before this session-level sanitizer ran.
+  const safePayload = eventPayload && event?.kind === "permission"
+    ? {
+        ...eventPayload,
+        tool_input: displaySafeToolInput(
+          eventPayload.tool_input && typeof eventPayload.tool_input === "object"
+            ? eventPayload.tool_input
+            : rawToolInput,
+        ),
+        ...(typeof eventPayload.command === "string"
+          ? { command: eventPayload.command.slice(0, 8192) }
+          : {}),
+        ...(typeof eventPayload.cwd === "string"
+          ? { cwd: eventPayload.cwd.slice(0, 1024) }
+          : {}),
+      }
+    : eventPayload;
   return {
     ...displaySafeEvent,
     sessionId,
     title: event?.title || `${tool} needs permission`,
     prompt: event?.prompt || "Review this action before continuing.",
-    payload: event?.payload || {
+    payload: safePayload || {
       tool,
       display_name: tool,
       tool_input: toolInput,

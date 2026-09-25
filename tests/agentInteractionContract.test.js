@@ -70,21 +70,38 @@ const DEFAULT_DECISIONS = [
   const out = permissionEventToInteraction(claudeEvent);
   assert.equal(out.type, "agent.interaction.requested");
   assert.equal(out.kind, "permission");
-  assert.equal(out.source, "hook",
-    "default source must be hook when caller omits extras.source");
+  assert.equal(
+    out.source,
+    "hook",
+    "default source must be hook when caller omits extras.source",
+  );
   assert.equal(out.provider, "claude");
   assert.equal(out.tool, "Bash");
-  assert.equal(out.interactionId, CLAUDE_CALL_ID,
-    "interactionId must equal the legacy callId");
-  assert.equal(out.callId, CLAUDE_CALL_ID,
-    "callId is preserved on the envelope for back-compat consumers");
+  assert.equal(
+    out.interactionId,
+    CLAUDE_CALL_ID,
+    "interactionId must equal the legacy callId",
+  );
+  assert.equal(
+    out.callId,
+    CLAUDE_CALL_ID,
+    "callId is preserved on the envelope for back-compat consumers",
+  );
   assert.deepEqual(out.input, { command: "npm test" });
+  assert.deepEqual(out.payload.tool_input, { command: "npm test" });
+  assert.equal(out.payload.remember_allowed, true);
   assert.deepEqual(out.permissionSuggestions, CLAUDE_PERMISSION_SUGGESTIONS);
-  assert.equal(out.resolution.eventType, "agent.interaction.resolve",
-    "new envelope always carries the new eventType");
+  assert.equal(
+    out.resolution.eventType,
+    "agent.interaction.resolve",
+    "new envelope always carries the new eventType",
+  );
   assert.deepEqual(out.resolution.decisions, DEFAULT_DECISIONS);
-  assert.equal(out.terminalReply, null,
-    "non raw_terminal kind must not invent a terminalReply envelope");
+  assert.equal(
+    out.terminalReply,
+    null,
+    "non raw_terminal kind must not invent a terminalReply envelope",
+  );
 }
 
 // ---- 11. Managed generic request/resolve contract ----
@@ -114,7 +131,11 @@ const DEFAULT_DECISIONS = [
   assert.equal(resolved.action, "submit");
   assert.deepEqual(resolved.response.answers.target, ["staging"]);
   assert.throws(
-    () => normalizeInteractionResolve({ interactionId: "ask-1", action: "approved" }),
+    () =>
+      normalizeInteractionResolve({
+        interactionId: "ask-1",
+        action: "approved",
+      }),
     TypeError,
   );
 }
@@ -138,8 +159,11 @@ const DEFAULT_DECISIONS = [
   });
   assert.equal(out.type, "agent.interaction.requested");
   assert.equal(out.kind, "permission");
-  assert.equal(out.source, "app-server",
-    "caller-supplied source must override the default hook value");
+  assert.equal(
+    out.source,
+    "app-server",
+    "caller-supplied source must override the default hook value",
+  );
   assert.equal(out.provider, "codex");
   assert.equal(out.tool, "exec");
   assert.equal(out.interactionId, CODEX_CALL_ID);
@@ -160,8 +184,11 @@ const DEFAULT_DECISIONS = [
   });
   assert.equal(out.interactionId, CLAUDE_CALL_ID);
   assert.equal(out.callId, CLAUDE_CALL_ID);
-  assert.equal(out.interactionId, out.callId,
-    "interactionId and callId must be the same string on the envelope");
+  assert.equal(
+    out.interactionId,
+    out.callId,
+    "interactionId and callId must be the same string on the envelope",
+  );
 }
 
 // ---- 4. tool and input preserved ----
@@ -183,8 +210,11 @@ const DEFAULT_DECISIONS = [
     callId: CLAUDE_CALL_ID,
     tool: "Read",
   });
-  assert.equal(noInput.input, null,
-    "missing input must surface as null, not a synthesized object");
+  assert.equal(
+    noInput.input,
+    null,
+    "missing input must surface as null, not a synthesized object",
+  );
 }
 
 // ---- 5. permissionSuggestions preserved ----
@@ -208,8 +238,11 @@ const DEFAULT_DECISIONS = [
     tool: "exec",
     input: { command: "ls" },
   });
-  assert.equal("permissionSuggestions" in noSuggestions, false,
-    "missing permissionSuggestions must be omitted from the envelope");
+  assert.equal(
+    "permissionSuggestions" in noSuggestions,
+    false,
+    "missing permissionSuggestions must be omitted from the envelope",
+  );
 }
 
 // ---- 6. resolution.decisions preserved (with new envelope eventType) ----
@@ -227,13 +260,19 @@ const DEFAULT_DECISIONS = [
     },
   });
   assert.deepEqual(out.resolution.decisions, DEFAULT_DECISIONS);
-  assert.equal(out.resolution.eventType, "agent.interaction.resolve",
-    "new envelope must always carry eventType \"agent.interaction.resolve\"; "
-    + "carrying the legacy eventType would mislead a 9.0 consumer");
+  assert.equal(
+    out.resolution.eventType,
+    "agent.interaction.resolve",
+    'new envelope must always carry eventType "agent.interaction.resolve"; ' +
+      "carrying the legacy eventType would mislead a 9.0 consumer",
+  );
   // A copy of the decisions array — mutating the input must not
   // leak into the output (non-mutation invariant).
-  assert.notEqual(out.resolution.decisions, DEFAULT_DECISIONS,
-    "decisions must be a fresh array, not the same reference as the input");
+  assert.notEqual(
+    out.resolution.decisions,
+    DEFAULT_DECISIONS,
+    "decisions must be a fresh array, not the same reference as the input",
+  );
 }
 
 // ---- 7. Default kind is "permission" + frozen check ----
@@ -246,14 +285,26 @@ const DEFAULT_DECISIONS = [
     tool: "Bash",
     input: { command: "ls" },
   });
-  assert.equal(out.kind, "permission",
-    "default kind must be permission when caller omits extras.kind");
-  assert.equal(INTERACTION_KINDS.PERMISSION, "permission",
-    "INTERACTION_KINDS.PERMISSION must stay \"permission\"");
-  assert.equal(Object.isFrozen(INTERACTION_KINDS), true,
-    "INTERACTION_KINDS must be frozen so a future typo breaks the test");
-  assert.equal(Object.isFrozen(INTERACTION_SOURCES), true,
-    "INTERACTION_SOURCES must be frozen so a future typo breaks the test");
+  assert.equal(
+    out.kind,
+    "permission",
+    "default kind must be permission when caller omits extras.kind",
+  );
+  assert.equal(
+    INTERACTION_KINDS.PERMISSION,
+    "permission",
+    'INTERACTION_KINDS.PERMISSION must stay "permission"',
+  );
+  assert.equal(
+    Object.isFrozen(INTERACTION_KINDS),
+    true,
+    "INTERACTION_KINDS must be frozen so a future typo breaks the test",
+  );
+  assert.equal(
+    Object.isFrozen(INTERACTION_SOURCES),
+    true,
+    "INTERACTION_SOURCES must be frozen so a future typo breaks the test",
+  );
   assert.equal(INTERACTION_SOURCES.HOOK, "hook");
   assert.equal(INTERACTION_SOURCES.APP_SERVER, "app-server");
   assert.equal(INTERACTION_SOURCES.JSONL, "jsonl");
@@ -292,12 +343,13 @@ const DEFAULT_DECISIONS = [
 
   // Missing callId on the input event → TypeError.
   assert.throws(
-    () => permissionEventToInteraction({
-      type: "agent.permission.request.detected",
-      provider: "claude",
-      tool: "Bash",
-      input: { command: "ls" },
-    }),
+    () =>
+      permissionEventToInteraction({
+        type: "agent.permission.request.detected",
+        provider: "claude",
+        tool: "Bash",
+        input: { command: "ls" },
+      }),
     TypeError,
     "missing callId must throw TypeError (interactionId anchor)",
   );
@@ -323,55 +375,76 @@ const DEFAULT_DECISIONS = [
 
   assert.equal(legacy.type, "agent.permission.request.detected");
   assert.equal(legacy.provider, "claude");
-  assert.equal(legacy.callId, CLAUDE_CALL_ID,
-    "reverse map must use interactionId as the legacy callId");
+  assert.equal(
+    legacy.callId,
+    CLAUDE_CALL_ID,
+    "reverse map must use interactionId as the legacy callId",
+  );
   assert.equal(legacy.tool, "Bash");
   assert.deepEqual(legacy.input, { command: "npm test" });
   assert.deepEqual(legacy.permissionSuggestions, CLAUDE_PERMISSION_SUGGESTIONS);
   assert.deepEqual(legacy.resolution.decisions, DEFAULT_DECISIONS);
-  assert.equal(legacy.resolution.eventType, "agent.permission.resolve",
-    "reverse map must always emit the legacy eventType on the legacy envelope");
+  assert.equal(
+    legacy.resolution.eventType,
+    "agent.permission.resolve",
+    "reverse map must always emit the legacy eventType on the legacy envelope",
+  );
 
   // Type guards.
-  assert.equal(isInteractionRequest(interaction), true,
-    "the new interaction envelope is an interaction request");
-  assert.equal(isInteractionRequest(legacy), false,
-    "the legacy envelope is not an interaction request");
-  assert.equal(isInteractionResolve(legacy), false,
-    "the legacy envelope is not an interaction resolve (type differs)");
+  assert.equal(
+    isInteractionRequest(interaction),
+    true,
+    "the new interaction envelope is an interaction request",
+  );
+  assert.equal(
+    isInteractionRequest(legacy),
+    false,
+    "the legacy envelope is not an interaction request",
+  );
+  assert.equal(
+    isInteractionResolve(legacy),
+    false,
+    "the legacy envelope is not an interaction resolve (type differs)",
+  );
 
   // sessionId is dropped on the reverse map (the legacy wire shape
   // did not carry it; the relay attaches it at the wrapper level).
-  assert.equal("sessionId" in legacy, false,
-    "reverse map must drop sessionId to preserve the legacy wire shape");
+  assert.equal(
+    "sessionId" in legacy,
+    false,
+    "reverse map must drop sessionId to preserve the legacy wire shape",
+  );
 
   // Non-permission kinds throw on the reverse map.
   assert.throws(
-    () => interactionToPermissionEvent({
-      type: "agent.interaction.requested",
-      kind: "confirm",
-      interactionId: "i1",
-    }),
+    () =>
+      interactionToPermissionEvent({
+        type: "agent.interaction.requested",
+        kind: "confirm",
+        interactionId: "i1",
+      }),
     TypeError,
     "non-permission kind must throw on the reverse map (only permission is reversible in 8.8)",
   );
 
   // Wrong type throws.
   assert.throws(
-    () => interactionToPermissionEvent({
-      type: "agent.permission.request.detected",
-      callId: "i1",
-    }),
+    () =>
+      interactionToPermissionEvent({
+        type: "agent.permission.request.detected",
+        callId: "i1",
+      }),
     TypeError,
     "interactionToPermissionEvent must reject non-interaction inputs",
   );
 
   // Missing interactionId throws.
   assert.throws(
-    () => interactionToPermissionEvent({
-      type: "agent.interaction.requested",
-      kind: "permission",
-    }),
+    () =>
+      interactionToPermissionEvent({
+        type: "agent.interaction.requested",
+        kind: "permission",
+      }),
     TypeError,
     "missing interactionId must throw on the reverse map",
   );
@@ -390,10 +463,16 @@ const DEFAULT_DECISIONS = [
   assert.equal(minimal.sessionId, "s1");
   assert.equal(minimal.interactionId, "i1");
   assert.equal(minimal.decision, "approved");
-  assert.equal("value" in minimal, false,
-    "value must be absent when caller does not pass it (not undefined)");
-  assert.equal("data" in minimal, false,
-    "data must be absent when caller does not pass it (not undefined)");
+  assert.equal(
+    "value" in minimal,
+    false,
+    "value must be absent when caller does not pass it (not undefined)",
+  );
+  assert.equal(
+    "data" in minimal,
+    false,
+    "data must be absent when caller does not pass it (not undefined)",
+  );
 
   // value passthrough (for future single_select / free_text / typed).
   const withValue = buildInteractionResolved({
@@ -403,8 +482,11 @@ const DEFAULT_DECISIONS = [
     value: "user typed text",
   });
   assert.equal(withValue.value, "user typed text");
-  assert.equal("data" in withValue, false,
-    "data must still be absent when caller passes only value");
+  assert.equal(
+    "data" in withValue,
+    false,
+    "data must still be absent when caller passes only value",
+  );
 
   // data passthrough (labeled raw-terminal escape hatch).
   const withData = buildInteractionResolved({
@@ -430,7 +512,8 @@ const DEFAULT_DECISIONS = [
 
   // Missing required fields throw.
   assert.throws(
-    () => buildInteractionResolved({ interactionId: "i1", decision: "approved" }),
+    () =>
+      buildInteractionResolved({ interactionId: "i1", decision: "approved" }),
     TypeError,
     "missing sessionId must throw",
   );
@@ -445,7 +528,12 @@ const DEFAULT_DECISIONS = [
     "missing decision must throw",
   );
   assert.throws(
-    () => buildInteractionResolved({ sessionId: "", interactionId: "i1", decision: "approved" }),
+    () =>
+      buildInteractionResolved({
+        sessionId: "",
+        interactionId: "i1",
+        decision: "approved",
+      }),
     TypeError,
     "empty-string sessionId must throw (non-empty required)",
   );
@@ -456,7 +544,10 @@ const DEFAULT_DECISIONS = [
   // A legacy permission.resolve event must NOT match the new
   // interaction-resolve guard (different type string).
   assert.equal(
-    isInteractionResolve({ type: "agent.permission.resolve", interactionId: "i1" }),
+    isInteractionResolve({
+      type: "agent.permission.resolve",
+      interactionId: "i1",
+    }),
     false,
     "legacy agent.permission.resolve must not match the new guard",
   );

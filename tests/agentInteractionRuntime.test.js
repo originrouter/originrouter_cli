@@ -19,6 +19,7 @@ import { CodexAdapter } from "../src/adapters/codexAdapter.js";
 import {
   buildModeStatusEvent,
   handleRemoteEvent,
+  normalizePtyInteraction,
 } from "../src/local/localAgentSession.js";
 
 // Capture the onPermissionRequest callback a fake hook server
@@ -106,6 +107,33 @@ function makeFakeHookServer() {
 
 const CLAUDE_CALL_ID = "claude-perm-1781663400000-a1b2c3d4e";
 const CODEX_CALL_ID = "codex-approval-1781663500000-zyxwvu";
+
+// Canonical permission payloads must still pass through the PTY display-safe
+// boundary before they are mirrored to the App or persisted in the local
+// event registry.
+{
+  const normalized = normalizePtyInteraction({
+    type: "agent.interaction.requested",
+    kind: "permission",
+    tool: "Bash",
+    input: {
+      command: "printf ok",
+      secret: "do-not-forward",
+    },
+    payload: {
+      tool: "Bash",
+      tool_input: {
+        command: "printf ok",
+        secret: "do-not-forward",
+      },
+      command: "printf ok",
+      cwd: "/tmp/project",
+    },
+  }, "s-safe-payload");
+  assert.equal(normalized.payload.command, "printf ok");
+  assert.equal(normalized.payload.cwd, "/tmp/project");
+  assert.equal(normalized.payload.tool_input.secret, "[redacted]");
+}
 
 // ---- 1. Claude dual-emit ----
 

@@ -46,10 +46,10 @@ export const INTERACTION_ACTIONS = Object.freeze({
 // The values are stable so a rename in 9.0+ breaks the test instead
 // of silently shipping.
 export const INTERACTION_SOURCES = Object.freeze({
-  HOOK: "hook",             // Claude PTY PermissionRequest hook (default)
-  JSONL: "jsonl",           // reserved for future Claude JSONL scanner
+  HOOK: "hook", // Claude PTY PermissionRequest hook (default)
+  JSONL: "jsonl", // reserved for future Claude JSONL scanner
   APP_SERVER: "app-server", // Codex app-server approvals
-  PTY: "pty",               // generic PTY fallback
+  PTY: "pty", // generic PTY fallback
 });
 
 // Default decision vocabulary. Matches today's `agent.permission.resolve`
@@ -97,16 +97,22 @@ export function buildInteractionRequest(payload = {}) {
     throw new TypeError("buildInteractionRequest: interactionId is required");
   }
   if (!isFrozenMember(INTERACTION_SOURCES, source)) {
-    throw new TypeError(`buildInteractionRequest: unknown source ${JSON.stringify(source)}`);
+    throw new TypeError(
+      `buildInteractionRequest: unknown source ${JSON.stringify(source)}`,
+    );
   }
-  if (![
-    INTERACTION_KINDS.PERMISSION,
-    INTERACTION_KINDS.CONFIRM,
-    INTERACTION_KINDS.QUESTIONS,
-    INTERACTION_KINDS.FORM,
-    INTERACTION_KINDS.URL,
-  ].includes(kind)) {
-    throw new TypeError(`buildInteractionRequest: unsupported managed kind ${JSON.stringify(kind)}`);
+  if (
+    ![
+      INTERACTION_KINDS.PERMISSION,
+      INTERACTION_KINDS.CONFIRM,
+      INTERACTION_KINDS.QUESTIONS,
+      INTERACTION_KINDS.FORM,
+      INTERACTION_KINDS.URL,
+    ].includes(kind)
+  ) {
+    throw new TypeError(
+      `buildInteractionRequest: unsupported managed kind ${JSON.stringify(kind)}`,
+    );
   }
   return {
     type: "agent.interaction.requested",
@@ -120,7 +126,9 @@ export function buildInteractionRequest(payload = {}) {
     prompt,
     payload: copyObject(requestPayload),
     containsSecret: Boolean(containsSecret),
-    expiresAt: Number.isFinite(expiresAt) ? Math.max(0, Math.floor(expiresAt)) : null,
+    expiresAt: Number.isFinite(expiresAt)
+      ? Math.max(0, Math.floor(expiresAt))
+      : null,
   };
 }
 
@@ -129,12 +137,18 @@ export function normalizeInteractionResolve(payload = {}) {
     throw new TypeError("normalizeInteractionResolve: payload is required");
   }
   const interactionId = payload.interactionId || payload.callId;
-  const action = String(payload.action || "").trim().toLowerCase();
+  const action = String(payload.action || "")
+    .trim()
+    .toLowerCase();
   if (!isNonEmptyString(interactionId)) {
-    throw new TypeError("normalizeInteractionResolve: interactionId is required");
+    throw new TypeError(
+      "normalizeInteractionResolve: interactionId is required",
+    );
   }
   if (!Object.values(INTERACTION_ACTIONS).includes(action)) {
-    throw new TypeError(`normalizeInteractionResolve: unknown action ${JSON.stringify(action)}`);
+    throw new TypeError(
+      `normalizeInteractionResolve: unknown action ${JSON.stringify(action)}`,
+    );
   }
   return {
     interactionId,
@@ -194,7 +208,7 @@ export function permissionEventToInteraction(event, extras = {}) {
     runtime: extras.runtime ?? null,
     sessionId: extras.sessionId ?? null,
     interactionId: event.callId, // canonical field
-    callId: event.callId,        // preserved for back-compat consumers
+    callId: event.callId, // preserved for back-compat consumers
     source,
     kind,
     title: extras.title || null,
@@ -205,9 +219,10 @@ export function permissionEventToInteraction(event, extras = {}) {
     defaultOptionId: extras.defaultOptionId ?? null,
     resolution,
     // raw_terminal-only reply envelope; null for all other kinds.
-    terminalReply: kind === INTERACTION_KINDS.RAW_TERMINAL
-      ? (extras.terminalReply || { strategy: "write_text", submit: "none" })
-      : null,
+    terminalReply:
+      kind === INTERACTION_KINDS.RAW_TERMINAL
+        ? extras.terminalReply || { strategy: "write_text", submit: "none" }
+        : null,
     createdAt: extras.createdAt ?? null,
     expiresAt: Number.isFinite(extras.expiresAt)
       ? Math.max(0, Math.floor(extras.expiresAt))
@@ -215,10 +230,42 @@ export function permissionEventToInteraction(event, extras = {}) {
     timeoutMs: extras.timeoutMs ?? null,
   };
 
+  // Keep the permission details in the canonical payload as well as the
+  // legacy top-level fields. App clients consume `payload` for the card
+  // details, while older clients still read `tool`/`input` directly.
+  if (kind === INTERACTION_KINDS.PERMISSION) {
+    const permissionInput = copyObject(event.input);
+    const permissionTool = event.tool ?? null;
+    const permissionSuggestions = Array.isArray(event.permissionSuggestions)
+      ? event.permissionSuggestions.slice()
+      : [];
+    out.payload = {
+      ...(permissionTool
+        ? { tool: permissionTool, display_name: permissionTool }
+        : {}),
+      ...(Object.keys(permissionInput).length
+        ? { tool_input: permissionInput }
+        : {}),
+      ...(permissionInput.command != null
+        ? { command: permissionInput.command }
+        : {}),
+      ...(permissionInput.cwd != null ? { cwd: permissionInput.cwd } : {}),
+      ...(permissionSuggestions.length
+        ? {
+            permission_suggestions: permissionSuggestions,
+            remember_allowed: true,
+          }
+        : {}),
+    };
+  }
+
   // permission-only metadata: carry it only when kind=permission AND
   // the input event actually had it. Other kinds omit it to keep the
   // envelope tight.
-  if (kind === INTERACTION_KINDS.PERMISSION && event.permissionSuggestions !== undefined) {
+  if (
+    kind === INTERACTION_KINDS.PERMISSION &&
+    event.permissionSuggestions !== undefined
+  ) {
     out.permissionSuggestions = event.permissionSuggestions;
   }
 
@@ -237,7 +284,9 @@ export function permissionEventToInteraction(event, extras = {}) {
 // wrapper level, not on the inner event.
 export function interactionToPermissionEvent(interaction) {
   if (!interaction || typeof interaction !== "object") {
-    throw new TypeError("interactionToPermissionEvent: interaction is required");
+    throw new TypeError(
+      "interactionToPermissionEvent: interaction is required",
+    );
   }
   if (interaction.type !== "agent.interaction.requested") {
     throw new TypeError(
@@ -317,18 +366,18 @@ export function buildInteractionResolved(payload = {}) {
 // schema validator.
 export function isInteractionRequest(event) {
   return Boolean(
-    event
-      && typeof event === "object"
-      && event.type === "agent.interaction.requested"
-      && isNonEmptyString(event.interactionId),
+    event &&
+    typeof event === "object" &&
+    event.type === "agent.interaction.requested" &&
+    isNonEmptyString(event.interactionId),
   );
 }
 
 export function isInteractionResolve(event) {
   return Boolean(
-    event
-      && typeof event === "object"
-      && event.type === "agent.interaction.resolve"
-      && isNonEmptyString(event.interactionId),
+    event &&
+    typeof event === "object" &&
+    event.type === "agent.interaction.resolve" &&
+    isNonEmptyString(event.interactionId),
   );
 }
