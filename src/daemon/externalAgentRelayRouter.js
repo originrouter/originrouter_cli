@@ -45,7 +45,8 @@ export class ExternalAgentRelayRouter {
         ? payload.sessionIds
         : [];
       const sessionIds = requested.filter((sessionId) =>
-        this.registry.has(sessionId),
+        this.registry.has(sessionId)
+        && this.isCollaborationSession?.(sessionId) !== true,
       );
       for (const sessionId of sessionIds) {
         await this.relayClient.send("agent.interactions.snapshot", {

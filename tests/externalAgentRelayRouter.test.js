@@ -219,6 +219,11 @@ test("collaboration workers never enter ordinary Agent control or event relay", 
     sessionId: "collab-worker-1",
     message: "must stay in collaboration",
   }), false);
+  assert.equal(await router.handle({
+    type: "agent.interactions.snapshot.request",
+    sessionIds: ["collab-worker-1"],
+    requestId: "snapshot-1",
+  }), false);
   assert.equal(await router.forwardRegistryNotification({
     type: "event",
     sessionId: "collab-worker-1",
