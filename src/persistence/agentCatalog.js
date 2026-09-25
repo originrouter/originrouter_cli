@@ -787,6 +787,25 @@ export class AgentCatalog {
     };
   }
 
+  /**
+   * Collaboration workers share the catalog so their durable provenance can
+   * survive a daemon restart, but they are not ordinary Agent conversations.
+   * Keep this check on the catalog boundary so deep-linked local API routes
+   * cannot accidentally expose or mutate a collaboration conversation.
+   */
+  isCollaborationConversation(conversationId) {
+    const id = safeText(conversationId, 96);
+    if (!id) return false;
+    const run = this.db.prepare(`
+      SELECT run_id, originrouter_session_id, started_by
+      FROM agent_runs
+      WHERE conversation_id = ?
+      ORDER BY started_at DESC, rowid DESC
+      LIMIT 1
+    `).get(id);
+    return isCollaborationSessionPayload(run || {});
+  }
+
   getConversationTranscriptLocator(conversationId) {
     const id = safeText(conversationId, 96);
     if (!id) return "";

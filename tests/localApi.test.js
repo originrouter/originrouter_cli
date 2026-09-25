@@ -1515,6 +1515,22 @@ try {
     assert.ok(!sessions.body.sessions.some((item) => item.session_id === sessionId));
     const events = await getJson("/agent/local/events?after=0");
     assert.ok(!events.body.events.some((item) => item.sessionId === sessionId));
+    const hiddenDetail = await getJson(
+      `/agent/catalog/conversations/${sessionId}`,
+    );
+    assert.equal(hiddenDetail.status, 404);
+    const hiddenRename = await putJson(
+      `/agent/catalog/conversations/${sessionId}/rename`,
+      { title: "must remain in collaboration" },
+    );
+    assert.equal(hiddenRename.status, 409);
+    assert.equal(hiddenRename.body.reason, "collaboration_session_only");
+    const hiddenArchive = await postJson(
+      `/agent/catalog/conversations/${sessionId}/archive`,
+      {},
+    );
+    assert.equal(hiddenArchive.status, 409);
+    assert.equal(hiddenArchive.body.reason, "collaboration_session_only");
     for (const action of ["message", "interrupt", "stop", "interaction", "mode", "autonomy"]) {
       const result = await postJson(`${sessionPath}/${action}`, {
         message: "must not reach worker",

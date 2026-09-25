@@ -1007,6 +1007,11 @@ async function dispatch(ctx, req, res) {
     if (req.method === "POST" && catalogArchiveMatch) {
       if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
       const conversationId = decodeURIComponent(catalogArchiveMatch[1]);
+      if (ctx.agentCatalog.isCollaborationConversation?.(conversationId)) {
+        return sendError(res, 409, "Use the collaboration session to manage this Agent.", {
+          reason: "collaboration_session_only",
+        });
+      }
       const conversation = ctx.agentCatalog.setConversationArchived(
         conversationId,
         catalogArchiveMatch[2] === "archive",
@@ -1021,8 +1026,14 @@ async function dispatch(ctx, req, res) {
       if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
       const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
       if (body.__error) return sendError(res, 400, body.__error);
+      const conversationId = decodeURIComponent(catalogRenameMatch[1]);
+      if (ctx.agentCatalog.isCollaborationConversation?.(conversationId)) {
+        return sendError(res, 409, "Use the collaboration session to manage this Agent.", {
+          reason: "collaboration_session_only",
+        });
+      }
       const conversation = ctx.agentCatalog.renameConversation(
-        decodeURIComponent(catalogRenameMatch[1]),
+        conversationId,
         body.title,
       );
       if (!conversation) return sendError(res, 404, "agent conversation not found");
@@ -1121,6 +1132,9 @@ async function dispatch(ctx, req, res) {
     if (req.method === "GET" && catalogConversationMatch) {
       if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
       const conversationId = decodeURIComponent(catalogConversationMatch[1]);
+      if (ctx.agentCatalog.isCollaborationConversation?.(conversationId)) {
+        return sendError(res, 404, "agent conversation not found");
+      }
       const conversation = ctx.agentCatalog.getConversation(conversationId);
       if (!conversation) return sendError(res, 404, "agent conversation not found");
       return sendOk(res, { conversation });
