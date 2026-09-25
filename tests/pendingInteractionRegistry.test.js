@@ -48,6 +48,22 @@ assert.equal(duplicateWhileApplying.firstDelivery, false);
 await new Promise((resolve) => setImmediate(resolve));
 assert.equal(results.at(-1).status, "applying");
 
+const conflictingWhileApplying = registry.resolve({
+  interactionId: "interaction-1",
+  responseId: "response-from-second-device",
+  action: "cancel",
+  response: {},
+});
+assert.deepEqual(conflictingWhileApplying, {
+  accepted: false,
+  status: "conflict",
+  firstDelivery: false,
+  reason: "interaction_already_claimed",
+});
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(results.at(-1).status, "conflict");
+assert.equal(registry.snapshot()[0].status, "applying");
+
 await registry.markResult("interaction-1", "applied", {
   responseId: "response-1",
 });

@@ -84,6 +84,25 @@ export class PendingInteractionRegistry {
         entry.resolve(entry.resolved);
         return { accepted: true, status: "applying", firstDelivery: true };
       }
+      if (entry.responseId !== responseId) {
+        // A second device may still have a stale card when the first device
+        // is already applying its answer. Do not report that second choice as
+        // accepted: only the first response is allowed to reach the native
+        // runtime. The original interaction remains owned by its first
+        // response and can still finish normally.
+        void this.onResult({
+          interactionId,
+          responseId,
+          status: "conflict",
+          reason: "interaction_already_claimed",
+        });
+        return {
+          accepted: false,
+          status: "conflict",
+          firstDelivery: false,
+          reason: "interaction_already_claimed",
+        };
+      }
       void this.onResult({
         interactionId,
         responseId,
