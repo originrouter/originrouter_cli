@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClaudeJsonlScanner, mapClaudeJsonLine, mapClaudeJsonLineSince } from "../src/adapters/claude/jsonlScanner.js";
@@ -14,6 +14,26 @@ import { ClaudeAdapter, mapClaudeHookEvent } from "../src/adapters/claudeAdapter
 import { mapClaudeSdkMessage } from "../src/runtime/claudeSdkEvents.js";
 
 assert.equal(new ClaudeAdapter({ args: [] }).describe().runtime, "claude-pty");
+
+// Claude Code 2.1.x emits PermissionRequest in --print/headless mode too.
+// The wrapper must still install the hook or the App can never see the
+// blocking choice shown in the terminal.
+{
+  let hookOptions;
+  const adapter = new ClaudeAdapter({
+    args: ["--print"],
+    hookServerFactory: async (options) => {
+      hookOptions = options;
+      return { port: 1, stop() {} };
+    },
+  });
+  await adapter.beforeStart({ sessionId: "headless-hook-test", send() {} });
+  assert.equal(typeof hookOptions?.onPermissionRequest, "function");
+  assert.equal(typeof adapter.hookSettingsPath, "string");
+  const settings = JSON.parse(readFileSync(adapter.hookSettingsPath, "utf8"));
+  assert.ok(settings.hooks.PermissionRequest, "headless runs must relay permissions");
+  adapter.cleanup();
+}
 
 const claudeEvents = mapClaudeJsonLine(JSON.stringify({
   type: "assistant",

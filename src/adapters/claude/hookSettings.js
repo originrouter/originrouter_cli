@@ -54,10 +54,10 @@ export function generateClaudeHookSettings({
     ],
   };
 
-  // PermissionRequest only fires in Claude Code's interactive mode. Under
-  // `claude -p` (non-interactive) the hook is registered but Claude Code
-  // doesn't suspend on its decision, so registering it adds no value. Skip
-  // it explicitly to keep the config honest about what is actually wired.
+  // Current Claude Code also invokes PermissionRequest while running in
+  // `--print`/headless mode. Keep this opt-out only for tests or an explicitly
+  // unsupported runtime; the production adapter registers it for every mode
+  // so a headless permission prompt cannot bypass the App relay.
   if (registerPermissionRequest) {
     hooks.PermissionRequest = [
       {

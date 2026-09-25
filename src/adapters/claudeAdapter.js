@@ -495,11 +495,11 @@ export class ClaudeAdapter extends TerminalAdapter {
     };
   }
 
-  // PermissionRequest only fires in Claude Code's interactive mode. Under
-  // `claude -p` / `claude --print`, registering the hook adds no value
-  // because Claude Code does not suspend on its decision. We detect both
-  // flag forms so the generated settings.json stays honest about what is
-  // actually wired.
+  // Keep the native mode metadata separate from hook registration. Current
+  // Claude Code releases also emit and suspend PermissionRequest hooks in
+  // `--print`/headless runs (the terminal prompt can therefore be mirrored
+  // to OriginRouter). Older releases simply never call the hook, which is
+  // harmless; omitting it here would make those current prompts invisible.
   isNonInteractive(args) {
     return args.includes("-p") || args.includes("--print");
   }
@@ -693,8 +693,8 @@ export class ClaudeAdapter extends TerminalAdapter {
     });
     this.hookSettingsPath = generateClaudeHookSettings({
       port: this.hookServer.port,
-      registerPermissionRequest: !this.isNonInteractive(this.args),
-      registerElicitation: !this.isNonInteractive(this.args),
+      registerPermissionRequest: true,
+      registerElicitation: true,
     });
   }
 
