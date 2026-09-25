@@ -375,7 +375,7 @@ export class ExternalAgentRegistry {
     return session.eventSequence;
   }
 
-  eventsAfter(after = 0, { sessionIds = null } = {}) {
+  eventsAfter(after = 0, { sessionIds = null, includeCollaboration = true } = {}) {
     const wanted =
       Array.isArray(sessionIds) && sessionIds.length > 0
         ? new Set(sessionIds.map(String))
@@ -386,7 +386,12 @@ export class ExternalAgentRegistry {
       if (wanted && !wanted.has(session.sessionId)) continue;
       for (const event of session.events) {
         const eventCursor = Number(event.localCursor || 0);
-        if (eventCursor > Number(after || 0)) events.push(event);
+        if (
+          eventCursor > Number(after || 0)
+          && (includeCollaboration || session.sessionKind !== "collaboration")
+        ) events.push(event);
+        // Hidden events still advance the cursor so ordinary clients do not
+        // repeatedly scan a collaboration-only tail of the shared stream.
         cursor = Math.max(cursor, eventCursor);
       }
     }

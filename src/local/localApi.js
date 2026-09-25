@@ -1150,7 +1150,10 @@ async function dispatch(ctx, req, res) {
       return sendError(res, 405, `method ${req.method} not allowed`);
     }
     if (req.method === "GET" && pathname === "/agent/local/events") {
-      return sendOk(res, ctx.externalAgentRegistry.eventsAfter(url.searchParams.get("after")));
+      return sendOk(res, ctx.externalAgentRegistry.eventsAfter(
+        url.searchParams.get("after"),
+        { includeCollaboration: false },
+      ));
     }
     if (req.method === "POST" && pathname === "/agent/local/sessions/register") {
       const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
@@ -1166,6 +1169,11 @@ async function dispatch(ctx, req, res) {
         return sendError(res, 405, `method ${req.method} not allowed`);
       }
       const sessionId = decodeURIComponent(localInquiryMatch[1]);
+      if (ctx.externalAgentRegistry.isCollaborationSession(sessionId)) {
+        return sendError(res, 409, "Use the collaboration session to access this Agent.", {
+          reason: "collaboration_session_only",
+        });
+      }
       const domain = localInquiryMatch[2];
       const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
       if (body.__error) return sendError(res, 400, body.__error);
@@ -1219,6 +1227,17 @@ async function dispatch(ctx, req, res) {
     if (localAgentMatch) {
       const sessionId = decodeURIComponent(localAgentMatch[1]);
       const action = localAgentMatch[2];
+      // Keep runtime registration, heartbeats, event publication and command
+      // polling intact. Only the collaboration coordinator may enqueue worker
+      // commands; ordinary App routes must not become a second controller.
+      if (
+        !["update", "unregister", "events", "commands"].includes(action)
+        && ctx.externalAgentRegistry.isCollaborationSession(sessionId)
+      ) {
+        return sendError(res, 409, "Use the collaboration session to access this Agent.", {
+          reason: "collaboration_session_only",
+        });
+      }
       try {
         if (req.method === "GET" && action === "commands") {
           return sendOk(

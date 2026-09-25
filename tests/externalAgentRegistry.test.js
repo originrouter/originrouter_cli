@@ -126,6 +126,30 @@ registry.register({
   agent: "claude",
 });
 assert.equal(registry.isCollaborationSession("collab-worker-1"), true);
+{
+  const isolated = new ExternalAgentRegistry();
+  isolated.register({ sessionId: "visible", agent: "claude" });
+  // An explicit kind must work without relying on the session-id prefix.
+  isolated.register({ sessionId: "hidden", agent: "codex", sessionKind: "collaboration" });
+  const notifications = [];
+  const unsubscribe = isolated.subscribe((event) => notifications.push(event));
+  isolated.appendEvent("visible", { type: "agent.text", text: "ordinary" });
+  isolated.appendEvent("hidden", {
+    type: "agent.interaction.requested", interactionId: "approval", kind: "permission",
+  });
+  const publicPage = isolated.eventsAfter(0, { includeCollaboration: false });
+  assert.deepEqual(publicPage.events.map((event) => event.sessionId), ["visible"]);
+  assert.equal(publicPage.cursor, publicPage.latestCursor);
+  assert.equal(isolated.eventsAfter(publicPage.cursor, { includeCollaboration: false }).events.length, 0);
+  assert.equal(isolated.eventsAfter(0).events.length, 2);
+  assert.equal(notifications.length, 2, "coordinator still receives worker notifications");
+  assert.equal(isolated.controlSnapshot("hidden").interactions.length, 1);
+  isolated.enqueueCommand("hidden", { type: "agent.interaction.resolve", interactionId: "approval" });
+  assert.equal(isolated.commandsAfter("hidden").commands.length, 1);
+  isolated.appendEvent("visible", { type: "agent.text", text: "next ordinary" });
+  assert.equal(isolated.eventsAfter(publicPage.cursor, { includeCollaboration: false }).events[0].text, "next ordinary");
+  unsubscribe();
+}
 assert.equal(registry.list({ includeCollaboration: false }).some(
   (session) => session.session_id === "collab-worker-1",
 ), false);

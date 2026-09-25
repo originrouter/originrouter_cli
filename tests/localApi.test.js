@@ -1492,6 +1492,53 @@ try {
     assert.ok(events.body.events.some((event) => event.text === "live reply"));
   }
 
+  // Collaboration workers remain available to their runtime, but never to
+  // ordinary Agent event feeds or controls, including a stale/deep-linked id.
+  {
+    const sessionId = "collab-local-isolation";
+    const sessionPath = `/agent/local/sessions/${sessionId}`;
+    const registered = await postJson("/agent/local/sessions/register", {
+      sessionId,
+      agent: "claude",
+      sessionKind: "collaboration",
+    });
+    assert.equal(registered.status, 200);
+    const published = await postJson(`${sessionPath}/events`, {
+      event: {
+        type: "agent.interaction.requested",
+        interactionId: "collab-approval",
+        kind: "permission",
+      },
+    });
+    assert.equal(published.status, 200);
+    const sessions = await getJson("/agent/local/sessions");
+    assert.ok(!sessions.body.sessions.some((item) => item.session_id === sessionId));
+    const events = await getJson("/agent/local/events?after=0");
+    assert.ok(!events.body.events.some((item) => item.sessionId === sessionId));
+    for (const action of ["message", "interrupt", "stop", "interaction", "mode", "autonomy"]) {
+      const result = await postJson(`${sessionPath}/${action}`, {
+        message: "must not reach worker",
+        interactionId: "collab-approval",
+        action: "allow",
+        mode: "default",
+        profile: "manual",
+      });
+      assert.equal(result.status, 409, action);
+      assert.equal(result.body.reason, "collaboration_session_only", action);
+    }
+    for (const action of ["history", "audit", "inquiries/approval/query", "inquiries/change/query"]) {
+      const result = action.startsWith("inquiries/")
+        ? await postJson(`${sessionPath}/${action}`, { query: "show activity" })
+        : await getJson(`${sessionPath}/${action}`);
+      assert.equal(result.status, 409, action);
+    }
+    const commands = await getJson(`${sessionPath}/commands?after=0`);
+    assert.equal(commands.status, 200);
+    assert.deepEqual(commands.body.commands, []);
+    assert.equal((await postJson(`${sessionPath}/update`, {})).status, 200);
+    assert.equal((await postJson(`${sessionPath}/unregister`, {})).status, 200);
+  }
+
   console.log("local api smoke ok");
 } finally {
   if (serverHandle) await serverHandle.close();
