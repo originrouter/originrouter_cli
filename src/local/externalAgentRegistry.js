@@ -19,6 +19,69 @@ function safeText(value, maxLength) {
   return String(value || "").slice(0, maxLength);
 }
 
+function canonicalTurnEventType(value) {
+  const type = safeText(value, 96).trim();
+  return ({
+    "agent.task.completed": "agent.task.complete",
+    task_complete: "agent.task.complete",
+    task_completed: "agent.task.complete",
+    task_result_ready: "agent.task.complete",
+    task_failed: "agent.task.failed",
+    turn_aborted: "agent.task.aborted",
+    task_aborted: "agent.task.aborted",
+    "agent.task.interrupted": "agent.task.aborted",
+    task_started: "agent.task.started",
+    "agent.task.start": "agent.task.started",
+  })[type] || type;
+}
+
+function turnStateForEvent(event, fallback = "unknown") {
+  const type = canonicalTurnEventType(event?.type);
+  if ([
+    "agent.interaction.requested",
+    "approval_requested",
+    "interaction_requested",
+  ].includes(type)) {
+    return safeText(event?.kind, 32) === "permission"
+      || safeText(event?.status, 32) === "waiting_approval"
+      ? "waiting_approval"
+      : "waiting_input";
+  }
+  if ([
+    "agent.task.started",
+    "agent.thinking",
+    "agent.tool_call.start",
+    "tool_call",
+  ].includes(type)) return "running";
+  if ([
+    "agent.task.complete",
+    "agent.task.failed",
+    "agent.task.aborted",
+    "agent.ready",
+    "session_completed",
+    "session_failed",
+    "session_stopped",
+    "session_terminated",
+  ].includes(type)) return "idle";
+  if ([
+    "agent.interaction.applied",
+    "agent.interaction.expired",
+    "agent.interaction.canceled",
+    "agent.interaction.failed",
+    "agent.permission.resolved",
+    "agent.interaction.auto_resolved",
+    "approval_applied",
+    "approval_expired",
+    "approval_failed",
+    "interaction_applied",
+    "interaction_expired",
+    "interaction_canceled",
+    "interaction_failed",
+    "agent.interaction.result",
+  ].includes(type)) return "running";
+  return fallback;
+}
+
 function isInternalTelemetryActivity(event) {
   if (event?.type !== "agent.activity") return false;
   return new Set([
@@ -196,6 +259,7 @@ export class ExternalAgentRegistry {
       currentStep: conversationChanged
         ? "Running locally"
         : existing?.currentStep || "Running locally",
+      turnState: conversationChanged ? "idle" : existing?.turnState || "idle",
     };
     this.sessions.set(sessionId, session);
     try {
@@ -219,6 +283,7 @@ export class ExternalAgentRegistry {
       session.pendingInteractions = new Set();
       session.pendingInteractionKinds = new Map();
       session.currentStep = "Running locally";
+      session.turnState = "idle";
     }
     if (payload.nativeSessionId) {
       session.nativeSessionId = safeText(payload.nativeSessionId, 191);
@@ -227,6 +292,9 @@ export class ExternalAgentRegistry {
       session.transcriptPath = safeText(payload.transcriptPath, 4096);
     }
     if (payload.status) session.status = safeText(payload.status, 32);
+    if (payload.turnState || payload.turn_state) {
+      session.turnState = safeText(payload.turnState || payload.turn_state, 32);
+    }
     session.lastSeenAtMs = this.now();
     try {
       this.catalog?.updateSession(sessionId, payload);
@@ -277,7 +345,11 @@ export class ExternalAgentRegistry {
     session.events.push(storedEvent);
     session.eventIds.add(storedEvent.eventId);
     const interactionId = String(event?.interactionId || event?.callId || "");
-    if (event?.type === "agent.interaction.requested" && interactionId) {
+    if ([
+      "agent.interaction.requested",
+      "approval_requested",
+      "interaction_requested",
+    ].includes(event?.type) && interactionId) {
       session.pendingInteractions.add(interactionId);
       session.pendingInteractionKinds.set(
         interactionId,
@@ -292,6 +364,7 @@ export class ExternalAgentRegistry {
         "agent.interaction.canceled",
         "agent.interaction.failed",
         "agent.permission.resolved",
+        "agent.interaction.auto_resolved",
       ].includes(event?.type)
     ) {
       session.pendingInteractions.delete(interactionId);
@@ -346,6 +419,7 @@ export class ExternalAgentRegistry {
       session.detailSource =
         safeText(event?.detailSource, 32) || session.detailSource;
     }
+    session.turnState = turnStateForEvent(event, session.turnState || "idle");
     session.currentStep = this.stepForEvent(event, session.currentStep);
     try {
       this.catalog?.recordEvent(sessionId, event);
@@ -460,6 +534,10 @@ export class ExternalAgentRegistry {
     return {
       interactions,
       events: session.events.slice(-100),
+      session: this.project(session),
+      turn_state: session.turnState,
+      event_cursor: this.eventCursor,
+      stream_id: this.eventStreamId,
       mode: session.mode,
       autonomyProfile: session.autonomyProfile,
       autonomy:
@@ -497,6 +575,16 @@ export class ExternalAgentRegistry {
   project(session) {
     const status = this.publicStatus(session);
     const conversation = this.catalog?.getConversation?.(session.conversationId);
+    const turnState = [
+      "running",
+      "waiting_approval",
+      "waiting_input",
+      "waiting_device",
+    ].includes(status)
+      ? (status === "waiting_approval" || status === "waiting_input"
+        ? status
+        : session.turnState || "idle")
+      : "idle";
     return {
       session_id: session.sessionId,
       session_kind: session.sessionKind,
@@ -506,6 +594,7 @@ export class ExternalAgentRegistry {
       title: conversation?.title || session.title,
       summary: conversation?.summary || "",
       status,
+      turn_state: turnState,
       device_id: session.deviceId,
       device_name: session.deviceName,
       workspace_path: session.cwd,
@@ -548,8 +637,12 @@ export class ExternalAgentRegistry {
   }
 
   stepForEvent(event, fallback) {
-    switch (event?.type) {
+    switch (canonicalTurnEventType(event?.type)) {
       case "agent.interaction.requested":
+        return "Waiting for input";
+      case "approval_requested":
+        return "Waiting for approval";
+      case "interaction_requested":
         return "Waiting for input";
       case "agent.interaction.result":
         return event?.status === "applying"
@@ -569,6 +662,8 @@ export class ExternalAgentRegistry {
         return "Ready";
       case "agent.task.aborted":
         return "Interrupted";
+      case "agent.task.failed":
+        return "Task needs attention";
       case "agent.ready":
         return "Ready";
       case "agent.activity":
