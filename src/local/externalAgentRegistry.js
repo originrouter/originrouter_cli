@@ -3,26 +3,13 @@ import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
 
 import { readClaudeConversationHistory } from "../runtime/claudeConversationHistory.js";
 import { readCodexConversationHistory } from "../adapters/codex/jsonlScanner.js";
+import { isCollaborationSessionPayload } from "../runtime/agentSessionKind.js";
+
+export { isCollaborationSessionPayload } from "../runtime/agentSessionKind.js";
 
 const MAX_EVENTS = 500;
 const MAX_COMMANDS = 200;
 const STALE_AFTER_MS = 90_000;
-
-// Collaboration workers are implementation details of a collaboration run.
-// Keep the classification at the registry boundary so every local API and
-// relay consumer applies the same visibility rule, including older runtimes
-// that do not send an explicit session kind yet.
-export function isCollaborationSessionPayload(payload = {}) {
-  const sessionId = safeText(payload.sessionId || payload.session_id, 96);
-  const runId = safeText(payload.runId || payload.run_id, 128);
-  const startedBy = safeText(payload.startedBy || payload.started_by, 64);
-  const explicitKind = safeText(payload.sessionKind || payload.session_kind, 32);
-  return explicitKind === "collaboration"
-    || runId.startsWith("acr_")
-    || sessionId.startsWith("collab-")
-    || startedBy === "collaboration-runtime"
-    || startedBy === "collaboration-remote";
-}
 
 function nowIso() {
   return new Date().toISOString();
@@ -118,11 +105,9 @@ export class ExternalAgentRegistry {
     );
     const session = {
       sessionId,
-      sessionKind: isCollaborationSessionPayload({
-        ...payload,
-        sessionKind: payload?.sessionKind || existing?.sessionKind,
-        sessionId,
-      }) ? "collaboration" : "interactive",
+      sessionKind: existing?.sessionKind === "collaboration"
+        || isCollaborationSessionPayload({ ...payload, sessionId })
+        ? "collaboration" : "interactive",
       agent: safeText(payload?.agent, 32) || "unknown",
       title:
         safeText(payload?.title, 191) || `${payload?.agent || "Agent"} session`,
@@ -214,7 +199,7 @@ export class ExternalAgentRegistry {
     };
     this.sessions.set(sessionId, session);
     try {
-      this.catalog?.upsertSession(payload);
+      this.catalog?.upsertSession({ ...payload, sessionKind: session.sessionKind });
     } catch {}
     this.notify("registered", sessionId, {
       ...payload,

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureStateDir } from "../persistence/state.js";
+import { isCollaborationSessionPayload } from "../runtime/agentSessionKind.js";
 import {
   deployApprovalPolicyBundle,
   readApprovalPolicy,
@@ -268,10 +269,9 @@ export class ManagedAgentSupervisor {
     const startedBy = nativeSessionId
       ? "app-resume"
       : safeText(payload.startedBy || payload.started_by, 64) || "app-remote";
-    const collaborationWorker = String(runId).startsWith("acr_")
-      || startedBy === "collaboration-runtime"
-      || startedBy === "collaboration-remote"
-      || String(sessionId).startsWith("collab-");
+    const collaborationWorker = isCollaborationSessionPayload({
+      ...payload, runId, sessionId, startedBy,
+    });
     if (collaborationWorker) {
       args.push("--originrouter-session-kind", "collaboration");
     }
@@ -333,6 +333,7 @@ export class ManagedAgentSupervisor {
     this.launches.set(launchId, result);
     this.catalog?.upsertSession({
       sessionId,
+      sessionKind: collaborationWorker ? "collaboration" : "interactive",
       conversationId,
       runId,
       agent,

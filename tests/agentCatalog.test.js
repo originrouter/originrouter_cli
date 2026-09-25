@@ -259,9 +259,42 @@ assert.equal(catalog.listConversations({
   includeCollaboration: false,
 }).some((conversation) => conversation.conversation_id === "collab-conversation-1"), false);
 
+// A managed worker re-registers through its runtime after the supervisor has
+// recorded the launch. That must not turn it into an ordinary history item.
+catalog.upsertSession({
+  sessionId: "collab-worker-1",
+  startedBy: "local-sdk",
+});
+catalog.upsertSession({
+  sessionId: "explicit-worker",
+  conversationId: "explicit-worker-conversation",
+  sessionKind: "collaboration",
+  agent: "codex",
+  startedBy: "local-app-server",
+});
+catalog.upsertSession({ sessionId: "explicit-worker", startedBy: "local-app-server" });
+catalog.finishSession("collab-worker-1", { status: "completed" });
+catalog.finishSession("explicit-worker", { status: "completed" });
+// Simulate records persisted by the previous version, before provenance was
+// preserved. Query-side filtering must hide them without rewriting the DB.
+catalog.db.prepare("UPDATE agent_runs SET started_by = 'local-sdk' WHERE originrouter_session_id = ?")
+  .run("collab-worker-1");
+for (const id of ["collab-conversation-1", "explicit-worker-conversation"]) {
+  assert.ok(catalog.getConversation(id), "internal collaboration history is retained");
+  assert.equal(catalog.listConversations({ includeCollaboration: false }).some(
+    (item) => item.conversation_id === id,
+  ), false, "runtime registration must preserve collaboration isolation");
+  assert.equal(catalog.listConversationPage({ includeCollaboration: false }).conversations.some(
+    (item) => item.conversation_id === id,
+  ), false, "paged history must apply the same isolation");
+}
+
 catalog.close();
 
 const reopened = new AgentCatalog({ stateDir, now });
+assert.equal(reopened.listConversations({ includeCollaboration: false }).some(
+  (item) => ["collab-conversation-1", "explicit-worker-conversation"].includes(item.conversation_id),
+), false, "isolation survives a catalog restart");
 assert.equal(reopened.getConversation("conversation-1").native_session_id, "thread-native-1");
 assert.equal(reopened.listConversations({ search: "checkout.dart" }).length, 1);
 reopened.close();

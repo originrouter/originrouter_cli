@@ -131,6 +131,9 @@ assert.equal(registry.isCollaborationSession("collab-worker-1"), true);
   isolated.register({ sessionId: "visible", agent: "claude" });
   // An explicit kind must work without relying on the session-id prefix.
   isolated.register({ sessionId: "hidden", agent: "codex", sessionKind: "collaboration" });
+  isolated.register({ sessionId: "hidden", agent: "codex", sessionKind: "interactive" });
+  assert.equal(isolated.isCollaborationSession("hidden"), true,
+    "re-registration cannot move a worker out of its collaboration run");
   const notifications = [];
   const unsubscribe = isolated.subscribe((event) => notifications.push(event));
   isolated.appendEvent("visible", { type: "agent.text", text: "ordinary" });

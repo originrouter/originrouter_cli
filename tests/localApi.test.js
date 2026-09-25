@@ -1495,7 +1495,7 @@ try {
   // Collaboration workers remain available to their runtime, but never to
   // ordinary Agent event feeds or controls, including a stale/deep-linked id.
   {
-    const sessionId = "collab-local-isolation";
+    const sessionId = "explicit-local-isolation";
     const sessionPath = `/agent/local/sessions/${sessionId}`;
     const registered = await postJson("/agent/local/sessions/register", {
       sessionId,
@@ -1537,6 +1537,12 @@ try {
     assert.deepEqual(commands.body.commands, []);
     assert.equal((await postJson(`${sessionPath}/update`, {})).status, 200);
     assert.equal((await postJson(`${sessionPath}/unregister`, {})).status, 200);
+    for (const suffix of ["?archived=true", "?view=history&page_size=100&auto_archive_days=0"]) {
+      const history = await getJson(`/agent/catalog/conversations${suffix}`);
+      assert.equal(history.status, 200);
+      assert.ok(!history.body.conversations.some((item) => item.conversation_id === sessionId),
+        "completed workers must not leak into ordinary history");
+    }
   }
 
   console.log("local api smoke ok");

@@ -68,6 +68,7 @@ import {
 } from "./agentAutonomyPolicy.js";
 import { protectOriginrouterCodingEnv } from "./originrouterCodingAuthProxy.js";
 import { PendingInteractionRegistry } from "./pendingInteractionRegistry.js";
+import { isCollaborationSessionPayload } from "./agentSessionKind.js";
 import {
   displaySafeToolInput,
   toolInputContainsSecret,
@@ -117,8 +118,9 @@ export async function runCodexAppServerSession(rawArgs) {
   const stateDir = ensureStateDir();
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
   const options = extractOptions(rawArgs);
-  const collaborationWorker = options.sessionKind === "collaboration"
-    || String(options.runId || "").startsWith("acr_");
+  const collaborationWorker = isCollaborationSessionPayload({
+    ...options, sessionId: options.session,
+  });
   if (!(await isCodexAppServerAvailable())) {
     throw new Error(
       "Codex app-server is unavailable. Upgrade Codex or use `originrouter codex-terminal`.",
@@ -1026,6 +1028,7 @@ export async function runCodexAppServerSession(rawArgs) {
     });
     relayViaDaemon = await localAgentBridge.start({
       sessionId,
+      sessionKind: collaborationWorker ? "collaboration" : "interactive",
       conversationId: options.conversationId || sessionId,
       runId: options.runId || sessionId,
       agent: "codex",
@@ -1041,7 +1044,8 @@ export async function runCodexAppServerSession(rawArgs) {
       provider: providerResult.provider?.name,
       model,
       permissionProfile: "workspace-write:on-request",
-      startedBy: options.resume ? "app-resume" : "local-app-server",
+      startedBy: collaborationWorker ? "collaboration-runtime"
+        : options.resume ? "app-resume" : "local-app-server",
       mode: currentMode,
       modeControl: "supported",
       availableModes: CODEX_MODES,
@@ -1066,7 +1070,7 @@ export async function runCodexAppServerSession(rawArgs) {
       pid: client.child?.pid,
       executor: "app-server",
       runtime: "codex-app-server",
-      startedBy: "local-app-server",
+      startedBy: collaborationWorker ? "collaboration-runtime" : "local-app-server",
       startedAt: new Date().toISOString(),
       status: "running",
     });

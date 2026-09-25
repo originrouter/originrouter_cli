@@ -63,6 +63,8 @@ assert.ok(spawns[0].args.includes("task-1"));
 assert.ok(spawns[0].args.includes(workspace.workspace_id));
 assert.ok(spawns[0].args.includes("--originrouter-title"));
 assert.ok(spawns[0].args.includes("Fix the checkout callback."));
+assert.ok(!spawns[0].args.includes("--originrouter-session-kind"),
+  "ordinary remote launches stay visible and controllable");
 
 const duplicate = await supervisor.start({
   launchId: "launch-1",
@@ -191,6 +193,24 @@ await assert.rejects(
   }),
   (error) => error.code === "AGENT_BUDGET_EXHAUSTED",
 );
+for (const agentType of ["claude", "codex"]) {
+  const sessionId = `explicit-${agentType}-worker`;
+  await supervisor.start({
+    launchId: sessionId,
+    sessionId,
+    runId: `run-${sessionId}`,
+    agentType,
+    workspaceId: workspace.workspace_id,
+    sessionKind: "collaboration",
+  });
+  const args = spawns.at(-1).args;
+  assert.equal(args[args.indexOf("--originrouter-session-kind") + 1], "collaboration");
+  assert.equal(catalog.getConversation(sessionId).runs[0].started_by, "collaboration-runtime");
+  assert.ok(!catalog.listConversations({ includeCollaboration: false }).some(
+    (item) => item.conversation_id === sessionId,
+  ));
+  child.emit("exit", 0, null);
+}
 catalog.close();
 
 console.log("managed Agent supervisor tests ok");

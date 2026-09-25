@@ -11,6 +11,7 @@ import Database from "better-sqlite3";
 
 import { ensureStateDir } from "./state.js";
 import { activeAccountStateDir } from "./accounts.js";
+import { isCollaborationSessionPayload } from "../runtime/agentSessionKind.js";
 import {
   preflightUnattendedWorkspaceAuthorization,
   requireUnattendedWorkspace,
@@ -275,13 +276,22 @@ export class AgentCatalog {
     const sessionId = safeText(payload.sessionId || payload.originrouterSessionId, 64);
     if (!sessionId) throw new Error("sessionId is required");
     const existingRun = this.db.prepare(
-      "SELECT run_id, conversation_id FROM agent_runs WHERE originrouter_session_id = ?",
+      "SELECT run_id, conversation_id, started_by FROM agent_runs WHERE originrouter_session_id = ?",
     ).get(sessionId);
     const conversationId = safeText(
       payload.conversationId || existingRun?.conversation_id || sessionId,
       96,
     );
     const requestedRunId = safeText(payload.runId || existingRun?.run_id || sessionId, 96);
+    // Runtime re-registration must not erase ownership recorded by the
+    // collaboration supervisor. Persist it in the existing provenance field.
+    const collaborationWorker = isCollaborationSessionPayload({
+      ...payload, sessionId, runId: requestedRunId,
+    }) || isCollaborationSessionPayload(existingRun || {});
+    const startedBy = collaborationWorker
+      ? (payload.startedBy === "collaboration-remote" || existingRun?.started_by === "collaboration-remote"
+        ? "collaboration-remote" : "collaboration-runtime")
+      : safeText(payload.startedBy, 64);
     const requestedRunOwner = this.db.prepare(
       "SELECT originrouter_session_id FROM agent_runs WHERE run_id = ?",
     ).get(requestedRunId);
@@ -398,7 +408,7 @@ export class AgentCatalog {
         safeText(payload.provider, 191),
         safeText(payload.model, 191),
         safeText(payload.permissionProfile || payload.autonomyProfile, 64),
-        safeText(payload.startedBy, 64),
+        startedBy,
         Number.isFinite(Number(payload.pid)) ? Number(payload.pid) : null,
         status,
         startedAt,
@@ -561,6 +571,8 @@ export class AgentCatalog {
     if (!includeArchived) clauses.push("c.archived_at IS NULL");
     if (!includeCollaboration) {
       clauses.push("COALESCE(r.started_by, '') NOT IN ('collaboration-runtime', 'collaboration-remote')");
+      clauses.push("substr(COALESCE(r.run_id, ''), 1, 4) <> 'acr_'");
+      clauses.push("substr(COALESCE(r.originrouter_session_id, ''), 1, 7) <> 'collab-'");
     }
     if (safeText(agent, 32)) {
       clauses.push("c.agent_type = @agent");
@@ -639,6 +651,8 @@ export class AgentCatalog {
     ];
     if (!includeCollaboration) {
       clauses.push("COALESCE(r.started_by, '') NOT IN ('collaboration-runtime', 'collaboration-remote')");
+      clauses.push("substr(COALESCE(r.run_id, ''), 1, 4) <> 'acr_'");
+      clauses.push("substr(COALESCE(r.originrouter_session_id, ''), 1, 7) <> 'collab-'");
     }
     const params = {
       pageSize: normalizedPageSize,

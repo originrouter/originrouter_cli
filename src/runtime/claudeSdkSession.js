@@ -59,6 +59,7 @@ import {
 } from "./claudeConversationHistory.js";
 import { mapClaudeSdkMessage } from "./claudeSdkEvents.js";
 import { PendingInteractionRegistry } from "./pendingInteractionRegistry.js";
+import { isCollaborationSessionPayload } from "./agentSessionKind.js";
 import { protectOriginrouterCodingEnv } from "./originrouterCodingAuthProxy.js";
 import {
   displaySafeToolInput,
@@ -313,8 +314,9 @@ export async function runClaudeSdkSession(rawArgs) {
   const stateDir = ensureStateDir();
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
   const options = extractOriginRouterOptions(rawArgs);
-  const collaborationWorker = options.sessionKind === "collaboration"
-    || String(options.runId || "").startsWith("acr_");
+  const collaborationWorker = isCollaborationSessionPayload({
+    ...options, sessionId: options.session,
+  });
   const relayConfig = readLocalApiConfig();
   const configuredRelayUrl =
     options.relay ||
@@ -1086,6 +1088,7 @@ export async function runClaudeSdkSession(rawArgs) {
     });
     relayViaDaemon = await localAgentBridge.start({
       sessionId,
+      sessionKind: collaborationWorker ? "collaboration" : "interactive",
       conversationId: options.conversationId || sessionId,
       runId: options.runId || sessionId,
       agent: "claude",
@@ -1101,7 +1104,7 @@ export async function runClaudeSdkSession(rawArgs) {
       provider: providerResult.provider?.name,
       model,
       permissionProfile: currentMode,
-      startedBy: "local-sdk",
+      startedBy: collaborationWorker ? "collaboration-runtime" : "local-sdk",
       mode: currentMode,
       modeControl: "supported",
       availableModes: CLAUDE_MODES,
