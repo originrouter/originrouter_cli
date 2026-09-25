@@ -165,11 +165,22 @@ export function normalizeAgentActivityEventType(event = {}) {
     user_message: "user.text",
     task_started: "agent.task.started",
     "agent.task.completed": "agent.task.complete",
+    task_complete: "agent.task.complete",
+    task_result_ready: "agent.task.complete",
+    task_failed: "agent.task.failed",
+    turn_aborted: "agent.task.aborted",
+    task_aborted: "agent.task.aborted",
   })[type] || type;
 }
 
 export function shouldSyncAgentActivitySnapshot(event = {}) {
-  return ["user.text", "agent.text", "agent.task.complete"].includes(
+  return [
+    "user.text",
+    "agent.text",
+    "agent.task.complete",
+    "agent.task.failed",
+    "agent.task.aborted",
+  ].includes(
     normalizeAgentActivityEventType(event),
   );
 }
@@ -195,7 +206,12 @@ export function updateAgentActivitySnapshot(snapshot, event = {}) {
   } else if (normalizedType === "agent.text") {
     target.lastMessagePreview = text;
     target.lastAgentPreview = text;
-  } else if (["agent.task.started", "agent.task.complete"].includes(normalizedType)) {
+  } else if ([
+    "agent.task.started",
+    "agent.task.complete",
+    "agent.task.failed",
+    "agent.task.aborted",
+  ].includes(normalizedType)) {
     target.summary = text;
   }
   return target;
@@ -256,6 +272,7 @@ function displaySummaryForAgentEvent(event) {
   if (type === "agent.interaction.auto_resolved") return "Blocking action continued automatically";
   if (type === "agent.task.started") return "Task started";
   if (type === "agent.task.complete") return "Task completed";
+  if (type === "agent.task.failed") return "Task needs attention";
   if (type === "agent.task.aborted") return "Task aborted";
   if (type === "agent.tool_call.start") return tool ? `Started ${tool}` : "Tool started";
   if (type === "agent.tool_call.end") return tool ? `Finished ${tool}` : "Tool finished";
@@ -332,6 +349,11 @@ function projectRuntimeEvent({ eventType, event, summary, riskLevel }) {
   const rawNestedType = safeText(event?.type, 64);
   const nestedType = ({
     "agent.task.completed": "agent.task.complete",
+    task_complete: "agent.task.complete",
+    task_result_ready: "agent.task.complete",
+    task_failed: "agent.task.failed",
+    turn_aborted: "agent.task.aborted",
+    task_aborted: "agent.task.aborted",
     agent_message: "agent.text",
     task_started: "agent.task.started",
     exec_command_begin: "agent.tool_call.start",

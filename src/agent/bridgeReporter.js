@@ -283,6 +283,18 @@ export function createRuntimeEventReporter({
         payload.current_step = payload.summary;
         taskActive = false;
       }
+    } else if (payload.event_type === "agent.task.aborted") {
+      // Aborts are terminal for the current turn even though the long-lived
+      // Agent process remains online. Do not let a later session heartbeat or
+      // reconnect resurrect the turn as active.
+      taskActive = false;
+      payload.summary = "Task interrupted";
+      payload.current_step = payload.summary;
+    } else if (payload.event_type === "agent.ready") {
+      // A provider can recover to ready without emitting a separate task
+      // result (for example after a cancelled prompt). It is still a turn
+      // boundary and must clear the reporter's active-turn latch.
+      taskActive = false;
     } else if (
       eventType === "session.exited" &&
       payload.status === "failed" &&
