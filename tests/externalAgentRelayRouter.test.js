@@ -373,6 +373,41 @@ test("targeted collaboration events are not broadcast to unrelated Apps", async 
   assert.equal(sent[0].payload.targetDeviceId, "coordinator-device");
 });
 
+test("targeted collaboration events also reach subscribed Apps that can control the session", async () => {
+  const sent = [];
+  const router = new ExternalAgentRelayRouter({
+    registry: { has: () => true },
+    targetDeviceForSession: () => "coordinator-device",
+    relayClient: {
+      send: async () => {
+        throw new Error("the targeted subscriber path must be used");
+      },
+      sendTargetedAndSubscribers: async (type, payload, options) => {
+        sent.push({ type, payload, options });
+        return { accepted: true };
+      },
+      sendBroadcast: async () => {
+        throw new Error("targeted collaboration events must not use broadcast-only routing");
+      },
+    },
+  });
+
+  await router.forwardRegistryNotification({
+    type: "event",
+    sessionId: "session-1",
+    payload: { type: "agent.text", eventId: "targeted-subscribed", text: "shared" },
+  });
+  assert.deepEqual(sent, [{
+    type: "agent.stream.event",
+    payload: {
+      sessionId: "session-1",
+      targetDeviceId: "coordinator-device",
+      event: { type: "agent.text", eventId: "targeted-subscribed", text: "shared" },
+    },
+    options: { targetDeviceId: "coordinator-device", routeKey: "session-1" },
+  }]);
+});
+
 test("daemon removes undefined fields before protected E2EE serialization", async () => {
   const { router, sent } = fixture();
   await router.forwardRegistryNotification({

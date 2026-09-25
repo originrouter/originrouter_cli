@@ -103,11 +103,17 @@ export class ExternalAgentRelayRouter {
     ).slice(0, 191);
     const route = targetDeviceId ? { targetDeviceId } : {};
 
-    // Collaboration assignments have an explicit coordinator target and must
-    // remain single-recipient. Ordinary Agent sessions are intentionally
-    // broadcast to every subscribed App so mirrored approval cards stay in
-    // sync.
-    const send = targetDeviceId
+    // Collaboration assignments have an explicit coordinator target. Keep
+    // that device authoritative, while also mirroring to any other App that
+    // has an active control subscription for the same visible session.
+    // Ordinary Agent sessions are broadcast to every subscribed App as well.
+    const send = targetDeviceId && typeof this.relayClient.sendTargetedAndSubscribers === "function"
+      ? (type, payload) => this.relayClient.sendTargetedAndSubscribers(
+        type,
+        payload,
+        { targetDeviceId, routeKey: sessionId },
+      )
+      : targetDeviceId
       ? (type, payload) => this.relayClient.send(type, payload)
       : typeof this.relayClient.sendBroadcast === "function"
       ? (type, payload) => this.relayClient.sendBroadcast(type, payload, { routeKey: sessionId })

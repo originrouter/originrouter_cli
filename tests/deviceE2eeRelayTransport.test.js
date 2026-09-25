@@ -84,6 +84,28 @@ assert.equal(opened.payload.event.text, "secret stream");
 const openedForSecondApp = app2Session.open(sent[1]);
 assert.equal(openedForSecondApp.payload.event.text, "secret stream");
 
+// A collaboration worker has an explicit coordinator target, but the same
+// session may also be visible in another App's ordinary Agent list. Those
+// subscribed Apps must receive the live event as well, while the coordinator
+// remains the guaranteed recipient when no subscription exists yet.
+const beforeTargetedSubscribers = sent.length;
+await transport.sendTargetedAndSubscribers("agent.stream.event", {
+  sessionId: "agent-session-1",
+  event: { text: "target plus subscribers" },
+}, {
+  targetDeviceId: "app-device-2",
+  routeKey: "agent-session-1",
+});
+assert.equal(sent.length, beforeTargetedSubscribers + 2);
+assert.equal(
+  app2Session.open(sent[beforeTargetedSubscribers]).payload.event.text,
+  "target plus subscribers",
+);
+assert.equal(
+  appSession.open(sent[beforeTargetedSubscribers + 1]).payload.event.text,
+  "target plus subscribers",
+);
+
 await transport.send("collaboration.control.response", {
   sessionId: "agent-session-1",
   data: {
@@ -147,6 +169,26 @@ assert.equal(transport.rejectsPlaintext({
   type: "agent.message",
   message: "must reject",
 }), true);
+for (const type of [
+  "approval.policy.capabilities",
+  "approval.policy.capabilities.result",
+  "approval.policy.validate",
+  "approval.policy.validate.result",
+  "approval.policy.simulate",
+  "approval.policy.simulate.result",
+  "approval.policy.revisions",
+  "approval.policy.revisions.result",
+  "approval.policy.rollback",
+  "approval.policy.rollback.result",
+  "collaboration.capabilities.request",
+  "collaboration.capabilities.response",
+  "collaboration.control.request",
+  "collaboration.control.response",
+  "collaboration.workspace.trust.request",
+  "collaboration.workspace.trust.response",
+]) {
+  assert.equal(transport.rejectsPlaintext({ type }), true, type);
+}
 
 await transport.send("collaboration.remote.dispatch", {
   protocolVersion: "1",

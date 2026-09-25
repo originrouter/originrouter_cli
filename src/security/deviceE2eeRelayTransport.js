@@ -30,6 +30,16 @@ export const PROTECTED_DEVICE_MESSAGE_TYPES = new Set([
   "agent.workspace.page",
   "agent.workspace.trust",
   "agent.workspace.trust.result",
+  "approval.policy.capabilities",
+  "approval.policy.capabilities.result",
+  "approval.policy.validate",
+  "approval.policy.validate.result",
+  "approval.policy.simulate",
+  "approval.policy.simulate.result",
+  "approval.policy.revisions",
+  "approval.policy.revisions.result",
+  "approval.policy.rollback",
+  "approval.policy.rollback.result",
   "agent.launch.request",
   "session.stop",
   "session.start",
@@ -283,7 +293,7 @@ export class DeviceE2eeRelayTransport {
     }
   }
 
-  _subscriberSessions(routeKey) {
+  _subscriberSessions(routeKey, { excludeSessionIds = null } = {}) {
     const subscribers = this.routeSubscribers.get(text(routeKey));
     if (!subscribers) return [];
     const cutoff = Date.now() - ROUTE_SUBSCRIBER_TTL_MS;
@@ -293,7 +303,9 @@ export class DeviceE2eeRelayTransport {
         subscribers.delete(sessionId);
         continue;
       }
-      sessions.push(this.sessions.get(sessionId));
+      if (!excludeSessionIds?.has(sessionId)) {
+        sessions.push(this.sessions.get(sessionId));
+      }
     }
     if (subscribers.size === 0) this.routeSubscribers.delete(text(routeKey));
     return sessions.filter(Boolean);
@@ -453,6 +465,39 @@ export class DeviceE2eeRelayTransport {
     return this._sendOnSession(session, type, wirePayload);
   }
 
+  async _ensureTargetSession({ targetDeviceId, keys = [], localIdentity }) {
+    const peer = await this.currentPeer(targetDeviceId);
+    const existing = [...this.sessions.values()].find((candidate) =>
+      candidate?.peer?.device_id === targetDeviceId
+        && candidate?.peer?.key_id === peer.key_id,
+    );
+    if (existing) return existing;
+    // A device key rotation invalidates any prior E2EE session. Remove the
+    // stale route before creating the replacement so one event is not sent to
+    // both the old and new key.
+    for (const [sessionId, candidate] of this.sessions) {
+      if (candidate?.peer?.device_id !== targetDeviceId) continue;
+      this.sessions.delete(sessionId);
+      for (const [routeKey, routedSessionId] of this.routes) {
+        if (routedSessionId === sessionId) this.routes.delete(routeKey);
+      }
+      for (const subscribers of this.routeSubscribers.values()) {
+        subscribers.delete(sessionId);
+      }
+    }
+    const session = DeviceE2eeSession.initiate({
+      local: localIdentity,
+      peer,
+    });
+    this.sessions.set(session.sessionId, session);
+    for (const key of keys) {
+      this.routes.delete(key);
+      this.routes.set(key, session.sessionId);
+    }
+    this._pruneRoutes();
+    return session;
+  }
+
   async _sendOnSession(session, type, wirePayload) {
     const previous = this.sendTails.get(session.sessionId) || Promise.resolve();
     const operation = previous.then(async () => {
@@ -504,6 +549,63 @@ export class DeviceE2eeRelayTransport {
     const sessions = this._subscriberSessions(key);
     if (sessions.length <= 1) return this.send(type, payload);
     const wirePayload = withoutUndefined(payload);
+    const results = await Promise.allSettled(
+      sessions.map((session) => this._sendOnSession(session, type, wirePayload)),
+    );
+    let accepted = false;
+    let reason = "";
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        const delivery = result.value?.data || result.value || {};
+        if (delivery.accepted !== false) accepted = true;
+        else reason ||= delivery.reason || "relay_rejected";
+      } else {
+        reason ||= result.reason?.code || result.reason?.message || "relay_error";
+        const session = sessions[index];
+        if (session) {
+          for (const subscribers of this.routeSubscribers.values()) {
+            subscribers.delete(session.sessionId);
+          }
+        }
+      }
+    });
+    return { accepted, reason };
+  }
+
+  /**
+   * Deliver a targeted event to its explicit recipient and to every other
+   * App that has an active control subscription for the same session. The
+   * explicit recipient remains authoritative when no App subscription exists
+   * yet (for example immediately after a collaboration worker starts).
+   */
+  async sendTargetedAndSubscribers(
+    type,
+    payload = {},
+    { targetDeviceId, routeKey } = {},
+  ) {
+    const target = text(targetDeviceId)
+      || text(payload.targetDeviceId)
+      || text(payload.target_device_id);
+    const key = text(routeKey) || text(payload.sessionId) || text(payload.session_id);
+    if (!target) return this.sendBroadcast(type, payload, { routeKey: key });
+
+    const localIdentity = this._refreshLocalIdentity();
+    const wirePayload = withoutUndefined({
+      ...payload,
+      targetDeviceId: target,
+    });
+    const keys = routeKeys(wirePayload);
+    const targetSession = await this._ensureTargetSession({
+      targetDeviceId: target,
+      keys,
+      localIdentity,
+    });
+    const sessions = [
+      targetSession,
+      ...this._subscriberSessions(key, {
+        excludeSessionIds: new Set([targetSession.sessionId]),
+      }),
+    ];
     const results = await Promise.allSettled(
       sessions.map((session) => this._sendOnSession(session, type, wirePayload)),
     );
