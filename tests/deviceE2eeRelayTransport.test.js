@@ -84,6 +84,34 @@ assert.equal(opened.payload.event.text, "secret stream");
 const openedForSecondApp = app2Session.open(sent[1]);
 assert.equal(openedForSecondApp.payload.event.text, "secret stream");
 
+// A failed subscriber must be removed from both the subscription index and
+// the route index. Otherwise a later single-subscriber broadcast can reuse
+// the dead session and fail repeatedly instead of using the healthy device.
+const failingTransport = new DeviceE2eeRelayTransport({
+  relayClient: {
+    send: async () => {},
+    sendEnvelope: async (envelope) => {
+      if (envelope.target_device_id === "app-device-2") {
+        throw Object.assign(new Error("subscriber socket closed"), {
+          code: "SOCKET_CLOSED",
+        });
+      }
+      return { accepted: true };
+    },
+  },
+  localIdentity: cli,
+  stateDir,
+  controlBaseUrl: "https://example.invalid",
+  credentialProvider: async () => credential,
+});
+await failingTransport.handleInbound(subscribe);
+await failingTransport.handleInbound(clearSecondSubscription);
+await failingTransport.sendBroadcast("agent.stream.event", {
+  sessionId: "agent-session-1",
+  event: { text: "healthy after failure" },
+}, { routeKey: "agent-session-1" });
+assert.equal(failingTransport.routes.has("agent-session-1"), true);
+
 // A collaboration worker has an explicit coordinator target, but the same
 // session may also be visible in another App's ordinary Agent list. Those
 // subscribed Apps must receive the live event as well, while the coordinator

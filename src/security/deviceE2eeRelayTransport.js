@@ -405,6 +405,19 @@ export class DeviceE2eeRelayTransport {
     }
   }
 
+  _discardSession(sessionId) {
+    const id = text(sessionId);
+    if (!id) return;
+    this.sessions.delete(id);
+    for (const [key, value] of this.routes) {
+      if (value === id) this.routes.delete(key);
+    }
+    for (const [key, subscribers] of this.routeSubscribers) {
+      subscribers.delete(id);
+      if (subscribers.size === 0) this.routeSubscribers.delete(key);
+    }
+  }
+
   async _verifyPeerDirectoryHead(peerHead) {
     if (!peerHead) {
       const error = new Error("E2EE peer omitted directory head");
@@ -522,10 +535,7 @@ export class DeviceE2eeRelayTransport {
       const result = await this.relayClient.sendEnvelope(envelope);
       const delivery = result?.data || result || {};
       if (delivery.accepted === false) {
-        this.sessions.delete(session.sessionId);
-        for (const [key, value] of this.routes) {
-          if (value === session.sessionId) this.routes.delete(key);
-        }
+        this._discardSession(session.sessionId);
       }
       return result;
     });
@@ -562,11 +572,7 @@ export class DeviceE2eeRelayTransport {
       } else {
         reason ||= result.reason?.code || result.reason?.message || "relay_error";
         const session = sessions[index];
-        if (session) {
-          for (const subscribers of this.routeSubscribers.values()) {
-            subscribers.delete(session.sessionId);
-          }
-        }
+        if (session) this._discardSession(session.sessionId);
       }
     });
     return { accepted, reason };
@@ -619,11 +625,7 @@ export class DeviceE2eeRelayTransport {
       } else {
         reason ||= result.reason?.code || result.reason?.message || "relay_error";
         const session = sessions[index];
-        if (session) {
-          for (const subscribers of this.routeSubscribers.values()) {
-            subscribers.delete(session.sessionId);
-          }
-        }
+        if (session) this._discardSession(session.sessionId);
       }
     });
     return { accepted, reason };
