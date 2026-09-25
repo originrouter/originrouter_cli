@@ -201,6 +201,122 @@ test("daemon forwards full transient text and session acknowledgements", async (
   assert.equal(sent[1].payload.sessionId, "session-1");
 });
 
+test("daemon broadcasts live events to every subscribed App for a session", async () => {
+  const sent = [];
+  const router = new ExternalAgentRelayRouter({
+    registry: {
+      has: (sessionId) => sessionId === "session-1",
+    },
+    relayClient: {
+      send: async () => {
+        throw new Error("live events must use the subscriber broadcast path");
+      },
+      sendBroadcast: async (type, payload, options) => {
+        sent.push({ type, payload, options });
+        return { accepted: true };
+      },
+    },
+  });
+
+  await router.forwardRegistryNotification({
+    type: "event",
+    sessionId: "session-1",
+    payload: {
+      type: "agent.interaction.requested",
+      interactionId: "permission-1",
+      kind: "permission",
+    },
+  });
+  await router.forwardRegistryNotification({
+    type: "event",
+    sessionId: "session-1",
+    payload: {
+      type: "agent.text",
+      eventId: "text-1",
+      text: "streaming",
+    },
+  });
+
+  assert.deepEqual(sent, [
+    {
+      type: "agent.interaction.requested",
+      payload: {
+        type: "agent.interaction.requested",
+        interactionId: "permission-1",
+        kind: "permission",
+        sessionId: "session-1",
+      },
+      options: { routeKey: "session-1" },
+    },
+    {
+      type: "agent.stream.event",
+      payload: {
+        sessionId: "session-1",
+        event: {
+          type: "agent.text",
+          eventId: "text-1",
+          text: "streaming",
+        },
+      },
+      options: { routeKey: "session-1" },
+    },
+  ]);
+});
+
+test("daemon broadcasts a losing interaction conflict to all subscribed Apps", async () => {
+  const sent = [];
+  const commands = [];
+  const router = new ExternalAgentRelayRouter({
+    registry: {
+      has: (sessionId) => sessionId === "session-1",
+      enqueueCommand: (sessionId, command) => commands.push({ sessionId, command }),
+    },
+    relayClient: {
+      send: async () => {
+        throw new Error("live conflicts must use the subscriber broadcast path");
+      },
+      sendBroadcast: async (type, payload, options) => {
+        sent.push({ type, payload });
+        assert.deepEqual(options, { routeKey: "session-1" });
+        return { accepted: true };
+      },
+    },
+  });
+
+  const inbound = {
+    type: "agent.interaction.resolve",
+    sessionId: "session-1",
+    interactionId: "permission-1",
+    action: "allow",
+    responseId: "response-b",
+  };
+  assert.equal(await router.handle(inbound), true);
+  assert.equal(commands[0].command.responseId, "response-b");
+
+  await router.forwardRegistryNotification({
+    type: "event",
+    sessionId: "session-1",
+    payload: {
+      type: "agent.interaction.result",
+      interactionId: "permission-1",
+      responseId: "response-b",
+      status: "conflict",
+      reason: "interaction_already_claimed",
+    },
+  });
+  assert.deepEqual(sent, [{
+    type: "agent.interaction.result",
+    payload: {
+      type: "agent.interaction.result",
+      interactionId: "permission-1",
+      responseId: "response-b",
+      status: "conflict",
+      reason: "interaction_already_claimed",
+      sessionId: "session-1",
+    },
+  }]);
+});
+
 test("remote collaboration events retain a target after E2EE reconnects", async () => {
   const { sent, commands } = fixture();
   const registry = {
@@ -228,6 +344,33 @@ test("remote collaboration events retain a target after E2EE reconnects", async 
   });
   assert.equal(sent[0].payload.targetDeviceId, "coordinator-device");
   assert.equal(sent[0].payload.event.text, "progress");
+});
+
+test("targeted collaboration events are not broadcast to unrelated Apps", async () => {
+  const sent = [];
+  const router = new ExternalAgentRelayRouter({
+    registry: {
+      has: () => true,
+    },
+    targetDeviceForSession: () => "coordinator-device",
+    relayClient: {
+      send: async (type, payload) => {
+        sent.push({ type, payload });
+        return { accepted: true };
+      },
+      sendBroadcast: async () => {
+        throw new Error("targeted collaboration events must not broadcast");
+      },
+    },
+  });
+
+  await router.forwardRegistryNotification({
+    type: "event",
+    sessionId: "session-1",
+    payload: { type: "agent.text", eventId: "targeted-1", text: "private" },
+  });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].payload.targetDeviceId, "coordinator-device");
 });
 
 test("daemon removes undefined fields before protected E2EE serialization", async () => {

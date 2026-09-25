@@ -98,6 +98,22 @@ assert.equal("absent" in sanitized, false);
 assert.deepEqual(sanitized.nested, { retained: true });
 assert.deepEqual(sanitized.values, ["present", null, { retained: "nested" }]);
 
+// A conflict result carries both the logical session and the losing App's
+// device id. The explicit device target must win over the session's latest
+// subscriber route, otherwise the wrong App can receive the error.
+await transport.send("agent.interaction.result", {
+  sessionId: "agent-session-1",
+  interactionId: "permission-1",
+  status: "conflict",
+  targetDeviceId: "app-device-2",
+});
+const targetedConflict = DeviceE2eeSession.accept({
+  local: app2,
+  peer: cli.public_identity,
+  firstEnvelope: sent.at(-1),
+}).firstPayload;
+assert.equal(targetedConflict.payload.targetDeviceId, "app-device-2");
+
 const inboundCollaboration = appSession.seal("collaboration.remote.dispatch", {
   protocolVersion: "1",
   sourceDeviceId: "app-device",

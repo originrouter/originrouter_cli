@@ -416,7 +416,14 @@ export class DeviceE2eeRelayTransport {
     }
     const wirePayload = withoutUndefined(payload);
     const keys = routeKeys(wirePayload);
-    const route = keys.find((key) => this.routes.has(key));
+    const explicitTargetDeviceId = text(wirePayload.targetDeviceId)
+      || text(wirePayload.target_device_id);
+    // An explicit target is authoritative. Without this guard, a conflict
+    // response carrying both sessionId and targetDeviceId could be sent to
+    // whichever App most recently refreshed the session route.
+    const route = explicitTargetDeviceId
+      ? null
+      : keys.find((key) => this.routes.has(key));
     const sessionId = route ? this.routes.get(route) : null;
     let session = type === "collaboration.remote.dispatch"
       ? null
