@@ -831,3 +831,19 @@ test("runtime reporter creates one task outcome for an active structured task", 
     "task_failed",
   ]);
 });
+
+test("disabled runtime reporter keeps collaboration workers out of ordinary server activity", async () => {
+  let calls = 0;
+  const reporter = createRuntimeEventReporter({
+    enabled: false,
+    sessionId: "collab-worker-1",
+    agentType: "claude",
+    reportRuntimeEventFn: async () => {
+      calls += 1;
+      return { ok: true };
+    },
+  });
+  await reporter.report("agent.event", { event: { type: "agent.text", text: "hidden" } });
+  await reporter.flush();
+  assert.equal(calls, 0);
+});

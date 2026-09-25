@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 
-import { ExternalAgentRegistry } from "../src/local/externalAgentRegistry.js";
+import {
+  ExternalAgentRegistry,
+  isCollaborationSessionPayload,
+} from "../src/local/externalAgentRegistry.js";
+
+assert.equal(isCollaborationSessionPayload({ runId: "acr_run-1" }), true);
+assert.equal(isCollaborationSessionPayload({ sessionId: "collab-remote-1" }), true);
+assert.equal(isCollaborationSessionPayload({ startedBy: "collaboration-runtime" }), true);
+assert.equal(isCollaborationSessionPayload({ sessionId: "agent-1", runId: "run-1" }), false);
 
 let now = 1_000_000;
 const registry = new ExternalAgentRegistry({ now: () => now });
@@ -75,6 +83,7 @@ assert.notEqual(
   events.streamId,
 );
 assert.equal(registry.list()[0].pending_approval_count, 1);
+assert.equal(registry.list()[0].session_kind, "interactive");
 assert.equal(registry.list()[0].status, "waiting_input");
 assert.equal(registry.list()[0].current_step, "Waiting for input");
 assert.equal(registry.list()[0].mode, "plan");
@@ -109,6 +118,21 @@ registry.appendEvent("claude-local-1", {
   type: "agent.task.complete",
 });
 assert.equal(registry.list()[0].current_step, "Ready");
+
+registry.register({
+  sessionId: "collab-worker-1",
+  runId: "acr_run-1",
+  startedBy: "collaboration-runtime",
+  agent: "claude",
+});
+assert.equal(registry.isCollaborationSession("collab-worker-1"), true);
+assert.equal(registry.list({ includeCollaboration: false }).some(
+  (session) => session.session_id === "collab-worker-1",
+), false);
+assert.equal(registry.list().some(
+  (session) => session.session_id === "collab-worker-1"
+    && session.session_kind === "collaboration",
+), true);
 registry.appendEvent("claude-local-1", {
   type: "agent.activity",
   activity: "rate_limit",

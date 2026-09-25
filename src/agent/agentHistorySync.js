@@ -150,7 +150,11 @@ export async function syncAgentHistoryBodies({
     return { ok: false, error: "catalog_unavailable", scanned: 0, synced: 0 };
   }
   const state = readState(catalog);
-  const conversations = catalog.listConversations({ includeArchived: true, limit: 200 });
+  const conversations = catalog.listConversations({
+    includeArchived: true,
+    includeCollaboration: false,
+    limit: 200,
+  });
   let synced = 0;
   let skipped = 0;
   for (const conversation of conversations) {

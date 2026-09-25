@@ -82,6 +82,7 @@ function readAllConversations(catalog) {
   for (let offset = 0; ; offset += PAGE_SIZE) {
     const page = catalog.listConversations({
       includeArchived: true,
+      includeCollaboration: false,
       limit: PAGE_SIZE,
       offset,
     });

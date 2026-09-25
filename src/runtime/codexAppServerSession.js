@@ -117,6 +117,8 @@ export async function runCodexAppServerSession(rawArgs) {
   const stateDir = ensureStateDir();
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
   const options = extractOptions(rawArgs);
+  const collaborationWorker = options.sessionKind === "collaboration"
+    || String(options.runId || "").startsWith("acr_");
   if (!(await isCodexAppServerAvailable())) {
     throw new Error(
       "Codex app-server is unavailable. Upgrade Codex or use `originrouter codex-terminal`.",
@@ -210,6 +212,7 @@ export async function runCodexAppServerSession(rawArgs) {
   const client = new CodexAppServerClient();
   const recentEvents = [];
   const runtimeReporter = createRuntimeEventReporter({
+    enabled: !collaborationWorker,
     sessionId,
     agentType: "codex",
     title: sessionTitle,
@@ -226,6 +229,7 @@ export async function runCodexAppServerSession(rawArgs) {
       deviceId: effectiveDeviceId,
       conversationId: options.conversationId || sessionId,
       runId: options.runId || sessionId,
+      sessionKind: options.sessionKind || (String(options.runId || "").startsWith("acr_") ? "collaboration" : "interactive"),
       taskId: options.taskId || "",
       telemetryOwner: options.telemetryOwner === "1",
       bundleOrigin: String(options.runId || "").startsWith("acr_")
@@ -279,8 +283,9 @@ export async function runCodexAppServerSession(rawArgs) {
   };
   let stopHeartbeat = () => {};
   const signalHandlers = new Map();
-  const syncCatalog = (status) =>
-    reportAgentConversationMetadata(
+  const syncCatalog = (status) => collaborationWorker
+    ? Promise.resolve({ ok: true, skipped: true })
+    : reportAgentConversationMetadata(
       {
         conversationId: options.conversationId || sessionId,
         agentType: "codex",
@@ -301,7 +306,7 @@ export async function runCodexAppServerSession(rawArgs) {
     ).catch(() => ({ ok: false }));
 
   const send = (type, extra = {}) => {
-    if (relayViaDaemon || !relayClient)
+    if (collaborationWorker || relayViaDaemon || !relayClient)
       return Promise.resolve({ accepted: false, localOnly: true });
     return relayClient
       .send(type, {
@@ -1047,7 +1052,9 @@ export async function runCodexAppServerSession(rawArgs) {
       detailSource: detail.source,
       transcriptPath,
     });
-    stopHeartbeat = startAgentSessionHeartbeat({ sessionId, stateDir });
+    stopHeartbeat = collaborationWorker
+      ? () => {}
+      : startAgentSessionHeartbeat({ sessionId, stateDir });
     await syncCatalog("running");
     appendSessionStart({
       sessionId,

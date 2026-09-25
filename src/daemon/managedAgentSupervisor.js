@@ -265,6 +265,16 @@ export class ManagedAgentSupervisor {
     ];
     const taskId = safeText(payload.taskId || payload.task_id, 195);
     if (taskId) args.push("--originrouter-task", taskId);
+    const startedBy = nativeSessionId
+      ? "app-resume"
+      : safeText(payload.startedBy || payload.started_by, 64) || "app-remote";
+    const collaborationWorker = String(runId).startsWith("acr_")
+      || startedBy === "collaboration-runtime"
+      || startedBy === "collaboration-remote"
+      || String(sessionId).startsWith("collab-");
+    if (collaborationWorker) {
+      args.push("--originrouter-session-kind", "collaboration");
+    }
     if (payload.telemetryOwner === true || payload.telemetryOwner === false) {
       args.push("--originrouter-telemetry-owner", payload.telemetryOwner ? "1" : "0");
     }
@@ -337,9 +347,7 @@ export class ManagedAgentSupervisor {
       provider,
       model,
       permissionProfile,
-      startedBy: nativeSessionId
-        ? "app-resume"
-        : safeText(payload.startedBy || payload.started_by, 64) || "app-remote",
+      startedBy,
       status: "starting",
     });
     this.catalog?.recordLaunchReceipt?.(result);

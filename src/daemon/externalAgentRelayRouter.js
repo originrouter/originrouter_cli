@@ -30,10 +30,11 @@ function withoutUndefined(value) {
 }
 
 export class ExternalAgentRelayRouter {
-  constructor({ registry, relayClient, targetDeviceForSession = null }) {
+  constructor({ registry, relayClient, targetDeviceForSession = null, isCollaborationSession = null }) {
     this.registry = registry;
     this.relayClient = relayClient;
     this.targetDeviceForSession = targetDeviceForSession;
+    this.isCollaborationSession = isCollaborationSession;
   }
 
   async handle(payload) {
@@ -58,6 +59,10 @@ export class ExternalAgentRelayRouter {
 
     const sessionId = String(payload.sessionId || "").slice(0, 64);
     if (!sessionId || !this.registry.has(sessionId)) return false;
+    // Ordinary Agent controls are intentionally unavailable for collaboration
+    // workers. The collaboration runtime owns their command path and projects
+    // results through the collaboration conversation.
+    if (this.isCollaborationSession?.(sessionId) === true) return false;
 
     if (payload.type === "agent.history.request") {
       let history;
@@ -98,15 +103,17 @@ export class ExternalAgentRelayRouter {
       notification.sessionId || event?.sessionId || "",
     ).slice(0, 64);
     if (!sessionId || !event || typeof event !== "object") return false;
+    // Do not duplicate collaboration worker events into the ordinary Agent
+    // stream. CollaborationRuntime delivers them to the matching run/page.
+    if (this.isCollaborationSession?.(sessionId) === true) return false;
     const targetDeviceId = String(
       this.targetDeviceForSession?.(sessionId) || "",
     ).slice(0, 191);
     const route = targetDeviceId ? { targetDeviceId } : {};
 
-    // Collaboration assignments have an explicit coordinator target. Keep
-    // that device authoritative, while also mirroring to any other App that
-    // has an active control subscription for the same visible session.
-    // Ordinary Agent sessions are broadcast to every subscribed App as well.
+    // Ordinary Agent sessions are broadcast to every subscribed App. A
+    // targeted visible session is delivered to its target and other active
+    // subscribers by the E2EE transport.
     const send = targetDeviceId && typeof this.relayClient.sendTargetedAndSubscribers === "function"
       ? (type, payload) => this.relayClient.sendTargetedAndSubscribers(
         type,

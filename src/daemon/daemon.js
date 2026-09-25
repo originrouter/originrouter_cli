@@ -255,6 +255,8 @@ export async function startDaemon(args) {
   const externalAgentRelayRouter = new ExternalAgentRelayRouter({
     registry: externalAgentRegistry,
     relayClient: deviceE2eeRelay,
+    isCollaborationSession: (sessionId) =>
+      externalAgentRegistry.isCollaborationSession(sessionId),
     targetDeviceForSession: (sessionId) =>
       collaborationStore.findRemoteAssignmentBySession(sessionId)?.source_device_id || "",
   });

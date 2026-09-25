@@ -51,6 +51,7 @@ function extractOptions(args) {
     else if (arg === "--originrouter-session") take("session");
     else if (arg === "--originrouter-conversation") take("conversationId");
     else if (arg === "--originrouter-run") take("runId");
+    else if (arg === "--originrouter-session-kind") take("sessionKind");
     else if (arg === "--originrouter-task") take("taskId");
     else if (arg === "--originrouter-telemetry-owner") take("telemetryOwner");
     else if (arg === "--originrouter-workspace") take("workspaceId");

@@ -555,10 +555,13 @@ export class AgentCatalog {
     return true;
   }
 
-  listConversations({ search = "", agent = "", deviceId = "", workspaceId = "", status = "", limit = DEFAULT_LIMIT, offset = 0, includeArchived = false } = {}) {
+  listConversations({ search = "", agent = "", deviceId = "", workspaceId = "", status = "", limit = DEFAULT_LIMIT, offset = 0, includeArchived = false, includeCollaboration = true } = {}) {
     const clauses = [];
     const params = {};
     if (!includeArchived) clauses.push("c.archived_at IS NULL");
+    if (!includeCollaboration) {
+      clauses.push("COALESCE(r.started_by, '') NOT IN ('collaboration-runtime', 'collaboration-remote')");
+    }
     if (safeText(agent, 32)) {
       clauses.push("c.agent_type = @agent");
       params.agent = safeText(agent, 32);
@@ -624,6 +627,7 @@ export class AgentCatalog {
     page = 1,
     pageSize = 20,
     autoArchiveDays = 30,
+    includeCollaboration = true,
   } = {}) {
     const normalizedCollection = collection === "archived" ? "archived" : "history";
     const normalizedPage = Math.max(1, Number(page) || 1);
@@ -633,6 +637,9 @@ export class AgentCatalog {
     const clauses = [
       "COALESCE(r.status, 'stopped') NOT IN ('running', 'waiting_approval', 'waiting_input', 'waiting_device', 'starting')",
     ];
+    if (!includeCollaboration) {
+      clauses.push("COALESCE(r.started_by, '') NOT IN ('collaboration-runtime', 'collaboration-remote')");
+    }
     const params = {
       pageSize: normalizedPageSize,
       offset,

@@ -241,6 +241,24 @@ assert.equal(
   "a target may inspect an existing registration without touching a protected path",
 );
 
+catalog.upsertSession({
+  sessionId: "collab-worker-1",
+  conversationId: "collab-conversation-1",
+  runId: "acr_run-1",
+  agent: "claude",
+  cwd: stateDir,
+  runtime: "claude-sdk",
+  startedBy: "collaboration-runtime",
+  status: "running",
+});
+assert.equal(catalog.listConversations({ includeArchived: true }).some(
+  (conversation) => conversation.conversation_id === "collab-conversation-1",
+), true);
+assert.equal(catalog.listConversations({
+  includeArchived: true,
+  includeCollaboration: false,
+}).some((conversation) => conversation.conversation_id === "collab-conversation-1"), false);
+
 catalog.close();
 
 const reopened = new AgentCatalog({ stateDir, now });

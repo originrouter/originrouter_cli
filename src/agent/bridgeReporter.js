@@ -112,10 +112,17 @@ export function createRuntimeEventReporter({
   workspaceDisplayPath = "",
   stateDir = getStateDir(),
   reportRuntimeEventFn = reportRuntimeEvent,
+  enabled = true,
   telemetryQueue = null,
   telemetryUploader = null,
   telemetryContext = null,
 } = {}) {
+  if (!enabled) {
+    return {
+      report: () => Promise.resolve({ ok: true, skipped: true }),
+      flush: () => Promise.resolve({ ok: true, skipped: true }),
+    };
+  }
   let sequence = 0;
   let tail = Promise.resolve();
   const deliveredDedupeKeys = new Set();

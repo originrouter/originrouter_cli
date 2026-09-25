@@ -176,6 +176,7 @@ function extractOriginRouterOptions(args) {
     else if (arg === "--originrouter-session") take("session");
     else if (arg === "--originrouter-conversation") take("conversationId");
     else if (arg === "--originrouter-run") take("runId");
+    else if (arg === "--originrouter-session-kind") take("sessionKind");
     else if (arg === "--originrouter-task") take("taskId");
     else if (arg === "--originrouter-telemetry-owner") take("telemetryOwner");
     else if (arg === "--originrouter-workspace") take("workspaceId");
@@ -312,6 +313,8 @@ export async function runClaudeSdkSession(rawArgs) {
   const stateDir = ensureStateDir();
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
   const options = extractOriginRouterOptions(rawArgs);
+  const collaborationWorker = options.sessionKind === "collaboration"
+    || String(options.runId || "").startsWith("acr_");
   const relayConfig = readLocalApiConfig();
   const configuredRelayUrl =
     options.relay ||
@@ -374,6 +377,7 @@ export async function runClaudeSdkSession(rawArgs) {
   const recentEvents = [];
   const abortController = new AbortController();
   const runtimeReporter = createRuntimeEventReporter({
+    enabled: !collaborationWorker,
     sessionId,
     agentType: "claude",
     title: sessionTitle,
@@ -390,6 +394,7 @@ export async function runClaudeSdkSession(rawArgs) {
       deviceId: effectiveDeviceId,
       conversationId: options.conversationId || sessionId,
       runId: options.runId || sessionId,
+      sessionKind: options.sessionKind || (String(options.runId || "").startsWith("acr_") ? "collaboration" : "interactive"),
       taskId: options.taskId || "",
       telemetryOwner: options.telemetryOwner === "1",
       bundleOrigin: String(options.runId || "").startsWith("acr_")
@@ -445,8 +450,9 @@ export async function runClaudeSdkSession(rawArgs) {
   };
   let stopHeartbeat = () => {};
   const signalHandlers = new Map();
-  const syncCatalog = (status) =>
-    reportAgentConversationMetadata(
+  const syncCatalog = (status) => collaborationWorker
+    ? Promise.resolve({ ok: true, skipped: true })
+    : reportAgentConversationMetadata(
       {
         conversationId: options.conversationId || sessionId,
         agentType: "claude",
@@ -467,7 +473,7 @@ export async function runClaudeSdkSession(rawArgs) {
     ).catch(() => ({ ok: false }));
 
   const send = (type, extra = {}) => {
-    if (relayViaDaemon || !relayClient)
+    if (collaborationWorker || relayViaDaemon || !relayClient)
       return Promise.resolve({ accepted: false, localOnly: true });
     return relayClient
       .send(type, {
@@ -1001,7 +1007,9 @@ export async function runClaudeSdkSession(rawArgs) {
       id: `launch:${sessionId}`,
     });
   }
-  stopHeartbeat = startAgentSessionHeartbeat({ sessionId, stateDir });
+  stopHeartbeat = collaborationWorker
+    ? () => {}
+    : startAgentSessionHeartbeat({ sessionId, stateDir });
 
   for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
     const handler = () =>

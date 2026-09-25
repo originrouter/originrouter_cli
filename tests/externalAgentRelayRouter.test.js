@@ -201,6 +201,33 @@ test("daemon forwards full transient text and session acknowledgements", async (
   assert.equal(sent[1].payload.sessionId, "session-1");
 });
 
+test("collaboration workers never enter ordinary Agent control or event relay", async () => {
+  const sent = [];
+  const commands = [];
+  const router = new ExternalAgentRelayRouter({
+    registry: {
+      has: (sessionId) => sessionId === "collab-worker-1",
+      enqueueCommand: (sessionId, command) => commands.push({ sessionId, command }),
+    },
+    relayClient: {
+      send: async (type, payload) => sent.push({ type, payload }),
+    },
+    isCollaborationSession: (sessionId) => sessionId === "collab-worker-1",
+  });
+  assert.equal(await router.handle({
+    type: "agent.message",
+    sessionId: "collab-worker-1",
+    message: "must stay in collaboration",
+  }), false);
+  assert.equal(await router.forwardRegistryNotification({
+    type: "event",
+    sessionId: "collab-worker-1",
+    payload: { type: "agent.interaction.requested", interactionId: "i-1" },
+  }), false);
+  assert.deepEqual(commands, []);
+  assert.deepEqual(sent, []);
+});
+
 test("daemon broadcasts live events to every subscribed App for a session", async () => {
   const sent = [];
   const router = new ExternalAgentRelayRouter({

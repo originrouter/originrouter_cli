@@ -648,7 +648,12 @@ async function dispatch(ctx, req, res) {
       return sendOk(res, { sessions: handleSessionsList(ctx) });
     }
     if (req.method === "GET" && pathname === "/agent/local/sessions") {
-      return sendOk(res, { sessions: ctx.externalAgentRegistry.list() });
+      // Collaboration workers are rendered and controlled by the
+      // collaboration surface only. They must never leak into the ordinary
+      // Agent list, even while their local process is still running.
+      return sendOk(res, {
+        sessions: ctx.externalAgentRegistry.list({ includeCollaboration: false }),
+      });
     }
     if (req.method === "POST" && pathname === "/agent/local/mcp-gateway") {
       if (!ctx.collaborationRuntime) {
@@ -979,6 +984,7 @@ async function dispatch(ctx, req, res) {
           page: url.searchParams.get("page"),
           pageSize,
           autoArchiveDays: url.searchParams.get("auto_archive_days"),
+          includeCollaboration: false,
         }));
       }
       return sendOk(res, {
@@ -991,6 +997,7 @@ async function dispatch(ctx, req, res) {
           limit: url.searchParams.get("limit"),
           offset: url.searchParams.get("offset"),
           includeArchived: url.searchParams.get("archived") === "true",
+          includeCollaboration: false,
         }),
       });
     }
