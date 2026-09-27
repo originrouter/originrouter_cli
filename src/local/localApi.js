@@ -1236,7 +1236,7 @@ async function dispatch(ctx, req, res) {
     }
 
     const localAgentMatch = pathname.match(
-      /^\/agent\/local\/sessions\/([^/]+)\/(update|unregister|events|commands|history|audit|message|interrupt|stop|interaction|mode|autonomy)$/,
+      /^\/agent\/local\/sessions\/([^/]+)\/(update|unregister|events|commands|snapshot|history|audit|message|interrupt|stop|interaction|mode|autonomy)$/,
     );
     if (localAgentMatch) {
       const sessionId = decodeURIComponent(localAgentMatch[1]);
@@ -1253,6 +1253,9 @@ async function dispatch(ctx, req, res) {
         });
       }
       try {
+        if (req.method === "GET" && action === "snapshot") {
+          return sendOk(res, ctx.externalAgentRegistry.controlSnapshot(sessionId));
+        }
         if (req.method === "GET" && action === "commands") {
           return sendOk(
             res,
@@ -1398,7 +1401,7 @@ async function dispatch(ctx, req, res) {
             }
           }
           if (profile === "ai_review") {
-            aiReviewPolicy = aiReviewPolicyFromPayload(body);
+            aiReviewPolicy = aiReviewPolicyFromPayload(body, { required: true });
           }
           const command = ctx.externalAgentRegistry.enqueueCommand(sessionId, {
             type: "agent.autonomy.set",

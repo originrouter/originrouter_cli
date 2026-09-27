@@ -175,6 +175,7 @@ export function normalizeAgentActivityEventType(event = {}) {
 
 export function shouldSyncAgentActivitySnapshot(event = {}) {
   return [
+    "agent.autonomy.status",
     "user.text",
     "agent.text",
     "agent.task.complete",

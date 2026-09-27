@@ -2,7 +2,7 @@ import { reportAgentConversationMetadata } from "./bridgeReporter.js";
 
 // Bump the cursor namespace when the projected metadata contract changes so
 // existing conversations are replayed once and receive workspace_display_path.
-const SYNC_META_KEY = "agent_activity_cloud_sync_v3";
+const SYNC_META_KEY = "agent_activity_cloud_sync_v4";
 const PAGE_SIZE = 200;
 
 function safeText(value, maxLength = 4096) {
@@ -67,6 +67,7 @@ export function agentActivityMetadataFromCatalog(conversation = {}) {
     provider: safeText(conversation.provider, 191),
     model: safeText(conversation.model, 191),
     permissionProfile: safeText(conversation.permission_profile, 64),
+    permissionRevision: Number(conversation.permission_revision) || 0,
     artifactCount: Math.max(
       0,
       Number.parseInt(String(conversation.artifact_count || 0), 10) || 0,

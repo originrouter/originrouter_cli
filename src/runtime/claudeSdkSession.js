@@ -1,3 +1,4 @@
+import { createAgentPermissionStateTracker } from "./agentPermissionStateTracker.js";
 import process from "node:process";
 import { randomUUID } from "node:crypto";
 import {
@@ -70,14 +71,13 @@ import {
   resolveAgentDetailProfile,
 } from "./agentDetailProfile.js";
 import { AiApprovalReviewer } from "./aiApprovalReviewer.js";
+import { inheritedPermissionConfiguration, resolveAgentAutonomyConfiguration } from "./agentAutonomyConfiguration.js";
 import {
   aiReviewPolicyFromEnvironment,
-  aiReviewPolicyFromPayload,
 } from "./aiReviewPolicy.js";
 import {
   readApprovalPolicyReference,
   readWorkspaceApprovalPolicySafe,
-  resolveApprovalPolicySelection,
 } from "./approvalPolicyStore.js";
 
 const CLAUDE_MODES = Object.freeze([
@@ -431,6 +431,7 @@ export async function runClaudeSdkSession(rawArgs) {
       "--originrouter-auto-allow requires --originrouter-autonomy custom or no explicit profile",
     );
   }
+  const inheritedPermission = inheritedPermissionConfiguration(process.env, { stateDir });
   let autonomyAllowedScopes = normalizeAutonomyScopes(
     options.autonomyAllowedScopes,
   );
@@ -438,12 +439,19 @@ export async function runClaudeSdkSession(rawArgs) {
     options.autonomyProfile ||
       (autonomyAllowedScopes.length ? "custom" : "manual"),
   );
-  let approvalPolicy = autonomyProfile === "custom" && options.approvalPolicyReference
-    ? readApprovalPolicyReference(options.approvalPolicyReference, { stateDir })
-    : null;
-  let aiReviewPolicy = autonomyProfile === "ai_review"
-    ? aiReviewPolicyFromEnvironment()
-    : null;
+  let approvalPolicy = inheritedPermission
+    ? inheritedPermission.approvalPolicy
+    : autonomyProfile === "custom" && options.approvalPolicyReference
+      ? readApprovalPolicyReference(options.approvalPolicyReference, { stateDir })
+      : null;
+  let aiReviewPolicy = inheritedPermission
+    ? inheritedPermission.aiReviewPolicy
+    : autonomyProfile === "ai_review" ? aiReviewPolicyFromEnvironment() : null;
+  if (inheritedPermission) {
+    autonomyProfile = inheritedPermission.profile;
+    autonomyAllowedScopes = inheritedPermission.allowedScopes;
+  }
+
   let pendingModePayload = null;
   const activitySnapshot = {
     summary: "",
@@ -469,6 +477,7 @@ export async function runClaudeSdkSession(rawArgs) {
         provider: providerResult.provider?.name,
         model,
         permissionProfile: autonomyProfile,
+      permissionRevision: permissionState.revision,
         ...activitySnapshot,
       },
       { stateDir },
@@ -544,12 +553,21 @@ export async function runClaudeSdkSession(rawArgs) {
       availableModes: CLAUDE_MODES,
       requestId,
     });
+  const permissionState = createAgentPermissionStateTracker({
+    stateDir, sessionId, cwd, deviceId: effectiveDeviceId,
+    workspaceId: options.workspaceId, agent: "claude", title: sessionTitle,
+    conversationId: options.conversationId || sessionId,
+  });
   const reportAutonomy = (requestId = null, { accepted = null, reason = null } = {}) =>
     sendAgentEvent(
       buildAutonomyStatusEvent({
         provider: "claude",
         runtime: "claude-sdk",
         profile: autonomyProfile,
+        autonomyRevision: permissionState.capture({
+          profile: autonomyProfile, allowedScopes: autonomyAllowedScopes,
+          approvalPolicy, aiReviewPolicy,
+        }),
         allowedScopes: autonomyAllowedScopes,
         requestId,
         approvalPolicy,
@@ -568,21 +586,13 @@ export async function runClaudeSdkSession(rawArgs) {
       availableDetailProfiles: AGENT_DETAIL_PROFILES,
     });
   const applyAutonomy = async (payload) => {
-    const requested = normalizeAutonomyProfile(payload?.profile, "");
-    if (!requested) return false;
     try {
-      const nextPolicy = requested === "custom"
-        ? resolveApprovalPolicySelection(payload, { stateDir, current: approvalPolicy })
-        : null;
-      const nextAiReviewPolicy = requested === "ai_review"
-        ? aiReviewPolicyFromPayload(payload)
-        : null;
-      autonomyProfile = requested;
-      approvalPolicy = nextPolicy;
-      aiReviewPolicy = nextAiReviewPolicy;
-      autonomyAllowedScopes = requested === "custom" && !approvalPolicy
-        ? normalizeAutonomyScopes(payload?.allowedScopes || payload?.allowed_scopes)
-        : [];
+      const next = resolveAgentAutonomyConfiguration(payload, { stateDir, currentPolicy: approvalPolicy });
+      permissionState.capture(next, { changed: true });
+      autonomyProfile = next.profile;
+      approvalPolicy = next.approvalPolicy;
+      aiReviewPolicy = next.aiReviewPolicy;
+      autonomyAllowedScopes = next.allowedScopes;
       await reportAutonomy(payload?.requestId || null, { accepted: true });
       return true;
     } catch (error) {
@@ -620,14 +630,17 @@ export async function runClaudeSdkSession(rawArgs) {
     interactions.markResult(resolved.interactionId, "applied", {
       responseId: resolved.responseId,
     });
-  const requestInteraction = (request, signal) =>
-    resolveWithAutonomy({
+  const requestInteraction = (request, signal) => {
+    const reviewPolicyAtRequest = aiReviewPolicy;
+    const profileAtRequest = autonomyProfile;
+    return resolveWithAutonomy({
       request,
       profile: autonomyProfile,
       allowedScopes: autonomyAllowedScopes,
       workspaceRoot: cwd,
       aiReviewer: aiApprovalReviewer,
       aiReviewPolicy,
+      isCurrent: () => profileAtRequest === autonomyProfile && reviewPolicyAtRequest === aiReviewPolicy,
       runtime: "claude-sdk",
       approvalPolicy,
       workspaceApprovalPolicy,
@@ -656,6 +669,7 @@ export async function runClaudeSdkSession(rawArgs) {
           decision: resolved.action,
         }),
     });
+  };
 
   const stopSession = async (signal = null, { exitProcess = false } = {}) => {
     if (stopped) return;

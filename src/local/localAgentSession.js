@@ -1,3 +1,4 @@
+import { createAgentPermissionStateTracker } from "../runtime/agentPermissionStateTracker.js";
 import process from "node:process";
 import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
@@ -55,14 +56,13 @@ import {
   resolveWithAutonomy,
 } from "../runtime/agentAutonomyPolicy.js";
 import { AiApprovalReviewer } from "../runtime/aiApprovalReviewer.js";
+import { inheritedPermissionConfiguration, resolveAgentAutonomyConfiguration } from "../runtime/agentAutonomyConfiguration.js";
 import {
   aiReviewPolicyFromEnvironment,
-  aiReviewPolicyFromPayload,
 } from "../runtime/aiReviewPolicy.js";
 import {
   readApprovalPolicyReference,
   readWorkspaceApprovalPolicySafe,
-  resolveApprovalPolicySelection,
 } from "../runtime/approvalPolicyStore.js";
 import { protectOriginrouterCodingEnv } from "../runtime/originrouterCodingAuthProxy.js";
 import {
@@ -246,6 +246,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
       "--originrouter-auto-allow requires --originrouter-autonomy custom or no explicit profile",
     );
   }
+  const inheritedPermission = inheritedPermissionConfiguration(process.env, { stateDir });
   let autonomyAllowedScopes = autonomySupported
     ? normalizeAutonomyScopes(options.autonomyAllowedScopes)
     : [];
@@ -255,12 +256,19 @@ export async function runLocalAgentSession(agent, rawArgs) {
           (autonomyAllowedScopes.length ? "custom" : "manual"),
       )
     : "manual";
-  let approvalPolicy = autonomySupported && autonomyProfile === "custom" && options.approvalPolicyReference
-    ? readApprovalPolicyReference(options.approvalPolicyReference, { stateDir })
-    : null;
-  let aiReviewPolicy = autonomySupported && autonomyProfile === "ai_review"
-    ? aiReviewPolicyFromEnvironment()
-    : null;
+  let approvalPolicy = inheritedPermission
+    ? inheritedPermission.approvalPolicy
+    : autonomySupported && autonomyProfile === "custom" && options.approvalPolicyReference
+      ? readApprovalPolicyReference(options.approvalPolicyReference, { stateDir })
+      : null;
+  let aiReviewPolicy = inheritedPermission
+    ? inheritedPermission.aiReviewPolicy
+    : autonomySupported && autonomyProfile === "ai_review" ? aiReviewPolicyFromEnvironment() : null;
+  if (inheritedPermission) {
+    autonomyProfile = inheritedPermission.profile;
+    autonomyAllowedScopes = inheritedPermission.allowedScopes;
+  }
+
   if (
     !autonomySupported &&
     (options.autonomyProfile || (options.autonomyAllowedScopes || []).length)
@@ -393,11 +401,19 @@ export async function runLocalAgentSession(agent, rawArgs) {
       ]);
     },
   });
+  const permissionState = createAgentPermissionStateTracker({
+    stateDir, sessionId, cwd, deviceId: effectiveDeviceId,
+    workspaceId: options.workspaceId, agent, title: `${agent} session`, conversationId,
+  });
   const autonomyStatus = (requestId = null, { accepted = null, reason = null } = {}) =>
     buildAutonomyStatusEvent({
       provider: agent,
       runtime: agent === "claude" ? "claude-pty" : "codex-pty",
       profile: autonomyProfile,
+      autonomyRevision: permissionState.capture({
+        profile: autonomyProfile, allowedScopes: autonomyAllowedScopes,
+        approvalPolicy, aiReviewPolicy,
+      }, { conversationId }),
       allowedScopes: autonomyAllowedScopes,
       approvalPolicy,
       aiReviewPolicy,
@@ -421,21 +437,13 @@ export async function runLocalAgentSession(agent, rawArgs) {
       await sendTransientEvent(autonomyStatus(payload?.requestId || null));
       return false;
     }
-    const requested = normalizeAutonomyProfile(payload?.profile, "");
-    if (!requested) return false;
     try {
-      const nextPolicy = requested === "custom"
-        ? resolveApprovalPolicySelection(payload, { stateDir, current: approvalPolicy })
-        : null;
-      const nextAiReviewPolicy = requested === "ai_review"
-        ? aiReviewPolicyFromPayload(payload)
-        : null;
-      autonomyProfile = requested;
-      approvalPolicy = nextPolicy;
-      aiReviewPolicy = nextAiReviewPolicy;
-      autonomyAllowedScopes = requested === "custom" && !approvalPolicy
-        ? normalizeAutonomyScopes(payload?.allowedScopes || payload?.allowed_scopes)
-        : [];
+      const next = resolveAgentAutonomyConfiguration(payload, { stateDir, currentPolicy: approvalPolicy });
+      permissionState.capture(next, { changed: true, conversationId });
+      autonomyProfile = next.profile;
+      approvalPolicy = next.approvalPolicy;
+      aiReviewPolicy = next.aiReviewPolicy;
+      autonomyAllowedScopes = next.allowedScopes;
       await sendTransientEvent(autonomyStatus(payload?.requestId || null, { accepted: true }));
       return true;
     } catch (error) {
@@ -451,6 +459,8 @@ export async function runLocalAgentSession(agent, rawArgs) {
     const request = normalizePtyInteraction(event, sessionId);
     if (registeredInteractions.has(request.interactionId)) return;
     registeredInteractions.add(request.interactionId);
+    const reviewPolicyAtRequest = aiReviewPolicy;
+    const profileAtRequest = autonomyProfile;
     const resolve = autonomySupported
       ? resolveWithAutonomy({
           request,
@@ -462,6 +472,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
           stateDir,
           aiReviewer: aiApprovalReviewer,
           aiReviewPolicy,
+          isCurrent: () => profileAtRequest === autonomyProfile && reviewPolicyAtRequest === aiReviewPolicy,
           runtime: "claude-pty",
           requestInteraction: (item) => interactions.request(item),
           onPolicyObserved: ({ request: item, evaluation }) =>
@@ -569,6 +580,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
           }
         }
         await sendTransientEvent(displayEvent);
+        if (event.type === "agent.session.start") {
+          await sendTransientEvent(autonomyStatus());
+        }
       }
     });
     structuredScanTail = pending.catch(() => {});
@@ -716,6 +730,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
       provider: resolvedProvider?.name,
       model: resolvedProvider?.model,
       permissionProfile: autonomyProfile,
+      permissionRevision: permissionState.revision,
       createdAt: sessionStartedAt,
       lastActivityAt: activityLastAt,
       ...activitySnapshot,
@@ -839,6 +854,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     provider: resolvedProvider?.name,
     model: resolvedProvider?.model,
     permissionProfile: autonomyProfile,
+    permissionRevision: permissionState.revision,
     startedBy: "local-wrapper",
     mode: initialModeStatus.mode,
     modeControl: initialModeStatus.modeControl,

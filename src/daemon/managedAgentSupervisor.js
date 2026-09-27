@@ -1,3 +1,4 @@
+import { resolvePersistedPermissionConfiguration } from "../runtime/agentAutonomyConfiguration.js";
 import { spawn } from "node:child_process";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -72,10 +73,28 @@ export class ManagedAgentSupervisor {
       payload.initialMessage || payload.initial_message,
       8192,
     );
-    const permissionProfile = safeText(
+    let permissionProfile = safeText(
       payload.permissionProfile || payload.permission_profile || "manual",
       32,
     ).toLowerCase();
+    const savedConversationId = safeText(payload.resumeConversationId || payload.resume_conversation_id, 96);
+    const inheritPermission = savedConversationId &&
+      (payload.inheritPermission === true || payload.inherit_permission === true ||
+       (!payload.permissionProfile && !payload.permission_profile));
+    const savedPermission = inheritPermission
+      ? this.catalog?.getConversationPermissionState(savedConversationId) : null;
+    if (savedPermission) {
+      permissionProfile = savedPermission.profile;
+      payload = { ...payload, allowedScopes: savedPermission.allowedScopes || [],
+        policyBundle: savedPermission.policyBundle, aiReviewPolicy: savedPermission.aiReviewPolicy,
+        policyId: savedPermission.policyBundle?.id || "", policyRevision: savedPermission.policyBundle?.revision || "" };
+    } else if (inheritPermission) {
+      const previous = this.catalog?.getConversation(savedConversationId)?.permission_profile;
+      if (["manual", "guarded", "unrestricted"].includes(previous)) permissionProfile = previous;
+      else if (previous === "custom" || previous === "ai_review") {
+        throw launchError("RESUME_PERMISSION_STATE_UNAVAILABLE", "This older session has no saved permission configuration. Select a policy explicitly before resuming.");
+      }
+    }
     let approvalPolicy = null;
     let aiReviewPolicy = null;
     const resumeConversationId = safeText(
@@ -110,7 +129,9 @@ export class ManagedAgentSupervisor {
       try {
         const bundle = payload.policyBundle || payload.policy_bundle;
         const policyId = safeText(payload.policyId || payload.policy_id, 64);
-        approvalPolicy = bundle
+        approvalPolicy = savedPermission?.policyBundle
+          ? resolvePersistedPermissionConfiguration(savedPermission).approvalPolicy
+          : bundle
           ? deployApprovalPolicyBundle(bundle, { stateDir: ensureStateDir() })
           : policyId
             ? readApprovalPolicy(policyId, { stateDir: ensureStateDir() })
@@ -134,7 +155,7 @@ export class ManagedAgentSupervisor {
       }
     }
     if (permissionProfile === "ai_review") {
-      aiReviewPolicy = aiReviewPolicyFromPayload(payload);
+      aiReviewPolicy = aiReviewPolicyFromPayload(payload, { required: true });
     }
     if (!workspaceReference) {
       throw launchError("WORKSPACE_REQUIRED", "A trusted workspace is required.");
@@ -303,6 +324,7 @@ export class ManagedAgentSupervisor {
       env: {
         ...process.env,
         ORIGINROUTER_MANAGED_AGENT: "1",
+        ORIGINROUTER_PERMISSION_CONVERSATION_ID: savedPermission ? savedConversationId : "",
         ...(aiReviewPolicy
           ? {
               ORIGINROUTER_AI_REVIEW_POLICY_B64:

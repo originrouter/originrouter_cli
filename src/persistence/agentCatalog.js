@@ -86,6 +86,7 @@ export class AgentCatalog {
         last_activity_at TEXT NOT NULL,
         archived_at TEXT,
         restored_at TEXT,
+        permission_state_json TEXT,
         FOREIGN KEY(workspace_id) REFERENCES agent_workspaces(workspace_id)
       ) STRICT;
 
@@ -153,6 +154,9 @@ export class AgentCatalog {
     }
     if (!conversationColumns.has("title_is_custom")) {
       this.db.exec("ALTER TABLE agent_conversations ADD COLUMN title_is_custom INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!conversationColumns.has("permission_state_json")) {
+      this.db.exec("ALTER TABLE agent_conversations ADD COLUMN permission_state_json TEXT");
     }
     const workspaceColumns = new Set(
       this.db.prepare("PRAGMA table_info(agent_workspaces)").all()
@@ -480,6 +484,37 @@ export class AgentCatalog {
         SELECT conversation_id FROM agent_runs WHERE originrouter_session_id = ?
       )
     `).run(endedAt, id);
+  }
+
+  ensureSessionForPermissionState(metadata) {
+    const existing = this.db.prepare("SELECT conversation_id FROM agent_runs WHERE originrouter_session_id = ?")
+      .get(safeText(metadata.sessionId, 64));
+    if (!existing) this.upsertSession(metadata);
+    else if (metadata.conversationId && existing.conversation_id !== metadata.conversationId) {
+      this.updateSession(metadata.sessionId, { conversationId: metadata.conversationId });
+    }
+  }
+
+  getConversationPermissionState(conversationId) {
+    const row = this.db.prepare("SELECT permission_state_json FROM agent_conversations WHERE conversation_id = ?")
+      .get(safeText(conversationId, 96));
+    return row?.permission_state_json ? JSON.parse(row.permission_state_json) : null;
+  }
+
+  saveConversationPermissionState(sessionId, state) {
+    if (!state?.profile || !Number.isSafeInteger(state.revision) || state.revision <= 0) return false;
+    return this.db.transaction(() => {
+      const run = this.db.prepare("SELECT conversation_id FROM agent_runs WHERE originrouter_session_id = ?")
+        .get(safeText(sessionId, 64));
+      if (!run) return false;
+      const current = this.getConversationPermissionState(run.conversation_id);
+      if (current && current.revision >= state.revision) return false;
+      this.db.prepare("UPDATE agent_conversations SET permission_state_json = ? WHERE conversation_id = ?")
+        .run(JSON.stringify(state), run.conversation_id);
+      this.db.prepare("UPDATE agent_runs SET permission_profile = ? WHERE originrouter_session_id = ?")
+        .run(state.profile, sessionId);
+      return true;
+    })();
   }
 
   recordEvent(sessionId, event = {}) {

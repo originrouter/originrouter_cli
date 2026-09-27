@@ -59,7 +59,7 @@ export function normalizeAiReviewPolicySnapshot(value, { required = false } = {}
   const templateId = String(value.template_id || "").trim();
   const name = String(value.name || "").trim();
   const instructions = String(value.instructions || "").trim();
-  const version = Number(value.version);
+  const version = value.version;
   const contentHash = String(value.content_hash || "").trim().toLowerCase();
   const rawScopes = Array.isArray(value.allowed_scopes) ? value.allowed_scopes : null;
   const allowedScopes = (rawScopes || [])
@@ -72,9 +72,9 @@ export function normalizeAiReviewPolicySnapshot(value, { required = false } = {}
     || !Number.isSafeInteger(version)
     || version < 0
     || !name
-    || name.length > 128
+    || Array.from(name).length > 128
     || !instructions
-    || instructions.length > 8000
+    || Array.from(instructions).length > 8000
     || rawScopes == null
     || allowedScopes.length !== rawScopes.length
     || new Set(rawScopes).size !== rawScopes.length
@@ -82,7 +82,7 @@ export function normalizeAiReviewPolicySnapshot(value, { required = false } = {}
     || typeof applicability !== "object"
     || Array.isArray(applicability)
     || Object.keys(applicability).some((key) => !["device_id", "workspace_reference"].includes(key))
-    || Object.values(applicability).some((item) => typeof item !== "string" || !item.trim() || item.length > 4096)
+    || Object.values(applicability).some((item) => typeof item !== "string" || !item.trim() || Array.from(item).length > 4096)
     || !CONTENT_HASH.test(contentHash)
   ) {
     throw invalid();

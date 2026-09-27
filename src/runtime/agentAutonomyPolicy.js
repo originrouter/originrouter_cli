@@ -348,6 +348,7 @@ export function buildAutonomyStatusEvent({
   control = "supported",
   allowedScopes = [],
   requestId = null,
+  autonomyRevision = null,
   reason = null,
   approvalPolicy = null,
   aiReviewPolicy = null,
@@ -359,6 +360,7 @@ export function buildAutonomyStatusEvent({
     provider: provider || null,
     runtime: runtime || null,
     autonomyProfile: normalizedProfile,
+    ...(autonomyRevision !== null ? { autonomyRevision } : {}),
     autonomyControl: control === "supported" ? "supported" : "unsupported",
     availableAutonomyProfiles: control === "supported" ? AGENT_AUTONOMY_PROFILES : [],
     allowedAutonomyScopes: control === "supported"
@@ -546,6 +548,7 @@ export async function resolveWithAutonomy({
   aiReviewer,
   aiReviewPolicy = null,
   runtime,
+  isCurrent = () => true,
   approvalPolicy = null,
   workspaceApprovalPolicy = null,
   stateDir = "",
@@ -645,6 +648,9 @@ export async function resolveWithAutonomy({
     const scopeAllowed = Boolean(
       classification.scope && policyScopes.has(classification.scope),
     );
+    // Outside the user's selected review scope there is no AI authority,
+    // including denial. Do not send those requests to the model at all.
+    if (aiReviewPolicy && !scopeAllowed) return requestInteraction(request);
     let review;
     try {
       review = await aiReviewer.review({
@@ -657,13 +663,20 @@ export async function resolveWithAutonomy({
     } catch {
       return requestInteraction(request);
     }
-    if (!review || !["allow", "deny", "escalate"].includes(review.decision)) {
+    if (!isCurrent() || !review || !["allow", "deny", "escalate"].includes(review.decision)) {
       return requestInteraction(request);
     }
     const highRisk = AGENT_AUTONOMY_SCOPES.find((item) => item.id === classification.scope)?.risk === "high";
     if (
       review.decision === "escalate"
-      || (review.decision === "allow" && (!scopeAllowed || highRisk || review.risk === "high"))
+      || (review.decision === "allow" && (
+        !scopeAllowed || highRisk || !["low", "medium"].includes(review.risk)
+        || !Number.isFinite(review.confidence) || review.confidence < 0.70 || review.confidence > 1
+        || (review.conditions != null && !Array.isArray(review.conditions))
+        || (Array.isArray(review.conditions) && review.conditions.length > 0)
+        || (review.user_confirmation_required != null && typeof review.user_confirmation_required !== "boolean")
+        || review.user_confirmation_required === true
+      ))
     ) {
       return requestInteraction(request);
     }

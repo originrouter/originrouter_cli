@@ -78,7 +78,14 @@ function turnStateForEvent(event, fallback = "unknown") {
     "interaction_canceled",
     "interaction_failed",
     "agent.interaction.result",
-  ].includes(type)) return "running";
+  ].includes(type)) {
+    if (type === "agent.interaction.result" &&
+        !["applied", "expired", "canceled", "failed", "not_found"].includes(event?.status)) {
+      return fallback;
+    }
+    // A delayed permission timeout/result must not restart a completed turn.
+    return fallback === "idle" ? "idle" : "running";
+  }
   return fallback;
 }
 
@@ -106,6 +113,15 @@ function approvalPolicySummary(value) {
     revision,
     source: safeText(value.source, 32) || "device",
   };
+}
+
+function aiReviewPolicySummary(value) {
+  if (!value || typeof value !== "object") return null;
+  const templateId = safeText(value.templateId, 84);
+  const contentHash = safeText(value.contentHash, 64);
+  const version = Number(value.version);
+  if (!templateId || !/^[a-f0-9]{64}$/.test(contentHash) || !Number.isSafeInteger(version) || version < 0) return null;
+  return { templateId, contentHash, version, name: safeText(value.name, 128) || templateId };
 }
 
 function approvalPolicyCapabilitiesSummary(value) {
@@ -205,10 +221,15 @@ export class ExternalAgentRegistry {
       eventSequence: conversationChanged ? 0 : existing?.eventSequence || 0,
       commands: existing?.commands || [],
       commandSequence: existing?.commandSequence || 0,
+      commandStreamId: existing?.commandStreamId || `local_commands_${randomUUID()}`,
       pendingInteractions:
         conversationChanged
           ? new Set()
           : existing?.pendingInteractions || new Set(),
+      pendingInteractionRequests:
+        conversationChanged
+          ? new Map()
+          : existing?.pendingInteractionRequests || new Map(),
       pendingInteractionKinds:
         conversationChanged
           ? new Map()
@@ -221,8 +242,9 @@ export class ExternalAgentRegistry {
       availableModes: Array.isArray(payload?.availableModes)
         ? payload.availableModes.slice(0, 16)
         : existing?.availableModes || [],
+      autonomyRevision: existing?.autonomyRevision || 0,
       autonomyProfile:
-        safeText(payload?.autonomyProfile, 32) ||
+        existing?.autonomyStatus?.autonomyProfile || safeText(payload?.autonomyProfile, 32) ||
         existing?.autonomyProfile ||
         "manual",
       autonomyControl:
@@ -241,9 +263,14 @@ export class ExternalAgentRegistry {
         ? payload.availableAutonomyScopes.slice(0, 32)
         : existing?.availableAutonomyScopes || [],
       approvalPolicy:
-        approvalPolicySummary(payload?.approvalPolicy) ||
-        existing?.approvalPolicy ||
-        null,
+        Object.hasOwn(payload, "approvalPolicy")
+          ? approvalPolicySummary(payload.approvalPolicy)
+          : existing?.approvalPolicy || null,
+      aiReviewPolicy: Object.hasOwn(payload || {}, "aiReviewPolicy")
+        ? aiReviewPolicySummary(payload.aiReviewPolicy)
+        : existing?.aiReviewPolicy || null,
+      autonomyStatus: existing?.autonomyStatus || null,
+      controlResults: existing?.controlResults || new Map(),
       approvalPolicyCapabilities:
         approvalPolicyCapabilitiesSummary(payload?.approvalPolicyCapabilities) ||
         existing?.approvalPolicyCapabilities ||
@@ -281,6 +308,7 @@ export class ExternalAgentRegistry {
       session.eventIds = new Set();
       session.eventSequence = 0;
       session.pendingInteractions = new Set();
+      session.pendingInteractionRequests = new Map();
       session.pendingInteractionKinds = new Map();
       session.currentStep = "Running locally";
       session.turnState = "idle";
@@ -351,6 +379,7 @@ export class ExternalAgentRegistry {
       "interaction_requested",
     ].includes(event?.type) && interactionId) {
       session.pendingInteractions.add(interactionId);
+      session.pendingInteractionRequests.set(interactionId, storedEvent);
       session.pendingInteractionKinds.set(
         interactionId,
         safeText(event?.kind, 32) || "input",
@@ -368,6 +397,7 @@ export class ExternalAgentRegistry {
       ].includes(event?.type)
     ) {
       session.pendingInteractions.delete(interactionId);
+      session.pendingInteractionRequests.delete(interactionId);
       session.pendingInteractionKinds.delete(interactionId);
     }
     if (
@@ -378,6 +408,7 @@ export class ExternalAgentRegistry {
       )
     ) {
       session.pendingInteractions.delete(interactionId);
+      session.pendingInteractionRequests.delete(interactionId);
       session.pendingInteractionKinds.delete(interactionId);
     }
     if (event?.type === "agent.mode.status") {
@@ -388,7 +419,9 @@ export class ExternalAgentRegistry {
         ? event.availableModes.slice(0, 16)
         : session.availableModes;
     }
-    if (event?.type === "agent.autonomy.status") {
+    if (event?.type === "agent.autonomy.status" &&
+        (Number(event.autonomyRevision || 0) >= Number(session.autonomyRevision || 0))) {
+      session.autonomyRevision = Number(event.autonomyRevision || 0);
       session.autonomyProfile =
         safeText(event?.autonomyProfile, 32) || session.autonomyProfile;
       session.autonomyControl =
@@ -409,6 +442,14 @@ export class ExternalAgentRegistry {
         ? event.availableAutonomyScopes.slice(0, 32)
         : session.availableAutonomyScopes;
       session.approvalPolicy = approvalPolicySummary(event?.approvalPolicy);
+      session.aiReviewPolicy = aiReviewPolicySummary(event?.aiReviewPolicy);
+      session.autonomyStatus = event;
+      if (event.requestId) {
+        session.controlResults.set(event.requestId, event);
+        while (session.controlResults.size > 32) {
+          session.controlResults.delete(session.controlResults.keys().next().value);
+        }
+      }
       session.approvalPolicyCapabilities =
         approvalPolicyCapabilitiesSummary(event?.approvalPolicyCapabilities) ||
         session.approvalPolicyCapabilities;
@@ -420,7 +461,11 @@ export class ExternalAgentRegistry {
         safeText(event?.detailSource, 32) || session.detailSource;
     }
     session.turnState = turnStateForEvent(event, session.turnState || "idle");
-    session.currentStep = this.stepForEvent(event, session.currentStep);
+    session.currentStep = session.turnState === "idle" &&
+      (String(event?.type || "").startsWith("agent.interaction.") ||
+        event?.type === "agent.permission.resolved")
+      ? session.currentStep
+      : this.stepForEvent(event, session.currentStep);
     try {
       this.catalog?.recordEvent(sessionId, event);
     } catch {}
@@ -487,7 +532,7 @@ export class ExternalAgentRegistry {
     const commands = session.commands.filter(
       (item) => Number(item.commandSequence || 0) > Number(after || 0),
     );
-    return { commands, cursor: session.commandSequence };
+    return { commands, cursor: session.commandSequence, streamId: session.commandStreamId };
   }
 
   history(sessionId, options) {
@@ -523,14 +568,9 @@ export class ExternalAgentRegistry {
 
   controlSnapshot(sessionId) {
     const session = this.require(sessionId);
-    const interactions = session.events.filter((event) => {
-      const interactionId = String(event?.interactionId || event?.callId || "");
-      return (
-        event?.type === "agent.interaction.requested" &&
-        interactionId &&
-        session.pendingInteractions.has(interactionId)
-      );
-    });
+    // Pending requests must outlive the bounded telemetry/event tail. An
+    // App returning from Settings may subscribe after hundreds of events.
+    const interactions = [...session.pendingInteractionRequests.values()];
     return {
       interactions,
       events: session.events.slice(-100),
@@ -541,10 +581,8 @@ export class ExternalAgentRegistry {
       mode: session.mode,
       autonomyProfile: session.autonomyProfile,
       autonomy:
-        session.events
-          .slice()
-          .reverse()
-          .find((event) => event?.type === "agent.autonomy.status") || null,
+        session.autonomyStatus,
+      controlResults: [...session.controlResults.values()],
     };
   }
 
@@ -613,11 +651,13 @@ export class ExternalAgentRegistry {
       mode_control: session.modeControl,
       available_modes: session.availableModes,
       autonomy_profile: session.autonomyProfile,
+      autonomy_revision: session.autonomyRevision,
       autonomy_control: session.autonomyControl,
       available_autonomy_profiles: session.availableAutonomyProfiles,
       allowed_autonomy_scopes: session.allowedAutonomyScopes,
       available_autonomy_scopes: session.availableAutonomyScopes,
       approval_policy: session.approvalPolicy,
+      ai_review_policy: session.aiReviewPolicy,
       approval_policy_capabilities: session.approvalPolicyCapabilities,
       detail_profile: session.detailProfile,
       detail_source: session.detailSource,

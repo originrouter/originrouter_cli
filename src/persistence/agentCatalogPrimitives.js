@@ -1,9 +1,10 @@
+import { publicPermissionState } from "../runtime/agentPermissionState.js";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
 
@@ -160,6 +161,7 @@ function collectArtifactPaths(value, key = "", result = []) {
 
 function publicConversation(row) {
   if (!row) return null;
+  const permissionState = row.permission_state_json ? JSON.parse(row.permission_state_json) : null;
   return {
     conversation_id: row.conversation_id,
     agent_type: row.agent_type,
@@ -179,7 +181,9 @@ function publicConversation(row) {
     runtime: row.runtime || "",
     provider: row.provider || "",
     model: row.model || "",
-    permission_profile: row.permission_profile || "",
+    permission_profile: permissionState?.profile || row.permission_profile || "",
+    permission_revision: Number(permissionState?.revision) || 0,
+    permission_state: publicPermissionState(permissionState),
     status: row.status || "stopped",
     started_at: row.started_at || null,
     exited_at: row.exited_at || null,

@@ -1,3 +1,4 @@
+import { publicAutonomyStatus } from "../runtime/agentPermissionState.js";
 import { randomUUID } from "node:crypto";
 
 import { readCodingAuth } from "../persistence/codingAuth.js";
@@ -99,6 +100,9 @@ export function buildRuntimeEventEnvelope({
     mode: safeText(projected.mode, 32),
     mode_control: safeText(projected.modeControl, 16),
     available_modes: projected.availableModes || [],
+    ...(publicAutonomyStatus(event) ? {
+      autonomy_status: publicAutonomyStatus(event),
+    } : {}),
     sequence: Math.max(0, Number.parseInt(String(sequence || 0), 10) || 0),
     client_event_id: safeText(clientEventId, 96),
   };
@@ -419,6 +423,7 @@ export function buildAgentConversationMetadata(payload = {}) {
       payload.permissionProfile || payload.permission_profile,
       64,
     ),
+    permission_revision: Number(payload.permissionRevision || payload.permission_revision) || 0,
     artifact_count: Math.max(0, Number.parseInt(String(payload.artifactCount || 0), 10) || 0),
     ...(createdAt ? { created_at: createdAt } : {}),
     ...(lastActivityAt ? { last_activity_at: lastActivityAt } : {}),

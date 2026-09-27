@@ -217,8 +217,14 @@ export function resolveApprovalPolicySelection(payload = {}, {
   current = null,
 } = {}) {
   const bundle = payload.policyBundle || payload.policy_bundle;
-  let selected = bundle ? deployApprovalPolicyBundle(bundle, { stateDir }) : null;
   const policyId = String(payload.policyId || payload.policy_id || "").trim();
+  const bundledPolicy = bundle?.content || bundle?.policy || bundle;
+  if (bundle && policyId && bundledPolicy?.id !== policyId) {
+    const error = new Error("selected approval policy id does not match its bundle");
+    error.code = "APPROVAL_POLICY_ID_MISMATCH";
+    throw error;
+  }
+  let selected = bundle ? deployApprovalPolicyBundle(bundle, { stateDir }) : null;
   if (!selected && policyId) selected = readApprovalPolicy(policyId, { stateDir });
   if (!selected && payload.policyReference) {
     selected = readApprovalPolicyReference(payload.policyReference, { stateDir });

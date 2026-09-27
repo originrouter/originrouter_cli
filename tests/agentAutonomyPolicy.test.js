@@ -19,6 +19,19 @@ const permission = (payload, extra = {}) => ({
   ...extra,
 });
 
+test("requests outside the selected AI scopes stay manual without contacting the reviewer", async () => {
+  let modelCalls = 0;
+  const resolved = await resolveWithAutonomy({
+    request: permission({ tool: "Bash", command: "git status", cwd: "/tmp/project" }),
+    profile: "ai_review", workspaceRoot: "/tmp/project",
+    aiReviewPolicy: { allowed_scopes: ["read_tools"] },
+    aiReviewer: { review: async () => { modelCalls++; return { decision: "deny" }; } },
+    requestInteraction: async () => ({ action: "allow", user: true }),
+  });
+  assert.equal(resolved.user, true);
+  assert.equal(modelCalls, 0);
+});
+
 test("guarded autonomy allows routine workspace work", () => {
   const command = evaluateAutonomyInteraction(
     permission({ tool: "command", command: "git status", cwd: "/tmp/project" }),
@@ -255,7 +268,7 @@ test("AI review template scopes can narrow an allow decision", async () => {
     },
     requestInteraction: async () => ({ action: "deny", user: true }),
   });
-  assert.equal(reviewedPolicy.template_id, "ait_read_only");
+  assert.equal(reviewedPolicy, undefined);
   assert.equal(result.user, true);
 });
 
@@ -334,6 +347,39 @@ test("AI review escalates uncertain, invalid, secret, and reviewer-high-risk req
   assert.equal(secret.user, true);
   assert.equal(reviewerCalls, 1, "secret requests never leave the device for AI review");
   assert.equal(userRequests, 4);
+});
+
+test("AI allow requires a complete unconditional confident receipt", async () => {
+  for (const overrides of [
+    { confidence: .69 }, { confidence: NaN }, { confidence: 2 },
+    { confidence: undefined }, { risk: "unknown" },
+    { conditions: ["Only after backup"] }, { user_confirmation_required: true },
+    { conditions: "Only after backup" }, { user_confirmation_required: "false" },
+  ]) {
+    const result = await resolveWithAutonomy({
+      profile: "ai_review", workspaceRoot: "/tmp/project",
+      request: permission({ tool: "command", command: "git status", cwd: "/tmp/project" }),
+      requestInteraction: async () => ({ user: true, action: "deny" }),
+      aiReviewer: { review: async () => ({ decision: "allow", risk: "low", confidence: .95, ...overrides }) },
+    });
+    assert.equal(result.user, true, JSON.stringify(overrides));
+  }
+});
+
+test("changing modes while an AI review is in flight invalidates its authority", async () => {
+  let release;
+  let current = true;
+  const review = new Promise((resolve) => { release = resolve; });
+  const result = resolveWithAutonomy({
+    profile: "ai_review", workspaceRoot: "/tmp/project",
+    request: permission({ tool: "command", command: "git status", cwd: "/tmp/project" }),
+    requestInteraction: async () => ({ user: true, action: "deny" }),
+    aiReviewer: { review: () => review },
+    isCurrent: () => current,
+  });
+  current = false;
+  release({ decision: "allow", risk: "low", confidence: .99 });
+  assert.equal((await result).user, true);
 });
 
 test("custom autonomy allows only explicitly selected scopes", () => {

@@ -92,6 +92,18 @@ assert.equal(registry.list()[0].autonomy_control, "supported");
 assert.deepEqual(registry.list()[0].allowed_autonomy_scopes, ["workspace_edits"]);
 assert.equal(registry.list()[0].available_autonomy_scopes.length, 2);
 assert.deepEqual(registry.list()[0].approval_policy_capabilities.versions, [1, 2]);
+const aiStatus = {
+  type: "agent.autonomy.status", autonomyProfile: "ai_review", accepted: true,
+  requestId: "apply-ai-1",
+  aiReviewPolicy: { templateId: "ait_daily_tests", name: "Daily tests", version: 2, contentHash: "b".repeat(64) },
+};
+registry.appendEvent("claude-local-1", aiStatus);
+assert.deepEqual(registry.list()[0].ai_review_policy, aiStatus.aiReviewPolicy);
+for (let i = 0; i < 510; i++) registry.appendEvent("claude-local-1", { type: "agent.activity", summary: `activity ${i}` });
+assert.equal(registry.controlSnapshot("claude-local-1").autonomy.requestId, "apply-ai-1");
+assert.equal(registry.controlSnapshot("claude-local-1").controlResults[0].requestId, "apply-ai-1");
+registry.appendEvent("claude-local-1", { type: "agent.autonomy.status", autonomyProfile: "manual", aiReviewPolicy: null, approvalPolicy: null });
+assert.equal(registry.list()[0].ai_review_policy, null);
 registry.appendEvent("claude-local-1", {
   type: "agent.interaction.result",
   interactionId: "interaction-1",
@@ -118,6 +130,38 @@ registry.appendEvent("claude-local-1", {
   type: "agent.task.complete",
 });
 assert.equal(registry.list()[0].current_step, "Ready");
+registry.appendEvent("claude-local-1", {
+  type: "agent.interaction.result", interactionId: "permission-1", status: "expired",
+});
+assert.equal(registry.list()[0].turn_state, "idle");
+assert.equal(registry.list()[0].current_step, "Ready");
+registry.appendEvent("claude-local-1", {
+  type: "agent.permission.resolved", callId: "permission-1", reason: "timeout",
+});
+assert.equal(registry.list()[0].turn_state, "idle");
+
+const commandStream = registry.commandsAfter("claude-local-1").streamId;
+assert.ok(commandStream);
+registry.register({ sessionId: "claude-local-1", agent: "claude" });
+assert.equal(registry.commandsAfter("claude-local-1").streamId, commandStream);
+const restartedRegistry = new ExternalAgentRegistry();
+restartedRegistry.register({ sessionId: "claude-local-1", agent: "claude" });
+assert.notEqual(restartedRegistry.commandsAfter("claude-local-1").streamId, commandStream);
+{
+  const lateSubscriber = new ExternalAgentRegistry();
+  lateSubscriber.register({ sessionId: "late-subscriber", agent: "claude" });
+  lateSubscriber.appendEvent("late-subscriber", {
+    type: "agent.interaction.requested", interactionId: "long-lived-permission", kind: "permission",
+  });
+  for (let n = 0; n < 550; n++) lateSubscriber.appendEvent("late-subscriber", {
+    type: "agent.activity", summary: `background-${n}`,
+  });
+  assert.equal(lateSubscriber.controlSnapshot("late-subscriber").interactions.length, 1);
+  lateSubscriber.appendEvent("late-subscriber", {
+    type: "agent.interaction.result", interactionId: "long-lived-permission", status: "canceled",
+  });
+  assert.equal(lateSubscriber.controlSnapshot("late-subscriber").interactions.length, 0);
+}
 
 registry.register({
   sessionId: "collab-worker-1",

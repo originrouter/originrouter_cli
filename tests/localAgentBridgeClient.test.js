@@ -2,6 +2,63 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { LocalAgentBridgeClient } from "../src/local/localAgentBridgeClient.js";
+import { ExternalAgentRegistry } from "../src/local/externalAgentRegistry.js";
+
+test("reconnect rehydrates the installed autonomy snapshot even after the event tail is gone", async () => {
+  const originalFetch = globalThis.fetch;
+  const delivered = [];
+  const client = new LocalAgentBridgeClient({ stateDir: "/tmp/originrouter-autonomy-reconnect-test",
+    sessionId: "audit", onCommand: async () => {},
+    endpointProvider: () => ({ baseUrl: "http://127.0.0.1:7437", token: "test" }),
+  });
+  globalThis.fetch = async (url, options) => {
+    if (url.endsWith("/events")) delivered.push(JSON.parse(options.body).event);
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+  try {
+    await client.sendEvent({ type: "agent.autonomy.status", eventId: "installed", autonomyProfile: "ai_review",
+      aiReviewPolicy: { templateId: "ait_test_template", version: 3, contentHash: "a".repeat(64) } });
+    client.setEndpoint(null);
+    await client.connect();
+    while (client.flushingEvents) await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.equal(delivered.length, 2);
+    assert.deepEqual(delivered[1].aiReviewPolicy, delivered[0].aiReviewPolicy);
+  } finally { client.close(); globalThis.fetch = originalFetch; }
+});
+
+test("a live wrapper consumes new commands after the daemon restarts", async () => {
+  const originalFetch = globalThis.fetch;
+  let registry = new ExternalAgentRegistry();
+  registry.register({ sessionId: "restart-test", agent: "claude" });
+  const applied = [];
+  const client = new LocalAgentBridgeClient({
+    stateDir: "/tmp/originrouter-command-epoch-test",
+    sessionId: "restart-test",
+    onCommand: (command) => applied.push(command.responseId),
+  });
+  client.endpoint = { baseUrl: "http://127.0.0.1:7437", token: "test" };
+  globalThis.fetch = async (url) => new Response(JSON.stringify(
+    registry.commandsAfter("restart-test", Number(new URL(url).searchParams.get("after"))),
+  ), { status: 200 });
+  try {
+    for (let n = 0; n < 6; n++) registry.enqueueCommand("restart-test", {
+      type: "agent.interaction.resolve", responseId: `before-${n}`,
+    });
+    await client.pollCommands();
+    assert.equal(client.commandCursor, 6);
+    registry = new ExternalAgentRegistry();
+    registry.register({ sessionId: "restart-test", agent: "claude" });
+    registry.enqueueCommand("restart-test", {
+      type: "agent.interaction.resolve", responseId: "allow-after-restart",
+    });
+    await client.pollCommands();
+    await client.pollCommands();
+    assert.equal(applied.filter((id) => id === "allow-after-restart").length, 1);
+    assert.equal(client.commandCursor, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("local agent command polling never applies one command twice", async () => {
   const originalFetch = globalThis.fetch;
@@ -111,6 +168,39 @@ test("event outbox replays an interaction after a short daemon outage", async ()
     }]);
     await client.close();
   } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reconnect restores a delivered native request, but not a finished request", async () => {
+  const originalFetch = globalThis.fetch;
+  const delivered = [];
+  const endpoint = { baseUrl: "http://127.0.0.1:7437", token: "test" };
+  globalThis.fetch = async (_url, options) => {
+    if (options.body) delivered.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+  const client = new LocalAgentBridgeClient({
+    stateDir: "/tmp/originrouter-reconnect-native-test", sessionId: "native-reconnect",
+    endpointProvider: () => endpoint,
+  });
+  try {
+    client.endpoint = endpoint;
+    await client.sendEvent({ type: "agent.interaction.requested", interactionId: "pending-native", eventId: "request-native" });
+    assert.equal(client.pendingEvents.length, 0);
+    client.setEndpoint(null);
+    await client.connect();
+    // connect starts the outbox asynchronously; wait for its request to finish.
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(delivered.filter((item) => item.event?.eventId === "request-native").length, 2);
+    await client.sendEvent({ type: "agent.interaction.result", interactionId: "pending-native", status: "applied" });
+    client.setEndpoint(null);
+    await client.connect();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(delivered.filter((item) => item.event?.eventId === "request-native").length, 2);
+    assert.equal(client.pendingInteractions.size, 0);
+  } finally {
+    await client.close();
     globalThis.fetch = originalFetch;
   }
 });

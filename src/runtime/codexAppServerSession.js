@@ -1,3 +1,4 @@
+import { createAgentPermissionStateTracker } from "./agentPermissionStateTracker.js";
 import process from "node:process";
 import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
@@ -78,14 +79,13 @@ import {
   resolveAgentDetailProfile,
 } from "./agentDetailProfile.js";
 import { AiApprovalReviewer } from "./aiApprovalReviewer.js";
+import { inheritedPermissionConfiguration, resolveAgentAutonomyConfiguration } from "./agentAutonomyConfiguration.js";
 import {
   aiReviewPolicyFromEnvironment,
-  aiReviewPolicyFromPayload,
 } from "./aiReviewPolicy.js";
 import {
   readApprovalPolicyReference,
   readWorkspaceApprovalPolicySafe,
-  resolveApprovalPolicySelection,
 } from "./approvalPolicyStore.js";
 import {
   CODEX_MODES,
@@ -264,6 +264,7 @@ export async function runCodexAppServerSession(rawArgs) {
       "--originrouter-auto-allow requires --originrouter-autonomy custom or no explicit profile",
     );
   }
+  const inheritedPermission = inheritedPermissionConfiguration(process.env, { stateDir });
   let autonomyAllowedScopes = normalizeAutonomyScopes(
     options.autonomyAllowedScopes,
   );
@@ -271,12 +272,19 @@ export async function runCodexAppServerSession(rawArgs) {
     options.autonomyProfile ||
       (autonomyAllowedScopes.length ? "custom" : "manual"),
   );
-  let approvalPolicy = autonomyProfile === "custom" && options.approvalPolicyReference
-    ? readApprovalPolicyReference(options.approvalPolicyReference, { stateDir })
-    : null;
-  let aiReviewPolicy = autonomyProfile === "ai_review"
-    ? aiReviewPolicyFromEnvironment()
-    : null;
+  let approvalPolicy = inheritedPermission
+    ? inheritedPermission.approvalPolicy
+    : autonomyProfile === "custom" && options.approvalPolicyReference
+      ? readApprovalPolicyReference(options.approvalPolicyReference, { stateDir })
+      : null;
+  let aiReviewPolicy = inheritedPermission
+    ? inheritedPermission.aiReviewPolicy
+    : autonomyProfile === "ai_review" ? aiReviewPolicyFromEnvironment() : null;
+  if (inheritedPermission) {
+    autonomyProfile = inheritedPermission.profile;
+    autonomyAllowedScopes = inheritedPermission.allowedScopes;
+  }
+
   let stopped = false;
   const activitySnapshot = {
     summary: "",
@@ -302,6 +310,7 @@ export async function runCodexAppServerSession(rawArgs) {
         provider: providerResult.provider?.name,
         model,
         permissionProfile: autonomyProfile,
+      permissionRevision: permissionState.revision,
         ...activitySnapshot,
       },
       { stateDir },
@@ -412,6 +421,11 @@ export async function runCodexAppServerSession(rawArgs) {
       availableModes: CODEX_MODES,
       requestId,
     });
+  const permissionState = createAgentPermissionStateTracker({
+    stateDir, sessionId, cwd, deviceId: effectiveDeviceId,
+    workspaceId: options.workspaceId, agent: "codex", title: sessionTitle,
+    conversationId: options.conversationId || sessionId,
+  });
   const reportAutonomy = (
     requestId = null,
     { accepted = null, reason = null } = {},
@@ -421,6 +435,10 @@ export async function runCodexAppServerSession(rawArgs) {
         provider: "codex",
         runtime: "codex-app-server",
         profile: autonomyProfile,
+        autonomyRevision: permissionState.capture({
+          profile: autonomyProfile, allowedScopes: autonomyAllowedScopes,
+          approvalPolicy, aiReviewPolicy,
+        }),
         allowedScopes: autonomyAllowedScopes,
         approvalPolicy,
         aiReviewPolicy,
@@ -439,14 +457,17 @@ export async function runCodexAppServerSession(rawArgs) {
       availableDetailProfiles: AGENT_DETAIL_PROFILES,
     });
 
-  const requestRemoteInteraction = (request) =>
-    resolveWithAutonomy({
+  const requestRemoteInteraction = (request) => {
+    const reviewPolicyAtRequest = aiReviewPolicy;
+    const profileAtRequest = autonomyProfile;
+    return resolveWithAutonomy({
       request,
       profile: autonomyProfile,
       allowedScopes: autonomyAllowedScopes,
       workspaceRoot: cwd,
       aiReviewer: aiApprovalReviewer,
       aiReviewPolicy,
+      isCurrent: () => profileAtRequest === autonomyProfile && reviewPolicyAtRequest === aiReviewPolicy,
       runtime: "codex-app-server",
       approvalPolicy,
       workspaceApprovalPolicy,
@@ -475,6 +496,7 @@ export async function runCodexAppServerSession(rawArgs) {
           decision: resolved.action,
         }),
     });
+  };
 
   const markInteractionApplied = (resolved) =>
     resolved.autoResolved
@@ -863,21 +885,13 @@ export async function runCodexAppServerSession(rawArgs) {
       return true;
     }
     if (payload.type === "agent.autonomy.set") {
-      const requested = normalizeAutonomyProfile(payload.profile, "");
-      if (!requested) return false;
       try {
-        const nextPolicy = requested === "custom"
-          ? resolveApprovalPolicySelection(payload, { stateDir, current: approvalPolicy })
-          : null;
-        const nextAiReviewPolicy = requested === "ai_review"
-          ? aiReviewPolicyFromPayload(payload)
-          : null;
-        autonomyProfile = requested;
-        approvalPolicy = nextPolicy;
-        aiReviewPolicy = nextAiReviewPolicy;
-        autonomyAllowedScopes = requested === "custom" && !approvalPolicy
-          ? normalizeAutonomyScopes(payload.allowedScopes || payload.allowed_scopes)
-          : [];
+        const next = resolveAgentAutonomyConfiguration(payload, { stateDir, currentPolicy: approvalPolicy });
+        permissionState.capture(next, { changed: true });
+        autonomyProfile = next.profile;
+        approvalPolicy = next.approvalPolicy;
+        aiReviewPolicy = next.aiReviewPolicy;
+        autonomyAllowedScopes = next.allowedScopes;
         await reportAutonomy(payload.requestId || null, { accepted: true });
         return true;
       } catch (error) {
@@ -888,6 +902,7 @@ export async function runCodexAppServerSession(rawArgs) {
           allowedScopes: autonomyAllowedScopes,
           approvalPolicy,
           requestId: payload.requestId || null,
+          aiReviewPolicy,
           accepted: false,
           reason: error.code || error.message,
         }));

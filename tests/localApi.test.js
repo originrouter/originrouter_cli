@@ -17,6 +17,11 @@ import { LocalAuditStore } from "../src/persistence/localAuditStore.js";
 import { AgentCatalog } from "../src/persistence/agentCatalog.js";
 import { ProxyRequestStore } from "../src/persistence/proxyRequestStore.js";
 import { saveApprovalPolicy } from "../src/runtime/approvalPolicyStore.js";
+import { ExternalAgentRegistry } from "../src/local/externalAgentRegistry.js";
+import { LocalAgentBridgeClient } from "../src/local/localAgentBridgeClient.js";
+import { ExternalAgentRelayRouter } from "../src/daemon/externalAgentRelayRouter.js";
+import { PendingInteractionRegistry } from "../src/runtime/pendingInteractionRegistry.js";
+import { startClaudeHookServer } from "../src/adapters/claude/hookServer.js";
 
 // Version comes from package.json so this test never needs a bump on release.
 const CLI_VERSION = JSON.parse(
@@ -222,6 +227,7 @@ try {
     });
   }
   liveCtx.proxyRequestStore = proxyRequestStore;
+  liveCtx.externalAgentRegistry = new ExternalAgentRegistry({ catalog: agentCatalog });
   serverHandle = await startLocalApi(liveCtx, { port: 0 });
   // The server's liveCtx reads `ctx.localApiPort` lazily; we patch the bound
   // port onto the SAME ctx object we passed in.
@@ -1386,6 +1392,9 @@ try {
     assert.equal(sessions.body.sessions.length, 1);
     assert.equal(sessions.body.sessions[0].control_path, "local");
     assert.ok(!JSON.stringify(sessions.body).includes(transcriptPath));
+    const initialSnapshot = await getJson("/agent/local/sessions/external-claude-1/snapshot");
+    assert.equal(initialSnapshot.status, 200);
+    assert.deepEqual(initialSnapshot.body.interactions, []);
 
     const history = await getJson("/agent/local/sessions/external-claude-1/history?limit=50");
     assert.deepEqual(history.body.messages.map((item) => item.text), [
@@ -1490,6 +1499,69 @@ try {
     });
     const events = await getJson("/agent/local/events?after=0");
     assert.ok(events.body.events.some((event) => event.text === "live reply"));
+
+    // Real HTTP PermissionRequest hook -> daemon queue -> live wrapper ->
+    // structured Claude hook response. No actual tool or user session runs.
+    for (const controlPath of ["direct", "bridge"]) {
+      let receivedRequest;
+      let finishRequest;
+      const requestSeen = new Promise((resolve) => { receivedRequest = resolve; });
+      const runtime = new PendingInteractionRegistry({
+        onRequested: (request) => liveCtx.externalAgentRegistry.appendEvent("external-claude-1", {
+          ...request, type: "agent.interaction.requested",
+        }),
+        onResult: (result) => liveCtx.externalAgentRegistry.appendEvent("external-claude-1", {
+          ...result, type: "agent.interaction.result",
+        }),
+      });
+      const hook = await startClaudeHookServer({
+        onPermissionRequest: (callId) => {
+          finishRequest = runtime.request({ interactionId: callId, kind: "permission" })
+            .then(async () => {
+              assert.equal(hook.resolvePermission({ callId, decision: "approved" }), true);
+              await runtime.markResult(callId, "applied");
+            });
+          receivedRequest(callId);
+        },
+      });
+      try {
+        const interactionId = `native-tool-${controlPath}`;
+        const nativeResponse = fetch(`http://127.0.0.1:${hook.port}/hook/permission-request`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tool_use_id: interactionId, tool_name: "Bash", tool_input: { command: "echo test" } }),
+          signal: AbortSignal.timeout(5000),
+        });
+        assert.equal(await requestSeen, interactionId);
+        // Subscribe only after the request: mirrors returning from Settings.
+        const sentSnapshots = [];
+        const router = new ExternalAgentRelayRouter({
+          registry: liveCtx.externalAgentRegistry,
+          relayClient: { send: async (_type, payload) => sentSnapshots.push(payload) },
+        });
+        await router.handle({ type: "agent.interactions.snapshot.request", sessionIds: ["external-claude-1"] });
+        assert.equal(sentSnapshots[0].interactions[0].interactionId, interactionId);
+        const command = { type: "agent.interaction.resolve", sessionId: "external-claude-1", interactionId,
+          responseId: `response-${controlPath}`, action: "allow", response: {} };
+        if (controlPath === "direct") {
+          assert.equal((await postJson("/agent/local/sessions/external-claude-1/interaction", command)).body.accepted, true);
+        } else {
+          assert.equal(await router.handle(command), true);
+        }
+        const wrapper = new LocalAgentBridgeClient({ stateDir: home, sessionId: "external-claude-1",
+          onCommand: (queued) => { if (queued.interactionId === interactionId) runtime.resolve(queued); } });
+        wrapper.endpoint = { baseUrl: base, token: TOKEN };
+        await wrapper.pollCommands();
+        await finishRequest;
+        assert.equal((await (await nativeResponse).json()).hookSpecificOutput.decision.behavior, "allow");
+        const resolvedSnapshot = await getJson("/agent/local/sessions/external-claude-1/snapshot");
+        assert.deepEqual(resolvedSnapshot.body.interactions, []);
+        await router.handle({ type: "agent.interactions.snapshot.request", sessionIds: ["external-claude-1"] });
+        assert.deepEqual(sentSnapshots.at(-1).interactions, []);
+      } finally {
+        hook.stop();
+        await runtime.cancelAll();
+      }
+    }
   }
 
   // Collaboration workers remain available to their runtime, but never to
