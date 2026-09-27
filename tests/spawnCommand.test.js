@@ -149,15 +149,21 @@ import {
 }
 
 {
-  // spawnCommand on a non-existent shim must surface an error event (not
-  // throw synchronously) — the EINVAL contract of node:child_process.
+  // spawnCommand on a non-existent shim must never throw synchronously and
+  // must settle asynchronously. Off Windows the child never starts, so spawn
+  // emits an error event (the EINVAL/ENOENT contract). On Windows the shim
+  // routes through cmd.exe, which starts fine and exits nonzero instead.
   const child = spawnCommandNamed("definitely-not-real-xyz.cmd", ["--version"]);
-  const sawError = await new Promise((resolve) => {
-    child.once("error", () => resolve(true));
-    child.once("exit", () => resolve(false));
-    setTimeout(() => resolve(false), 5_000);
+  const outcome = await new Promise((resolve) => {
+    child.once("error", () => resolve("error"));
+    child.once("exit", (code) => resolve(code === 0 ? "exit-zero" : "exit-nonzero"));
+    setTimeout(() => resolve("timeout"), 15_000);
   });
-  assert.ok(sawError, "shim spawn must emit error asynchronously");
+  if (process.platform === "win32") {
+    assert.equal(outcome, "exit-nonzero", "cmd.exe shim route must exit nonzero for a missing command");
+  } else {
+    assert.equal(outcome, "error", "shim spawn must emit error asynchronously");
+  }
 }
 
 console.log("spawn command tests ok");
