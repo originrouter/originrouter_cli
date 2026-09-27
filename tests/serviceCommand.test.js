@@ -90,7 +90,12 @@ const common = {
   const encoded = task.match(/-EncodedCommand ([^<]+)<\/Arguments>/)?.[1];
   const decoded = Buffer.from(encoded, "base64").toString("utf16le");
   assert.match(decoded, /\$env:PATH =/);
-  assert.match(decoded, /Program Files\\\\nodejs/);
+  // The wrapper must use PowerShell single-quote literals. JSON.stringify
+  // escaping emits backslash-escaped quotes, which PowerShell does not honor,
+  // so the encoded script failed to parse and the daemon never launched.
+  assert.doesNotMatch(decoded, /\\"/);
+  assert.match(decoded, /-ArgumentList '[^']* daemon'/);
+  assert.match(decoded, /Program Files\\nodejs/);
 }
 
 {

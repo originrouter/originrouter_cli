@@ -164,8 +164,13 @@ export function buildWindowsTaskXml({
   stderrPath,
   environmentPath = buildServiceEnvironmentPath({ nodePath, cliPath, currentPlatform: "win32" }),
 }) {
-  const args = `"${cliPath}" daemon`;
-  const logCommand = `$env:PATH = ${JSON.stringify(environmentPath)}; $p = Start-Process -FilePath ${JSON.stringify(nodePath)} -ArgumentList ${JSON.stringify(args)} -NoNewWindow -PassThru -RedirectStandardOutput ${JSON.stringify(stdoutPath)} -RedirectStandardError ${JSON.stringify(stderrPath)}; $p.WaitForExit(); exit $p.ExitCode`;
+  // Wrap every value in PowerShell single quotes. JSON.stringify-style
+  // escaping produces backslash-escaped quotes, which PowerShell does not
+  // honor — the encoded script failed to parse there and the daemon never
+  // launched. Single-quoted strings are literal in PowerShell; the embedded
+  // double quotes around cliPath stay intact.
+  const args = psSingleQuote(`"${cliPath}" daemon`);
+  const logCommand = `$env:PATH = ${psSingleQuote(environmentPath)}; $p = Start-Process -FilePath ${psSingleQuote(nodePath)} -ArgumentList ${args} -NoNewWindow -PassThru -RedirectStandardOutput ${psSingleQuote(stdoutPath)} -RedirectStandardError ${psSingleQuote(stderrPath)}; $p.WaitForExit(); exit $p.ExitCode`;
   const encoded = powershellEncodedCommand(logCommand);
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">

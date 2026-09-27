@@ -3,6 +3,17 @@
 All notable changes to OriginRouter CLI will be documented here. The project
 uses Semantic Versioning and follows the Keep a Changelog structure.
 
+## 0.4.4 - 2026-09-27
+
+### Fixed
+
+- Fixed the Windows background service never launching: the scheduled task's
+  embedded PowerShell wrapper escaped embedded quotes in the Bash style
+  (`\"`), which PowerShell does not honor, so the wrapper script failed to
+  parse and the daemon never started — leaving the Local API permanently
+  not ready with no log output. All values are now wrapped in PowerShell
+  single-quote literals.
+
 ## 0.4.3 - 2026-09-27
 
 ### Fixed
