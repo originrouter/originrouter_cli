@@ -24,7 +24,11 @@ while [[ $# -gt 0 ]]; do
       RELEASE="$2"
       shift
       ;;
-    --yes|--no-proxy|--noproxy)
+    --yes)
+      SETUP_ARGS+=("$1")
+      ;;
+    --no-proxy|--noproxy)
+      NO_PROXY=true
       SETUP_ARGS+=("$1")
       ;;
     --dry-run)
@@ -58,6 +62,38 @@ fi
 NODE_MIN_MAJOR=22
 NODESOURCE_MAJOR=22
 
+# Inherit the system proxy (macOS settings or ORIGINROUTER_PROXY) so curl and
+# npm work behind local proxies such as Clash or Surge. Environment variables
+# are passed through to child processes as-is.
+resolve_system_proxy() {
+  if [[ -n "${ORIGINROUTER_PROXY:-}" ]]; then
+    printf '%s\n' "$ORIGINROUTER_PROXY"
+    return
+  fi
+  if [[ -n "${HTTPS_PROXY:-}${https_proxy:-}${HTTP_PROXY:-}${http_proxy:-}" ]]; then
+    return 1  # already set in the environment; keep it
+  fi
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v scutil >/dev/null 2>&1; then
+    local proxy_info proxy port
+    proxy_info="$(scutil --proxy 2>/dev/null || true)"
+    if [[ "$(awk '/^HTTPSEnable/ {print $3}' <<<"$proxy_info")" == "1" ]]; then
+      proxy="$(awk '/^HTTPSProxy/ {print $3}' <<<"$proxy_info")"
+      port="$(awk '/^HTTPSPort/ {print $3}' <<<"$proxy_info")"
+      if [[ -n "$proxy" && -n "$port" ]]; then
+        printf 'http://%s:%s\n' "$proxy" "$port"
+        return
+      fi
+    fi
+  fi
+  return 1
+}
+
+if [[ "${NO_PROXY:-false}" != true ]] && SYSTEM_PROXY="$(resolve_system_proxy)" && [[ -n "$SYSTEM_PROXY" ]]; then
+  echo "==> Using proxy $SYSTEM_PROXY"
+  export HTTP_PROXY="$SYSTEM_PROXY" HTTPS_PROXY="$SYSTEM_PROXY"
+  export http_proxy="$SYSTEM_PROXY" https_proxy="$SYSTEM_PROXY"
+fi
+
 # Privilege helper: on a root session run directly; otherwise require sudo.
 priv_prefix() {
   if [[ "$(id -u)" -eq 0 ]]; then
@@ -69,13 +105,37 @@ priv_prefix() {
   fi
 }
 
+# Run a slow command with an elapsed-time indicator; dump its log on failure.
+run_with_elapsed() {
+  local label="$1"
+  shift
+  local log_file cmd_pid started_at elapsed exit_code=0
+  log_file="$(mktemp "${TMPDIR:-/tmp}/originrouter-step.XXXXXX.log")"
+  "$@" >"$log_file" 2>&1 &
+  cmd_pid=$!
+  started_at=$SECONDS
+  while kill -0 "$cmd_pid" 2>/dev/null; do
+    elapsed=$((SECONDS - started_at))
+    printf '\r==> %s (%02dm%02ds)\033[K' "$label" "$((elapsed / 60))" "$((elapsed % 60))"
+    sleep 1
+  done
+  wait "$cmd_pid" || exit_code=$?
+  printf '\r\033[K'
+  if [[ "$exit_code" -ne 0 ]]; then
+    cat "$log_file" >&2
+  fi
+  rm -f "$log_file"
+  return "$exit_code"
+}
+
 install_node_via_nvm() {
   echo "==> Installing Node.js ${NODE_MIN_MAJOR} via nvm (installs to your home directory, no sudo required)"
   curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash || return 1
   export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
   # shellcheck disable=SC1091
   [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" || return 1
-  nvm install "${NODE_MIN_MAJOR}" || return 1
+  run_with_elapsed "Downloading and installing Node.js ${NODE_MIN_MAJOR} via nvm (this may take a few minutes)" \
+    nvm install "${NODE_MIN_MAJOR}" || return 1
   nvm use "${NODE_MIN_MAJOR}" || return 1
 }
 

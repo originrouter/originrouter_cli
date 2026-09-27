@@ -1,11 +1,10 @@
-import { spawn } from "node:child_process";
+import { spawnCommand } from "./spawn.js";
 
 export function runCapture(command, args = [], { timeoutMs = 5000 } = {}) {
   return new Promise((resolve) => {
     let settled = false;
-    const child = spawn(command, args, {
+    const child = spawnCommand(command, args, {
       stdio: ["ignore", "pipe", "pipe"],
-      shell: false,
     });
 
     let output = "";

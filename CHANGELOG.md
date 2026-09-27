@@ -5,6 +5,57 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ## Unreleased
 
+## 0.4.1 - 2026-09-27
+
+### Added
+
+- Windows installer (`install.ps1`) now shows real-time progress for every
+  download and long-running step: byte-accurate inline progress for the Node.js
+  archive and release list, per-file extraction counts, and spinners for npm
+  install and setup, replacing silent waits and the legacy blue progress dialog.
+- The Windows installer inherits the system proxy (Windows Internet Settings,
+  `ORIGINROUTER_PROXY`, or existing `HTTPS_PROXY`/`HTTP_PROXY`) so npm and
+  downloads work behind local proxies such as Clash; `-NoProxy` skips this.
+- The installer reuses a previously installed user-level Node.js runtime even
+  when the current console has not picked up the updated user PATH, and
+  resolves npm/OriginRouter commands to their `.cmd` shims explicitly.
+- Agent permission configuration (autonomy profile, allowed scopes, approval
+  policy, AI review policy) is now persisted per conversation with a monotonic
+  revision, so every execution surface shares one consistent boundary instead
+  of re-deriving policy ad hoc.
+- Resuming a conversation now inherits its saved permission configuration by
+  default; explicit permission arguments override it, and older sessions
+  without saved state fail with a clear actionable error.
+
+### Changed
+
+- Claude SDK/PTY and Codex sessions capture permission state revisions for
+  autonomy status updates; only a bounded display projection leaves the
+  device, and full approval rules and AI review instructions stay local.
+- Approval and AI review policy selections remain sticky across bridge
+  reconnects within a conversation instead of being reset by partial payloads.
+
+### Fixed
+
+- Fixed `originrouter setup` failing with `spawn EINVAL` on Windows with
+  Node.js 18.20+ (CVE-2024-27980 hardening): npm-installed `.cmd` shims are
+  now routed through `cmd.exe` with strict argument quoting, and bare command
+  names are resolved against `PATH`/`PATHEXT` so npm-installed CLIs are
+  detected on Windows.
+- Fixed npm install exit codes being unreliable on Windows PowerShell 5.1,
+  which made successful installs report failure.
+- A delayed permission interaction timeout or result can no longer restart a
+  turn that has already completed.
+- Failure output from npm install and setup is now shown in full when the
+  Windows installer fails, instead of being swallowed.
+
+### Quality
+
+- Added regression coverage for Windows command resolution and `.cmd` shim
+  routing, argument quoting, conversation permission state revisions, resume
+  inheritance, external agent registry autonomy status, bridge client
+  interaction stream handling, and local API autonomy routes.
+
 ## 0.4.0 - 2026-09-23
 
 ### Added

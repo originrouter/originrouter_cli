@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawnCommand } from "../utils/spawn.js";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { platform } from "node:os";
@@ -71,7 +71,7 @@ export function installerEnvironment(installer, baseEnv = process.env) {
 
 function runProcess(command, args, { env = process.env } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: "inherit", shell: false, env });
+    const child = spawnCommand(command, args, { stdio: "inherit", env });
     child.once("error", (error) => resolve({ ok: false, error }));
     child.once("exit", (code, signal) => resolve({ ok: code === 0, code, signal }));
   });

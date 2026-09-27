@@ -7,7 +7,6 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-$ProgressPreference = "SilentlyContinue"
 $PackageName = "@originrouter/cli"
 $MinimumNodeMajor = 22
 
@@ -16,9 +15,188 @@ if ($Release -notmatch '^(latest|\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$') {
     exit 1
 }
 
+# Inherit the system proxy so npm (which ignores Windows proxy settings) can
+# reach the registry behind local proxies such as Clash. The .NET HttpClient
+# picks up the system proxy on its own; ORIGINROUTER_PROXY overrides, -NoProxy skips.
+function Get-SystemProxy {
+    if ($NoProxy) { return $null }
+    if ($env:ORIGINROUTER_PROXY) { return $env:ORIGINROUTER_PROXY }
+    if ($env:HTTPS_PROXY) { return $null }  # already set in the environment; keep it
+    try {
+        $settings = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        if (-not $settings.ProxyEnable) { return $null }
+        $server = $settings.ProxyServer
+        if (-not $server) { return $null }
+        if ($server -notmatch "=") { return "http://$server" }
+        foreach ($part in $server.Split(";")) {
+            if ($part -match "^https?=(.+)$") { return "http://$($Matches[1])" }
+        }
+    } catch { }
+    return $null
+}
+
+$systemProxy = Get-SystemProxy
+if ($systemProxy) {
+    Write-Host "==> Using proxy $systemProxy"
+    $env:HTTP_PROXY = $systemProxy
+    $env:HTTPS_PROXY = $systemProxy
+}
+
 function Stop-WithNodeGuidance([string]$Message) {
     Write-Error "$Message`nInstall Node.js from https://nodejs.org/en/download and run this command again. The Node.js installer includes npm."
     exit 1
+}
+
+$script:InlineStatusLength = 0
+
+function Write-InlineStatus([string]$Text) {
+    if ($Text.Length -gt 110) { $Text = $Text.Substring(0, 110) }
+    $padding = [Math]::Max(0, $script:InlineStatusLength - $Text.Length)
+    Write-Host -NoNewline ("`r{0}{1}" -f $Text, (" " * $padding))
+    $script:InlineStatusLength = $Text.Length
+}
+
+function Clear-InlineStatus {
+    if ($script:InlineStatusLength -gt 0) {
+        Write-Host -NoNewline ("`r{0}`r" -f (" " * $script:InlineStatusLength))
+        $script:InlineStatusLength = 0
+    }
+}
+
+function Expand-ZipWithProgress([string]$ZipPath, [string]$DestinationPath, [string]$Activity) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    $total = $zip.Entries.Count
+    $done = 0
+    $frames = @("|", "/", "-", "\")
+    $frameIndex = 0
+    $lastRendered = [DateTime]::MinValue
+    $fullDest = [System.IO.Path]::GetFullPath($DestinationPath)
+    try {
+        foreach ($entry in $zip.Entries) {
+            $targetPath = [System.IO.Path]::GetFullPath((Join-Path $DestinationPath $entry.FullName))
+            if (-not $targetPath.StartsWith($fullDest, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "The archive contains an unsafe path: $($entry.FullName)"
+            }
+            if ($entry.FullName.EndsWith("/") -or [string]::IsNullOrEmpty($entry.Name)) {
+                [System.IO.Directory]::CreateDirectory($targetPath) | Out-Null
+            } else {
+                $parent = Split-Path -Path $targetPath -Parent
+                if (-not (Test-Path -LiteralPath $parent)) {
+                    [System.IO.Directory]::CreateDirectory($parent) | Out-Null
+                }
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $targetPath, $true)
+            }
+            $done++
+            if (((Get-Date) - $lastRendered).TotalMilliseconds -ge 100) {
+                $lastRendered = Get-Date
+                $pct = [int](100 * $done / $total)
+                Write-InlineStatus ("{0}: {1}/{2} files ({3}%) {4}" -f $Activity, $done, $total, $pct, $frames[$frameIndex])
+                $frameIndex = ($frameIndex + 1) % $frames.Count
+            }
+        }
+        Clear-InlineStatus
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+function Read-WebFileWithProgress([string]$Url, [string]$OutPath, [string]$Activity) {
+    # Single-threaded copy loop: no event handlers, which crash Windows
+    # PowerShell 5.1 when they fire on .NET thread-pool threads.
+    Add-Type -AssemblyName System.Net.Http
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromMinutes(30)
+    $fileStream = $null
+    $contentStream = $null
+    try {
+        $response = $client.GetAsync($Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) {
+            throw "Download failed with HTTP $($response.StatusCode): $Url"
+        }
+        $contentStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        $total = $response.Content.Headers.ContentLength
+        $fileStream = [System.IO.File]::Create($OutPath)
+        $buffer = New-Object byte[] 81920
+        $received = [long]0
+        $frames = @("|", "/", "-", "\")
+        $frameIndex = 0
+        $lastRendered = [DateTime]::MinValue
+        while (($read = $contentStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $fileStream.Write($buffer, 0, $read)
+            $received += $read
+            if (((Get-Date) - $lastRendered).TotalMilliseconds -ge 100) {
+                $lastRendered = Get-Date
+                if ($total) {
+                    $pct = [int](100 * $received / $total)
+                    Write-InlineStatus ("{0}: {1:N1} / {2:N1} MB ({3}%) {4}" -f $Activity, ($received / 1MB), ($total / 1MB), $pct, $frames[$frameIndex])
+                } else {
+                    Write-InlineStatus ("{0}: {1:N1} MB {2}" -f $Activity, ($received / 1MB), $frames[$frameIndex])
+                }
+                $frameIndex = ($frameIndex + 1) % $frames.Count
+            }
+        }
+        Clear-InlineStatus
+    } finally {
+        if ($null -ne $fileStream) { $fileStream.Dispose() }
+        if ($null -ne $contentStream) { $contentStream.Dispose() }
+        $client.Dispose()
+    }
+}
+
+function Resolve-Executable([string]$CommandName) {
+    $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
+    if ($null -eq $cmd) { return $null }
+    $source = $cmd.Source
+    $ext = [System.IO.Path]::GetExtension($source)
+    if ($ext -ne ".cmd" -and $ext -ne ".exe") {
+        $candidate = Join-Path (Split-Path -Path $source -Parent) "$CommandName.cmd"
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    return $source
+}
+
+function Invoke-WithSpinner {
+    param(
+        [string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [string]$Activity
+    )
+    $outLog = [System.IO.Path]::GetTempFileName()
+    $errLog = [System.IO.Path]::GetTempFileName()
+    $frames = @("|", "/", "-", "\")
+    $frameIndex = 0
+    try {
+        # Run through cmd.exe with file redirection: Start-Process on a .cmd
+        # child returns an unreliable (often null) ExitCode on Windows
+        # PowerShell 5.1, so cmd owns the batch file and the redirection.
+        $quotedArgs = ($ArgumentList | ForEach-Object { '"' + ($_ -replace '"', '') + '"' }) -join " "
+        $cmdLine = '""{0}" {1} > "{2}" 2> "{3}""' -f $FilePath, $quotedArgs, $outLog, $errLog
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "cmd.exe"
+        $psi.Arguments = "/d /s /c $cmdLine"
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        while (-not $proc.HasExited) {
+            $frameIndex = ($frameIndex + 1) % $frames.Count
+            Write-InlineStatus ("{0}... {1}" -f $Activity, $frames[$frameIndex])
+            Start-Sleep -Milliseconds 120
+        }
+        $proc.WaitForExit()
+        $exitCode = $proc.ExitCode
+        Clear-InlineStatus
+        if ($exitCode -ne 0) {
+            Write-Host "==> $FilePath exited with code $exitCode"
+            $errText = Get-Content -LiteralPath $errLog -Raw -ErrorAction SilentlyContinue
+            if ($errText) { Write-Host $errText.TrimEnd() }
+            $outText = Get-Content -LiteralPath $outLog -Raw -ErrorAction SilentlyContinue
+            if ($outText) { Write-Host $outText.TrimEnd() }
+        }
+        return $exitCode
+    } finally {
+        Remove-Item -LiteralPath $outLog, $errLog -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Test-NodeUsable {
@@ -47,7 +225,7 @@ function Test-Elevated {
 
 function Install-NodeViaWinget {
     if ($null -eq (Get-Command winget -ErrorAction SilentlyContinue)) { return $false }
-    Write-Output "==> Installing Node.js 22 LTS via winget (Windows may show an elevation prompt)"
+    Write-Host "==> Installing Node.js 22 LTS via winget (Windows may show an elevation prompt)"
     & winget install --id OpenJS.NodeJS.LTS --exact --silent --accept-package-agreements --accept-source-agreements
     if ($LASTEXITCODE -ne 0) { return $false }
     Update-SessionPathFromRegistry
@@ -55,10 +233,13 @@ function Install-NodeViaWinget {
 }
 
 function Install-NodeViaUserZip {
-    Write-Output "==> Installing a user-level Node.js 22 runtime under $env:LOCALAPPDATA (no elevation required)"
+    Write-Host "==> Installing a user-level Node.js 22 runtime under $env:LOCALAPPDATA (no elevation required)"
     $entry = $null
     try {
-        $versions = Invoke-RestMethod "https://nodejs.org/dist/index.json" -TimeoutSec 30
+        Write-Host "==> Checking the latest Node.js $MinimumNodeMajor release"
+        $indexCache = Join-Path $env:TEMP "originrouter-node-index.json"
+        Read-WebFileWithProgress -Url "https://nodejs.org/dist/index.json" -OutPath $indexCache -Activity "Fetching the Node.js release list"
+        $versions = Get-Content -LiteralPath $indexCache -Raw | ConvertFrom-Json
         $entry = $versions | Where-Object { $_.version -like "v$MinimumNodeMajor.*" } | Select-Object -First 1
     } catch {
         return $false
@@ -72,8 +253,9 @@ function Install-NodeViaUserZip {
     try {
         if (-not (Test-Path -LiteralPath (Join-Path $binDir "node.exe"))) {
             $zipPath = Join-Path $env:TEMP $zipName
-            Invoke-WebRequest $zipUrl -OutFile $zipPath -TimeoutSec 600
-            Expand-Archive $zipPath -DestinationPath $installRoot -Force
+            Read-WebFileWithProgress -Url $zipUrl -OutPath $zipPath -Activity "Downloading Node.js v$version"
+            Write-Host "==> Extracting Node.js v$version (this may take a minute)"
+            Expand-ZipWithProgress -ZipPath $zipPath -DestinationPath $installRoot -Activity "Extracting Node.js v$version"
             Remove-Item $zipPath -Force
         }
     } catch {
@@ -88,8 +270,16 @@ function Install-NodeViaUserZip {
     return $true
 }
 
+# Reuse a Node runtime installed by a previous run of this installer even if
+# the current console has not picked up the updated user PATH yet.
+$userNodeBin = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA "OriginRouter") -Directory -Filter "node-*-win-x64" -ErrorAction SilentlyContinue |
+    Sort-Object -Property Name -Descending | Select-Object -First 1
+if ($null -ne $userNodeBin) {
+    $env:Path = "$($userNodeBin.FullName);$env:Path"
+}
+
 if (-not (Test-NodeUsable)) {
-    Write-Output "==> Node.js $MinimumNodeMajor or later with npm was not found."
+    Write-Host "==> Node.js $MinimumNodeMajor or later with npm was not found."
     $installed = $false
     if (Test-Elevated) {
         $installed = Install-NodeViaWinget
@@ -113,6 +303,8 @@ if (-not $mutex.WaitOne(0)) {
 
 try {
     $existing = Get-Command originrouter -ErrorAction SilentlyContinue
+    $existingPath = $null
+    if ($null -ne $existing) { $existingPath = Resolve-Executable "originrouter" }
     $npmPrefix = (& npm prefix --global).Trim()
     $expectedCommand = Join-Path $npmPrefix "originrouter.cmd"
     $globalPackage = Join-Path ((& npm root --global).Trim()) "@originrouter\cli"
@@ -122,7 +314,7 @@ try {
             throw "A repository-linked OriginRouter installation was found at $globalPackage. Run npm unlink --global @originrouter/cli before using the official installer."
         }
     }
-    if ($null -ne $existing -and -not $existing.Source.Equals($expectedCommand, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if ($null -ne $existingPath -and -not $existingPath.Equals($expectedCommand, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "An OriginRouter command outside the active npm global directory was found at $($existing.Source). Resolve the PATH or installation conflict before continuing."
     }
     if ($null -ne $existing) {
@@ -133,8 +325,7 @@ try {
     }
 
     $packageSpec = "$PackageName@$Release"
-    Write-Output "==> Node.js $nodeVersionText"
-    Write-Output "==> Installing $packageSpec from npm"
+    Write-Host "==> Node.js $nodeVersionText"
 
     $setupArgs = @()
     if ($Yes) { $setupArgs += "--yes" }
@@ -142,38 +333,43 @@ try {
     if ($DryRun) { $setupArgs += "--dry-run" }
 
     if ($DryRun) {
-        Write-Output "Would run: npm install --global $packageSpec"
-        if ($null -ne $existing) {
-            & $existing.Source setup @setupArgs
+        Write-Host "Would run: npm install --global $packageSpec"
+        if ($null -ne $existingPath) {
+            & $existingPath setup @setupArgs
         } else {
-            Write-Output "Would run: originrouter setup --dry-run"
+            Write-Host "Would run: originrouter setup --dry-run"
         }
         exit 0
     }
 
-    & npm install --global $packageSpec
-    if ($LASTEXITCODE -ne 0) {
+    Write-Host "==> Installing $packageSpec from npm (this may take a few minutes)"
+    $npmCommand = Resolve-Executable "npm"
+    $installExit = Invoke-WithSpinner -FilePath $npmCommand -ArgumentList @("install", "--global", $packageSpec) -Activity "Installing $packageSpec"
+    if ($installExit -ne 0) {
         throw "OriginRouter CLI installation failed. Verify that the npm global directory is writable and that the npm registry is reachable. The installer does not change npm permissions automatically."
     }
 
-    $cli = Get-Command originrouter -ErrorAction SilentlyContinue
-    if ($null -eq $cli) {
+    $cliPath = Resolve-Executable "originrouter"
+    if ($null -eq $cliPath) {
         $candidate = Join-Path $npmPrefix "originrouter.cmd"
         if (Test-Path -LiteralPath $candidate) {
             $cliPath = $candidate
         } else {
             throw "OriginRouter was installed, but the command could not be found on PATH. Open a new terminal and run this installer again."
         }
-    } else {
-        $cliPath = $cli.Source
     }
 
     & $cliPath --version
     if ($LASTEXITCODE -ne 0) { throw "The installed OriginRouter command failed verification." }
-    Write-Output "==> Preparing the OriginRouter runtime"
-    & $cliPath setup @setupArgs
-    if ($LASTEXITCODE -ne 0) { throw "OriginRouter setup did not complete successfully. Run the same installer command again to resume." }
-    Write-Output "==> OriginRouter installation complete"
+    Write-Host "==> Preparing the OriginRouter runtime"
+    if ($Yes) {
+        $setupExit = Invoke-WithSpinner -FilePath $cliPath -ArgumentList $setupArgs -Activity "Preparing the OriginRouter runtime"
+        if ($setupExit -ne 0) { throw "OriginRouter setup did not complete successfully. Run the same installer command again to resume." }
+    } else {
+        & $cliPath setup @setupArgs
+        if ($LASTEXITCODE -ne 0) { throw "OriginRouter setup did not complete successfully. Run the same installer command again to resume." }
+    }
+    Write-Host "==> OriginRouter installation complete"
 }
 finally {
     $mutex.ReleaseMutex()

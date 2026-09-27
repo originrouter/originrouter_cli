@@ -124,3 +124,40 @@ import { buildSpawnOptions, spawnCommand, SPAWN_DEFAULTS } from "../src/utils/sp
 }
 
 console.log("spawn command tests ok");
+
+// ---- Windows shim hardening (pure-function coverage) ----
+import {
+  quoteWindowsArgument,
+  resolveWindowsCommand,
+  spawnCommand as spawnCommandNamed,
+} from "../src/utils/spawn.js";
+
+{
+  // quoteWindowsArgument: plain tokens pass through, spaced/empty get quoted.
+  assert.equal(quoteWindowsArgument("--global"), "--global");
+  assert.equal(quoteWindowsArgument(""), '""');
+  assert.equal(quoteWindowsArgument("a b"), '"a b"');
+  assert.equal(quoteWindowsArgument('he said "hi"'), '"he said \\"hi\\""');
+}
+
+{
+  // resolveWindowsCommand: qualified paths and extensioned names are kept.
+  assert.equal(resolveWindowsCommand("/usr/bin/node"), "/usr/bin/node");
+  assert.equal(resolveWindowsCommand("C:\\tools\\x.cmd"), "C:\\tools\\x.cmd");
+  assert.equal(resolveWindowsCommand("npm.cmd"), "npm.cmd");
+  assert.equal(resolveWindowsCommand("definitely-not-a-real-command-xyz"), "definitely-not-a-real-command-xyz");
+}
+
+{
+  // spawnCommand on a non-existent shim must surface an error event (not
+  // throw synchronously) — the EINVAL contract of node:child_process.
+  const child = spawnCommandNamed("definitely-not-real-xyz.cmd", ["--version"]);
+  const sawError = await new Promise((resolve) => {
+    child.once("error", () => resolve(true));
+    child.once("exit", () => resolve(false));
+    setTimeout(() => resolve(false), 5_000);
+  });
+  assert.ok(sawError, "shim spawn must emit error asynchronously");
+}
+
+console.log("spawn command tests ok");
