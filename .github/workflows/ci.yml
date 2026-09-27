@@ -39,6 +39,8 @@ jobs:
       - run: npm run release:check
       - run: npm run test:completion
       - run: node ./tests/serviceCommand.test.js
+      - run: node --test ./tests/localApiAuth.test.js ./tests/windowsServiceElevation.test.js ./tests/windowsServiceLifecycle.test.js ./tests/windowsInstallerCleanup.test.js
+      - run: npm run test:update
       - run: node ./tests/spawnCommand.test.js
       - run: npm pack
       - shell: pwsh

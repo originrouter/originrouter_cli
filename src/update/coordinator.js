@@ -1,7 +1,9 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
+import { dirname, join } from "node:path";
 import { readApiToken } from "../persistence/authToken.js";
 import { getStateDir, readDaemonState } from "../persistence/state.js";
-import { isServiceInstalled, restartService } from "../commands/service.js";
+import { isServiceInstalled } from "../commands/service.js";
+import { spawnCommand } from "../utils/spawn.js";
 import { VERSION } from "../constants.js";
 import { cachedUpdateStatus, checkForUpdate } from "./checker.js";
 import { detectInstallContext, readInstalledVersion } from "./installContext.js";
@@ -125,19 +127,21 @@ function forceKillInstaller(child) {
 }
 
 export function runInstaller(command, args, {
-  spawnFn = spawn,
+  spawnFn = spawnCommand,
   stdio = ["inherit", "inherit", "pipe"],
   timeoutMs = 5 * 60_000,
   killGraceMs = 2_000,
   forceKillWaitMs = 2_000,
   onSpawn = () => {},
+  env = process.env,
 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawnFn(command, args, {
       stdio,
-      shell: process.platform === "win32",
+      shell: false,
+      windowsHide: true,
       detached: process.platform !== "win32",
-      env: { ...process.env, npm_config_yes: "true" },
+      env: { ...env, npm_config_yes: "true" },
     });
     onSpawn(child);
     let stderrTail = "";
@@ -202,13 +206,28 @@ export function runInstaller(command, args, {
   });
 }
 
+export async function refreshInstalledService({ installContext, stateDir, start, spawnFn = spawnCommand }) {
+  const root = installContext.package_json_path
+    ? dirname(installContext.package_json_path) : installContext.package_root;
+  if (!root) throw new Error("Cannot locate the newly installed CLI to refresh its service.");
+  const args = [join(root, "bin", "originrouter.js"), "service", "refresh"];
+  if (start) args.push("--start");
+  // A fresh process reads the files installed by npm rather than using the
+  // update command's already-imported, previous-version service module.
+  await runInstaller(process.execPath, args, {
+    spawnFn,
+    timeoutMs: 180_000,
+    env: { ...process.env, ORIGINROUTER_HOME: stateDir, ORIGINROUTER_DISABLE_UPDATE_CHECK: "1" },
+  });
+}
+
 export async function installLatestVersion({
   stateDir = getStateDir(),
   config = {},
   installContext = detectInstallContext(),
   fetchFn = globalThis.fetch,
-  spawnFn = spawn,
-  restartServiceFn = restartService,
+  spawnFn = spawnCommand,
+  refreshServiceFn = refreshInstalledService,
   serviceInstalledFn = isServiceInstalled,
   readInstalledVersionFn = readInstalledVersion,
   installerTimeoutMs,
@@ -254,6 +273,7 @@ export async function installLatestVersion({
   if (activity.active) {
     return { updated: false, reason: activity.reason, status: checked };
   }
+  const serviceWasInstalled = serviceInstalledFn();
 
   let lock;
   try {
@@ -293,19 +313,23 @@ export async function installLatestVersion({
       throw error;
     }
     let service_restarted = false;
+    let service_refreshed = false;
     let service_restart_error = null;
-    if (activity.daemon_running && serviceInstalledFn()) {
+    if (serviceWasInstalled) {
       try {
-        await restartServiceFn();
-        service_restarted = true;
+        await refreshServiceFn({ installContext, stateDir, start: activity.daemon_running, spawnFn });
+        service_refreshed = true;
+        service_restarted = activity.daemon_running;
       } catch (error) {
         service_restart_error = String(error?.message || error);
+        if (error?.keep_update_lock) releaseLock = false;
       }
     }
     const state = writeUpdateState(stateDir, {
       latest_version: checked.latest_version,
-      last_result: "updated",
-      last_error: null,
+      last_result: service_restart_error ? "service_refresh_failed" : "updated",
+      last_error: service_restart_error,
+      last_failure_kind: service_restart_error ? "service_refresh_failed" : null,
       installed_version: installedVersion,
       installed_at: new Date().toISOString(),
       dismissed_version: null,
@@ -317,6 +341,7 @@ export async function installLatestVersion({
       to_version: checked.latest_version,
       daemon_was_running: activity.daemon_running,
       service_restarted,
+      service_refreshed,
       service_restart_error,
       restart_required: compareSemver(installedVersion, VERSION) > 0,
       status: cachedUpdateStatus({ stateDir, config, installContext }),

@@ -5,6 +5,7 @@ import {
   buildServiceEnvironmentPath,
   buildSystemdUnit,
   buildWindowsTaskXml,
+  buildWindowsElevationCommand,
   waitForLocalApiReady,
   waitForLaunchdUnloaded,
 } from "../src/commands/service.js";
@@ -94,8 +95,26 @@ const common = {
   // escaping emits backslash-escaped quotes, which PowerShell does not honor,
   // so the encoded script failed to parse and the daemon never launched.
   assert.doesNotMatch(decoded, /\\"/);
-  assert.match(decoded, /-ArgumentList '[^']* daemon'/);
+  assert.match(decoded, /-ArgumentList '[^']* daemon --originrouter-service-home /);
+  assert.match(task, /-NonInteractive -WindowStyle Hidden/);
   assert.match(decoded, /Program Files\\nodejs/);
+}
+
+{
+  const command = buildWindowsElevationCommand({
+    nodePath: "C:\\Program Files\\nodejs\\node.exe",
+    cliPath: "C:\\Users\\O'Brien\\Origin Router\\originrouter.js",
+  });
+  assert.match(command, /-FilePath 'C:\\Program Files\\nodejs\\node.exe'/);
+  assert.match(command, /-ArgumentList '"C:\\Users\\O''Brien\\Origin Router\\originrouter.js" service install --originrouter-elevated'/);
+  assert.match(command, /-Wait -PassThru; exit \$p.ExitCode/);
+  const uninstall = buildWindowsElevationCommand({
+    nodePath: "C:\\Program Files\\nodejs\\node.exe",
+    cliPath: "C:\\Users\\O'Brien\\Origin Router\\originrouter.js",
+    action: "uninstall",
+  });
+  assert.match(uninstall, /service uninstall --originrouter-elevated/);
+  assert.throws(() => buildWindowsElevationCommand({ nodePath: "node", cliPath: "cli", action: "stop" }), /unsupported/);
 }
 
 {
@@ -113,7 +132,7 @@ const common = {
     },
     fetchFn: async (requestUrl, options) => {
       requests.push({ requestUrl, options });
-      return { ok: requests.length === 2 };
+      return { ok: requests.length === 2, json: async () => ({ daemon: { pid: 1234 } }) };
     },
     sleep: async () => {},
   });
@@ -124,6 +143,22 @@ const common = {
   assert.deepEqual(requests[1].options.headers, {
     Authorization: "Bearer test-token",
   });
+}
+
+{
+  let attempts = 0;
+  const ready = await waitForLocalApiReady({
+    timeoutMs: 1000,
+    readState: () => ({ pid: 1234, localApiPort: 7437 }),
+    readToken: () => "test-token",
+    fetchFn: async () => ({
+      ok: true,
+      json: async () => ({ daemon: { pid: ++attempts === 1 ? 9999 : 1234 } }),
+    }),
+    sleep: async () => {},
+  });
+  assert.equal(ready, "http://127.0.0.1:7437");
+  assert.equal(attempts, 2, "a stale daemon must not satisfy readiness");
 }
 
 {
@@ -142,6 +177,20 @@ const common = {
 
   assert.equal(checks, 3);
   assert.equal(sleeps, 2);
+}
+
+{
+  const startedAt = Date.now();
+  await assert.rejects(waitForLocalApiReady({
+    timeoutMs: 40,
+    readState: () => ({ localApiPort: 7437 }),
+    readToken: () => "test-token",
+    fetchFn: async (_url, { signal }) => new Promise((_resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("Test hung without abort")), 1_000);
+      signal.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+    }),
+  }), /not ready within 40ms/);
+  assert.ok(Date.now() - startedAt < 500, "a stalled HTTP request must respect the readiness deadline");
 }
 
 console.log("service command tests ok");

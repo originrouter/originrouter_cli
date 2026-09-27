@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { cachedUpdateStatus, checkForUpdate, updateCheckIsDue } from "../src/update/checker.js";
-import { inspectUpdateActivity, installLatestVersion, runInstaller } from "../src/update/coordinator.js";
+import { inspectUpdateActivity, installLatestVersion, refreshInstalledService, runInstaller } from "../src/update/coordinator.js";
 import { writeApiToken } from "../src/persistence/authToken.js";
 import { detectInstallContext } from "../src/update/installContext.js";
 import { renderUpdatePrompt, updateSelectionForKey } from "../src/update/prompt.js";
@@ -228,6 +228,65 @@ try {
     daemon_running: true,
     active: true,
     reason: "daemon_activity_unknown",
+  });
+
+  for (const running of [false, true]) {
+    const refreshDir = join(root, `refresh-${running}`);
+    writeUpdateState(refreshDir, { latest_version: "9.9.9" });
+    if (running) {
+      writeApiToken(refreshDir, "b".repeat(64));
+      writeFileSync(join(refreshDir, "daemon.state.json"), JSON.stringify({ pid: process.pid, localApiPort: 7437 }));
+    }
+    let refreshed;
+    const updated = await installLatestVersion({
+      stateDir: refreshDir,
+      installContext: { ...npmContext, writable: true },
+      forceCheck: false,
+      fetchFn: async () => responseFor({ sessions: [], runs: [] }),
+      serviceInstalledFn: () => true,
+      readInstalledVersionFn: () => "9.9.9",
+      refreshServiceFn: async (options) => { refreshed = options; },
+      spawnFn: () => {
+        const child = new EventEmitter();
+        queueMicrotask(() => child.emit("exit", 0, null));
+        return child;
+      },
+    });
+    assert.equal(refreshed.start, running);
+    assert.equal(refreshed.stateDir, refreshDir);
+    assert.equal(updated.service_refreshed, true);
+    assert.equal(updated.service_restarted, running);
+  }
+
+  const refreshFailureDir = join(root, "refresh-failure");
+  writeUpdateState(refreshFailureDir, { latest_version: "9.9.9" });
+  const refreshFailure = await installLatestVersion({
+    stateDir: refreshFailureDir,
+    installContext: { ...npmContext, writable: true },
+    forceCheck: false,
+    serviceInstalledFn: () => true,
+    readInstalledVersionFn: () => "9.9.9",
+    refreshServiceFn: async () => { throw new Error("registration denied"); },
+    spawnFn: () => {
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit("exit", 0, null));
+      return child;
+    },
+  });
+  assert.equal(refreshFailure.updated, true, "the package update already completed");
+  assert.equal(refreshFailure.service_refreshed, false);
+  assert.match(refreshFailure.service_restart_error, /registration denied/);
+  assert.equal(readUpdateState(refreshFailureDir).last_result, "service_refresh_failed");
+  assert.equal(readUpdateState(refreshFailureDir).last_failure_kind, "service_refresh_failed");
+
+  // Execute a real fresh CLI process, checking the lexical package location
+  // and inherited state directory rather than importing the old service code.
+  mkdirSync(join(npmRoot, "bin"), { recursive: true });
+  const refreshRecord = join(root, "fresh-cli.json");
+  writeFileSync(join(npmRoot, "bin", "originrouter.js"), `require('node:fs').writeFileSync(${JSON.stringify(refreshRecord)}, JSON.stringify({ args: process.argv.slice(2), home: process.env.ORIGINROUTER_HOME }));`);
+  await refreshInstalledService({ installContext: npmContext, stateDir: refreshFailureDir, start: true });
+  assert.deepEqual(JSON.parse(readFileSync(refreshRecord, "utf8")), {
+    args: ["service", "refresh", "--start"], home: refreshFailureDir,
   });
 
   if (oldHome === undefined) delete process.env.ORIGINROUTER_HOME;

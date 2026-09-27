@@ -3,6 +3,28 @@
 All notable changes to OriginRouter CLI will be documented here. The project
 uses Semantic Versioning and follows the Keep a Changelog structure.
 
+## 0.4.5 - 2026-09-28
+
+### Fixed
+
+- Windows Local API token authentication now resolves the state directory with
+  native paths, so an otherwise healthy scheduled daemon passes setup checks.
+- Windows service registration now propagates the elevated child failure and
+  checks the registered task action against the generated configuration.
+  Service uninstall also elevates automatically if Windows denies task deletion.
+- The scheduled daemon starts with a hidden console, reports its real exit
+  code, and writes startup errors to the service log.
+- Failed Windows service starts stop the task and its owned daemon process
+  tree, even if no state file was written; scheduled retries stay suppressed
+  until an explicit start. Stop, reinstall, and uninstall clean up the same
+  owned processes without targeting unrelated Node applications.
+- Updating an installed CLI refreshes the service configuration from the newly
+  installed files, including services that were stopped before the update.
+  A refresh failure is reported separately from a successful package update.
+- The Windows installer now passes `setup` in unattended mode, selects a valid
+  user Node runtime by numeric version, and terminates npm/setup descendants
+  if a step times out. The website and package copies of the installer match.
+
 ## 0.4.4 - 2026-09-27
 
 ### Fixed

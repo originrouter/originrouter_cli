@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, platform, userInfo } from "node:os";
 import { dirname, join, posix as posixPath, resolve, win32 as win32Path } from "node:path";
 import process from "node:process";
@@ -162,6 +162,7 @@ export function buildWindowsTaskXml({
   cliPath,
   stdoutPath,
   stderrPath,
+  stateDir = win32Path.dirname(win32Path.dirname(stderrPath)),
   environmentPath = buildServiceEnvironmentPath({ nodePath, cliPath, currentPlatform: "win32" }),
 }) {
   // Wrap every value in PowerShell single quotes. JSON.stringify-style
@@ -169,8 +170,19 @@ export function buildWindowsTaskXml({
   // honor — the encoded script failed to parse there and the daemon never
   // launched. Single-quoted strings are literal in PowerShell; the embedded
   // double quotes around cliPath stay intact.
-  const args = psSingleQuote(`"${cliPath}" daemon`);
-  const logCommand = `$env:PATH = ${psSingleQuote(environmentPath)}; $p = Start-Process -FilePath ${psSingleQuote(nodePath)} -ArgumentList ${args} -NoNewWindow -PassThru -RedirectStandardOutput ${psSingleQuote(stdoutPath)} -RedirectStandardError ${psSingleQuote(stderrPath)}; $p.WaitForExit(); exit $p.ExitCode`;
+  const args = psSingleQuote(`"${cliPath}" daemon --originrouter-service-home "${stateDir}"`);
+  const logCommand = [
+    "$ErrorActionPreference = 'Stop'",
+    `if (Test-Path -LiteralPath ${psSingleQuote(win32Path.join(stateDir, "service-start-failed"))}) { exit 0 }`,
+    `$env:PATH = ${psSingleQuote(environmentPath)}`,
+    `$env:ORIGINROUTER_HOME = ${psSingleQuote(stateDir)}`,
+    // Hidden applies to the child as well as the scheduled PowerShell. A
+    // redirected console still creates a blank Terminal window otherwise.
+    // With a quickly exiting redirected child, WaitForExit on the returned
+    // Process can leave ExitCode null in PowerShell 5.1. Start-Process -Wait
+    // retains the exit code; otherwise a daemon crash is reported as success.
+    `try { $p = Start-Process -FilePath ${psSingleQuote(nodePath)} -ArgumentList ${args} -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput ${psSingleQuote(stdoutPath)} -RedirectStandardError ${psSingleQuote(stderrPath)}; exit $p.ExitCode } catch { [IO.File]::AppendAllText(${psSingleQuote(stderrPath)}, ($_ | Out-String)); exit 1 }`,
+  ].join("; ");
   const encoded = powershellEncodedCommand(logCommand);
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -213,7 +225,7 @@ export function buildWindowsTaskXml({
   <Actions Context="Author">
     <Exec>
       <Command>powershell.exe</Command>
-      <Arguments>-NoProfile -ExecutionPolicy Bypass -EncodedCommand ${windowsXmlEscape(encoded)}</Arguments>
+      <Arguments>-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand ${windowsXmlEscape(encoded)}</Arguments>
     </Exec>
   </Actions>
 </Task>
@@ -251,20 +263,25 @@ function psSingleQuote(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
-function runElevatedServiceInstall() {
-  const entry = cliEntryPath();
+export function buildWindowsElevationCommand({ nodePath, cliPath, action = "install" }) {
+  if (action !== "install" && action !== "uninstall") {
+    throw new Error(`Cannot elevate unsupported service action: ${action}`);
+  }
   const inner = [
-    quoteWindowsArgument(process.execPath),
-    quoteWindowsArgument(entry),
-    "service", "install", ELEVATION_FLAG,
+    quoteWindowsArgument(cliPath),
+    "service", action, ELEVATION_FLAG,
   ].join(" ");
-  const command = "Start-Process -FilePath " + psSingleQuote(process.execPath)
+  return "$ErrorActionPreference = 'Stop'; $p = Start-Process -FilePath " + psSingleQuote(nodePath)
     + " -ArgumentList " + psSingleQuote(inner)
-    + " -Verb RunAs -Wait";
-  console.log("Administrator approval is needed to register the background service.");
+    + " -Verb RunAs -Wait -PassThru; exit $p.ExitCode";
+}
+
+function runElevatedServiceAction(action) {
+  const command = buildWindowsElevationCommand({ nodePath: process.execPath, cliPath: cliEntryPath(), action });
+  console.log(`Administrator approval is needed to ${action} the background service.`);
   console.log(">>> Click \"Yes\" on the Windows permission prompt to continue. <<<");
   try {
-    execFileSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], {
+    execFileSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", powershellEncodedCommand(command)], {
       stdio: "inherit",
       timeout: 180_000,
       windowsHide: false,
@@ -274,8 +291,8 @@ function runElevatedServiceInstall() {
       throw new Error("Timed out waiting for the UAC approval prompt.");
     }
     throw new Error(
-      "Administrator approval was declined or failed, so the background service was not registered. "
-      + "Re-run `originrouter service install` and click \"Yes\" on the permission prompt."
+      `Administrator approval was declined or failed, so the background service could not be ${action}ed. `
+      + `Re-run \`originrouter service ${action}\` and click "Yes" on the permission prompt.`
     );
   }
 }
@@ -298,19 +315,18 @@ function runSchtasks(args, { dryRun = false } = {}) {
     });
   } catch (error) {
     const text = `${error?.stdout || ""}\n${error?.stderr || ""}\n${error?.message || ""}`;
-    if (/Access is denied|拒绝访问/i.test(text) && args[0] === "/Create"
+    const elevatedAction = args[0] === "/Create" ? "install" : args[0] === "/Delete" ? "uninstall" : null;
+    if (/Access is denied|拒绝访问/i.test(text) && elevatedAction
         && !process.argv.includes(ELEVATION_FLAG)) {
-      // Registration was denied: pop the UAC prompt and let Windows ask the
-      // user directly. The elevated child registers the task; nothing else
-      // is required from the user.
-      runElevatedServiceInstall();
+      // Task registration or deletion was denied: let Windows ask the user
+      // directly, then relay the elevated child's exit code.
+      runElevatedServiceAction(elevatedAction);
       return "";
     }
     if (/Access is denied|拒绝访问/i.test(text)) {
       throw new Error(
-        "Registering the background service requires administrator rights on this machine. "
-        + "Open an elevated PowerShell once and run `originrouter service install` there; "
-        + "daily use afterwards needs no elevation."
+        "Changing the background service requires administrator rights on this machine. "
+        + `Open an elevated PowerShell and run \`originrouter service ${elevatedAction || "install"}\` there.`
       );
     }
     throw error;
@@ -360,6 +376,7 @@ function serviceConfigForPlatform(currentPlatform = platform()) {
     cliPath: cliEntryPath(),
     stdoutPath: paths.stdout,
     stderrPath: paths.stderr,
+    stateDir: getStateDir(),
   };
   common.environmentPath = buildServiceEnvironmentPath({
     nodePath: common.nodePath,
@@ -388,7 +405,7 @@ function localApiUrlFromState(state) {
 
 export async function waitForLocalApiReady({
   dryRun = false,
-  timeoutMs = 10_000,
+  timeoutMs = platform() === "win32" ? 30_000 : 10_000,
   readState = readDaemonState,
   readToken = () => readApiToken(getStateDir()),
   fetchFn = globalThis.fetch,
@@ -409,20 +426,34 @@ export async function waitForLocalApiReady({
         const token = readToken();
         const response = await fetchFn(`${baseUrl}/local/status`, {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
+          signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
         });
-        if (response.ok) return baseUrl;
+        if (response.ok) {
+          const payload = await response.json();
+          const apiPid = Number(payload?.daemon?.pid);
+          if (Number.isInteger(apiPid) && apiPid > 0
+            && (!Number.isInteger(state?.pid) || state.pid === apiPid)) return baseUrl;
+        }
       } catch {
         // Daemon may have written state before the socket is accepting.
       }
     }
-    await sleep(250);
+    const remaining = deadline - Date.now();
+    if (remaining > 0) await sleep(Math.min(250, remaining));
   }
-  throw new Error(`OriginRouter service started, but Local API was not ready within ${timeoutMs}ms${lastUrl ? ` (${lastUrl})` : ""}. Check ~/.originrouter/logs/daemon.err.log.`);
+  throw new Error(`OriginRouter Local API was not ready within ${timeoutMs}ms${lastUrl ? ` (${lastUrl})` : ""}. Check ${logPaths().stderr}.`);
 }
 
 function installService({ dryRun = false } = {}) {
   const currentPlatform = platform();
   const { paths, body } = serviceConfigForPlatform(currentPlatform);
+  const previousConfig = !dryRun && existsSync(paths.configPath) ? readFileSync(paths.configPath) : null;
+  if (currentPlatform === "win32") {
+    // Reinstalling must release the old wrapper and daemon before replacing
+    // the task. Otherwise IgnoreNew can leave the old CLI running after an
+    // upgrade, and the new setup still probes its broken API.
+    stopService({ dryRun });
+  }
   if (dryRun) {
     console.log(`# would write ${paths.configPath}`);
     console.log(body.trimEnd());
@@ -471,8 +502,19 @@ function installService({ dryRun = false } = {}) {
   }
 
   if (currentPlatform === "win32") {
-    const xmlPath = dryRun ? paths.configPath : paths.configPath;
-    runSchtasks(["/Create", "/TN", WINDOWS_TASK, "/XML", xmlPath, "/F"], { dryRun });
+    try {
+      runSchtasks(["/Create", "/TN", WINDOWS_TASK, "/XML", paths.configPath, "/F"], { dryRun });
+      // The elevated child can regenerate PATH. Compare the registered
+      // action with the final file on disk, not the parent's earlier XML.
+      const verify = `$ErrorActionPreference = 'Stop'; $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); $task = $scheduler.GetFolder('\\').GetTask(${psSingleQuote(WINDOWS_TASK)}); [xml]$expected = Get-Content -LiteralPath ${psSingleQuote(paths.configPath)} -Raw; [xml]$actual = $task.Xml; if ($expected.Task.Actions.Exec.Command -cne $actual.Task.Actions.Exec.Command -or $expected.Task.Actions.Exec.Arguments -cne $actual.Task.Actions.Exec.Arguments) { throw 'The registered service action differs from its configuration file.' }`;
+      run("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", powershellEncodedCommand(verify)], { dryRun });
+    } catch (error) {
+      if (!dryRun) {
+        if (previousConfig) writeFileSync(paths.configPath, previousConfig);
+        else if (existsSync(paths.configPath)) unlinkSync(paths.configPath);
+      }
+      throw error;
+    }
     console.log(`${dryRun ? "Would install" : "Installed"} Windows scheduled task: ${WINDOWS_TASK}`);
     console.log("Run `originrouter service start` to start it now.");
   }
@@ -499,16 +541,63 @@ async function startService({ dryRun = false } = {}) {
     return;
   }
   if (currentPlatform === "win32") {
-    runSchtasks(["/Run", "/TN", WINDOWS_TASK], { dryRun });
-    const localApiUrl = await waitForLocalApiReady({ dryRun });
+    let localApiUrl;
+    try {
+      const failedPath = join(getStateDir(), "service-start-failed");
+      if (!dryRun && existsSync(failedPath)) unlinkSync(failedPath);
+      runSchtasks(["/Run", "/TN", WINDOWS_TASK], { dryRun });
+      localApiUrl = await waitForLocalApiReady({ dryRun });
+    } catch (error) {
+      const diagnostics = windowsServiceDiagnostics();
+      let cleanupError = null;
+      try {
+        // Scheduled retries must not resurrect a start that we reported as
+        // failed. A deliberate subsequent start clears this marker.
+        writeFileSync(join(getStateDir(), "service-start-failed"), String(error.message));
+        stopService({ dryRun });
+      } catch (failure) {
+        cleanupError = failure;
+      }
+      throw new Error(`${error.message}\n${cleanupError ? `Service cleanup failed: ${cleanupError.message}` : "The failed service was stopped."}\n${diagnostics}`, { cause: error });
+    }
     console.log(`OriginRouter service started${localApiUrl ? `: ${localApiUrl}` : "."}`);
     return;
   }
   throw new Error(`Unsupported platform for service management: ${currentPlatform}`);
 }
 
+function readLogTail(path) {
+  let fd;
+  try {
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    const buffer = Buffer.alloc(Math.min(size, 4096));
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, Math.max(0, size - buffer.length));
+    return buffer.subarray(0, bytesRead).toString("utf8").trim() || "(empty)";
+  } catch (error) {
+    return error.code === "ENOENT" ? "(not created)" : `(cannot read: ${error.message})`;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function windowsServiceDiagnostics() {
+  const paths = servicePaths("win32");
+  const details = [];
+  try {
+    details.push(`Scheduled task:\n${runSchtasks(["/Query", "/TN", WINDOWS_TASK, "/V", "/FO", "LIST"]).trim()}`);
+  } catch (error) {
+    details.push(`Scheduled task query failed: ${error.message}`);
+  }
+  for (const path of [paths.stdout, paths.stderr]) {
+    details.push(`${path}:\n${readLogTail(path)}`);
+  }
+  return details.join("\n");
+}
+
 export async function restartService({ dryRun = false } = {}) {
-  try { stopService({ dryRun }); } catch {}
+  if (platform() === "win32") stopService({ dryRun });
+  else try { stopService({ dryRun }); } catch {}
   if (platform() === "darwin" && !dryRun) {
     await waitForLaunchdUnloaded();
   }
@@ -536,6 +625,23 @@ export async function waitForLaunchdUnloaded({
   throw new Error(`OriginRouter service did not finish stopping within ${timeoutMs}ms.`);
 }
 
+export function buildWindowsStopCommand({ cliPath, stateDir, pid = null, taskName = WINDOWS_TASK }) {
+  // New daemons identify the managed state directory on their command line,
+  // so they can be found even if startup failed before writing daemon.state.
+  // Legacy daemons are eligible only at the recorded PID and exact CLI path.
+  const marker = `--originrouter-service-home "${stateDir}"`;
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "$scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect()",
+    `$task = $null; try { $task = $scheduler.GetFolder('\\').GetTask(${psSingleQuote(taskName)}) } catch { $exception = $_.Exception; while ($exception.InnerException) { $exception = $exception.InnerException }; if ($exception.HResult -ne -2147024894) { throw } }`,
+    "if ($task) { $task.Stop(0) }",
+    `$marker = ${psSingleQuote(marker)}; $cli = ${psSingleQuote(`"${cliPath}"`)}; $legacyPid = ${Number.isInteger(pid) && pid > 0 ? pid : 0}`,
+    "$owned = @(Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -and $_.CommandLine -match '(?:^|\\s)daemon(?:\\s|$)' -and (($_.CommandLine.IndexOf($marker, [StringComparison]::OrdinalIgnoreCase) -ge 0) -or ($_.ProcessId -eq $legacyPid -and $_.CommandLine.IndexOf($cli, [StringComparison]::OrdinalIgnoreCase) -ge 0)) })",
+    "foreach ($item in $owned) { $current = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $item.ProcessId); if (-not $current -or $current.CreationDate -ne $item.CreationDate) { continue }; & taskkill.exe /PID $item.ProcessId /T /F | Out-Null; if ($LASTEXITCODE -ne 0 -and (Get-Process -Id $item.ProcessId -ErrorAction SilentlyContinue)) { throw ('Cannot terminate daemon PID ' + $item.ProcessId) } }",
+    "foreach ($item in $owned) { $remaining = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $item.ProcessId); if ($remaining -and $remaining.CreationDate -eq $item.CreationDate) { throw ('Daemon PID ' + $item.ProcessId + ' is still running') } }",
+  ].join("; ");
+}
+
 function stopService({ dryRun = false } = {}) {
   const currentPlatform = platform();
   if (currentPlatform === "darwin") {
@@ -551,7 +657,12 @@ function stopService({ dryRun = false } = {}) {
     return;
   }
   if (currentPlatform === "win32") {
-    runSchtasks(["/End", "/TN", WINDOWS_TASK], { dryRun });
+    let state = null;
+    try { state = readDaemonState(); } catch { /* Recover a corrupt state file too. */ }
+    const command = buildWindowsStopCommand({ cliPath: cliEntryPath(), stateDir: getStateDir(), pid: state?.pid });
+    run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", powershellEncodedCommand(command)], { dryRun });
+    const statePath = join(getStateDir(), "daemon.state.json");
+    if (!dryRun && existsSync(statePath)) unlinkSync(statePath);
     console.log("OriginRouter service stopped. Autostart task remains installed.");
     return;
   }
@@ -603,6 +714,7 @@ function uninstallService({ dryRun = false } = {}) {
     return;
   }
   if (currentPlatform === "win32") {
+    stopService({ dryRun });
     runSchtasks(["/Delete", "/TN", WINDOWS_TASK, "/F"], { dryRun });
     if (dryRun) console.log(`$ rm ${paths.configPath}`);
     else if (existsSync(paths.configPath)) unlinkSync(paths.configPath);
@@ -630,6 +742,14 @@ export async function handleServiceCommand(args) {
   }
   if (action === "install") {
     installService({ dryRun });
+    return;
+  }
+  if (action === "refresh") {
+    // Called in a fresh CLI process after updating the installed package.
+    // Rebuild the task/unit with the new implementation and executable paths.
+    if (platform() !== "win32") stopService({ dryRun });
+    installService({ dryRun });
+    if (args.includes("--start")) await startService({ dryRun });
     return;
   }
   if (action === "start") {

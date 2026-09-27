@@ -32,8 +32,9 @@ function printUpdatedResult(result) {
   console.log(`OriginRouter CLI updated: ${result.from_version} → ${result.to_version}.`);
   if (result.service_restarted) console.log("OriginRouter service restarted.");
   else if (result.service_restart_error) {
-    console.log(`OriginRouter was updated, but the managed service could not restart: ${result.service_restart_error}`);
+    console.log(`OriginRouter was updated, but its service configuration or restart failed: ${result.service_restart_error}`);
   }
+  else if (result.service_refreshed) console.log("OriginRouter service configuration updated; the service remains stopped.");
   else if (result.daemon_was_running) {
     console.log("A manually started daemon is still using the previous version; restart it when safe.");
   }
@@ -68,9 +69,10 @@ export async function handleUpdateCommand(args, dependencies = {}) {
       installContext,
       fetchFn: dependencies.fetchFn,
       spawnFn: dependencies.spawnFn,
-      restartServiceFn: dependencies.restartServiceFn,
+      refreshServiceFn: dependencies.refreshServiceFn,
       serviceInstalledFn: dependencies.serviceInstalledFn,
     });
+    if (result.service_restart_error) process.exitCode = 1;
     if (json) {
       console.log(JSON.stringify(result, null, 2));
     } else if (result.updated) {

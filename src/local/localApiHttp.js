@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import { dirname } from "node:path";
 import { readApiToken } from "../persistence/authToken.js";
 import { getStateDir } from "../persistence/state.js";
 
@@ -101,7 +102,7 @@ export function requireAuth(req, ctx) {
   if (!m) {
     return { ok: false, status: 401, error: "unauthorized", reason: "malformed" };
   }
-  const stored = readApiToken(ctx.apiTokenPath ? dirnameOf(ctx.apiTokenPath) : getStateDir());
+  const stored = readApiToken(ctx.apiTokenPath ? dirname(ctx.apiTokenPath) : getStateDir());
   if (!stored) {
     return { ok: false, status: 503, error: "auth-not-initialized", reason: "auth-not-initialized" };
   }
@@ -109,10 +110,4 @@ export function requireAuth(req, ctx) {
     return { ok: false, status: 401, error: "unauthorized", reason: "invalid" };
   }
   return { ok: true };
-}
-
-function dirnameOf(p) {
-  // Lightweight dirname to avoid pulling another helper.
-  const i = String(p).lastIndexOf("/");
-  return i < 0 ? "." : String(p).slice(0, i);
 }

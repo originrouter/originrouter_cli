@@ -72,10 +72,11 @@ function Expand-ZipWithProgress([string]$ZipPath, [string]$DestinationPath, [str
     $frameIndex = 0
     $lastRendered = [DateTime]::MinValue
     $fullDest = [System.IO.Path]::GetFullPath($DestinationPath)
+    $safePrefix = $fullDest.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
     try {
         foreach ($entry in $zip.Entries) {
             $targetPath = [System.IO.Path]::GetFullPath((Join-Path $DestinationPath $entry.FullName))
-            if (-not $targetPath.StartsWith($fullDest, [System.StringComparison]::OrdinalIgnoreCase)) {
+            if (-not $targetPath.StartsWith($safePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
                 throw "The archive contains an unsafe path: $($entry.FullName)"
             }
             if ($entry.FullName.EndsWith("/") -or [string]::IsNullOrEmpty($entry.Name)) {
@@ -90,7 +91,7 @@ function Expand-ZipWithProgress([string]$ZipPath, [string]$DestinationPath, [str
             $done++
             if (((Get-Date) - $lastRendered).TotalMilliseconds -ge 100) {
                 $lastRendered = Get-Date
-                $pct = [int](100 * $done / $total)
+                $pct = if ($total -gt 0) { [int](100 * $done / $total) } else { 100 }
                 Write-InlineStatus ("{0}: {1}/{2} files ({3}%) {4}" -f $Activity, $done, $total, $pct, $frames[$frameIndex])
                 $frameIndex = ($frameIndex + 1) % $frames.Count
             }
@@ -160,12 +161,14 @@ function Invoke-WithSpinner {
     param(
         [string]$FilePath,
         [string[]]$ArgumentList = @(),
-        [string]$Activity
+        [string]$Activity,
+        [int]$TimeoutSeconds = 900
     )
     $outLog = [System.IO.Path]::GetTempFileName()
     $errLog = [System.IO.Path]::GetTempFileName()
     $frames = @("|", "/", "-", "\")
     $frameIndex = 0
+    $proc = $null
     try {
         # Run through cmd.exe with file redirection: Start-Process on a .cmd
         # child returns an unreliable (often null) ExitCode on Windows
@@ -178,7 +181,9 @@ function Invoke-WithSpinner {
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
         $proc = [System.Diagnostics.Process]::Start($psi)
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
         while (-not $proc.HasExited) {
+            if ([DateTime]::UtcNow -ge $deadline) { throw "$Activity timed out after $TimeoutSeconds seconds." }
             $frameIndex = ($frameIndex + 1) % $frames.Count
             Write-InlineStatus ("{0}... {1}" -f $Activity, $frames[$frameIndex])
             Start-Sleep -Milliseconds 120
@@ -195,6 +200,25 @@ function Invoke-WithSpinner {
         }
         return $exitCode
     } finally {
+        # A timeout, exception or Ctrl+C must not leave npm/setup descendants
+        # running after the installer has released its installation lock.
+        if ($null -ne $proc) {
+            try {
+                if (-not $proc.HasExited) {
+                    $killInfo = New-Object System.Diagnostics.ProcessStartInfo
+                    $killInfo.FileName = Join-Path $env:WINDIR 'System32\taskkill.exe'
+                    $killInfo.Arguments = '/PID ' + $proc.Id + ' /T /F'
+                    $killInfo.UseShellExecute = $false
+                    $killInfo.CreateNoWindow = $true
+                    $killer = [System.Diagnostics.Process]::Start($killInfo)
+                    try {
+                        if (-not $killer.WaitForExit(10000)) { throw 'Timed out terminating the installer process tree.' }
+                        if (-not $proc.WaitForExit(5000)) { throw 'The installer process is still running after cleanup.' }
+                    } finally { $killer.Dispose() }
+                }
+            } finally { $proc.Dispose() }
+        }
+        Clear-InlineStatus
         Remove-Item -LiteralPath $outLog, $errLog -Force -ErrorAction SilentlyContinue
     }
 }
@@ -272,10 +296,15 @@ function Install-NodeViaUserZip {
 
 # Reuse a Node runtime installed by a previous run of this installer even if
 # the current console has not picked up the updated user PATH yet.
-$userNodeBin = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA "OriginRouter") -Directory -Filter "node-*-win-x64" -ErrorAction SilentlyContinue |
-    Sort-Object -Property Name -Descending | Select-Object -First 1
-if ($null -ne $userNodeBin) {
-    $env:Path = "$($userNodeBin.FullName);$env:Path"
+$userNodeBins = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA "OriginRouter") -Directory -Filter "node-*-win-x64" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^node-v(\d+)\.(\d+)\.(\d+)-win-x64$' } |
+    Sort-Object -Property @{ Expression = { [version]($_.Name -replace '^node-v([0-9.]+)-win-x64$', '$1') } } -Descending
+foreach ($userNodeBin in $userNodeBins) {
+    if ((Test-Path -LiteralPath (Join-Path $userNodeBin.FullName 'node.exe')) -and
+        (Test-Path -LiteralPath (Join-Path $userNodeBin.FullName 'npm.cmd'))) {
+        $env:Path = "$($userNodeBin.FullName);$env:Path"
+        if (Test-NodeUsable) { break }
+    }
 }
 
 if (-not (Test-NodeUsable)) {
@@ -363,12 +392,15 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "The installed OriginRouter command failed verification." }
     Write-Host "==> Preparing the OriginRouter runtime"
     if ($Yes) {
-        $setupExit = Invoke-WithSpinner -FilePath $cliPath -ArgumentList $setupArgs -Activity "Preparing the OriginRouter runtime"
+        $setupExit = Invoke-WithSpinner -FilePath $cliPath -ArgumentList (@("setup") + $setupArgs) -Activity "Preparing the OriginRouter runtime" -TimeoutSeconds 1800
         if ($setupExit -ne 0) { throw "OriginRouter setup did not complete successfully. Run the same installer command again to resume." }
     } else {
         & $cliPath setup @setupArgs
         if ($LASTEXITCODE -ne 0) { throw "OriginRouter setup did not complete successfully. Run the same installer command again to resume." }
     }
+    Write-Host "==> Verifying the installation"
+    & $cliPath setup --verify
+    if ($LASTEXITCODE -ne 0) { throw "OriginRouter verification failed. Run the same installer command again to resume." }
     Write-Host "==> OriginRouter installation complete"
 }
 finally {
