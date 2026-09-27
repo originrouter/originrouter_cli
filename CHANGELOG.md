@@ -5,6 +5,18 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ## Unreleased
 
+## 0.4.2 - 2026-09-27
+
+### Added
+
+- Python runtime and LiteLLM downloads (pip, uv, and the uv archive itself)
+  now inherit the Windows system proxy automatically, so `originrouter setup`
+  and `originrouter proxy install` work behind local proxies such as Clash
+  without manual environment setup. `ORIGINROUTER_PROXY` overrides and
+  `originrouter proxy install` work behind local proxies such as Clash without
+  manual environment setup. `ORIGINROUTER_PROXY` overrides and
+  `ORIGINROUTER_NO_PROXY=1` disables detection.
+
 ### Fixed
 
 - Fixed Windows background service installation failing with

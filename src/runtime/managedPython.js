@@ -15,6 +15,7 @@ import { arch, platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { runCapture } from "../utils/detect.js";
+import { inheritSystemProxyEnv } from "../utils/systemProxy.js";
 
 export const MANAGED_PYTHON_VERSION = "3.12.13";
 export const UV_VERSION = "0.12.9";
@@ -24,7 +25,7 @@ function run(command, args, options = {}) {
     const child = spawn(command, args, {
       stdio: options.stdio || "inherit",
       shell: false,
-      env: options.env || process.env,
+      env: options.env ? options.env : inheritSystemProxyEnv(process.env),
     });
     child.once("error", (error) => resolve({ ok: false, error }));
     child.once("exit", (code, signal) => resolve({ ok: code === 0, code, signal }));
