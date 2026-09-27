@@ -1,6 +1,6 @@
 {
   "name": "@originrouter/cli",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Local CLI and connector for OriginRouter Agent Control.",
   "keywords": [
     "ai-agent",

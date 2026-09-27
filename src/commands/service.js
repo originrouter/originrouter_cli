@@ -6,6 +6,7 @@ import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { readApiToken } from "../persistence/authToken.js";
 import { getStateDir, readDaemonState } from "../persistence/state.js";
+import { quoteWindowsArgument } from "../utils/spawn.js";
 
 const SERVICE_LABEL = "com.originrouter.daemon";
 const SYSTEMD_UNIT = "originrouter.service";
@@ -235,6 +236,82 @@ function run(cmd, args, { dryRun = false } = {}) {
   }
 }
 
+// Windows may deny scheduled-task registration to standard shells. Instead
+// of telling the user to open an elevated console themselves, relaunch this
+// exact command through a UAC prompt: the user only clicks "Yes". The
+// elevated child runs in its own window and its exit code is relayed here.
+const ELEVATION_FLAG = "--originrouter-elevated";
+
+function psSingleQuote(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+function runElevatedServiceInstall() {
+  const entry = cliEntryPath();
+  const inner = [
+    quoteWindowsArgument(process.execPath),
+    quoteWindowsArgument(entry),
+    "service", "install", ELEVATION_FLAG,
+  ].join(" ");
+  const command = "Start-Process -FilePath " + psSingleQuote(process.execPath)
+    + " -ArgumentList " + psSingleQuote(inner)
+    + " -Verb RunAs -Wait";
+  console.log("Administrator approval is needed to register the background service.");
+  console.log(">>> Click \"Yes\" on the Windows permission prompt to continue. <<<");
+  try {
+    execFileSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], {
+      stdio: "inherit",
+      timeout: 180_000,
+      windowsHide: false,
+    });
+  } catch (error) {
+    if (error?.signal === "SIGTERM") {
+      throw new Error("Timed out waiting for the UAC approval prompt.");
+    }
+    throw new Error(
+      "Administrator approval was declined or failed, so the background service was not registered. "
+      + "Re-run `originrouter service install` and click \"Yes\" on the permission prompt."
+    );
+  }
+}
+
+// schtasks prints in the local ANSI code page (GBK on zh-CN systems), which
+// Node's utf8 decode renders as mojibake. Switch the console to UTF-8 first
+// so captured output and error messages are readable.
+function runSchtasks(args, { dryRun = false } = {}) {
+  if (dryRun) {
+    console.log(`$ schtasks.exe ${args.join(" ")}`);
+    return "";
+  }
+  const commandLine = `chcp 65001 >nul & schtasks.exe ${args.map(quoteWindowsArgument).join(" ")}`;
+  try {
+    return execFileSync("cmd.exe", ["/d", "/s", "/c", commandLine], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 15_000,
+      windowsVerbatimArguments: true,
+    });
+  } catch (error) {
+    const text = `${error?.stdout || ""}\n${error?.stderr || ""}\n${error?.message || ""}`;
+    if (/Access is denied|拒绝访问/i.test(text) && args[0] === "/Create"
+        && !process.argv.includes(ELEVATION_FLAG)) {
+      // Registration was denied: pop the UAC prompt and let Windows ask the
+      // user directly. The elevated child registers the task; nothing else
+      // is required from the user.
+      runElevatedServiceInstall();
+      return "";
+    }
+    if (/Access is denied|拒绝访问/i.test(text)) {
+      throw new Error(
+        "Registering the background service requires administrator rights on this machine. "
+        + "Open an elevated PowerShell once and run `originrouter service install` there; "
+        + "daily use afterwards needs no elevation."
+      );
+    }
+    throw error;
+  }
+}
+
 function tryRun(cmd, args, { dryRun = false } = {}) {
   try {
     return run(cmd, args, { dryRun });
@@ -390,7 +467,7 @@ function installService({ dryRun = false } = {}) {
 
   if (currentPlatform === "win32") {
     const xmlPath = dryRun ? paths.configPath : paths.configPath;
-    run("schtasks.exe", ["/Create", "/TN", WINDOWS_TASK, "/XML", xmlPath, "/F"], { dryRun });
+    runSchtasks(["/Create", "/TN", WINDOWS_TASK, "/XML", xmlPath, "/F"], { dryRun });
     console.log(`${dryRun ? "Would install" : "Installed"} Windows scheduled task: ${WINDOWS_TASK}`);
     console.log("Run `originrouter service start` to start it now.");
   }
@@ -417,7 +494,7 @@ async function startService({ dryRun = false } = {}) {
     return;
   }
   if (currentPlatform === "win32") {
-    run("schtasks.exe", ["/Run", "/TN", WINDOWS_TASK], { dryRun });
+    runSchtasks(["/Run", "/TN", WINDOWS_TASK], { dryRun });
     const localApiUrl = await waitForLocalApiReady({ dryRun });
     console.log(`OriginRouter service started${localApiUrl ? `: ${localApiUrl}` : "."}`);
     return;
@@ -469,7 +546,7 @@ function stopService({ dryRun = false } = {}) {
     return;
   }
   if (currentPlatform === "win32") {
-    run("schtasks.exe", ["/End", "/TN", WINDOWS_TASK], { dryRun });
+    runSchtasks(["/End", "/TN", WINDOWS_TASK], { dryRun });
     console.log("OriginRouter service stopped. Autostart task remains installed.");
     return;
   }
@@ -486,7 +563,7 @@ function statusService({ dryRun = false } = {}) {
     const output = run("systemctl", ["--user", "status", SYSTEMD_UNIT, "--no-pager"], { dryRun });
     if (output) console.log(output.trimEnd());
   } else if (currentPlatform === "win32") {
-    const output = run("schtasks.exe", ["/Query", "/TN", WINDOWS_TASK, "/V", "/FO", "LIST"], { dryRun });
+    const output = runSchtasks(["/Query", "/TN", WINDOWS_TASK, "/V", "/FO", "LIST"], { dryRun });
     if (output) console.log(output.trimEnd());
   } else {
     throw new Error(`Unsupported platform for service management: ${currentPlatform}`);
@@ -521,7 +598,7 @@ function uninstallService({ dryRun = false } = {}) {
     return;
   }
   if (currentPlatform === "win32") {
-    run("schtasks.exe", ["/Delete", "/TN", WINDOWS_TASK, "/F"], { dryRun });
+    runSchtasks(["/Delete", "/TN", WINDOWS_TASK, "/F"], { dryRun });
     if (dryRun) console.log(`$ rm ${paths.configPath}`);
     else if (existsSync(paths.configPath)) unlinkSync(paths.configPath);
     console.log("OriginRouter service uninstalled.");

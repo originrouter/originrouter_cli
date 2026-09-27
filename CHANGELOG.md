@@ -3,7 +3,22 @@
 All notable changes to OriginRouter CLI will be documented here. The project
 uses Semantic Versioning and follows the Keep a Changelog structure.
 
-## Unreleased
+## 0.4.3 - 2026-09-27
+
+### Fixed
+
+- Fixed the background daemon shutting down immediately after start on
+  logged-out installs: `undefined` vs `null` account-scope comparisons were
+  misread as an account context change. This surfaced on Windows, where the
+  scheduled task does not supervise and restart the daemon, leaving the
+  Local API never ready.
+- Windows service commands now switch the console to UTF-8 before capturing
+  `schtasks` output, so status and error text no longer appear as mojibake,
+  and `service install` reports a clear message when scheduled-task
+  registration requires administrator rights instead of a garbled error. When
+  registration is denied in a normal console, the installer now raises the
+  Windows UAC prompt automatically (the user only clicks "Yes") instead of
+  asking the user to open an elevated PowerShell themselves.
 
 ## 0.4.2 - 2026-09-27
 

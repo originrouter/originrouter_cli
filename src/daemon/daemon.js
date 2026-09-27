@@ -121,8 +121,12 @@ export async function startDaemon(args) {
   // the next loop iteration picks them up and connects the remote bridge.
   let effectiveDeviceId = device.deviceId;
   const initialCredential = readCodingAuth(stateDir);
-  let accountScope = initialCredential?.accountScope;
-  let sessionId = initialCredential?.sessionId;
+  // Normalize to null so the "no account yet" case matches the
+  // `credential?.accountScope || null` comparisons in the relay loop below;
+  // undefined !== null otherwise trips a spurious ACCOUNT_CHANGED shutdown
+  // on every start of a logged-out daemon.
+  let accountScope = initialCredential?.accountScope || null;
+  let sessionId = initialCredential?.sessionId || null;
   let relayAuthState = "pending";
   let relayAuthError = null;
   const relayClient = new RelayClient({
@@ -561,8 +565,11 @@ export async function startDaemon(args) {
   authContextTimer = setInterval(() => {
     if (shuttingDown) return;
     const credential = readCodingAuth(stateDir);
-    const nextAccountScope = credential?.accountScope;
-    const nextSessionId = credential?.sessionId;
+    // Normalize with || null to match the variables initialized from
+    // `initialCredential?.X || null` above; otherwise undefined vs null
+    // reads as a context change on logged-out installs.
+    const nextAccountScope = credential?.accountScope || null;
+    const nextSessionId = credential?.sessionId || null;
     if (
       nextAccountScope !== accountScope ||
       nextSessionId !== sessionId

@@ -298,7 +298,12 @@ export async function handleSetupCommand(args = []) {
         await handleServiceCommand(["start"]);
         console.log("✓ OriginRouter background service is running.");
       } catch (error) {
-        console.error(`✗ Background service setup failed: ${error.message || error}`);
+        const message = String(error?.message || error);
+        console.error(`✗ Background service setup failed: ${message}`);
+        if (platform() === "win32" && /administrator rights|Access is denied|拒绝访问/i.test(message)) {
+          console.error("  This machine requires administrator rights to register scheduled tasks.");
+          console.error("  Fix: open an elevated PowerShell once and run `originrouter service install`, then `originrouter service start`.");
+        }
         // Best-effort diagnostics so users can paste actionable context.
         try {
           const { execFileSync } = await import("node:child_process");
