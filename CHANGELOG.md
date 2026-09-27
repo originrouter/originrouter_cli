@@ -5,6 +5,12 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ## Unreleased
 
+### Fixed
+
+- Fixed Windows background service installation failing with
+  `(35,25): Interval:PT30S` — Task Scheduler rejects sub-minute
+  `RestartOnFailure` intervals; the task XML now uses the minimum `PT1M`.
+
 ## 0.4.1 - 2026-09-27
 
 ### Added

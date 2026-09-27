@@ -81,6 +81,11 @@ const common = {
   assert.match(task, /<LogonTrigger>/);
   assert.match(task, /<RestartOnFailure>/);
   assert.match(task, /<Count>3<\/Count>/);
+  // Task Scheduler rejects sub-minute RestartOnFailure intervals (schtasks
+  // reports "(35,25): Interval:PT30S" as out of range); PT1M is the minimum.
+  assert.match(task, /<Interval>PT1M<\/Interval>/);
+  assert.doesNotMatch(task, /<Interval>PT0?S<\/Interval>/);
+  assert.doesNotMatch(task, /<Interval>PT\d+S<\/Interval>/);
   assert.match(task, /-EncodedCommand /);
   const encoded = task.match(/-EncodedCommand ([^<]+)<\/Arguments>/)?.[1];
   const decoded = Buffer.from(encoded, "base64").toString("utf16le");

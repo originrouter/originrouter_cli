@@ -200,7 +200,7 @@ export function buildWindowsTaskXml({
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <RestartOnFailure>
-      <Interval>PT30S</Interval>
+      <Interval>PT1M</Interval>
       <Count>3</Count>
     </RestartOnFailure>
   </Settings>
