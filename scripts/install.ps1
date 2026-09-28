@@ -157,6 +157,57 @@ function Resolve-Executable([string]$CommandName) {
     return $source
 }
 
+function Stop-PreviousOriginRouterService {
+    param(
+        [string]$PackageRoot,
+        [string]$StateDir = $(if ($env:ORIGINROUTER_HOME) { $env:ORIGINROUTER_HOME } else { Join-Path $env:USERPROFILE '.originrouter' }),
+        [string]$TaskName = 'OriginRouterDaemon'
+    )
+    # Stop before npm replaces native modules. Keep this independent of the
+    # installed CLI so it can recover versions whose service stop was broken.
+    $scheduler = New-Object -ComObject 'Schedule.Service'
+    $scheduler.Connect()
+    $task = $null
+    try { $task = $scheduler.GetFolder('\').GetTask($TaskName) }
+    catch {
+        $exception = $_.Exception
+        while ($exception.InnerException) { $exception = $exception.InnerException }
+        if ($exception.HResult -ne -2147024894) { throw }
+    }
+    if ($task) { $task.Stop(0) }
+    $statePath = Join-Path $StateDir 'daemon.state.json'
+    $legacyPid = 0
+    if (Test-Path -LiteralPath $statePath) {
+        try { $legacyPid = [int]((Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json).pid) } catch { }
+    }
+    $marker = '--originrouter-service-home "' + $StateDir + '"'
+    $cli = '"' + (Join-Path $PackageRoot 'bin\originrouter.js') + '"'
+    $owned = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object {
+        $_.CommandLine -and $_.CommandLine -match '(?:^|\s)daemon(?:\s|$)' -and
+        (($_.CommandLine.IndexOf($marker, [StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+         ($_.ProcessId -eq $legacyPid -and $_.CommandLine.IndexOf($cli, [StringComparison]::OrdinalIgnoreCase) -ge 0))
+    })
+    foreach ($item in $owned) {
+        $current = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $item.ProcessId)
+        if (-not $current -or $current.CreationDate -ne $item.CreationDate) { continue }
+        $process = $null
+        try {
+            $process = [Diagnostics.Process]::GetProcessById([int]$item.ProcessId)
+            if ($process.HasExited) { continue }
+            # The process can exit between HasExited and taskkill. Its handle
+            # is the final check; a "process not found" stderr is harmless.
+            $savedPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                & taskkill.exe /PID $item.ProcessId /T /F 2>&1 | Out-Null
+            } finally { $ErrorActionPreference = $savedPreference }
+            if (-not $process.WaitForExit(5000)) { throw "Previous OriginRouter daemon PID $($item.ProcessId) did not exit within 5000ms." }
+        } catch [ArgumentException] { }
+        finally { if ($process) { $process.Dispose() } }
+    }
+    if (Test-Path -LiteralPath $statePath) { Remove-Item -LiteralPath $statePath -Force }
+}
+
 function Invoke-WithSpinner {
     param(
         [string]$FilePath,
@@ -371,6 +422,8 @@ try {
         exit 0
     }
 
+    Write-Host "==> Stopping the previous OriginRouter background service"
+    Stop-PreviousOriginRouterService -PackageRoot $globalPackage
     Write-Host "==> Installing $packageSpec from npm (this may take a few minutes)"
     $npmCommand = Resolve-Executable "npm"
     $installExit = Invoke-WithSpinner -FilePath $npmCommand -ArgumentList @("install", "--global", $packageSpec) -Activity "Installing $packageSpec"

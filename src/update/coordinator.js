@@ -92,6 +92,7 @@ function classifyUpdateFailure(error) {
   if (error?.code === "UPDATE_TIMEOUT") return "install_timeout";
   if (error?.code === "UPDATE_POST_INSTALL_VERSION_MISMATCH") return "post_install_version_mismatch";
   if (error?.code === "UPDATE_CHECK_FAILED") return "registry_unavailable";
+  if (error?.code === "UPDATE_SERVICE_STOP_FAILED") return "service_stop_failed";
   if (["EACCES", "EPERM"].includes(error?.code) || /not writable|permission denied|EACCES/i.test(detail)) {
     return "no_permissions";
   }
@@ -206,19 +207,25 @@ export function runInstaller(command, args, {
   });
 }
 
-export async function refreshInstalledService({ installContext, stateDir, start, spawnFn = spawnCommand }) {
+async function runInstalledServiceCommand({ installContext, stateDir, args, spawnFn = spawnCommand }) {
   const root = installContext.package_json_path
     ? dirname(installContext.package_json_path) : installContext.package_root;
-  if (!root) throw new Error("Cannot locate the newly installed CLI to refresh its service.");
-  const args = [join(root, "bin", "originrouter.js"), "service", "refresh"];
-  if (start) args.push("--start");
+  if (!root) throw new Error("Cannot locate the installed CLI to manage its service.");
   // A fresh process reads the files installed by npm rather than using the
   // update command's already-imported, previous-version service module.
-  await runInstaller(process.execPath, args, {
+  await runInstaller(process.execPath, [join(root, "bin", "originrouter.js"), "service", ...args], {
     spawnFn,
     timeoutMs: 180_000,
     env: { ...process.env, ORIGINROUTER_HOME: stateDir, ORIGINROUTER_DISABLE_UPDATE_CHECK: "1" },
   });
+}
+
+export function refreshInstalledService({ start, ...options }) {
+  return runInstalledServiceCommand({ ...options, args: ["refresh", ...(start ? ["--start"] : [])] });
+}
+
+export function stopInstalledService(options) {
+  return runInstalledServiceCommand({ ...options, args: ["stop"] });
 }
 
 export async function installLatestVersion({
@@ -228,7 +235,9 @@ export async function installLatestVersion({
   fetchFn = globalThis.fetch,
   spawnFn = spawnCommand,
   refreshServiceFn = refreshInstalledService,
+  stopServiceFn = stopInstalledService,
   serviceInstalledFn = isServiceInstalled,
+  currentPlatform = process.platform,
   readInstalledVersionFn = readInstalledVersion,
   installerTimeoutMs,
   installerKillGraceMs,
@@ -297,6 +306,18 @@ export async function installLatestVersion({
     });
     const installArgs = installContext.args.map((arg) =>
       arg === "@originrouter/cli@latest" ? `@originrouter/cli@${checked.latest_version}` : arg);
+    if (currentPlatform === "win32" && serviceWasInstalled) {
+      // Windows cannot remove a loaded native module. Release the old daemon
+      // before npm replaces its directory, then restore its prior running state
+      // through the newly installed CLI below.
+      try {
+        await stopServiceFn({ installContext, stateDir, spawnFn });
+      } catch (error) {
+        error.message = `Cannot stop the previous background service before updating: ${error.message}`;
+        error.code = "UPDATE_SERVICE_STOP_FAILED";
+        throw error;
+      }
+    }
     await runInstaller(installContext.command, installArgs, {
       spawnFn,
       timeoutMs: installerTimeoutMs,

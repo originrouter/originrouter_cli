@@ -3,6 +3,23 @@
 All notable changes to OriginRouter CLI will be documented here. The project
 uses Semantic Versioning and follows the Keep a Changelog structure.
 
+## 0.4.6 - 2026-09-28
+
+### Fixed
+
+- Windows login tasks now enter through the Windows Script Host GUI launcher,
+  which hides PowerShell before its console is created. This prevents the
+  persistent blank Windows Terminal window left by the previous launcher.
+- Windows service stop waits for the owned daemon's process handle to signal
+  exit instead of immediately checking a potentially stale CIM snapshot.
+  Reinstalling or restarting no longer fails while the old daemon is exiting.
+- Windows service failures show the actual command error in UTF-8 text,
+  without dumping encoded PowerShell commands or progress XML into setup.
+- The Windows installer and CLI updater stop the old service before npm
+  replaces loaded native modules, preventing obsolete package directories
+  from being left behind. The installer can stop older broken CLI versions
+  without invoking their service commands.
+
 ## 0.4.5 - 2026-09-28
 
 ### Fixed

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { cachedUpdateStatus, checkForUpdate, updateCheckIsDue } from "../src/update/checker.js";
-import { inspectUpdateActivity, installLatestVersion, refreshInstalledService, runInstaller } from "../src/update/coordinator.js";
+import { inspectUpdateActivity, installLatestVersion, refreshInstalledService, stopInstalledService, runInstaller } from "../src/update/coordinator.js";
 import { writeApiToken } from "../src/persistence/authToken.js";
 import { detectInstallContext } from "../src/update/installContext.js";
 import { renderUpdatePrompt, updateSelectionForKey } from "../src/update/prompt.js";
@@ -238,15 +238,19 @@ try {
       writeFileSync(join(refreshDir, "daemon.state.json"), JSON.stringify({ pid: process.pid, localApiPort: 7437 }));
     }
     let refreshed;
+    const order = [];
     const updated = await installLatestVersion({
       stateDir: refreshDir,
       installContext: { ...npmContext, writable: true },
       forceCheck: false,
       fetchFn: async () => responseFor({ sessions: [], runs: [] }),
       serviceInstalledFn: () => true,
+      currentPlatform: "win32",
+      stopServiceFn: async (options) => { assert.equal(options.stateDir, refreshDir); order.push("stop"); },
       readInstalledVersionFn: () => "9.9.9",
-      refreshServiceFn: async (options) => { refreshed = options; },
+      refreshServiceFn: async (options) => { refreshed = options; order.push("refresh"); },
       spawnFn: () => {
+        order.push("install");
         const child = new EventEmitter();
         queueMicrotask(() => child.emit("exit", 0, null));
         return child;
@@ -256,7 +260,21 @@ try {
     assert.equal(refreshed.stateDir, refreshDir);
     assert.equal(updated.service_refreshed, true);
     assert.equal(updated.service_restarted, running);
+    assert.deepEqual(order, ["stop", "install", "refresh"]);
   }
+
+  const stopFailureDir = join(root, "stop-failure");
+  writeUpdateState(stopFailureDir, { latest_version: "9.9.9" });
+  await assert.rejects(installLatestVersion({
+    stateDir: stopFailureDir,
+    installContext: { ...npmContext, writable: true },
+    forceCheck: false,
+    serviceInstalledFn: () => true,
+    currentPlatform: "win32",
+    stopServiceFn: async () => { throw new Error("termination denied"); },
+    spawnFn: () => { assert.fail("npm must not replace files while the old service cannot be stopped"); },
+  }), /Cannot stop the previous background service.*termination denied/);
+  assert.equal(readUpdateState(stopFailureDir).last_failure_kind, "service_stop_failed");
 
   const refreshFailureDir = join(root, "refresh-failure");
   writeUpdateState(refreshFailureDir, { latest_version: "9.9.9" });
@@ -287,6 +305,10 @@ try {
   await refreshInstalledService({ installContext: npmContext, stateDir: refreshFailureDir, start: true });
   assert.deepEqual(JSON.parse(readFileSync(refreshRecord, "utf8")), {
     args: ["service", "refresh", "--start"], home: refreshFailureDir,
+  });
+  await stopInstalledService({ installContext: npmContext, stateDir: refreshFailureDir });
+  assert.deepEqual(JSON.parse(readFileSync(refreshRecord, "utf8")), {
+    args: ["service", "stop"], home: refreshFailureDir,
   });
 
   if (oldHome === undefined) delete process.env.ORIGINROUTER_HOME;

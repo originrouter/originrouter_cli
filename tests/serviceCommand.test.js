@@ -87,8 +87,9 @@ const common = {
   assert.match(task, /<Interval>PT1M<\/Interval>/);
   assert.doesNotMatch(task, /<Interval>PT0?S<\/Interval>/);
   assert.doesNotMatch(task, /<Interval>PT\d+S<\/Interval>/);
-  assert.match(task, /-EncodedCommand /);
-  const encoded = task.match(/-EncodedCommand ([^<]+)<\/Arguments>/)?.[1];
+  assert.match(task, /wscript\.exe<\/Command>/);
+  assert.match(task, /originrouter-windows-service\.js/);
+  const encoded = task.match(/--encoded-command ([^<]+)<\/Arguments>/)?.[1];
   const decoded = Buffer.from(encoded, "base64").toString("utf16le");
   assert.match(decoded, /\$env:PATH =/);
   // The wrapper must use PowerShell single-quote literals. JSON.stringify
@@ -96,7 +97,7 @@ const common = {
   // so the encoded script failed to parse and the daemon never launched.
   assert.doesNotMatch(decoded, /\\"/);
   assert.match(decoded, /-ArgumentList '[^']* daemon --originrouter-service-home /);
-  assert.match(task, /-NonInteractive -WindowStyle Hidden/);
+  assert.match(task, /\/\/B \/\/NoLogo \/\/E:JScript/);
   assert.match(decoded, /Program Files\\nodejs/);
 }
 

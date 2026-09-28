@@ -54,7 +54,8 @@ function windowsXmlEscape(value) {
 }
 
 function powershellEncodedCommand(script) {
-  return Buffer.from(script, "utf16le").toString("base64");
+  const prelude = "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; ";
+  return Buffer.from(prelude + script, "utf16le").toString("base64");
 }
 
 export function buildServiceEnvironmentPath({
@@ -163,6 +164,7 @@ export function buildWindowsTaskXml({
   stdoutPath,
   stderrPath,
   stateDir = win32Path.dirname(win32Path.dirname(stderrPath)),
+  launcherPath = win32Path.join(win32Path.dirname(cliPath), "originrouter-windows-service.js"),
   environmentPath = buildServiceEnvironmentPath({ nodePath, cliPath, currentPlatform: "win32" }),
 }) {
   // Wrap every value in PowerShell single quotes. JSON.stringify-style
@@ -176,7 +178,8 @@ export function buildWindowsTaskXml({
     `if (Test-Path -LiteralPath ${psSingleQuote(win32Path.join(stateDir, "service-start-failed"))}) { exit 0 }`,
     `$env:PATH = ${psSingleQuote(environmentPath)}`,
     `$env:ORIGINROUTER_HOME = ${psSingleQuote(stateDir)}`,
-    // Hidden applies to the child as well as the scheduled PowerShell. A
+    // The GUI launcher hides PowerShell before Windows creates its console.
+    // Hidden applies to the redirected Node child as well. A
     // redirected console still creates a blank Terminal window otherwise.
     // With a quickly exiting redirected child, WaitForExit on the returned
     // Process can leave ExitCode null in PowerShell 5.1. Start-Process -Wait
@@ -224,8 +227,8 @@ export function buildWindowsTaskXml({
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>powershell.exe</Command>
-      <Arguments>-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand ${windowsXmlEscape(encoded)}</Arguments>
+      <Command>${windowsXmlEscape(win32Path.join(process.env.SystemRoot || "C:\\Windows", "System32", "wscript.exe"))}</Command>
+      <Arguments>//B //NoLogo //E:JScript ${windowsXmlEscape(`"${launcherPath}"`)} --encoded-command ${windowsXmlEscape(encoded)}</Arguments>
     </Exec>
   </Actions>
 </Task>
@@ -242,12 +245,22 @@ function run(cmd, args, { dryRun = false } = {}) {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 15_000,
+      windowsHide: true,
     });
   } catch (error) {
     if (error?.signal === "SIGTERM") {
+      if (platform() === "win32") {
+        throw new Error(`${win32Path.basename(cmd)} timed out after 15s while managing the background service.`, { cause: error });
+      }
       throw new Error(
         `\`${cmd} ${args.join(" ")}\` timed out after 15s. If this machine has no usable systemd user session, run \`originrouter service uninstall\` or reinstall with the service step disabled.`
       );
+    }
+    if (platform() === "win32") {
+      // Encoded PowerShell commands can be thousands of characters long.
+      // Report the actual error rather than dumping that command into setup.
+      const detail = String(error?.stderr || error?.stdout || error?.code || "Unknown error").trim();
+      throw new Error(`${win32Path.basename(cmd)} failed${Number.isInteger(error?.status) ? ` (exit ${error.status})` : ""}: ${detail}`, { cause: error });
     }
     throw error;
   }
@@ -312,6 +325,7 @@ function runSchtasks(args, { dryRun = false } = {}) {
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 15_000,
       windowsVerbatimArguments: true,
+      windowsHide: true,
     });
   } catch (error) {
     const text = `${error?.stdout || ""}\n${error?.stderr || ""}\n${error?.message || ""}`;
@@ -449,6 +463,7 @@ function installService({ dryRun = false } = {}) {
   const { paths, body } = serviceConfigForPlatform(currentPlatform);
   const previousConfig = !dryRun && existsSync(paths.configPath) ? readFileSync(paths.configPath) : null;
   if (currentPlatform === "win32") {
+    run("cscript.exe", ["//B", "//NoLogo", "//E:JScript", join(dirname(cliEntryPath()), "originrouter-windows-service.js"), "--check"], { dryRun });
     // Reinstalling must release the old wrapper and daemon before replacing
     // the task. Otherwise IgnoreNew can leave the old CLI running after an
     // upgrade, and the new setup still probes its broken API.
@@ -507,7 +522,7 @@ function installService({ dryRun = false } = {}) {
       // The elevated child can regenerate PATH. Compare the registered
       // action with the final file on disk, not the parent's earlier XML.
       const verify = `$ErrorActionPreference = 'Stop'; $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); $task = $scheduler.GetFolder('\\').GetTask(${psSingleQuote(WINDOWS_TASK)}); [xml]$expected = Get-Content -LiteralPath ${psSingleQuote(paths.configPath)} -Raw; [xml]$actual = $task.Xml; if ($expected.Task.Actions.Exec.Command -cne $actual.Task.Actions.Exec.Command -or $expected.Task.Actions.Exec.Arguments -cne $actual.Task.Actions.Exec.Arguments) { throw 'The registered service action differs from its configuration file.' }`;
-      run("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", powershellEncodedCommand(verify)], { dryRun });
+      run("powershell.exe", ["-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand", powershellEncodedCommand(verify)], { dryRun });
     } catch (error) {
       if (!dryRun) {
         if (previousConfig) writeFileSync(paths.configPath, previousConfig);
@@ -625,7 +640,7 @@ export async function waitForLaunchdUnloaded({
   throw new Error(`OriginRouter service did not finish stopping within ${timeoutMs}ms.`);
 }
 
-export function buildWindowsStopCommand({ cliPath, stateDir, pid = null, taskName = WINDOWS_TASK }) {
+export function buildWindowsStopCommand({ cliPath, stateDir, pid = null, taskName = WINDOWS_TASK, taskkillPath = "taskkill.exe" }) {
   // New daemons identify the managed state directory on their command line,
   // so they can be found even if startup failed before writing daemon.state.
   // Legacy daemons are eligible only at the recorded PID and exact CLI path.
@@ -637,8 +652,10 @@ export function buildWindowsStopCommand({ cliPath, stateDir, pid = null, taskNam
     "if ($task) { $task.Stop(0) }",
     `$marker = ${psSingleQuote(marker)}; $cli = ${psSingleQuote(`"${cliPath}"`)}; $legacyPid = ${Number.isInteger(pid) && pid > 0 ? pid : 0}`,
     "$owned = @(Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -and $_.CommandLine -match '(?:^|\\s)daemon(?:\\s|$)' -and (($_.CommandLine.IndexOf($marker, [StringComparison]::OrdinalIgnoreCase) -ge 0) -or ($_.ProcessId -eq $legacyPid -and $_.CommandLine.IndexOf($cli, [StringComparison]::OrdinalIgnoreCase) -ge 0)) })",
-    "foreach ($item in $owned) { $current = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $item.ProcessId); if (-not $current -or $current.CreationDate -ne $item.CreationDate) { continue }; & taskkill.exe /PID $item.ProcessId /T /F | Out-Null; if ($LASTEXITCODE -ne 0 -and (Get-Process -Id $item.ProcessId -ErrorAction SilentlyContinue)) { throw ('Cannot terminate daemon PID ' + $item.ProcessId) } }",
-    "foreach ($item in $owned) { $remaining = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $item.ProcessId); if ($remaining -and $remaining.CreationDate -eq $item.CreationDate) { throw ('Daemon PID ' + $item.ProcessId + ' is still running') } }",
+    // taskkill and Task.Stop return before Windows finishes tearing down a
+    // process. CIM can also still return that exiting process. Wait on its
+    // process handle instead of treating an immediate CIM snapshot as final.
+    "foreach ($item in $owned) { $current = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $item.ProcessId); if (-not $current -or $current.CreationDate -ne $item.CreationDate) { continue }; $process = $null; try { $process = [Diagnostics.Process]::GetProcessById([int]$item.ProcessId); if ($process.HasExited) { continue }; $savedPreference = $ErrorActionPreference; try { $ErrorActionPreference = 'Continue'; & " + psSingleQuote(taskkillPath) + " /PID $item.ProcessId /T /F 2>&1 | Out-Null } finally { $ErrorActionPreference = $savedPreference }; if (-not $process.WaitForExit(5000)) { throw ('Daemon PID ' + $item.ProcessId + ' did not exit within 5000ms') } } catch [ArgumentException] { } finally { if ($process) { $process.Dispose() } } }",
   ].join("; ");
 }
 
@@ -660,7 +677,7 @@ function stopService({ dryRun = false } = {}) {
     let state = null;
     try { state = readDaemonState(); } catch { /* Recover a corrupt state file too. */ }
     const command = buildWindowsStopCommand({ cliPath: cliEntryPath(), stateDir: getStateDir(), pid: state?.pid });
-    run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", powershellEncodedCommand(command)], { dryRun });
+    run("powershell.exe", ["-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-ExecutionPolicy", "Bypass", "-EncodedCommand", powershellEncodedCommand(command)], { dryRun });
     const statePath = join(getStateDir(), "daemon.state.json");
     if (!dryRun && existsSync(statePath)) unlinkSync(statePath);
     console.log("OriginRouter service stopped. Autostart task remains installed.");
