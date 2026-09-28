@@ -40,6 +40,31 @@ function writeRemoteShareConfig({ enabled, providers, port, e2eePolicy }) {
   return next.remoteShare;
 }
 
+export async function handleRemoteShareStatusPayload(ctx) {
+  const config = readConfig();
+  const configured = config.remoteShare || {};
+  const status = await ctx.getRemoteShareProxyStatus();
+  const providerNames = Array.isArray(status.currentProviders) && status.currentProviders.length > 0
+    ? status.currentProviders
+    : configured.providers || [];
+  const catalog = remoteShareProviders(config, providerNames)
+    .flatMap((provider) => remoteShareModelEntries(provider))
+    .map(({ provider, model, sourceProvider, pricing }) => ({
+      provider,
+      model,
+      sourceProvider,
+      pricing,
+    }));
+  return {
+    ...status,
+    enabled: configured.enabled === true,
+    providers: providerNames,
+    catalog,
+    e2eePolicy: "required",
+    e2eeSupported: true,
+  };
+}
+
 export async function handleRemoteShareStatus(ctx, res) {
   return sendOk(res, await handleRemoteShareStatusPayload(ctx));
 }

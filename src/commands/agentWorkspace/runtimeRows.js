@@ -548,6 +548,7 @@ function buildRuntimeRows(runtime, columns, maxRows, {
 }
 
 export {
+  SPINNER_FRAMES,
   buildRuntimeRows,
   elapsedText,
   reviewScrollDirection,

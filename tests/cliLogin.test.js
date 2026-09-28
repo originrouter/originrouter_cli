@@ -1,22 +1,24 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import http from "node:http";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { writeCodingAuth } from "../src/persistence/codingAuth.js";
+import { readCodingAuth, writeCodingAuth } from "../src/persistence/codingAuth.js";
+import { ensureDeviceE2eeIdentity, readDeviceE2eeIdentity } from "../src/crypto/deviceE2eeIdentity.js";
 import { makeOAuthCredential } from "./support/oauthCredential.js";
 
 const repo = dirname(dirname(fileURLToPath(import.meta.url)));
 const bin = resolve(repo, "bin", "originrouter.js");
 
-function runCli(home, args) {
+function runCli(home, args, env = {}) {
   return new Promise((resolveRun) => {
     const child = spawn(process.execPath, [bin, ...args], {
       cwd: repo,
-      env: { ...process.env, ORIGINROUTER_HOME: home, NO_COLOR: "1" },
+      env: { ...process.env, ...env, ORIGINROUTER_HOME: home, NO_COLOR: "1" },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -34,6 +36,50 @@ test("auth status reports no local OAuth session", async () => {
     assert.equal(result.code, 0);
     assert.match(result.stdout, /Not logged in\./);
   } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("logout device removal signs with the current account epoch and preserves the installation key", async () => {
+  const home = mkdtempSync(join(tmpdir(), "originrouter-cli-device-removal-"));
+  const deviceId = "device-logout-test";
+  const requests = [];
+  let removal = null;
+  const server = http.createServer(async (req, res) => {
+    requests.push(req.url);
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === "/cli/v1/device-e2ee/status") {
+      res.end(JSON.stringify({ data: { policy: { epoch: 9 } } }));
+    } else if (req.url === "/cli/v1/device-e2ee/self/remove") {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      removal = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      res.end(JSON.stringify({ data: { identity: { trust_status: "revoked" } } }));
+    } else {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: "unexpected request" }));
+    }
+  });
+  try {
+    writeCodingAuth(home, makeOAuthCredential({ deviceId }));
+    writeFileSync(join(home, "device.json"), JSON.stringify({ deviceId, displayName: "Test device" }));
+    const identity = ensureDeviceE2eeIdentity(home, { deviceId });
+    await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    const result = await runCli(home, ["logout", "--remove-device"], {
+      ORIGINROUTER_CONTROL_BASE_URL: `http://127.0.0.1:${server.address().port}`,
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /Signed out and removed this device/);
+    assert.deepEqual(requests, [
+      "/cli/v1/device-e2ee/status",
+      "/cli/v1/device-e2ee/self/remove",
+    ]);
+    assert.equal(removal.account_epoch, 9);
+    assert.equal(removal.device_id, deviceId);
+    assert.equal(readCodingAuth(home), null);
+    assert.equal(readDeviceE2eeIdentity(home).public_identity.key_id, identity.public_identity.key_id);
+  } finally {
+    await new Promise((resolveClose) => server.close(resolveClose));
     rmSync(home, { recursive: true, force: true });
   }
 });

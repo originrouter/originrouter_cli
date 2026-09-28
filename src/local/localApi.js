@@ -155,6 +155,7 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
     stopRemoteShareProxy: ctx.stopRemoteShareProxy,
     restartRemoteShareProxy: ctx.restartRemoteShareProxy,
     discoverProviderModels: ctx.discoverProviderModels || discoverProviderModels,
+    probeProviderModel: ctx.probeProviderModel || probeProviderModel,
     sessionManager: ctx.sessionManager,
     auditStore,
     agentBudgetStore,

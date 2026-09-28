@@ -20,6 +20,7 @@ import {
 } from "../crypto/deviceE2eeIdentity.js";
 import {
   getCliDeviceE2eeDirectory,
+  getCliDeviceE2eeStatus,
   registerCliDeviceE2eeIdentity,
   removeCurrentCliDevice,
   signOutCurrentCliDevice,

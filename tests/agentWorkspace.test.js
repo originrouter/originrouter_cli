@@ -665,6 +665,12 @@ let activeExitReady;
 const activeExitReadyPromise = new Promise((resolve) => {
   activeExitReady = resolve;
 });
+const activeExitWrite = activeExitTerminal.output.write;
+activeExitTerminal.output.write = (chunk) => {
+  const result = activeExitWrite(chunk);
+  if (String(chunk).includes("⠙")) activeExitReady();
+  return result;
+};
 const activeExitRun = handleAgentWorkspaceCommand([], {
   input: activeExitTerminal.input,
   output: activeExitTerminal.output,
@@ -679,7 +685,6 @@ const activeExitRun = handleAgentWorkspaceCommand([], {
       },
       events: [],
     });
-    activeExitReady();
     await new Promise((resolve, reject) => {
       options.signal?.addEventListener("abort", () => {
         const error = new Error("detached");
@@ -693,11 +698,18 @@ const activeExitRun = handleAgentWorkspaceCommand([], {
 await new Promise((resolve) => setImmediate(resolve));
 emitText(activeExitTerminal.input, "inspect while I leave");
 activeExitTerminal.input.emit("keypress", undefined, { name: "return" });
+const activeExitAnimationTimeout = setTimeout(activeExitReady, 1000);
 await activeExitReadyPromise;
+clearTimeout(activeExitAnimationTimeout);
 emitText(activeExitTerminal.input, "/exit");
 activeExitTerminal.input.emit("keypress", undefined, { name: "return" });
 await activeExitRun;
 assert.equal(activeExitStarted, true);
+assert.match(
+  activeExitTerminal.writes.join(""),
+  /⠙ Choosing the Agent team/,
+  "an active Run advances its spinner through the animation timer before exiting",
+);
 assert.deepEqual(activeExitCancelledRuns, [], "/exit detaches without cancelling the active Run");
 assert.match(activeExitTerminal.writes.join(""), /Leaving OriginRouter/);
 

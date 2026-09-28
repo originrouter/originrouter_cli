@@ -120,6 +120,7 @@ import {
   workspaceStatusPanel,
 } from "./agentWorkspace/panels.js";
 import {
+  SPINNER_FRAMES,
   buildRuntimeRows,
   elapsedText,
   reviewScrollDirection,

@@ -1078,7 +1078,7 @@ async function handleEnvPrint(args) {
         catch { return null; }
       })();
       const device = (() => {
-        try { return ensureDeviceForLogin(); }
+        try { return ensureDevice(); }
         catch { return { deviceId: DEFAULT_DEVICE_ID }; }
       })();
       const relayUrl = process.env.ORIGINROUTER_RELAY || DEFAULT_RELAY_URL;

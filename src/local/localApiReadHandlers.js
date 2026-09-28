@@ -1,7 +1,6 @@
 import { closeSync, openSync, readSync, statSync } from "node:fs";
 
-import { remoteShareModelEntries } from "../config/providerModels.js";
-import { remoteShareProviders } from "./localApiRemoteShare.js";
+import { handleRemoteShareStatusPayload } from "./localApiRemoteShare.js";
 import { AGENT_DETAIL_PROFILES, agentDetailDefaultFromConfig } from "../runtime/agentDetailProfile.js";
 import { cachedUpdateStatus } from "../update/checker.js";
 import { detectInstallContext } from "../update/installContext.js";
@@ -47,31 +46,6 @@ export async function handleLocalStatus(ctx) {
       config: readConfig(),
       installContext: detectInstallContext(),
     }),
-  };
-}
-
-async function handleRemoteShareStatusPayload(ctx) {
-  const config = readConfig();
-  const configured = config.remoteShare || {};
-  const status = await ctx.getRemoteShareProxyStatus();
-  const providerNames = Array.isArray(status.currentProviders) && status.currentProviders.length > 0
-    ? status.currentProviders
-    : configured.providers || [];
-  const catalog = remoteShareProviders(config, providerNames)
-    .flatMap((provider) => remoteShareModelEntries(provider))
-    .map(({ provider, model, sourceProvider, pricing }) => ({
-      provider,
-      model,
-      sourceProvider,
-      pricing,
-    }));
-  return {
-    ...status,
-    enabled: configured.enabled === true,
-    providers: providerNames,
-    catalog,
-    e2eePolicy: "required",
-    e2eeSupported: true,
   };
 }
 

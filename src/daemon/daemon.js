@@ -39,6 +39,7 @@ import { parseOptions } from "../utils/options.js";
 import { SessionManager } from "./sessionManager.js";
 import { agentDetailDefaultFromConfig } from "../runtime/agentDetailProfile.js";
 import { remoteShareModelEntries } from "../config/providerModels.js";
+import { normalizeProviderForRead } from "../config/providers.js";
 import { LocalAuditStore } from "../persistence/localAuditStore.js";
 import { createTelemetryPipeline } from "../telemetry/index.js";
 import { AiOperationReviewer } from "../runtime/aiOperationReviewer.js";

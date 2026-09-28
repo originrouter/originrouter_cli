@@ -564,6 +564,8 @@ export class SessionManager {
         console.error(`[relay] ${error.message}`);
       });
     };
+    let resolvedProvider = null;
+    let providerSource = "";
     const runtimeReporter = createRuntimeEventReporter({
       sessionId,
       agentType: agent,
@@ -705,8 +707,8 @@ export class SessionManager {
         throw providerErr;
       }
       const providerEnv = providerResult.env;
-      const resolvedProvider = providerResult.provider;
-      const providerSource = providerResult.source;
+      resolvedProvider = providerResult.provider;
+      providerSource = providerResult.source;
       if (typeof adapter.setRoutedModel === "function") {
         adapter.setRoutedModel(providerEnv.OPENAI_MODEL);
       }

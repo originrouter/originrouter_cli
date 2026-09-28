@@ -87,6 +87,7 @@ try {
   const proxyRestartCalls = [];
   const proxyStartCalls = [];
   const remoteShareStartCalls = [];
+  const modelProbeCalls = [];
   let remoteShareStatus = {
     state: "stopped",
     port: null,
@@ -204,6 +205,11 @@ try {
       source: "https://models.example/v1/models",
       fetchedAt: "2026-07-25T00:00:00.000Z",
     }),
+    probeProviderModel: async (provider, model) => {
+      modelProbeCalls.push({ provider, model });
+      if (model === "unavailable-model") throw new Error("model is unavailable");
+      return { model, verified: true };
+    },
     startedAt: new Date(Date.now() - 5000).toISOString(), // 5s uptime
     pid: 99999,
     version: "test-0.1.0",
@@ -378,6 +384,25 @@ try {
       "deepseek/deepseek-chat",
     ]);
     assert.equal(body.e2eePolicy, "required");
+  }
+
+  // ---------- GET /remote-share/status ----------
+  {
+    const { status, body } = await getJson("/remote-share/status");
+    assert.equal(status, 200);
+    assert.equal(body.state, "running");
+    assert.equal(body.enabled, true);
+    assert.deepEqual(body.providers, ["minimax", "deepseek"]);
+    assert.deepEqual(body.catalog.map((item) => item.provider), [
+      "minimax/MiniMax-M3",
+      "deepseek/deepseek-chat",
+    ]);
+    assert.equal(body.e2eePolicy, "required");
+    const { ok, ...sharedStatus } = body;
+    assert.equal(ok, true);
+    const localStatus = await getJson("/local/status");
+    assert.equal(localStatus.status, 200);
+    assert.deepEqual(localStatus.body.remoteShare, sharedStatus);
   }
 
   // ---------- POST /proxy/restart ----------
@@ -1194,6 +1219,26 @@ try {
       "deepseek-reasoner",
     ]);
     assert.equal(body.source, "https://models.example/v1/models");
+  }
+
+  {
+    const { status, body } = await postJson("/catalog/litellm-model-test", {
+      existingName: "deepseek",
+      model: "deepseek-chat",
+      baseUrl: "https://probe.example.test/v1",
+    });
+    assert.equal(status, 200);
+    assert.equal(body.verified, true);
+    assert.equal(body.model, "deepseek-chat");
+    assert.equal(modelProbeCalls.at(-1).provider.name, "deepseek");
+    assert.equal(modelProbeCalls.at(-1).provider.baseUrl, "https://probe.example.test/v1");
+    assert.equal(modelProbeCalls.at(-1).model, "deepseek-chat");
+    const failed = await postJson("/catalog/litellm-model-test", {
+      existingName: "deepseek",
+      model: "unavailable-model",
+    });
+    assert.equal(failed.status, 422);
+    assert.equal(failed.body.error, "model is unavailable");
   }
 
   // ---------- POST /providers with type=litellm + litellmProvider=bedrock ----------

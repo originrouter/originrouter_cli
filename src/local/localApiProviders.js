@@ -125,7 +125,7 @@ export async function handleProviderModelProbe(ctx, res, body) {
     if (typeof value === "string" && value.trim()) draft[key] = value.trim();
   }
   try {
-    return sendOk(res, await probeProviderModel(draft, body.model));
+    return sendOk(res, await ctx.probeProviderModel(draft, body.model));
   } catch (error) {
     return sendError(res, 422, error?.message || "model verification failed");
   }

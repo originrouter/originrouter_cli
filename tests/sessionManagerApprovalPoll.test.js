@@ -13,10 +13,20 @@ test("SessionManager applies the resolved Codex model before building the launch
   let startOptions = null;
   let exitHandler = null;
 
+  const telemetryEvents = [];
+
   const manager = new SessionManager({
     relayClient: { send: () => Promise.resolve() },
     deviceId: "device-test",
     defaultExecutor: "fake",
+    telemetry: {
+      queue: {
+        enqueue(input, context) {
+          telemetryEvents.push({ input, context });
+          return { inserted: false };
+        },
+      },
+    },
     createAdapterFn: () => ({
       async beforeStart() {},
       setRoutedModel(model) {
@@ -51,7 +61,7 @@ test("SessionManager applies the resolved Codex model before building the launch
         OPENAI_API_KEY: "test-key",
         OPENAI_MODEL: "gpt-5.6-sol",
       },
-      provider: { name: "originrouter-cloud", model: "gpt-5.6-sol" },
+      provider: { name: "originrouter-cloud", type: "proxy", model: "gpt-5.6-sol" },
       source: "test",
     }),
     startApprovalDecisionPollingFn: () => () => {},
@@ -66,9 +76,62 @@ test("SessionManager applies the resolved Codex model before building the launch
   assert.equal(routedModel, "gpt-5.6-sol");
   assert.deepEqual(startOptions.args, ["--model", "gpt-5.6-sol"]);
   assert.equal(startOptions.env.OPENAI_MODEL, "gpt-5.6-sol");
+  const startedTelemetry = telemetryEvents.find(({ input }) => input.eventType === "session_started");
+  assert.ok(startedTelemetry, "session startup emits telemetry with the resolved Provider");
+  assert.equal(startedTelemetry.context.providerSource, "test");
+  assert.equal(startedTelemetry.context.providerType, "proxy");
+  assert.equal(startedTelemetry.context.provider, "originrouter-cloud");
+  assert.equal(startedTelemetry.context.model, "gpt-5.6-sol");
 
+  const exitPromise = manager.sessions.get("session-model-1").exitPromise;
   exitHandler?.({ code: 0, signal: null });
+  await exitPromise;
+  assert.ok(telemetryEvents.some(({ input, context }) => (
+    input.eventType === "session_terminated" && context.provider === "originrouter-cloud"
+  )));
   rmSync(home, { recursive: true, force: true });
+});
+
+test("SessionManager reports failures before Provider resolution with telemetry enabled", async () => {
+  const previousHome = process.env.ORIGINROUTER_HOME;
+  const home = mkdtempSync(join(tmpdir(), "originrouter-session-telemetry-error-"));
+  process.env.ORIGINROUTER_HOME = home;
+  const sent = [];
+  const telemetryEvents = [];
+  try {
+    const manager = new SessionManager({
+      relayClient: { send: async (type, payload) => { sent.push({ type, payload }); } },
+      deviceId: "device-test",
+      defaultExecutor: "fake",
+      telemetry: {
+        queue: {
+          enqueue(input, context) {
+            telemetryEvents.push({ input, context });
+            return { inserted: false };
+          },
+        },
+      },
+      createAdapterFn: () => ({
+        async beforeStart() { throw new Error("adapter unavailable"); },
+      }),
+      createExecutorFn: () => ({}),
+    });
+    const start = manager.startSession({ sessionId: "session-telemetry-error", agent: "terminal" });
+    const exitPromise = manager.sessions.get("session-telemetry-error").exitPromise;
+    await start;
+    await exitPromise;
+    assert.equal(manager.sessions.size, 0);
+    assert.ok(sent.some(({ type, payload }) => (
+      type === "session.error" && payload.message === "adapter unavailable"
+    )));
+    assert.equal(telemetryEvents[0].input.eventType, "session_runtime_error");
+    assert.equal(telemetryEvents[0].context.providerSource, "");
+    assert.equal(telemetryEvents[0].context.provider, undefined);
+  } finally {
+    if (previousHome === undefined) delete process.env.ORIGINROUTER_HOME;
+    else process.env.ORIGINROUTER_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("SessionManager feeds polled approval decisions back into the running adapter", async () => {
