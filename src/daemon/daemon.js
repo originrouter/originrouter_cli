@@ -64,7 +64,10 @@ import {
   getCliDeviceE2eeDirectory,
   registerCliDeviceE2eeIdentity,
 } from "../security/deviceE2eeClient.js";
-import { storeDeviceE2eeDirectoryCache } from "../security/deviceE2eeDirectoryCache.js";
+import {
+  deviceE2eeDirectoryNamespace,
+  storeDeviceE2eeDirectoryCache,
+} from "../security/deviceE2eeDirectoryCache.js";
 import { DeviceE2eeRelayTransport } from "../security/deviceE2eeRelayTransport.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import { refreshCompatibilityPack } from "../compatibility/updater.js";
@@ -706,7 +709,7 @@ export async function startDaemon(args) {
       accessToken,
     });
     storeDeviceE2eeDirectoryCache(stateDir, directory, {
-      namespace: credential.sessionId,
+      namespace: deviceE2eeDirectoryNamespace(credential),
     });
   };
   sessionManager.onLocalControlChanged = async () => {

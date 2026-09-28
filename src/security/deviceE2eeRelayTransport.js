@@ -1,8 +1,11 @@
 import { DeviceE2eeSession } from "../crypto/deviceE2eeEnvelope.js";
 import {
+  adoptLegacyDeviceE2eeDirectoryCache,
+  cachedDeviceStatus,
   currentCachedDeviceIdentity,
   deviceE2eeDirectoryHead,
   deviceE2eeDirectoryCacheState,
+  deviceE2eeDirectoryNamespace,
   readDeviceE2eeDirectoryCache,
   storeDeviceE2eeDirectoryCache,
 } from "./deviceE2eeDirectoryCache.js";
@@ -146,6 +149,7 @@ export class DeviceE2eeRelayTransport {
     this.routeSubscribers = new Map();
     this.sendTails = new Map();
     this.inboundTail = Promise.resolve();
+    this.adoptedLegacyCache = false;
   }
 
   setLocalIdentity(identity) {
@@ -175,13 +179,26 @@ export class DeviceE2eeRelayTransport {
       error.code = "DEVICE_E2EE_AUTH_UNAVAILABLE";
       throw error;
     }
+    // The cache moved from a per-sign-in namespace to the account scope. Carry
+    // any existing session-scoped state over once so the upgrade keeps its
+    // pinned key history instead of starting cold.
+    if (!this.adoptedLegacyCache) {
+      this.adoptedLegacyCache = true;
+      try {
+        adoptLegacyDeviceE2eeDirectoryCache(this.stateDir, {
+          namespace: deviceE2eeDirectoryNamespace(credential),
+        });
+      } catch {
+        // Adoption is an optimization. A refresh still repopulates the cache.
+      }
+    }
     return credential;
   }
 
   async _peer(deviceId, keyId, { refresh = false } = {}) {
     const credential = await this._credential();
     let cache = refresh ? null : readDeviceE2eeDirectoryCache(this.stateDir, {
-      namespace: credential.sessionId,
+      namespace: deviceE2eeDirectoryNamespace(credential),
     });
     let peer = cache?.identities?.find((item) =>
       item.device_id === deviceId
@@ -193,7 +210,7 @@ export class DeviceE2eeRelayTransport {
       accessToken: credential.accessTokens.control.token,
     });
     cache = storeDeviceE2eeDirectoryCache(this.stateDir, directory, {
-      namespace: credential.sessionId,
+      namespace: deviceE2eeDirectoryNamespace(credential),
     });
     peer = cache.identities.find((item) =>
       item.device_id === deviceId
@@ -210,7 +227,7 @@ export class DeviceE2eeRelayTransport {
   async currentPeer(deviceId, { refresh = false } = {}) {
     const credential = await this._credential();
     let cache = refresh ? null : readDeviceE2eeDirectoryCache(this.stateDir, {
-      namespace: credential.sessionId,
+      namespace: deviceE2eeDirectoryNamespace(credential),
     });
     let peer = currentCachedDeviceIdentity(cache, deviceId);
     if (peer?.trust_status === "trusted") return peer;
@@ -219,12 +236,19 @@ export class DeviceE2eeRelayTransport {
       accessToken: credential.accessTokens.control.token,
     });
     cache = storeDeviceE2eeDirectoryCache(this.stateDir, directory, {
-      namespace: credential.sessionId,
+      namespace: deviceE2eeDirectoryNamespace(credential),
     });
     peer = currentCachedDeviceIdentity(cache, deviceId);
     if (peer?.trust_status !== "trusted") {
-      const error = new Error("target device is not trusted for E2EE");
+      const status = cachedDeviceStatus(cache, deviceId);
+      // Name the actual cause. A quarantined device failed chain verification
+      // and is a different problem from one that is absent or untrusted, and
+      // the two need different operator action.
+      const error = new Error(status.usable
+        ? "target device is not trusted for E2EE"
+        : `target device is unusable for E2EE (${status.reason})`);
       error.code = "DEVICE_E2EE_PEER_UNAVAILABLE";
+      error.deviceStatus = status.reason;
       throw error;
     }
     return peer;
@@ -233,7 +257,7 @@ export class DeviceE2eeRelayTransport {
   async _ensureDirectoryFresh() {
     const credential = await this._credential();
     let cache = readDeviceE2eeDirectoryCache(this.stateDir, {
-      namespace: credential.sessionId,
+      namespace: deviceE2eeDirectoryNamespace(credential),
     });
     if (deviceE2eeDirectoryCacheState(cache).fresh) return cache;
     try {
@@ -242,7 +266,7 @@ export class DeviceE2eeRelayTransport {
         accessToken: credential.accessTokens.control.token,
       });
       cache = storeDeviceE2eeDirectoryCache(this.stateDir, directory, {
-        namespace: credential.sessionId,
+        namespace: deviceE2eeDirectoryNamespace(credential),
       });
       return cache;
     } catch (error) {
@@ -258,7 +282,7 @@ export class DeviceE2eeRelayTransport {
       accessToken: credential.accessTokens.control.token,
     });
     const cache = storeDeviceE2eeDirectoryCache(this.stateDir, directory, {
-      namespace: credential.sessionId,
+      namespace: deviceE2eeDirectoryNamespace(credential),
     });
     if (clearSessions) this.clearSessions();
     return cache;

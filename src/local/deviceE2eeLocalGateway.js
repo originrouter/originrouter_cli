@@ -17,6 +17,7 @@ import { DeviceE2eeSession } from "../crypto/deviceE2eeEnvelope.js";
 import {
   deviceE2eeDirectoryCacheState,
   deviceE2eeDirectoryHead,
+  deviceE2eeDirectoryNamespace,
   readDeviceE2eeDirectoryCache,
 } from "../security/deviceE2eeDirectoryCache.js";
 
@@ -215,7 +216,7 @@ export class DeviceE2eeLocalGateway {
     const credential = readCodingAuth(this.stateDir);
     const cache = credential?.sessionId
       ? readDeviceE2eeDirectoryCache(this.stateDir, {
-          namespace: credential.sessionId,
+          namespace: deviceE2eeDirectoryNamespace(credential),
         })
       : null;
     const trusted = currentTrustedIdentity(

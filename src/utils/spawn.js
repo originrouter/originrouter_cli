@@ -19,7 +19,7 @@ import { platform } from "node:os";
 // against PATH/PATHEXT so shim scripts are found.
 
 const IS_WINDOWS = platform() === "win32";
-const CMD_SHIM_PATTERN = /\.(cmd|bat)$/i;
+export const CMD_SHIM_PATTERN = /\.(cmd|bat)$/i;
 const WINDOWS_EXECUTABLE_EXTENSIONS = String(process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD")
     .split(";")
     .map((entry) => entry.trim().toLowerCase())
@@ -50,7 +50,7 @@ export function quoteWindowsArgument(value) {
     return `"${value.replace(/(\\*)"/g, "$1\\\"").replace(/(\\+)$/, "$1$1")}"`;
 }
 
-function toWindowsCommandLine(command, args) {
+export function toWindowsCommandLine(command, args) {
     return [command, ...args].map(quoteWindowsArgument).join(" ");
 }
 

@@ -1,6 +1,11 @@
 import { execFileSync } from "node:child_process";
 
 import { scheduleForceKill } from "./processTreeKill.js";
+import {
+  CMD_SHIM_PATTERN,
+  resolveWindowsCommand,
+  toWindowsCommandLine,
+} from "../utils/spawn.js";
 
 function ttyUsesOutputPostprocessing({ input = process.stdin, exec = execFileSync } = {}) {
   if (!input?.isTTY) return false;
@@ -41,6 +46,28 @@ export function disableNestedPtyOutputPostprocessing(
   }
 }
 
+// Pure helper: pick what node-pty should spawn. On Windows, ConPTY launches
+// through CreateProcess, which — unlike PowerShell or the spawnCommand path —
+// never resolves bare names against PATH/PATHEXT and cannot execute .cmd/.bat
+// shims directly (npm installs `claude` as claude.cmd; node-pty then fails
+// with "File not found: claude"). Mirror spawnCommand: resolve the bare name
+// against PATH/PATHEXT and route shims through cmd.exe. node-pty does not
+// re-quote an argument that is already fully quoted, so the pre-quoted /c
+// line passes through untouched.
+export function resolvePtySpawnTarget(command, args, { platform = process.platform } = {}) {
+  if (platform !== "win32") {
+    return { command, args };
+  }
+  const resolved = resolveWindowsCommand(command);
+  if (CMD_SHIM_PATTERN.test(resolved)) {
+    return {
+      command: "cmd.exe",
+      args: ["/d", "/s", "/c", `"${toWindowsCommandLine(resolved, args)}"`],
+    };
+  }
+  return { command: resolved, args };
+}
+
 export class PtyExecutor {
   constructor({ forceKillMs } = {}) {
     this.terminal = null;
@@ -74,7 +101,8 @@ export class PtyExecutor {
       throw new Error("node-pty is not installed. Install it before using --executor pty.");
     }
 
-    this.terminal = pty.spawn(command, args, {
+    const target = resolvePtySpawnTarget(command, args);
+    this.terminal = pty.spawn(target.command, target.args, {
       name: "xterm-256color",
       cols,
       rows,

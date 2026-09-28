@@ -25,7 +25,10 @@ import {
   removeCurrentCliDevice,
   signOutCurrentCliDevice,
 } from "../security/deviceE2eeClient.js";
-import { storeDeviceE2eeDirectoryCache } from "../security/deviceE2eeDirectoryCache.js";
+import {
+  deviceE2eeDirectoryNamespace,
+  storeDeviceE2eeDirectoryCache,
+} from "../security/deviceE2eeDirectoryCache.js";
 import {
   clearCodingAuth,
   readCodingAuth,
@@ -293,7 +296,7 @@ export async function handleLogin(args, {
         accessToken: credential.accessTokens.control.token,
       });
       storeDeviceE2eeDirectoryCache(stateDir, directory, {
-        namespace: credential.sessionId,
+        namespace: deviceE2eeDirectoryNamespace(credential),
       });
     } catch (error) {
       registrationError = error;

@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   renameSync,
   writeFileSync,
 } from "node:fs";
@@ -24,6 +25,27 @@ function namespaceSuffix(namespace) {
   return `-${createHash("sha256").update(String(namespace)).digest("base64url").slice(0, 22)}`;
 }
 
+/**
+ * The directory belongs to an account, not to one sign-in.
+ *
+ * Namespacing the cache by `sessionId` gave every `originrouter login` a cold
+ * cache: the new session started with no pinned history, every device had to
+ * be refetched before it could be addressed, and the abandoned files stayed on
+ * disk holding contradictory views of the same account. Prefer the account
+ * scope and keep `sessionId` only as a fallback for credentials recorded
+ * before the scope was persisted.
+ */
+export function deviceE2eeDirectoryNamespace(credential) {
+  const accountScope = credential?.accountScope;
+  if (typeof accountScope === "string" && accountScope.trim()) {
+    return `account:${accountScope.trim()}`;
+  }
+  const sessionId = credential?.sessionId;
+  return typeof sessionId === "string" && sessionId.trim()
+    ? sessionId.trim()
+    : "";
+}
+
 export function deviceE2eeDirectoryCachePath(stateDir, { namespace } = {}) {
   return join(stateDir, `device-e2ee-directory-v2${namespaceSuffix(namespace)}.json`);
 }
@@ -37,6 +59,61 @@ export function readDeviceE2eeDirectoryCache(stateDir, { namespace } = {}) {
     throw new Error("invalid E2EE directory cache");
   }
   return value;
+}
+
+/**
+ * Carry a pre-existing session-scoped cache into the account namespace.
+ *
+ * Without this, moving the namespace from `sessionId` to the account scope
+ * would start every client cold and discard the pinned key history — the same
+ * history that lets a truncated chain be completed. Adopt the newest usable
+ * session-scoped file once, then leave the stale files alone; they are no
+ * longer consulted and can be cleaned up separately.
+ *
+ * The adopted file was written by this device and was verified when it was
+ * stored, so this moves already-trusted state rather than importing anything
+ * new. The highest epoch wins so the adoption cannot be used to walk the
+ * account epoch backwards.
+ */
+export function adoptLegacyDeviceE2eeDirectoryCache(stateDir, {
+  namespace,
+  now = Date.now(),
+  maxStaleMs = DEVICE_E2EE_DIRECTORY_MAX_STALE_MS,
+} = {}) {
+  if (!namespace || !namespace.startsWith("account:")) return null;
+  const target = deviceE2eeDirectoryCachePath(stateDir, { namespace });
+  if (existsSync(target)) return null;
+  let candidates;
+  try {
+    candidates = readdirSync(stateDir).filter((name) =>
+      name.startsWith("device-e2ee-directory-v2-") && name.endsWith(".json"));
+  } catch {
+    return null;
+  }
+  let best = null;
+  for (const name of candidates) {
+    const candidatePath = join(stateDir, name);
+    if (candidatePath === target) continue;
+    let value;
+    try {
+      value = JSON.parse(readFileSync(candidatePath, "utf8"));
+    } catch {
+      continue;
+    }
+    if (value?.schema !== 1 || !Array.isArray(value.identities)
+        || !Number.isSafeInteger(value?.policy?.epoch)) continue;
+    if (!deviceE2eeDirectoryCacheState(value, { now, maxStaleMs }).usable) continue;
+    const epoch = Number(value.policy.epoch);
+    const fetchedAt = Date.parse(value.fetched_at) || 0;
+    if (!best
+        || epoch > best.epoch
+        || (epoch === best.epoch && fetchedAt > best.fetchedAt)) {
+      best = { value, epoch, fetchedAt };
+    }
+  }
+  if (!best) return null;
+  writeCache(stateDir, best.value, { namespace });
+  return best.value;
 }
 
 function writeCache(stateDir, value, { namespace } = {}) {
@@ -174,34 +251,134 @@ function verifyTrustProofs(policy, identities) {
   if (unresolved.size) throw new Error("unverified trusted device in directory");
 }
 
-function verifyDirectory(directory) {
+/**
+ * Complete a truncated chain using key history this device already pinned.
+ *
+ * A directory that starts a device at key_version > 1 is not evidence of an
+ * attack: the server may simply be serving only the currently bound key. The
+ * pinned history is the authority here, because a previous fetch already
+ * verified those keys and `verifyPinnedHistory` forbids them from changing.
+ * Splicing them back in reconstructs a chain that can be verified in full,
+ * which keeps a server-side omission from permanently wedging the client.
+ *
+ * Only keys whose key_id was pinned earlier are reused, so this can never
+ * introduce key material the server did not previously vouch for.
+ */
+function splicePinnedHistory(identities, previous) {
+  // Prefer the retained known set so history survives across refreshes even
+  // for a device that is currently quarantined. Older caches only have
+  // `identities`.
+  const pinned = Array.isArray(previous?.known_identities)
+      && previous.known_identities.length
+    ? previous.known_identities
+    : previous?.identities;
+  if (!pinned?.length) return identities;
+  const present = new Set(identities.map((item) => item.key_id));
+  const byDevice = new Map();
+  for (const identity of identities) {
+    if (!byDevice.has(identity.device_id)) byDevice.set(identity.device_id, []);
+    byDevice.get(identity.device_id).push(identity);
+  }
+  const restored = [];
+  for (const [deviceId, chain] of byDevice) {
+    const lowest = chain.reduce((left, right) =>
+      Number(left.key_version) <= Number(right.key_version) ? left : right);
+    if (Number(lowest.key_version) === 1 && lowest.previous_key_id == null) {
+      continue;
+    }
+    const pinnedForDevice = pinned
+      .filter((item) => item.device_id === deviceId
+        && Number(item.key_version) < Number(lowest.key_version)
+        && !present.has(item.key_id))
+      .sort((left, right) => Number(left.key_version) - Number(right.key_version));
+    restored.push(...pinnedForDevice);
+  }
+  if (!restored.length) return identities;
+  return sortedIdentities({ identities: [...identities, ...restored] });
+}
+
+/**
+ * Verify each device's chain independently.
+ *
+ * A single unverifiable device used to throw and reject the entire directory,
+ * so one bad record made every other device unreachable. Isolate the failure
+ * instead: the offending device is quarantined and reported in
+ * `deviceStatus`, while every device that verifies stays usable. That is still
+ * fail-closed for the device at fault — a quarantined device is never offered
+ * as a peer — without taking the account down with it.
+ *
+ * Cryptographic failures are never tolerated. An invalid signature, a rotation
+ * without a valid predecessor signature, or a mutated pinned key all keep the
+ * device out of the trusted set.
+ */
+function verifyDirectory(directory, { previous = null } = {}) {
   const epoch = Number(directory?.policy?.epoch);
   if (!Number.isSafeInteger(epoch) || epoch <= 0) {
     throw new Error("invalid E2EE directory epoch");
   }
-  const heads = new Map();
+  const received = sortedIdentities(directory);
   const keyIds = new Map();
-  const identities = sortedIdentities(directory);
-  for (const identity of identities) {
+  for (const identity of received) {
     const encoded = canonicalJson(publicIdentityRecord(identity));
     if (keyIds.has(identity.key_id) && keyIds.get(identity.key_id) !== encoded) {
+      // A key id that resolves to two different records breaks the identity
+      // of every chain that references it, so this stays fatal.
       throw new Error("directory key id collision");
     }
     keyIds.set(identity.key_id, encoded);
-    const previous = heads.get(identity.device_id);
-    if (!previous) {
-      if (identity.key_version !== 1 || identity.previous_key_id != null
-          || !verifyDeviceE2eeIdentity(identity)) {
-        throw new Error("invalid initial directory identity");
-      }
-    } else if (!verifyDeviceE2eeRotation(previous, identity)
-        && !verifyRecoveryTransition(previous, identity)) {
-      throw new Error("invalid directory key rotation");
-    }
-    heads.set(identity.device_id, identity);
   }
-  verifyTrustProofs(directory.policy, identities);
-  return { policy: directory.policy, identities };
+  const spliced = splicePinnedHistory(received, previous);
+  const identities = spliced;
+  const chains = new Map();
+  for (const identity of identities) {
+    if (!chains.has(identity.device_id)) chains.set(identity.device_id, []);
+    chains.get(identity.device_id).push(identity);
+  }
+  const deviceStatus = new Map();
+  const verified = [];
+  for (const [deviceId, chain] of chains) {
+    let reason = "";
+    for (let index = 0; index < chain.length; index += 1) {
+      const identity = chain[index];
+      if (index === 0) {
+        if (Number(identity.key_version) !== 1 || identity.previous_key_id != null) {
+          reason = "incomplete_key_chain";
+          break;
+        }
+        if (!verifyDeviceE2eeIdentity(identity)) {
+          reason = "invalid_identity_signature";
+          break;
+        }
+        continue;
+      }
+      const prior = chain[index - 1];
+      if (!verifyDeviceE2eeRotation(prior, identity)
+          && !verifyRecoveryTransition(prior, identity)) {
+        reason = "invalid_key_rotation";
+        break;
+      }
+    }
+    deviceStatus.set(deviceId, reason ? { usable: false, reason } : { usable: true, reason: "" });
+    if (!reason) verified.push(...chain);
+  }
+  // Trust proofs are account-wide. Evaluate them over the devices that
+  // verified so one quarantined device cannot invalidate the whole policy,
+  // and keep a proof failure fatal because it governs the account itself.
+  verifyTrustProofs(directory.policy, verified);
+  return {
+    policy: directory.policy,
+    // Addressable peers: verified chains only, quarantined devices removed.
+    identities: verified,
+    // The head must describe exactly what the server served, before any local
+    // splicing or quarantine. Peers compare heads across implementations, so
+    // it can only agree if every client derives it from the same input.
+    receivedIdentities: received,
+    // Served keys plus history restored from the previous pin. Pinned-history
+    // continuity is checked against this, so a key the server stopped serving
+    // is retained rather than being reported as removed.
+    knownIdentities: spliced,
+    deviceStatus: Object.fromEntries(deviceStatus),
+  };
 }
 
 // Account-key recovery is the one intentional break in the signed rotation
@@ -263,12 +440,17 @@ export function storeDeviceE2eeDirectoryCache(stateDir, directory, {
   namespace,
 } = {}) {
   const previous = readDeviceE2eeDirectoryCache(stateDir, { namespace });
-  const verified = verifyDirectory(directory);
+  const verified = verifyDirectory(directory, { previous });
   if (previous && verified.policy.epoch < previous.policy.epoch) {
     throw new Error("E2EE account epoch rollback");
   }
   if (previous && verified.policy.epoch === previous.policy.epoch) {
-    verifyPinnedHistory(previous, verified);
+    // Compare against what the server served, not the post-quarantine set.
+    // A quarantined device must not read as "history removed", and a genuinely
+    // mutated pinned key must still be fatal.
+    verifyPinnedHistory(previous, {
+      identities: verified.knownIdentities,
+    });
     verifyPolicyTransition(previous, verified);
   }
   const value = {
@@ -276,6 +458,14 @@ export function storeDeviceE2eeDirectoryCache(stateDir, directory, {
     fetched_at: now.toISOString(),
     policy: verified.policy,
     identities: verified.identities,
+    // Retained so the directory head stays byte-identical to the served
+    // directory.
+    received_identities: verified.receivedIdentities,
+    // Retained so a later fetch can still splice history the server has
+    // stopped serving, including for a quarantined device that is absent from
+    // `identities`.
+    known_identities: verified.knownIdentities,
+    device_status: verified.deviceStatus,
   };
   writeCache(stateDir, value, { namespace });
   return value;
@@ -298,14 +488,41 @@ export function deviceE2eeDirectoryCacheState(cache, {
 }
 
 export function currentCachedDeviceIdentity(cache, deviceId) {
+  // `identities` already excludes quarantined devices, so a device whose chain
+  // failed verification is never returned as an addressable peer.
   return (cache?.identities || [])
     .filter((item) => item.device_id === deviceId)
     .sort((left, right) => right.key_version - left.key_version)[0] || null;
 }
 
+/**
+ * Why a device is unusable, when it is. Lets callers report the specific cause
+ * instead of a generic "peer unavailable", and lets them distinguish a
+ * quarantined device from one that is simply absent from the directory.
+ */
+export function cachedDeviceStatus(cache, deviceId) {
+  const status = cache?.device_status?.[String(deviceId)];
+  if (status) return status;
+  const known = (cache?.identities || [])
+    .some((item) => item.device_id === deviceId);
+  return known ? { usable: true, reason: "" } : { usable: false, reason: "unknown_device" };
+}
+
+export function quarantinedDeviceIds(cache) {
+  return Object.entries(cache?.device_status || {})
+    .filter(([, status]) => status?.usable === false)
+    .map(([deviceId]) => deviceId);
+}
+
 export function deviceE2eeDirectoryHead(cache) {
   if (!cache?.policy || !Array.isArray(cache.identities)) return null;
-  const identities = sortedIdentities(cache).map((identity) => ({
+  // Prefer the served set so the head matches every other implementation's
+  // view of the same directory. Older caches predate this field and fall back
+  // to their verified identities, which were the served set at the time.
+  const source = Array.isArray(cache.received_identities)
+    ? { identities: cache.received_identities }
+    : cache;
+  const identities = sortedIdentities(source).map((identity) => ({
     protocol: identity.protocol,
     device_id: identity.device_id,
     source: identity.source,
