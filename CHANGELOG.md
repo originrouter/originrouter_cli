@@ -3,6 +3,23 @@
 All notable changes to OriginRouter CLI will be documented here. The project
 uses Semantic Versioning and follows the Keep a Changelog structure.
 
+## 0.4.7 - Unreleased
+
+### Fixed
+
+- Device removal during logout now reads the current account epoch before
+  signing the request and preserves the installation's device identity key.
+- Agent sessions now record the resolved provider and model in lifecycle
+  telemetry. Failures before provider resolution no longer raise a telemetry
+  error that hides the original failure.
+- `originrouter env print` now reads the existing device identity without
+  starting the login-specific device setup flow.
+- Workspace's active-run spinner advances correctly, and missing runtime
+  references no longer interrupt the Workspace or daemon.
+- Local API remote-share status uses the same payload for the dedicated
+  endpoint and the local status summary. Model verification uses the
+  configured probe function.
+
 ## 0.4.6 - 2026-09-28
 
 ### Fixed
