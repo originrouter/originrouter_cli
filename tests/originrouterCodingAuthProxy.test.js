@@ -45,7 +45,7 @@ async function localRequest(proxy, path, {
   });
 }
 
-test("collaboration proxy attaches a server-issued discount grant", async () => {
+test("collaboration proxy overrides a client-supplied collaboration run header", async () => {
   const calls = [];
   const proxy = new OriginRouterCodingAuthProxy({
     stateDir: "/tmp/originrouter-test",

@@ -15,9 +15,15 @@ import { createAdapter } from "../adapters/createAdapter.js";
 import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
 import {
   buildAgentProviderEnv,
+  buildClaudeSettingsOverride,
+  describeClaudeSettingsConflicts,
   remoteCodingRouteTarget,
   willRouteRemoteCoding,
 } from "../config/claudeConfig.js";
+import {
+  formatClaudeSettingsConflicts,
+  readClaudeForeignSettings,
+} from "../adapters/claude/settingsConflicts.js";
 import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
 import { DEFAULT_DEVICE_ID, DEFAULT_EXECUTOR } from "../constants.js";
 import { createExecutor, normalizeExecutor } from "../executors/createExecutor.js";
@@ -215,6 +221,25 @@ export async function runLocalAgentSession(agent, rawArgs) {
       envKey: "OPENAI_API_KEY",
       wireApi: "responses",
     } : null);
+  }
+  // Claude Code merges `~/.claude/settings.json` env *above* the subprocess
+  // environment, so providerEnv alone loses to a stale settings file. The
+  // adapter writes this override into the --settings file it already passes
+  // (Claude Code's flagSettings layer), which outranks every filesystem
+  // settings layer. buildClaudeSettingsOverride returns null for
+  // native-config and inherited routes, leaving native behavior untouched.
+  if (typeof adapter.setSettingsOverride === "function") {
+    const settingsOverride = buildClaudeSettingsOverride(providerResult);
+    adapter.setSettingsOverride(settingsOverride);
+    if (settingsOverride) {
+      for (const line of formatClaudeSettingsConflicts(
+        settingsOverride,
+        readClaudeForeignSettings(cwd),
+        describeClaudeSettingsConflicts,
+      )) {
+        process.stderr.write(`${line}\n`);
+      }
+    }
   }
   const baseEnv = { ...process.env, ...providerEnv };
   let exited = false;

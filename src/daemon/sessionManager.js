@@ -7,7 +7,10 @@ import {
   startApprovalDecisionPolling,
 } from "../agent/bridgeReporter.js";
 import { createAdapter } from "../adapters/createAdapter.js";
-import { buildAgentProviderEnv } from "../config/claudeConfig.js";
+import {
+  buildAgentProviderEnv,
+  buildClaudeSettingsOverride,
+} from "../config/claudeConfig.js";
 import { clearRoute, replaceAgentRoutes, setRoute } from "../config/routes.js";
 import { createExecutor } from "../executors/createExecutor.js";
 import { staticProxyStatusFn } from "../proxy/snapshot.js";
@@ -664,16 +667,6 @@ export class SessionManager {
     session.finalize = finalizeSession;
 
     try {
-      if (typeof adapter.beforeStart === "function") {
-        await adapter.beforeStart({
-          cwd,
-          env: process.env,
-          sessionId,
-          relayClient: this.relayClient,
-          send,
-        });
-      }
-
       // Provider resolution goes through the same entry point as localAgentSession.
       // `payload.provider` is the forward-looking remote-supplied override; falls
       // back to currentProvider[agent] when absent. PROVIDER_UNSUPPORTED is a
@@ -712,6 +705,26 @@ export class SessionManager {
       if (typeof adapter.setRoutedModel === "function") {
         adapter.setRoutedModel(providerEnv.OPENAI_MODEL);
       }
+      // Must precede beforeStart(): the Claude adapter writes its --settings
+      // file there, and that file carries the transport override that keeps a
+      // stale ~/.claude/settings.json from replacing the resolved route.
+      if (typeof adapter.setSettingsOverride === "function") {
+        adapter.setSettingsOverride(buildClaudeSettingsOverride(providerResult));
+      }
+
+      // Runs after provider resolution so the adapter has the resolved route
+      // before it writes any launch-time file, and so the child sees the
+      // routed env rather than the daemon's own.
+      if (typeof adapter.beforeStart === "function") {
+        await adapter.beforeStart({
+          cwd,
+          env: { ...process.env, ...providerEnv },
+          sessionId,
+          relayClient: this.relayClient,
+          send,
+        });
+      }
+
       const launch = adapter.buildLaunch();
       const metadata = adapter.describe();
       terminalActivityReporter = createTerminalActivityReporter({

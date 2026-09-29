@@ -276,6 +276,10 @@ export class ClaudeAdapter extends TerminalAdapter {
     this.hookServerFactory = hookServerFactory || startClaudeHookServer;
     this.hookServer = null;
     this.hookSettingsPath = null;
+    // Transport override written into the --settings file at beforeStart().
+    // Set by the session once the route is resolved (setSettingsOverride);
+    // stays null under --native-config, and for an inherited route.
+    this.settingsOverride = null;
     this.pendingEvents = [];
     // Captured at beforeStart() from the session context. The hook
     // server and event mapper never see sessionId; we enrich here.
@@ -483,9 +487,19 @@ export class ClaudeAdapter extends TerminalAdapter {
     };
   }
 
+  // Called by the session after the route resolves, before beforeStart().
+  // Passing null (or nothing) leaves the settings file hooks-only, which is
+  // what --native-config and an inherited route both want.
+  setSettingsOverride(override) {
+    this.settingsOverride = override || null;
+  }
+
   buildLaunch() {
     const args = [...this.args];
     if (this.hookSettingsPath) {
+      // Always last: Claude Code's flagSettings layer is what makes the
+      // transport override outrank ~/.claude/settings.json, and the user
+      // never types this flag.
       args.push("--settings", this.hookSettingsPath);
     }
     return {
@@ -695,6 +709,7 @@ export class ClaudeAdapter extends TerminalAdapter {
       port: this.hookServer.port,
       registerPermissionRequest: true,
       registerElicitation: true,
+      settingsOverride: this.settingsOverride,
     });
   }
 

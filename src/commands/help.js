@@ -146,6 +146,7 @@ Other:
                       [--bind 127.0.0.1|0.0.0.0] [--allow-lan]
   originrouter daemon-port                           Print the running daemon's local API URL (reads daemon.state.json)
   originrouter service install|start|stop|restart|status|uninstall
+  originrouter services                             Alias for service
   originrouter run -- <command> [args...]
   originrouter claude [args...]                   Start native Claude Code TUI with remote control
   originrouter codex [args...]                    Start native Codex TUI with remote control

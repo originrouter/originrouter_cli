@@ -92,7 +92,7 @@ test("SessionManager applies the resolved Codex model before building the launch
   rmSync(home, { recursive: true, force: true });
 });
 
-test("SessionManager reports failures before Provider resolution with telemetry enabled", async () => {
+test("SessionManager reports adapter beforeStart failures with telemetry enabled", async () => {
   const previousHome = process.env.ORIGINROUTER_HOME;
   const home = mkdtempSync(join(tmpdir(), "originrouter-session-telemetry-error-"));
   process.env.ORIGINROUTER_HOME = home;
@@ -125,7 +125,13 @@ test("SessionManager reports failures before Provider resolution with telemetry 
       type === "session.error" && payload.message === "adapter unavailable"
     )));
     assert.equal(telemetryEvents[0].input.eventType, "session_runtime_error");
-    assert.equal(telemetryEvents[0].context.providerSource, "");
+    // Provider resolution now runs before adapter.beforeStart(), because the
+    // Claude adapter writes its --settings file there and that file carries
+    // the transport override built from the resolved route. A beforeStart
+    // failure therefore reports the resolved provider context rather than an
+    // empty one; "none" is providers.js's value for an agent with no provider
+    // configured, which is correct for the terminal agent used here.
+    assert.equal(telemetryEvents[0].context.providerSource, "none");
     assert.equal(telemetryEvents[0].context.provider, undefined);
   } finally {
     if (previousHome === undefined) delete process.env.ORIGINROUTER_HOME;

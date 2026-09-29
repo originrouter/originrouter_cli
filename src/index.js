@@ -72,7 +72,7 @@ import { handleSecurityCommand } from "./commands/security.js";
 import { handleCollaborationCommand } from "./commands/collaboration.js";
 import { handleAgentWorkspaceCommand } from "./commands/agentWorkspace.js";
 import { handleHistoryCommand } from "./commands/history.js";
-import { getCompletionCandidates, handleCompletionCommand } from "./commands/completion.js";
+import { formatCompletionOutput, handleCompletionCommand } from "./commands/completion.js";
 import {
   handleStartupUpdate,
   handleUpdateCommand,
@@ -1280,7 +1280,7 @@ export async function main(argv) {
   }
 
   if (command === "__complete") {
-    console.log(getCompletionCandidates(args).join("\n"));
+    console.log(formatCompletionOutput(args));
     return;
   }
 

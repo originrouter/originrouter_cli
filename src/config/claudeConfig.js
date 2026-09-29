@@ -298,6 +298,143 @@ function buildClaudeModelEnv(mainModel, smallModel = mainModel) {
   };
 }
 
+// ---------- Claude Code settings override (transport ownership) ----------
+//
+// Why this exists: passing our env to the Claude Code child process is not
+// enough. Claude Code merges settings layers in this order, later winning:
+//
+//   userSettings -> projectSettings -> localSettings -> flagSettings -> policySettings
+//
+// A `~/.claude/settings.json` with an `env` block therefore outranks
+// everything we put in the subprocess environment, silently replacing the
+// resolved OriginRouter route with a stale base URL, model or key. The
+// `--settings` file we already pass for hooks is the `flagSettings` layer,
+// which sits above all three filesystem layers, so the override rides along
+// in that same file. Verified against Claude Code 2.1.283: the `env` block
+// merges per key, so keys we do not name still fall back to the user's own
+// settings — which is exactly the behavior we want.
+//
+// The dividing line, applied to every key below and to any key added later:
+//
+//   OriginRouter owns the transport — where the request goes, which
+//   credential it carries, and which model answers it.
+//   The user owns their workspace — theme, permissions, statusLine,
+//   output style, their own hooks, plugins.
+//
+// `policySettings` (enterprise managed-settings.json) outranks flagSettings
+// by design and cannot be overridden from here; callers surface a warning
+// instead of pretending the override took effect.
+
+// Transport keys we force whenever a route is resolved. Superset of every
+// key buildClaudeModelEnv can emit plus the base URL and both credential
+// variables. Claude Code matches the model-family defaults with
+// /^ANTHROPIC_DEFAULT_[A-Z]+_MODEL$/, so this list grows whenever a new
+// family ships — keep it aligned with buildClaudeModelEnv above.
+export const CLAUDE_TRANSPORT_ENV_KEYS = Object.freeze([
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
+]);
+
+// Third-party provider switches. Claude Code reads these straight off the
+// environment and, when any is truthy, sends the request to Bedrock /
+// Vertex / Foundry instead of ANTHROPIC_BASE_URL. Measured: a single
+// CLAUDE_CODE_USE_BEDROCK=1 in ~/.claude/settings.json diverts every request
+// away from our proxy even when base URL, token and models are all pinned.
+// Empty string is how Claude Code reads "off".
+//
+// Deliberately enumerated rather than matched with a CLAUDE_CODE_* wildcard:
+// most CLAUDE_CODE_* variables are legitimate user preferences
+// (CLAUDE_CODE_MAX_CONTEXT_TOKENS, the CLAUDE_CODE_DISABLE_* family) and
+// blanking keys we do not understand would break things we do not own.
+export const CLAUDE_PROVIDER_REDIRECT_ENV_KEYS = Object.freeze([
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "CLAUDE_CODE_USE_GATEWAY",
+  "CLAUDE_CODE_USE_MANTLE",
+]);
+
+// Settings fields, not env vars, that inject a credential of their own.
+// apiKeyHelper is the important one: measured against 2.1.283, a helper
+// configured in ~/.claude/settings.json still adds its key as `x-api-key`
+// on the very same request our ANTHROPIC_AUTH_TOKEN authorizes, so the
+// user's key leaves the machine for whatever endpoint we routed to. Setting
+// the field to "" in the flagSettings layer removes that header.
+// The *AuthRefresh / *CredentialExport hooks are the cloud-provider
+// equivalents, and forceLoginMethod can push an interactive re-login that
+// replaces the credential we just installed.
+export const CLAUDE_CREDENTIAL_SETTINGS_FIELDS = Object.freeze([
+  "apiKeyHelper",
+  "awsAuthRefresh",
+  "awsCredentialExport",
+  "gcpAuthRefresh",
+  "gcpCredentialExport",
+  "forceLoginMethod",
+]);
+
+// Builds the flagSettings payload for a resolved provider result.
+// Returns null when there is nothing to pin, so "no OriginRouter route
+// configured" stays byte-for-byte native behavior.
+export function buildClaudeSettingsOverride(providerResult = {}) {
+  const source = String(providerResult?.source || "");
+  if (!source || source === "inherited" || source === "native-config") return null;
+
+  const sourceEnv = providerResult?.env || {};
+  const env = {};
+  for (const key of CLAUDE_TRANSPORT_ENV_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(sourceEnv, key)) {
+      env[key] = String(sourceEnv[key] ?? "");
+    }
+  }
+  if (Object.keys(env).length === 0) return null;
+
+  // Shadow a stale ANTHROPIC_API_KEY even when the resolved route does not
+  // set one. Leaving the key absent here lets a filesystem settings layer
+  // supply its own, which both re-triggers Claude Code's "both
+  // ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY set" warning and sends an
+  // unrelated key upstream.
+  if (env.ANTHROPIC_AUTH_TOKEN && !Object.prototype.hasOwnProperty.call(env, "ANTHROPIC_API_KEY")) {
+    env.ANTHROPIC_API_KEY = "";
+  }
+  for (const key of CLAUDE_PROVIDER_REDIRECT_ENV_KEYS) env[key] = "";
+
+  const settings = { env };
+  for (const field of CLAUDE_CREDENTIAL_SETTINGS_FIELDS) settings[field] = "";
+  return settings;
+}
+
+// Keys from `override` that a lower settings layer had also set, so callers
+// can tell the user what was replaced. Today's failure mode was not the
+// wrong precedence but a silent one: the route was correct, the session used
+// something else, and nothing said so.
+export function describeClaudeSettingsConflicts(override, foreignSettings) {
+  if (!override || !foreignSettings) return [];
+  const foreignEnv = foreignSettings.env && typeof foreignSettings.env === "object"
+    ? foreignSettings.env
+    : {};
+  const conflicts = [];
+  for (const key of Object.keys(override.env || {})) {
+    // Only report keys we actually change: a provider switch the user never
+    // set, blanked to "", is not a conflict worth a line of output.
+    if (!Object.prototype.hasOwnProperty.call(foreignEnv, key)) continue;
+    if (String(foreignEnv[key] ?? "") === String(override.env[key] ?? "")) continue;
+    conflicts.push(key);
+  }
+  for (const field of CLAUDE_CREDENTIAL_SETTINGS_FIELDS) {
+    const value = foreignSettings[field];
+    if (typeof value === "string" && value.length > 0) conflicts.push(field);
+  }
+  return conflicts;
+}
+
 // ---------- New unified entry point (Stage 7.6: single path) ----------
 
 // Returns { env, provider, source } (or { env, routes, proxy, source } for claude).

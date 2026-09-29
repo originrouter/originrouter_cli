@@ -3,70 +3,16 @@ import os from "node:os";
 import path from "node:path";
 
 import { readConfig } from "../persistence/state.js";
+import {
+  COMPLETION_VALUES,
+  VALUE_FLAGS,
+  WORKSPACE_OPTIONS,
+  resolveCommand,
+  topLevelCommands,
+} from "./commandCatalog.js";
 
 const COMPLETION_START = "# >>> originrouter completion >>>";
 const COMPLETION_END = "# <<< originrouter completion <<<";
-
-const TOP_LEVEL = [
-  "status", "doctor", "sessions", "devices", "env", "agent", "history", "remote",
-  "collaborate", "collaboration", "provider", "route", "proxy",
-  "compatibility", "login", "logout", "auth", "security", "service", "services",
-  "local", "config", "completion", "help", "update", "setup", "claude", "codex", "run",
-];
-
-const SUBCOMMANDS = {
-  agent: ["setup", "detail", "budget", "history"],
-  auth: ["status", "login", "logout"],
-  collaboration: ["templates", "list", "drafts", "draft", "show", "attach", "attention", "resolve", "doctor", "create", "confirm", "revise", "pause", "resume", "retry", "cancel", "archive", "delete", "export"],
-  compatibility: ["status", "list", "inspect", "check", "update", "refresh", "rollback"],
-  completion: ["bash", "zsh", "fish", "powershell", "install", "uninstall"],
-  config: ["show", "set", "unset"],
-  help: ["all"],
-  env: ["print"],
-  local: ["key", "token", "config", "api"],
-  provider: ["add", "update", "list", "show", "use", "remove"],
-  proxy: ["install", "start", "stop", "restart", "switch", "status"],
-  route: ["list", "show", "set", "clear", "cloud", "remote"],
-  security: ["status", "verify", "rotate"],
-  service: ["install", "start", "stop", "restart", "status", "uninstall"],
-  services: ["install", "start", "stop", "restart", "status", "uninstall"],
-  update: ["status", "check", "install"],
-};
-
-const NESTED = {
-  "agent budget": ["show", "set", "clear"],
-  "agent detail": ["set"],
-  "agent history": ["show"],
-  "collaboration draft": ["show", "resume", "delete"],
-  "local api": ["status", "pair", "connect", "set-host", "set-port"],
-  "local config": ["show", "set"],
-  "local key": ["show", "rotate"],
-  "local token": ["show", "rotate"],
-  "route cloud": ["models", "set"],
-  "route remote": ["devices", "set"],
-  remote: ["setup", "status", "share", "workspace"],
-  "remote share": ["status", "start", "stop", "restart"],
-  "remote workspace": ["list", "authorize", "request"],
-};
-
-const OPTIONS = {
-  workspace: ["-c", "--coordinator", "-m", "--mode", "--team", "--review", "--yes", "--detach"],
-  doctor: ["--json"],
-  sessions: ["--json"],
-  devices: ["--json"],
-  history: ["--agent", "--device", "--workspace", "--since", "--until", "--limit", "--archived", "--json"],
-  provider: ["--type", "--engine", "--litellm-provider", "--base-url", "--api-key", "--auth-token", "--model", "--small-fast-model", "--agent", "--force"],
-  route: ["--provider", "--model", "--main-model", "--small-model", "--device"],
-  remote: ["--device", "--workspace", "--providers", "--port"],
-  proxy: ["--provider", "--port", "--version"],
-  login: ["--no-browser"],
-  collaboration: ["--objective", "--participant", "--role", "--route", "--permission", "--preference", "--template", "--coordination-prompt", "--concurrency", "--token-limit", "--amount-limit", "--currency", "--yes", "--detach", "--no-wait", "--timeout", "--review", "--json"],
-  claude: ["--native-config", "--originrouter-autonomy", "--originrouter-policy", "--originrouter-detail"],
-  codex: ["--native-config", "--originrouter-autonomy", "--originrouter-policy", "--originrouter-detail"],
-  update: ["--json"],
-  setup: ["--no-proxy", "--noproxy", "--proxy", "--yes", "--dry-run", "--verify"],
-  completion: ["--shell", "--dry-run"],
-};
 
 function providerNames() {
   try {
@@ -76,73 +22,218 @@ function providerNames() {
   }
 }
 
-function valuesFor(previous) {
-  if (["-c", "--coordinator"].includes(previous)) return ["codex", "claude"];
-  if (["-m", "--mode", "--team"].includes(previous)) {
-    return ["auto", "solo", "build-review", "plan-build-verify", "parallel-research", "review-panel", "remote-ops"];
-  }
-  if (previous === "--agent") return ["claude", "codex"];
-  if (previous === "--type") return ["proxy", "litellm"];
-  if (previous === "--engine") return ["litellm"];
-  if (previous === "--provider") return providerNames();
-  if (previous === "--originrouter-autonomy") return ["manual", "guarded", "ai_review", "unrestricted", "custom"];
-  if (previous === "--originrouter-detail") return ["concise", "standard", "detailed"];
-  if (previous === "--allow-lan") return ["on", "off"];
-  if (previous === "--relay-mode") return ["auto", "cloud", "local", "custom"];
-  if (previous === "--format") return ["json", "markdown"];
-  if (previous === "--shell") return ["bash", "zsh", "fish", "powershell"];
-  if (previous === "updates.mode") return ["prompt", "auto", "off"];
-  return [];
+// Flags whose value is a live resource name rather than a fixed string. The
+// list comes from local state, so it is resolved on every TAB instead of
+// being baked into the catalog.
+const DYNAMIC_VALUE_FOR = {
+  "--provider": providerNames,
+};
+
+// Values the CLI will accept after `previous`, from the catalog plus the
+// dynamic resource lookups. A flag's values can be declared either globally
+// (COMPLETION_VALUES) or on the command that defines the flag; the dynamic
+// lookup wins, then the command-local declaration, then the global map.
+function valuesFor(previous, node = null) {
+  const dynamic = DYNAMIC_VALUE_FOR[previous]?.();
+  if (dynamic?.length) return dynamic;
+  const local = node?.valuesFor?.[previous];
+  if (local?.length) return local;
+  return COMPLETION_VALUES[previous] || [];
 }
 
 function unique(values) {
   return [...new Set(values)].sort();
 }
 
+// Which catalog node the already-typed words point at. A flag such as
+// `remote --port 1` must not be read as a subcommand, so words that start
+// with `-` (and the value that follows a value-taking flag) are skipped.
+function flagTakesValue(word, node) {
+  if (word.includes("=")) return false;
+  if (VALUE_FLAGS.has(word)) return true;
+  return Boolean(node?.valuesFor?.[word]?.length);
+}
+
+function catalogPathFor(completed) {
+  const path = [];
+  let expectValue = false;
+  for (const word of completed) {
+    if (expectValue) {
+      expectValue = false;
+      continue;
+    }
+    if (word.startsWith("-")) {
+      const { node } = resolveCommand(path);
+      if (flagTakesValue(word, node)) expectValue = true;
+      continue;
+    }
+    path.push(word);
+  }
+  return path;
+}
+
+// True once a passthrough command has been handed something to forward, i.e.
+// an argument other than OriginRouter's own leading flags. `claude` alone
+// still offers its wrapper flags; `claude --model x` or `run -- ls` does not.
+// A bare `--` is itself the boundary (`originrouter run -- <cmd>`).
+//
+// A passthrough command (`run -- cmd`, `claude <native args>`) hands the rest
+// of its argv to another program. Until something has actually been handed
+// over, OriginRouter still offers its own wrapper flags; once any argument
+// follows, completion defers to the shell.
+function isForwarding(completed) {
+  for (let end = completed.length; end > 0; end -= 1) {
+    const { node } = resolveCommand(completed.slice(0, end));
+    if (!node?.passthrough) continue;
+    return completed.length > end;
+  }
+  return false;
+}
+
 export function getCompletionCandidates(argv = []) {
   const words = argv.map(String);
   const current = words.at(-1) || "";
   const completed = words.slice(0, -1);
-  const first = completed[0] || "";
-  const second = completed[1] || "";
   const previous = completed.at(-1) || "";
+  const path = catalogPathFor(completed);
+  const { node, children } = resolveCommand(path);
 
-  let candidates = valuesFor(previous);
-  if (candidates.length === 0) {
-    if (completed.length === 0) candidates = TOP_LEVEL;
-    else if (completed.length === 1 && !current.startsWith("-")) candidates = SUBCOMMANDS[first] || [];
-    else if (completed.length === 2 && !current.startsWith("-")) candidates = NESTED[`${first} ${second}`] || [];
+  // A value-taking flag wins over everything else: `--provider <TAB>` must
+  // list providers even though the path still resolves to a command, and
+  // `claude --originrouter-autonomy g<TAB>` is still OriginRouter's own flag
+  // rather than something handed to the forwarded program.
+  let candidates = valuesFor(previous, node);
+
+  // Past a passthrough boundary the shell should complete files, not
+  // OriginRouter flags: `run -- ls <TAB>` must not suggest `--json`.
+  if (candidates.length === 0 && isForwarding(completed)) return [];
+
+  if (candidates.length === 0 && !current.startsWith("-")) {
+    if (path.length === 0) {
+      candidates = topLevelCommands().map((entry) => entry.name);
+    } else {
+      // Positional values declared on the node (e.g. `route set <TAB>`
+      // offering agent.slot names) join the subcommands rather than
+      // replacing them: a command may accept both.
+      const positional = node?.valuesFor?.["(positional)"] || [];
+      candidates = [...children.map((entry) => entry.name), ...positional];
+    }
   }
 
   if (current.startsWith("-") || candidates.length === 0) {
-    candidates = [...candidates, ...(OPTIONS[first] || []), ...(completed.length === 0 ? OPTIONS.workspace : [])];
+    const nodeOptions = node?.options || [];
+    const visibleChildren = path.length === 0 ? [] : children.map((entry) => entry.name);
+    candidates = [
+      ...candidates,
+      ...nodeOptions,
+      ...visibleChildren,
+      ...(path.length === 0 ? WORKSPACE_OPTIONS : []),
+    ];
   }
 
-  if (["provider", "route"].includes(first) && ["show", "use", "remove", "update"].includes(second)) {
-    candidates.push(...providerNames());
+  // A provider name is also a positional on the subcommands that take one,
+  // and on `route ... --provider <name>`.
+  if (path[0] === "provider" && ["show", "use", "remove", "update"].includes(path[1])) {
+    if (current && !current.startsWith("-")) candidates.push(...providerNames());
   }
 
   return unique(candidates).filter((candidate) => candidate.startsWith(current));
 }
 
+// Same candidate set, with the description the shell shows next to each
+// value. Cobra's wire format is `value\tdescription` with a trailing
+// `:<directive>` line, and every generated script below parses exactly that.
+export function getCompletionRichCandidates(argv = []) {
+  const candidates = getCompletionCandidates(argv);
+  const completed = argv.map(String).slice(0, -1);
+  const path = catalogPathFor(completed);
+  const { node, children } = resolveCommand(path);
+
+  const described = candidates.map((candidate) => {
+    const child = children.find((entry) => entry.name === candidate);
+    return { value: candidate, description: child?.summary || "" };
+  });
+
+  // A forwarded command's empty answer means "let the shell complete files",
+  // which is directive 0 rather than 4.
+  const directive = described.length === 0 && isForwarding(completed)
+    ? SHELL_COMP_DEFAULT
+    : SHELL_COMP_DIRECTIVE;
+
+  return { candidates: described, directive };
+}
+
+// Cobra's ShellCompDirectiveNoFileComp (4): the shell must not fall back to
+// filename completion, which otherwise turns a wrong TAB into a directory
+// listing. ShellCompDirectiveDefault (0) explicitly allows the fallback, and
+// is what a passthrough command needs.
+export const SHELL_COMP_DIRECTIVE = 4;
+export const SHELL_COMP_DEFAULT = 0;
+
+export function formatCompletionOutput(argv = []) {
+  const { candidates, directive } = getCompletionRichCandidates(argv);
+  const lines = candidates.map(({ value, description }) => (
+    description ? `${value}\t${description}` : value
+  ));
+  lines.push(`:${directive}`);
+  return lines.join("\n");
+}
+
 const BASH = `# bash completion for OriginRouter CLI
 _originrouter_completion() {
-  local IFS=$'\\n'
-  COMPREPLY=( $(originrouter __complete "\${COMP_WORDS[@]:1}") )
+  # No global IFS override: it also applies to the command substitution below
+  # and collapses the multi-line reply down to its last line.
+  local out directive="" line
+  out=$( "\${COMP_WORDS[0]}" __complete "\${COMP_WORDS[@]:1}" 2>/dev/null )
+  local -a values=()
+  while IFS= read -r line; do
+    case "$line" in
+      :*) directive="\${line#:}" ;;
+      *) values+=( "\${line%%$'\\t'*}" ) ;;
+    esac
+  done <<< "$out"
+  COMPREPLY=()
+  if [ "\${#values[@]}" -gt 0 ]; then
+    COMPREPLY=( $(compgen -W "\${values[*]}" -- "$2") )
+  fi
+  # 4 = ShellCompDirectiveNoFileComp: suppress bash's filename fallback.
+  # Anything else (0) leaves the shell's own file completion in place.
+  if [ "$directive" = "4" ]; then compopt +o default 2>/dev/null || true; fi
 }
 complete -o default -F _originrouter_completion originrouter or`;
 
 const ZSH = `#compdef originrouter
 _originrouter_completion() {
-  local -a candidates
-  candidates=("\${(@f)$(originrouter __complete "\${words[@]:1}")}")
-  compadd -- $candidates
+  local -a lines candidates
+  local line
+  # '(@)' is required: without it zsh joins \${words[2,-1]} into a single
+  # word, so the CLI receives "remote " instead of "remote" "".
+  lines=("\${(@f)$( "\${words[1]}" __complete "\${(@)words[2,-1]}" 2>/dev/null )}")
+  for line in "\${lines[@]}"; do
+    # Trailing ':directive' line is Cobra's wire format, not a candidate.
+    [[ "$line" == :* ]] && continue
+    candidates+=( "\${line%%$'\\t'*}" )
+  done
+  (( \${#candidates[@]} )) && compadd -- "\${candidates[@]}"
 }
 compdef _originrouter_completion originrouter or`;
 
 const FISH = `# fish completion for OriginRouter CLI
-complete -c originrouter -f -a '(originrouter __complete (commandline -opc)[2..-1] (commandline -ct))'
-complete -c or -f -a '(or __complete (commandline -opc)[2..-1] (commandline -ct))'`;
+function __originrouter_complete
+  set -l args (commandline -opc)
+  # $args[2..-1] is the already-typed words, (commandline -ct) the word being
+  # completed. The reply is 'value<TAB>description' lines plus a ':directive'
+  # trailer, which fish must strip before offering anything.
+  set -l out ($args[1] __complete $args[2..-1] (commandline -ct) 2>/dev/null)
+  for line in $out
+    if string match -q ':*' -- $line
+      continue
+    end
+    echo (string split -m 1 \\t -- $line)[1]
+  end
+end
+complete -c originrouter -f -a '(__originrouter_complete)'
+complete -c or -f -a '(__originrouter_complete)'`;
 
 const POWERSHELL = `# PowerShell completion for OriginRouter CLI
 $originrouterCompleter = {
@@ -151,13 +242,27 @@ $originrouterCompleter = {
   if ($words.Count -eq 0 -or $words[-1] -ne $wordToComplete) {
     $words += $wordToComplete
   }
-  originrouter __complete @words | ForEach-Object {
-    [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+  $exe = $commandAst.CommandElements[0].Extent.Text
+  # Each line is 'value<TAB>description'; the final line is ':directive'.
+  # The backtick-t below is PowerShell's tab escape.
+  & $exe __complete @words 2>$null | ForEach-Object {
+    if ($_ -like ':*') { return }
+    $parts = $_ -split "\`t", 2
+    $tip = if ($parts.Count -gt 1) { $parts[1] } else { $parts[0] }
+    [System.Management.Automation.CompletionResult]::new($parts[0], $parts[0], 'ParameterValue', $tip)
   }
 }
 Register-ArgumentCompleter -Native -CommandName originrouter,or -ScriptBlock $originrouterCompleter`;
 
 const SCRIPTS = { bash: BASH, zsh: ZSH, fish: FISH, powershell: POWERSHELL };
+
+// The script text for one shell, without printing it. Used by `printCompletion`
+// and by the tests that pin the constructs each shell needs.
+export function completionScript(shell) {
+  const script = SCRIPTS[shell];
+  if (!script) throw new Error("Usage: originrouter completion bash|zsh|fish|powershell");
+  return script;
+}
 
 function homeDirectory(env = process.env) {
   return env.HOME || env.USERPROFILE || os.homedir();
@@ -300,6 +405,5 @@ export function handleCompletionCommand(args = []) {
 }
 
 export function printCompletion(shell) {
-  if (!SCRIPTS[shell]) throw new Error("Usage: originrouter completion bash|zsh|fish|powershell");
-  console.log(SCRIPTS[shell]);
+  console.log(completionScript(shell));
 }

@@ -16,7 +16,10 @@ import {
   startAgentSessionHeartbeat,
   updateAgentActivitySnapshot,
 } from "../agent/bridgeReporter.js";
-import { buildAgentProviderEnv } from "../config/claudeConfig.js";
+import {
+  buildAgentProviderEnv,
+  buildClaudeSettingsOverride,
+} from "../config/claudeConfig.js";
 import { createTelemetryPipeline } from "../telemetry/index.js";
 import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
 import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
@@ -116,38 +119,28 @@ export function resolveClaudeSdkModelSelection(options = {}, providerResult = {}
   };
 }
 
-const CLAUDE_RUNTIME_ENV_KEYS = Object.freeze([
-  "ANTHROPIC_BASE_URL",
-  "ANTHROPIC_AUTH_TOKEN",
-  "ANTHROPIC_API_KEY",
-  "ANTHROPIC_MODEL",
-  "ANTHROPIC_SMALL_FAST_MODEL",
-]);
-
 // Claude filesystem settings are merged after the subprocess environment and
 // can otherwise replace an explicit OriginRouter route with a stale user-level
 // ANTHROPIC_BASE_URL. Use the SDK's highest-priority flag-settings layer to
-// pin only the runtime route fields. The local capability token never appears
-// in argv: it lives in a mode-0600 temporary file for the session lifetime.
+// pin the transport fields. The local capability token never appears in argv:
+// it lives in a mode-0600 temporary file for the session lifetime.
+//
+// The payload comes from buildClaudeSettingsOverride so this path and the PTY
+// path pin exactly the same set. It previously named only five env keys, which
+// left CLAUDE_CODE_SUBAGENT_MODEL and the whole ANTHROPIC_DEFAULT_*_MODEL
+// family — the keys a stale settings.json is most likely to hold — unpinned.
 export function createClaudeRuntimeSettingsOverride(
   providerResult = {},
   { temporaryRoot = tmpdir() } = {},
 ) {
-  const source = String(providerResult?.source || "");
-  if (!source || source === "inherited") return null;
-  const sourceEnv = providerResult?.env || {};
-  const env = Object.fromEntries(
-    CLAUDE_RUNTIME_ENV_KEYS
-      .filter((key) => Object.prototype.hasOwnProperty.call(sourceEnv, key))
-      .map((key) => [key, String(sourceEnv[key] ?? "")]),
-  );
-  if (Object.keys(env).length === 0) return null;
+  const settings = buildClaudeSettingsOverride(providerResult);
+  if (!settings) return null;
 
   const directory = mkdtempSync(join(temporaryRoot, "originrouter-claude-settings-"));
   const path = join(directory, "settings.json");
   try {
     chmodSync(directory, 0o700);
-    writeFileSync(path, `${JSON.stringify({ env })}\n`, { mode: 0o600 });
+    writeFileSync(path, `${JSON.stringify(settings)}\n`, { mode: 0o600 });
   } catch (error) {
     rmSync(directory, { recursive: true, force: true });
     throw error;

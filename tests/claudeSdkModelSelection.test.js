@@ -84,14 +84,22 @@ const settingsOverride = createClaudeRuntimeSettingsOverride({
 }, { temporaryRoot });
 assert.ok(settingsOverride);
 assert.equal(statSync(settingsOverride.path).mode & 0o777, 0o600);
-assert.deepEqual(JSON.parse(readFileSync(settingsOverride.path, "utf8")), {
-  env: {
-    ANTHROPIC_BASE_URL: "http://127.0.0.1:43210/coding",
-    ANTHROPIC_AUTH_TOKEN: "or_local_secret",
-    ANTHROPIC_API_KEY: "",
-    ANTHROPIC_MODEL: "grok-4.5",
-  },
-});
+const writtenOverride = JSON.parse(readFileSync(settingsOverride.path, "utf8"));
+// Transport keys are copied through; unrelated environment entries are not.
+assert.deepEqual(writtenOverride.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:43210/coding");
+assert.deepEqual(writtenOverride.env.ANTHROPIC_AUTH_TOKEN, "or_local_secret");
+assert.deepEqual(writtenOverride.env.ANTHROPIC_API_KEY, "");
+assert.deepEqual(writtenOverride.env.ANTHROPIC_MODEL, "grok-4.5");
+assert.equal("UNRELATED_SECRET" in writtenOverride.env, false);
+// Provider redirect switches are blanked: a CLAUDE_CODE_USE_BEDROCK left set
+// by a filesystem settings layer diverts the request away from our proxy even
+// when base URL, token and model are all pinned.
+assert.equal(writtenOverride.env.CLAUDE_CODE_USE_BEDROCK, "");
+assert.equal(writtenOverride.env.CLAUDE_CODE_USE_VERTEX, "");
+// apiKeyHelper is neutralized: otherwise its key still rides along as
+// `x-api-key` on the request our auth token authorizes.
+assert.equal(writtenOverride.apiKeyHelper, "");
+assert.equal(writtenOverride.forceLoginMethod, "");
 settingsOverride.cleanup();
 assert.throws(() => statSync(settingsOverride.path), /ENOENT/);
 settingsOverride.cleanup();
