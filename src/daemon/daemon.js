@@ -65,7 +65,7 @@ import {
   registerCliDeviceE2eeIdentity,
 } from "../security/deviceE2eeClient.js";
 import {
-  deviceE2eeDirectoryNamespace,
+  ensureDeviceE2eeDirectoryCacheMigrated,
   storeDeviceE2eeDirectoryCache,
 } from "../security/deviceE2eeDirectoryCache.js";
 import { DeviceE2eeRelayTransport } from "../security/deviceE2eeRelayTransport.js";
@@ -709,7 +709,9 @@ export async function startDaemon(args) {
       accessToken,
     });
     storeDeviceE2eeDirectoryCache(stateDir, directory, {
-      namespace: deviceE2eeDirectoryNamespace(credential),
+      // Migrate first so the fresh directory is stored alongside any pinned
+      // history carried over from a session-scoped cache.
+      namespace: ensureDeviceE2eeDirectoryCacheMigrated(stateDir, credential),
     });
   };
   sessionManager.onLocalControlChanged = async () => {

@@ -1,11 +1,11 @@
 import { DeviceE2eeSession } from "../crypto/deviceE2eeEnvelope.js";
 import {
-  adoptLegacyDeviceE2eeDirectoryCache,
   cachedDeviceStatus,
   currentCachedDeviceIdentity,
   deviceE2eeDirectoryHead,
   deviceE2eeDirectoryCacheState,
   deviceE2eeDirectoryNamespace,
+  ensureDeviceE2eeDirectoryCacheMigrated,
   readDeviceE2eeDirectoryCache,
   storeDeviceE2eeDirectoryCache,
 } from "./deviceE2eeDirectoryCache.js";
@@ -149,7 +149,6 @@ export class DeviceE2eeRelayTransport {
     this.routeSubscribers = new Map();
     this.sendTails = new Map();
     this.inboundTail = Promise.resolve();
-    this.adoptedLegacyCache = false;
   }
 
   setLocalIdentity(identity) {
@@ -182,16 +181,7 @@ export class DeviceE2eeRelayTransport {
     // The cache moved from a per-sign-in namespace to the account scope. Carry
     // any existing session-scoped state over once so the upgrade keeps its
     // pinned key history instead of starting cold.
-    if (!this.adoptedLegacyCache) {
-      this.adoptedLegacyCache = true;
-      try {
-        adoptLegacyDeviceE2eeDirectoryCache(this.stateDir, {
-          namespace: deviceE2eeDirectoryNamespace(credential),
-        });
-      } catch {
-        // Adoption is an optimization. A refresh still repopulates the cache.
-      }
-    }
+    ensureDeviceE2eeDirectoryCacheMigrated(this.stateDir, credential);
     return credential;
   }
 

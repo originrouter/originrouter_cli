@@ -12,7 +12,10 @@ function safeText(value, maxLength = 4096) {
 function expandHome(value) {
   const text = safeText(value);
   if (!text || text === "~") return homedir();
-  if (text.startsWith(`~${sep}`)) return join(homedir(), text.slice(2));
+  // Accept both separators: on Windows `path.sep` is "\\", but users and
+  // PowerShell both routinely type "~/dir", which would otherwise be left
+  // unexpanded and resolved as a literal "~" directory.
+  if (/^~[\\/]/.test(text)) return join(homedir(), text.slice(2));
   return text;
 }
 

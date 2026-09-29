@@ -26,7 +26,11 @@ export async function openBrowser(url) {
   const commands = {
     darwin: ["open", [url]],
     linux: ["xdg-open", [url]],
-    win32: ["cmd", ["/c", "start", '""', url]],
+    // rundll32 instead of `cmd /c start`: the login URL carries query
+    // parameters joined with "&", and cmd splits unquoted arguments at
+    // every "&" — the browser would receive a truncated URL. rundll32's
+    // FileProtocolHandler opens the URL directly, no shell parsing.
+    win32: ["rundll32", ["url.dll,FileProtocolHandler", url]],
   };
   const selected = commands[process.platform];
   if (!selected) {

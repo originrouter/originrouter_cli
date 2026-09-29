@@ -96,7 +96,9 @@ function eventTime(event, now) {
 function isInsideWorkspace(candidate, workspaceRoot) {
   const value = safeText(candidate, 4096);
   if (!value) return true;
-  if (value === "~" || value.startsWith("~/") || value.startsWith("$")) return false;
+  // `~\\dir` is the Windows spelling of the same home-relative path, and
+  // PowerShell expands it, so treat both separators as outside the workspace.
+  if (value === "~" || /^~[\\/]/.test(value) || value.startsWith("$")) return false;
   const root = path.resolve(String(workspaceRoot || process.cwd()));
   const resolved = path.resolve(root, value);
   return resolved === root || resolved.startsWith(`${root}${path.sep}`);

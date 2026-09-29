@@ -18,6 +18,7 @@ import {
   deviceE2eeDirectoryCacheState,
   deviceE2eeDirectoryHead,
   deviceE2eeDirectoryNamespace,
+  ensureDeviceE2eeDirectoryCacheMigrated,
   readDeviceE2eeDirectoryCache,
 } from "../security/deviceE2eeDirectoryCache.js";
 
@@ -26,7 +27,6 @@ const CHALLENGE_TTL_MS = 60_000;
 const MAX_RPC_BODY_BYTES = 8 * 1024 * 1024;
 const AUTH_DEVICE_SIGNATURE = "device_signature_v1";
 const AUTH_LOCAL_ACCESS_KEY = "local_access_key_v1";
-const AUTH_LEGACY_HMAC = "legacy_hmac_v2";
 
 function safeEqual(a, b) {
   const left = Buffer.from(String(a || ""), "utf8");
@@ -48,7 +48,7 @@ function accessKeyBinding(token) {
 }
 
 function usesAccessKeyAuthentication(method) {
-  return method === AUTH_LOCAL_ACCESS_KEY || method === AUTH_LEGACY_HMAC;
+  return method === AUTH_LOCAL_ACCESS_KEY;
 }
 
 function currentTrustedIdentity(cache, deviceId, keyId) {
@@ -207,8 +207,12 @@ export class DeviceE2eeLocalGateway {
       error.code = "invalid_app_identity";
       throw error;
     }
-    const method = String(authMethod || "").trim() || AUTH_LEGACY_HMAC;
-    if (![AUTH_DEVICE_SIGNATURE, AUTH_LOCAL_ACCESS_KEY, AUTH_LEGACY_HMAC].includes(method)) {
+    // The authentication method is always negotiated explicitly from the
+    // ``auth_methods`` list advertised by ``createChallenge``. There is no
+    // implicit default: an absent method is a client too old to negotiate,
+    // and it must upgrade rather than silently fall into a weaker path.
+    const method = String(authMethod || "").trim();
+    if (![AUTH_DEVICE_SIGNATURE, AUTH_LOCAL_ACCESS_KEY].includes(method)) {
       const error = new Error("unsupported local E2EE authentication method");
       error.code = "unsupported_auth_method";
       throw error;
@@ -216,7 +220,13 @@ export class DeviceE2eeLocalGateway {
     const credential = readCodingAuth(this.stateDir);
     const cache = credential?.sessionId
       ? readDeviceE2eeDirectoryCache(this.stateDir, {
-          namespace: deviceE2eeDirectoryNamespace(credential),
+          // Runs the session-scoped to account-scoped migration on first use so
+          // a direct connection does not start from a cold cache and fall back
+          // to access-key authentication unnecessarily.
+          namespace: ensureDeviceE2eeDirectoryCacheMigrated(
+            this.stateDir,
+            credential,
+          ),
         })
       : null;
     const trusted = currentTrustedIdentity(
@@ -258,27 +268,13 @@ export class DeviceE2eeLocalGateway {
         throw error;
       }
       localAccessKeyBinding = accessKeyBinding(token);
-      if (method === AUTH_LEGACY_HMAC) {
-        if (!deviceE2eeDirectoryCacheState(cache).usable) {
-          const error = new Error("cached device trust state is too old");
-          error.code = "device_trust_state_stale";
-          throw error;
-        }
-        if (!publicFieldsMatch) {
-          const error = new Error("App device is not trusted in the cached directory");
-          error.code = "app_device_not_trusted";
-          throw error;
-        }
-        trustContext = deviceE2eeDirectoryHead(cache);
-      } else {
-        // Explicit access-key pairing is the offline/local-deployment path.
-        // The HMAC authenticates the self-signed App identity without
-        // granting it any account or Relay trust.
-        trustContext = localTrustContext(
-          appIdentity,
-          localIdentity.public_identity,
-        );
-      }
+      // Explicit access-key pairing is the offline/local-deployment path.
+      // The HMAC authenticates the self-signed App identity without
+      // granting it any account or Relay trust.
+      trustContext = localTrustContext(
+        appIdentity,
+        localIdentity.public_identity,
+      );
     }
     this.approvedPeers.set(appIdentity.key_id, {
       identity: appIdentity,

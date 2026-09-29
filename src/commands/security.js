@@ -15,7 +15,7 @@ import {
   registerCliDeviceE2eeIdentity,
 } from "../security/deviceE2eeClient.js";
 import {
-  deviceE2eeDirectoryNamespace,
+  ensureDeviceE2eeDirectoryCacheMigrated,
   storeDeviceE2eeDirectoryCache,
 } from "../security/deviceE2eeDirectoryCache.js";
 import qrcode from "qrcode-terminal";
@@ -105,7 +105,7 @@ async function verify() {
     const authorizationStatus = status.enrollment?.authorization_status;
     if (trustStatus === "trusted" || authorizationStatus === "approved") {
       const directory = await getCliDeviceE2eeDirectory(options);
-      storeDeviceE2eeDirectoryCache(stateDir, directory, { namespace: deviceE2eeDirectoryNamespace(auth) });
+      storeDeviceE2eeDirectoryCache(stateDir, directory, { namespace: ensureDeviceE2eeDirectoryCacheMigrated(stateDir, auth) });
       console.log("CLI device is now trusted.");
       return;
     }
@@ -144,7 +144,7 @@ async function rotate() {
     accessToken: auth.accessTokens.control.token,
   });
   storeDeviceE2eeDirectoryCache(stateDir, directory, {
-    namespace: deviceE2eeDirectoryNamespace(auth),
+    namespace: ensureDeviceE2eeDirectoryCacheMigrated(stateDir, auth),
   });
   console.log("Device encryption key rotated.");
   console.log(`Key ID:      ${registered.key_id}`);

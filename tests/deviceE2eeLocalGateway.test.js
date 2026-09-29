@@ -72,10 +72,25 @@ assert.deepEqual(bootstrap.auth_methods, [
   "device_signature_v1",
   "local_access_key_v1",
 ]);
+// An absent auth method is no longer accepted: the implicit legacy HMAC
+// default has been retired, so a client that cannot negotiate must upgrade.
+assert.throws(
+  () => gateway.authorize({
+    challengeId: bootstrap.challenge.challenge_id,
+    appIdentity: app.public_identity,
+    hmacProof: localE2eeChallengeProof(token, bootstrap.challenge),
+  }),
+  /unsupported local E2EE authentication method/,
+);
+const rpcBootstrap = gateway.createChallenge({
+  appDeviceId: app.public_identity.device_id,
+  appKeyId: app.public_identity.key_id,
+});
 gateway.authorize({
-  challengeId: bootstrap.challenge.challenge_id,
+  challengeId: rpcBootstrap.challenge.challenge_id,
   appIdentity: app.public_identity,
-  hmacProof: localE2eeChallengeProof(token, bootstrap.challenge),
+  authMethod: "device_signature_v1",
+  deviceProof: signDeviceE2eeLocalChallenge(app, rpcBootstrap.challenge),
 });
 
 const session = DeviceE2eeSession.initiate({

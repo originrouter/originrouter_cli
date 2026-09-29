@@ -3,7 +3,64 @@
 All notable changes to OriginRouter CLI will be documented here. The project
 uses Semantic Versioning and follows the Keep a Changelog structure.
 
-## 0.4.7 - Unreleased
+## 0.4.8 - 2026-09-29
+
+### Fixed
+
+- The device directory cache is now scoped to the account instead of to a
+  single sign-in. Every `originrouter login` previously started from a cold
+  cache, which discarded the pinned key history and left abandoned files on
+  disk holding contradictory views of the same account. Existing
+  session-scoped caches are carried over once, and the superseded files are
+  removed.
+- A directory containing one unverifiable device no longer makes every other
+  device unreachable. Each device's key chain is verified independently: the
+  offending device is quarantined and reported with a specific reason, while
+  the devices that verify stay usable. Invalid signatures, unsigned rotations,
+  and mutated pinned keys remain fatal for the device at fault.
+- A device whose key chain is served starting above version 1 can be completed
+  from key history this installation already pinned, so a server-side omission
+  no longer permanently prevents a session from opening. Only previously
+  pinned key IDs are reused.
+- Peer errors now name the actual cause, distinguishing a quarantined device
+  from one that is absent or untrusted.
+- The App-to-CLI local connection negotiates its authentication method
+  explicitly. The superseded `legacy_hmac_v2` path has been removed from both
+  ends; a client that cannot negotiate is told to update instead of falling
+  back to the weaker path.
+
+### Fixed (Windows)
+
+- `originrouter login` no longer opens a truncated URL. The launcher used
+  `cmd /c start`, and cmd splits unquoted arguments at every `&`, so the
+  browser received only the first query parameter and the device code was
+  lost. The URL is now opened directly, without shell parsing.
+- `originrouter run --` and agent launches can execute npm-installed commands
+  again. These ship as `.cmd` shims, which `CreateProcess` cannot run, so
+  spawning `claude` failed outright; bare names are now resolved against
+  `PATH`/`PATHEXT` and shims are routed through `cmd.exe`. The same fix
+  applies to the pty executor, where node-pty reported "File not found".
+- System proxy settings are detected again, so managed Python and uv can be
+  downloaded from behind a proxy. The registry reader matched a single
+  hardcoded value type and silently returned nothing for values of any other
+  type.
+- Stopping an agent now terminates the whole process tree. Windows has no
+  POSIX signals, so the previous group-signal path could not reach
+  descendants.
+- `~/path` and `~\path` are expanded consistently in workspace, approval
+  policy, audit store, autonomy policy, and agent catalog paths. Two of these
+  only accepted the separator that does not appear on Windows.
+
+### Security
+
+- The state directory holding credentials and device keys is now restricted by
+  ACL on Windows, where filesystem mode bits have no effect. Access is granted
+  only to the current user and `SYSTEM`, inheritance is removed so new secret
+  files are covered automatically, and principals are addressed by SID so the
+  hardening works on localized systems. Best-effort: a directory that refuses
+  ACL edits stays usable and warns once.
+
+## 0.4.7 - 2026-09-28
 
 ### Fixed
 

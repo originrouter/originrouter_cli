@@ -660,7 +660,9 @@ function lexicalPath(value, base) {
   const text = String(value || "").trim();
   if (!text) return "";
   if (text === "~") return homedir();
-  if (text.startsWith("~/")) return path.resolve(homedir(), text.slice(2));
+  // Both separators: "~\\dir" is the native Windows spelling and would
+  // otherwise resolve against the cwd as a literal "~" directory.
+  if (/^~[\\/]/.test(text)) return path.resolve(homedir(), text.slice(2));
   return path.resolve(base || process.cwd(), text);
 }
 

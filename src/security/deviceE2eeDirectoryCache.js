@@ -5,6 +5,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -50,6 +51,31 @@ export function deviceE2eeDirectoryCachePath(stateDir, { namespace } = {}) {
   return join(stateDir, `device-e2ee-directory-v2${namespaceSuffix(namespace)}.json`);
 }
 
+// The namespace migration only has to run once per process, but every entry
+// point that reads the cache has to be behind it. Track it here so callers
+// cannot disagree about whether it already happened.
+const migratedStateDirs = new Set();
+
+/**
+ * Run the session-scoped to account-scoped migration once per state directory.
+ *
+ * Safe to call on every cache read: after the first call it is a set lookup.
+ * Never throws — a failed migration only costs a directory refetch.
+ */
+export function ensureDeviceE2eeDirectoryCacheMigrated(stateDir, credential) {
+  const namespace = deviceE2eeDirectoryNamespace(credential);
+  if (!namespace.startsWith("account:")) return namespace;
+  const key = `${stateDir}\u0000${namespace}`;
+  if (migratedStateDirs.has(key)) return namespace;
+  migratedStateDirs.add(key);
+  try {
+    adoptLegacyDeviceE2eeDirectoryCache(stateDir, { namespace });
+  } catch {
+    // Migration is an optimization: a refresh repopulates the cache anyway.
+  }
+  return namespace;
+}
+
 export function readDeviceE2eeDirectoryCache(stateDir, { namespace } = {}) {
   const path = deviceE2eeDirectoryCachePath(stateDir, { namespace });
   if (!existsSync(path)) return null;
@@ -82,7 +108,6 @@ export function adoptLegacyDeviceE2eeDirectoryCache(stateDir, {
 } = {}) {
   if (!namespace || !namespace.startsWith("account:")) return null;
   const target = deviceE2eeDirectoryCachePath(stateDir, { namespace });
-  if (existsSync(target)) return null;
   let candidates;
   try {
     candidates = readdirSync(stateDir).filter((name) =>
@@ -90,6 +115,7 @@ export function adoptLegacyDeviceE2eeDirectoryCache(stateDir, {
   } catch {
     return null;
   }
+  const superseded = [];
   let best = null;
   for (const name of candidates) {
     const candidatePath = join(stateDir, name);
@@ -98,8 +124,11 @@ export function adoptLegacyDeviceE2eeDirectoryCache(stateDir, {
     try {
       value = JSON.parse(readFileSync(candidatePath, "utf8"));
     } catch {
+      // Unreadable leftovers are removed too: nothing can consult them.
+      superseded.push(candidatePath);
       continue;
     }
+    superseded.push(candidatePath);
     if (value?.schema !== 1 || !Array.isArray(value.identities)
         || !Number.isSafeInteger(value?.policy?.epoch)) continue;
     if (!deviceE2eeDirectoryCacheState(value, { now, maxStaleMs }).usable) continue;
@@ -111,9 +140,22 @@ export function adoptLegacyDeviceE2eeDirectoryCache(stateDir, {
       best = { value, epoch, fetchedAt };
     }
   }
-  if (!best) return null;
-  writeCache(stateDir, best.value, { namespace });
-  return best.value;
+  // Adopt only when the account namespace has nothing yet. An existing
+  // account-scoped cache is already the authority and must not be overwritten
+  // by an older session-scoped file.
+  const adopted = best && !existsSync(target) ? best.value : null;
+  if (adopted) writeCache(stateDir, adopted, { namespace });
+  // Remove the session-scoped files once their content has been carried over.
+  // They are never consulted again, and leaving them behind keeps
+  // contradictory views of the same account on disk indefinitely.
+  for (const path of superseded) {
+    try {
+      unlinkSync(path);
+    } catch {
+      // A file that cannot be removed is still unreachable; ignore it.
+    }
+  }
+  return adopted;
 }
 
 function writeCache(stateDir, value, { namespace } = {}) {

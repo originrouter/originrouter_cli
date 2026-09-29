@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { startDaemon } from "./daemon/daemon.js";
 import {
   CLAUDE_CONFIG_KEYS,
@@ -118,6 +117,7 @@ import {
   setAgentDetailDefault,
 } from "./runtime/agentDetailProfile.js";
 import { printHelp, printSummaryHelp } from "./commands/help.js";
+import { spawnCommand } from "./utils/spawn.js";
 
 
 export function resolveAgentCommand(command, args = []) {
@@ -154,11 +154,13 @@ function runCommand(command, args) {
     return;
   }
 
-  const child = spawn(command, args, {
+  // spawnCommand (not raw spawn) so Windows resolves bare names against
+  // PATH/PATHEXT and routes npm .cmd shims (claude.cmd, npm.cmd) through
+  // cmd.exe — CreateProcess alone cannot run them.
+  const child = spawnCommand(command, args, {
     cwd: process.cwd(),
     env: process.env,
     stdio: "inherit",
-    shell: false,
   });
 
   child.on("error", (error) => {

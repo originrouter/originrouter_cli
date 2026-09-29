@@ -33,7 +33,7 @@ function canonicalPath(value) {
 // never an arbitrary /Users/<name> or /home/<name> prefix.
 export function workspaceDisplayPath(value) {
   const path = safeText(value, 4096);
-  if (!path || path === "~" || path.startsWith("~/")) return path;
+  if (!path || path === "~" || /^~[\\/]/.test(path)) return path;
   const home = canonicalPath(homedir());
   const candidate = canonicalPath(path);
   if (!home || !candidate) return path;

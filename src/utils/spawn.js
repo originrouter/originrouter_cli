@@ -57,6 +57,11 @@ export function toWindowsCommandLine(command, args) {
 // Resolve a bare command name (e.g. "claude") to a real executable on PATH.
 // Returns the input unchanged when it already has an extension/path or when
 // nothing is found (the spawn will fail with ENOENT as before).
+//
+// Do NOT reimplement this with `where.exe`: measured on a real Windows box,
+// `where npm` lists the extensionless Unix shell script (unrunnable via
+// CreateProcess) BEFORE npm.cmd. Probing PATH x PATHEXT in order is what
+// makes this land on the .cmd shim.
 export function resolveWindowsCommand(command) {
     if (path.isAbsolute(command) || command.includes("/") || command.includes("\\") || path.extname(command)) {
         return command;

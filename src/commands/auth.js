@@ -26,7 +26,7 @@ import {
   signOutCurrentCliDevice,
 } from "../security/deviceE2eeClient.js";
 import {
-  deviceE2eeDirectoryNamespace,
+  ensureDeviceE2eeDirectoryCacheMigrated,
   storeDeviceE2eeDirectoryCache,
 } from "../security/deviceE2eeDirectoryCache.js";
 import {
@@ -296,7 +296,7 @@ export async function handleLogin(args, {
         accessToken: credential.accessTokens.control.token,
       });
       storeDeviceE2eeDirectoryCache(stateDir, directory, {
-        namespace: deviceE2eeDirectoryNamespace(credential),
+        namespace: ensureDeviceE2eeDirectoryCacheMigrated(stateDir, credential),
       });
     } catch (error) {
       registrationError = error;

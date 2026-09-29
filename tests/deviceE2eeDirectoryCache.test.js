@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createPrivateKey, sign } from "node:crypto";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,10 +13,13 @@ import {
   adoptLegacyDeviceE2eeDirectoryCache,
   cachedDeviceStatus,
   currentCachedDeviceIdentity,
+  deviceE2eeDirectoryCachePath,
   deviceE2eeDirectoryCacheState,
   deviceE2eeDirectoryHead,
   deviceE2eeDirectoryNamespace,
+  ensureDeviceE2eeDirectoryCacheMigrated,
   quarantinedDeviceIds,
+  readDeviceE2eeDirectoryCache,
   storeDeviceE2eeDirectoryCache,
 } from "../src/security/deviceE2eeDirectoryCache.js";
 
@@ -364,6 +367,10 @@ assert.throws(
     namespace: "or_ses_old",
     now: new Date(),
   });
+  const legacyPath = deviceE2eeDirectoryCachePath(legacyDir, {
+    namespace: "or_ses_old",
+  });
+  assert.ok(existsSync(legacyPath), "the session-scoped file starts present");
   const adopted = adoptLegacyDeviceE2eeDirectoryCache(legacyDir, {
     namespace: "account:sha256:abc",
   });
@@ -371,6 +378,14 @@ assert.throws(
   assert.equal(
     currentCachedDeviceIdentity(adopted, "legacy-device").key_id,
     legacyIdentity.public_identity.key_id,
+  );
+  // The session-scoped file is removed once its content has been carried over.
+  // Leaving it behind keeps contradictory views of one account on disk forever,
+  // which is how the epoch-2/epoch-1 split arose in the first place.
+  assert.equal(
+    existsSync(legacyPath),
+    false,
+    "the superseded session-scoped cache must be cleaned up",
   );
   assert.equal(
     adoptLegacyDeviceE2eeDirectoryCache(legacyDir, {
@@ -383,6 +398,79 @@ assert.throws(
     adoptLegacyDeviceE2eeDirectoryCache(legacyDir, { namespace: "or_ses_old" }),
     null,
     "adoption only targets an account-scoped namespace",
+  );
+
+  // An account-scoped cache already present stays authoritative, and the
+  // leftover session files are still cleaned up rather than being adopted over
+  // the newer state.
+  const keepDir = join(root, "legacy-keep");
+  const keepIdentity = ensureDeviceE2eeIdentity(join(root, "keep-identity"), {
+    deviceId: "current-device",
+  });
+  storeDeviceE2eeDirectoryCache(keepDir, legacyDirectory, {
+    namespace: "or_ses_superseded",
+  });
+  storeDeviceE2eeDirectoryCache(keepDir, {
+    policy,
+    identities: [trusted(keepIdentity.public_identity)],
+  }, { namespace: "account:sha256:keep" });
+  assert.equal(
+    adoptLegacyDeviceE2eeDirectoryCache(keepDir, {
+      namespace: "account:sha256:keep",
+    }),
+    null,
+  );
+  assert.equal(
+    existsSync(deviceE2eeDirectoryCachePath(keepDir, {
+      namespace: "or_ses_superseded",
+    })),
+    false,
+    "leftovers are cleaned up even when nothing is adopted",
+  );
+  assert.equal(
+    currentCachedDeviceIdentity(
+      readDeviceE2eeDirectoryCache(keepDir, { namespace: "account:sha256:keep" }),
+      "current-device",
+    ).key_id,
+    keepIdentity.public_identity.key_id,
+    "the existing account-scoped cache must survive untouched",
+  );
+
+  // Running migration repeatedly must be safe and must not refetch or rewrite.
+  const migrateDir = join(root, "legacy-migrate");
+  storeDeviceE2eeDirectoryCache(migrateDir, legacyDirectory, {
+    namespace: "or_ses_migrate",
+  });
+  const credential = { accountScope: "sha256:mig", sessionId: "or_ses_migrate" };
+  assert.equal(
+    ensureDeviceE2eeDirectoryCacheMigrated(migrateDir, credential),
+    "account:sha256:mig",
+  );
+  assert.equal(
+    ensureDeviceE2eeDirectoryCacheMigrated(migrateDir, credential),
+    "account:sha256:mig",
+    "migration is idempotent",
+  );
+  assert.ok(
+    readDeviceE2eeDirectoryCache(migrateDir, { namespace: "account:sha256:mig" }),
+    "migration must leave an account-scoped cache in place",
+  );
+  // A credential without an account scope must be left entirely alone.
+  const legacyOnlyDir = join(root, "legacy-only");
+  storeDeviceE2eeDirectoryCache(legacyOnlyDir, legacyDirectory, {
+    namespace: "or_ses_only",
+  });
+  assert.equal(
+    ensureDeviceE2eeDirectoryCacheMigrated(legacyOnlyDir, {
+      sessionId: "or_ses_only",
+    }),
+    "or_ses_only",
+  );
+  assert.ok(
+    existsSync(deviceE2eeDirectoryCachePath(legacyOnlyDir, {
+      namespace: "or_ses_only",
+    })),
+    "a session-only credential must keep using its own cache",
   );
 
   // A cache past the usable window must not be adopted: it would reintroduce

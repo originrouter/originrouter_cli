@@ -7,6 +7,7 @@ import { randomBytes } from "node:crypto";
 import { VERSION } from "../constants.js";
 import { migrateLegacyConfig } from "../config/migration.js";
 import { activeAccountStateDir } from "./accounts.js";
+import { restrictDirectoryToCurrentUser } from "../utils/windowsAcl.js";
 
 export function getStateDir() {
   return process.env.ORIGINROUTER_HOME || join(homedir(), ".originrouter");
@@ -14,10 +15,28 @@ export function getStateDir() {
 
 export function ensureStateDir() {
   const root = getStateDir();
-  mkdirSync(root, { recursive: true });
-  mkdirSync(join(root, "logs"), { recursive: true });
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  mkdirSync(join(root, "logs"), { recursive: true, mode: 0o700 });
+  // fs mode bits do nothing on Windows, so the state directory is hardened
+  // through its ACL instead. Idempotent and best-effort: a directory that
+  // refuses ACL edits (network home, restricted volume) must stay usable.
+  if (platform() === "win32") {
+    const applied = restrictDirectoryToCurrentUser(root);
+    if (!applied.ok && !warnedAboutStateDirAcl) {
+      warnedAboutStateDirAcl = true;
+      process.stderr.write(
+        `Warning: could not restrict permissions on ${root} (${applied.reason}). `
+        + "Credentials and device keys stored there may be readable by other "
+        + "accounts on this machine.\n",
+      );
+    }
+  }
   return root;
 }
+
+// One warning per process; ensureStateDir is called on essentially every
+// command path and a repeated warning would bury real output.
+let warnedAboutStateDirAcl = false;
 
 function readJson(path) {
   if (!existsSync(path)) return null;
