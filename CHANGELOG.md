@@ -3,6 +3,113 @@
 All notable changes to OriginRouter CLI will be documented here. The project
 uses Semantic Versioning and follows the Keep a Changelog structure.
 
+## 0.4.9 - 2026-09-30
+
+### Fixed
+
+- Shell completion now describes the whole command surface instead of a
+  hand-maintained subset. The candidate list is derived from a single command
+  catalog, so subcommands, options, and value completions can no longer drift
+  apart from the command tree they are meant to describe. Completion refreshes
+  for an upgraded CLI as well: it is loaded from the installed binary on every
+  shell start, so a new version's completions appear without reinstalling.
+- `originrouter update` re-applies shell completion after a successful upgrade.
+  Only profiles that already carry a completion block are touched, so updating
+  the CLI never configures a shell that was never configured.
+- `originrouter login` and `originrouter run --` can execute npm-installed
+  commands again on Windows when the CLI is installed by `scripts/install.ps1`.
+
+### Fixed (Windows)
+
+- PowerShell completion now installs into both profiles. Windows ships two
+  PowerShells that read different files — Windows PowerShell 5.1 reads
+  `Documents\WindowsPowerShell\` and PowerShell 7+ reads `Documents\PowerShell\`
+  — and only the 7+ path was written, so completion was installed yet never
+  loaded for `powershell`. Uninstall clears both.
+- Completion works when completing an empty word. PowerShell 5.1 drops a
+  trailing empty argument when invoking a native command, so the CLI received
+  `provider` where the user had typed `provider <TAB>` and echoed the word back
+  instead of offering its subcommands. The generated script now sends a
+  sentinel the CLI maps back to an empty word.
+
+### Security
+
+- The Codex app-server provider id is now unique per process. Codex merges its
+  config layers by key, and a table merges field by field rather than replacing
+  wholesale, so a `[model_providers.<id>]` block under our fixed id in the
+  user's `config.toml` survived the merge and smuggled `env_http_headers`,
+  `http_headers`, and `query_params` onto the request our own credential had
+  authorized — sending the user's key wherever the route pointed. An empty-table
+  override does not clear them; removing the merge partner does.
+- Both Anthropic credential variables are pinned when a route is applied, not
+  just the unused one. A route that sets `ANTHROPIC_API_KEY` previously left
+  `ANTHROPIC_AUTH_TOKEN` absent, which let a stale one in
+  `~/.claude/settings.json` reach the request as a `Bearer` token; Claude Code
+  prefers that token, so the proxy was handed the user's stale credential and
+  the user's own key left the machine.
+- Command discovery no longer loses whole command families. `originrouter help`
+  omitted the entire `local api` family — including `local api pair`, which had
+  no other entry point — and several other subcommand lists drifted from the
+  command tree they document. The help text is hand-authored by design (its
+  sections are grouped by concept, not tree position), so it is checked against
+  the catalog instead of generated from it, and that check now covers
+  subcommands rather than only top-level names.
+- Removed a completion entry for a subcommand the CLI rejects. `auth logout` was
+  declared in the command catalog but never implemented: TAB offered it, and
+  choosing it failed with "Unknown auth subcommand". The top-level
+  `originrouter logout` already covers signing out.
+- The catalog's subcommands are now checked for reachability, not just
+  declaration. A name could previously be declared and offered by completion
+  while no dispatch branch accepted it — the check now resolves each entry
+  against the module that owns its branch, with unexplained exemptions refused.
+
+### Fixed
+
+- A Claude session no longer silently runs on a stale user settings file. Claude
+  Code merges its own settings files *above* the subprocess environment, so a
+  `~/.claude/settings.json` env block outranked the resolved route and replaced
+  it. The route is now pinned through the `--settings` (flagSettings) layer,
+  which outranks every filesystem settings layer except enterprise managed
+  settings.
+- Pin the same transport key set on every launch path. The SDK path pinned five
+  env keys by hand, leaving `CLAUDE_CODE_SUBAGENT_MODEL` and the whole
+  `ANTHROPIC_DEFAULT_*_MODEL` family — the keys a stale settings file is most
+  likely to hold — unpinned while the PTY path pinned them.
+- Report settings conflicts rather than resolving them silently. A conflicting
+  layer is now named at launch and by `originrouter env print`, so a correct
+  route that a settings file was overriding no longer looks like a routing
+  failure.
+- `originrouter env print` describes what a session will really see. It reported
+  only the process environment and printed "(unset)" for keys a settings file
+  was actively forcing; it now lists the settings layers above it, the transport
+  keys each one sets, and whether OriginRouter overrides them. Credential *keys*
+  are named, never their values, and enterprise managed settings are identified
+  as outranking OriginRouter.
+- A session that is online but idle no longer reports an active turn.
+  `session.status` describes the long-lived CLI process — a healthy idle Agent
+  sits at `running` for hours — so treating it as turn activity opened the App
+  with a stop button and flickered against every refresh.
+- The control snapshot and the session projection no longer disagree. The
+  snapshot published the raw turn latch while the session published a gated
+  projection, so the App alternated between two answers on every refresh.
+- A waiting state survives an approval that expires without an event. Pending
+  interactions are now the authoritative source for the waiting states, which a
+  turn-event latch cannot observe.
+- Re-registering a session no longer resurrects a finished turn. An Agent
+  reconnecting after a turn ended while the App was away inherited the previous
+  `running` latch and showed a stop button until a terminal event that never
+  came.
+
+### Validation
+
+- The full CLI test suite passes, including new tests for the command catalog,
+  completion (sentinel and dual-profile install), settings overrides, provider
+  isolation, `env print` layers, and turn-state projection.
+- The refresh-on-upgrade path is covered by a test that proves a failure inside
+  it can never turn a successful upgrade into a failed command.
+- Shell completion was exercised end to end in real Bash, Zsh, and Windows
+  PowerShell 5.1 sessions.
+
 ## 0.4.8 - 2026-09-29
 
 ### Fixed
