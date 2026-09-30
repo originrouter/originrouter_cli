@@ -238,12 +238,18 @@ try {
       wireApi: "responses",
     });
     const launch = adapter.buildLaunch();
+    // The id carries a per-process nonce: Codex merges config tables field by
+    // field, so a fixed id let a `[model_providers.originrouter_proxy]` block in
+    // the user's config.toml add env_http_headers / http_headers / query_params
+    // to the provider we define, and those rode out on our own request.
+    const id = launch.args[1].slice('model_provider="'.length, -1);
+    assert.match(id, /^originrouter_proxy_[a-z0-9]+$/);
     assert.deepEqual(launch.args.slice(0, 12), [
-      "-c", "model_provider=\"originrouter_proxy\"",
-      "-c", "model_providers.originrouter_proxy.name=\"OriginRouter Proxy\"",
-      "-c", "model_providers.originrouter_proxy.base_url=\"http://127.0.0.1:40123/coding/v1\"",
-      "-c", "model_providers.originrouter_proxy.env_key=\"OPENAI_API_KEY\"",
-      "-c", "model_providers.originrouter_proxy.wire_api=\"responses\"",
+      "-c", `model_provider="${id}"`,
+      "-c", `model_providers.${id}.name="OriginRouter Proxy"`,
+      "-c", `model_providers.${id}.base_url="http://127.0.0.1:40123/coding/v1"`,
+      "-c", `model_providers.${id}.env_key="OPENAI_API_KEY"`,
+      "-c", `model_providers.${id}.wire_api="responses"`,
       "--model", "grok-4.6",
     ]);
     assert.equal(launch.env.OPENAI_MODEL, "grok-4.6");

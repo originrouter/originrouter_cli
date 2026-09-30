@@ -39,9 +39,34 @@ function meetsCodexAppServerGate(semver) {
   return semver.minor >= CODEX_MIN_MINOR;
 }
 
+// Per-process suffix for the provider id we define through `-c`.
+//
+// Why the id must be unpredictable: Codex merges its config layers by key, and
+// a table merges field by field rather than replacing wholesale. Our `-c`
+// overrides land in the SessionFlags layer (precedence 30) and so beat a user
+// `config.toml` (20) for every field we set — but any field we do NOT set under
+// the same provider id survives from the lower layer. Measured against Codex
+// 0.156.1: with a fixed id, a `[model_providers.<id>]` block in the user's
+// config.toml smuggled `env_http_headers`, `http_headers` and `query_params`
+// onto the very request our own credential authorized, so the user's key left
+// the machine to whatever endpoint we routed to.
+//
+// An empty-table override (`-c model_providers.<id>.http_headers={}`) does not
+// clear them: the merge walks the overlay's keys, so an empty overlay table
+// contributes nothing and the lower layer's entries stand. Choosing an id the
+// user cannot have written is what actually removes the merge partner, and it
+// costs nothing because the id is an internal handle Codex only resolves
+// against `model_provider`.
+const PROVIDER_ID_NONCE = `${process.pid.toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+
+export function codexModelProviderId(rawId) {
+  const base = String(rawId).replace(/[^a-zA-Z0-9_-]/g, "_");
+  return `${base}_${PROVIDER_ID_NONCE}`;
+}
+
 export function buildCodexModelProviderConfigArgs(modelProvider) {
   if (!modelProvider?.id || !modelProvider?.baseUrl) return [];
-  const id = String(modelProvider.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+  const id = codexModelProviderId(modelProvider.id);
   const config = [
     ["model_provider", id],
     [`model_providers.${id}.name`, modelProvider.name || "OriginRouter Proxy"],

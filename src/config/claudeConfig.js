@@ -396,13 +396,17 @@ export function buildClaudeSettingsOverride(providerResult = {}) {
   }
   if (Object.keys(env).length === 0) return null;
 
-  // Shadow a stale ANTHROPIC_API_KEY even when the resolved route does not
-  // set one. Leaving the key absent here lets a filesystem settings layer
-  // supply its own, which both re-triggers Claude Code's "both
-  // ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY set" warning and sends an
-  // unrelated key upstream.
-  if (env.ANTHROPIC_AUTH_TOKEN && !Object.prototype.hasOwnProperty.call(env, "ANTHROPIC_API_KEY")) {
-    env.ANTHROPIC_API_KEY = "";
+  // OriginRouter owns both credential variables, so whichever one the route
+  // does not use is pinned empty rather than left absent. An absent key is
+  // supplied by a lower settings layer instead, and Claude Code then sends it:
+  // measured against 2.1.283, a stale ANTHROPIC_AUTH_TOKEN in
+  // ~/.claude/settings.json rides out as `Bearer` alongside our own
+  // ANTHROPIC_API_KEY, and Claude Code prefers that bearer token — so the
+  // proxy is handed the user's stale credential and the user's key leaves the
+  // machine. Pinning both also keeps Claude Code's "both ANTHROPIC_AUTH_TOKEN
+  // and ANTHROPIC_API_KEY set" warning from coming back.
+  for (const key of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]) {
+    if (!Object.prototype.hasOwnProperty.call(env, key)) env[key] = "";
   }
   for (const key of CLAUDE_PROVIDER_REDIRECT_ENV_KEYS) env[key] = "";
 

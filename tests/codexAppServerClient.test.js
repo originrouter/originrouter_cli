@@ -733,13 +733,21 @@ async function captureSpawnEnv(env) {
     jsonrpc: "2.0", id: 1, result: { protocolVersion: "v1" },
   }));
   await connectPromise;
-  assert.deepEqual(capturedArgs.slice(0, 3), [
-    "app-server",
-    "-c",
-    'model_provider="originrouter_proxy"',
-  ]);
-  assert.ok(capturedArgs.includes('model_providers.originrouter_proxy.base_url="http://127.0.0.1:40123/v1"'));
-  assert.ok(capturedArgs.includes('model_providers.originrouter_proxy.wire_api="responses"'));
+  // The provider id carries a per-process nonce so a `[model_providers.<id>]`
+  // block in the user's config.toml has nothing to merge into. Codex merges
+  // config tables field by field, so a fixed id let a lower layer contribute
+  // env_http_headers / http_headers / query_params to the provider we define.
+  assert.deepEqual(capturedArgs.slice(0, 2), ["app-server", "-c"]);
+  const providerSelect = capturedArgs[2];
+  assert.match(providerSelect, /^model_provider="originrouter_proxy_[a-z0-9]+"$/);
+  const providerId = providerSelect.slice('model_provider="'.length, -1);
+  assert.ok(capturedArgs.includes(`model_providers.${providerId}.base_url="http://127.0.0.1:40123/v1"`));
+  assert.ok(capturedArgs.includes(`model_providers.${providerId}.wire_api="responses"`));
+  // Nothing may still address the bare id: that is the merge partner we removed.
+  assert.equal(
+    capturedArgs.some((a) => a.startsWith("model_providers.originrouter_proxy.")),
+    false,
+  );
   assert.ok(capturedArgs.includes('mcp_servers.originrouter.command="/usr/local/bin/node"'));
   assert.ok(capturedArgs.includes('mcp_servers.originrouter.args=["/cli","agent-mcp-server"]'));
   assert.deepEqual(capturedArgs.slice(-2), ["--listen", "stdio://"]);
