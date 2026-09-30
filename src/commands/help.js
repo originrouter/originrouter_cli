@@ -9,7 +9,7 @@ Usage:
   originrouter --help
   originrouter --version
   originrouter update [status|check|install] [--json]
-  originrouter completion <shell>
+  originrouter completion bash|zsh|fish|powershell
   originrouter completion install [--shell <shell>] [--dry-run]
   originrouter completion uninstall [--shell <shell>] [--dry-run]
   originrouter status
@@ -129,10 +129,26 @@ Provider field metadata:
 Local API auth:
   originrouter token show                            Print the current token + Local API URL
   originrouter token rotate                          Mint a new token (invalidates existing clients)
+  originrouter local token show                      Alias for token show
+  originrouter local token rotate                    Alias for token rotate
   originrouter local key show                        Alias for token show
   originrouter local key rotate                      Alias for token rotate
   originrouter local config show                     Print persisted local API bind/port settings
   originrouter local config set [--port <p>] [--bind <addr>] [--allow-lan on|off] [--relay-mode auto|cloud|local|custom] [--relay-url <url>]
+
+Local API inspection and App pairing:
+  originrouter local api status                      Print bind, port, allowLan, tokenSet, and running state
+  originrouter local api pair                        Pair an App with this Local API (alias: connect)
+  originrouter local api connect                     Alias for pair
+  originrouter local api set-host <addr> [--allow-lan on]   Change the bind address
+  originrouter local api set-port <int>              Change the Local API port
+
+  "local api pair" asks the running daemon for a short-lived pairing ticket and
+  prints a pairing line. The access key is never printed or embedded in it: the
+  App redeems the line by proving possession of an ephemeral key, so the
+  credential is never handed over in the clear. The ticket expires in 5 minutes
+  and can be used by one App only. Paste the line into
+  Add direct address > CLI pairing. The daemon must be running.
 
 Configuration:
   originrouter config show
@@ -146,7 +162,8 @@ Other:
                       [--bind 127.0.0.1|0.0.0.0] [--allow-lan]
   originrouter daemon-port                           Print the running daemon's local API URL (reads daemon.state.json)
   originrouter service install|start|stop|restart|status|uninstall
-  originrouter services                             Alias for service
+  originrouter services install|start|stop|restart|status|uninstall
+                                      Alias for service
   originrouter run -- <command> [args...]
   originrouter claude [args...]                   Start native Claude Code TUI with remote control
   originrouter codex [args...]                    Start native Codex TUI with remote control
@@ -167,6 +184,8 @@ Examples:
   originrouter route cloud set claude.main
   originrouter route remote set codex.main
   originrouter provider use minimax
+  # Read-only preview of what the agent will see: the resolved route, the env
+  # OriginRouter injects, and any Claude Code settings file it overrides.
   originrouter env print
   originrouter claude
   originrouter route set claude.main --provider minimax --model MiniMax-M3
@@ -189,7 +208,7 @@ OriginRouter OAuth login:
                      [--no-browser]
   originrouter logout [--remove-device]
   originrouter auth status|verify
-  originrouter security status|rotate
+  originrouter security status|verify|rotate
 
   Login uses RFC 8628 Device Authorization Grant directly with Surety. It prints
   an 8-character user code + verification URL, opens the browser

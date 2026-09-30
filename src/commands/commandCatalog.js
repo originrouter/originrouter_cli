@@ -274,11 +274,14 @@ export const COMMAND_CATALOG = [
     children: [leaf("status", "Show sign-in status")],
   }),
   leaf("logout", "Sign out of this device", { options: ["--remove-device"] }),
+  // `auth logout` is deliberately absent: `handleAuthCommand` accepts only
+  // `status` and `verify`, and the top-level `originrouter logout` already
+  // covers signing out. Declaring it here made completion offer a subcommand
+  // the CLI rejects with "Unknown auth subcommand".
   leaf("auth", "Inspect and manage this device's authorization", {
     children: [
       leaf("status", "Show authorization status"),
       leaf("verify", "Verify the stored credentials"),
-      leaf("logout", "Sign out"),
     ],
   }),
   leaf("security", "Manage device identity and key rotation", {
@@ -430,6 +433,67 @@ export const COMMAND_CATALOG = [
     hidden: true,
   }),
 ];
+
+// The catalog answers "what can be completed". This table answers "and is it
+// actually dispatchable" — the drift test walks `allCommandPaths()` and asserts
+// each name appears in the module that owns its branch. Without it the test can
+// only confirm a name exists somewhere, which is how `auth logout` stayed in
+// the catalog offering a subcommand the CLI rejected.
+//
+// Values are source files, relative to the repo root.
+export const SUBSYSTEM_MODULE = Object.freeze({
+  agent: "src/index.js",
+  "agent-mcp-server": "src/index.js",
+  auth: "src/commands/auth.js",
+  claude: "src/index.js",
+  "claude-config": "src/index.js",
+  "claude-sdk": "src/index.js",
+  "claude-terminal": "src/index.js",
+  codex: "src/index.js",
+  "codex-app-server": "src/index.js",
+  "codex-terminal": "src/index.js",
+  collaboration: "src/commands/collaboration.js",
+  collaborate: "src/commands/collaboration.js",
+  compatibility: "src/commands/compatibility.js",
+  completion: "src/commands/completion.js",
+  config: "src/index.js",
+  daemon: "src/index.js",
+  "daemon-port": "src/index.js",
+  devices: "src/index.js",
+  doctor: "src/index.js",
+  env: "src/index.js",
+  help: "src/index.js",
+  history: "src/index.js",
+  local: "src/index.js",
+  login: "src/index.js",
+  logout: "src/commands/auth.js",
+  provider: "src/index.js",
+  proxy: "src/index.js",
+  remote: "src/commands/remote.js",
+  route: "src/index.js",
+  run: "src/index.js",
+  security: "src/commands/security.js",
+  service: "src/commands/service.js",
+  services: "src/commands/service.js",
+  sessions: "src/index.js",
+  setup: "src/index.js",
+  status: "src/index.js",
+  token: "src/commands/localApi.js",
+  update: "src/commands/update.js",
+});
+
+// Subcommands that reach their implementation indirectly, so the name never
+// appears as a literal in `SUBSYSTEM_MODULE`'s file. Each entry must say why:
+// an unexplained exemption is just a hole in the check.
+export const INDIRECT_DISPATCH = Object.freeze({
+  // `originrouter local <sub>` hands the rest to another command's handler, so
+  // `index.js` matches "key"/"token"/"config"/"api" and the second-level names
+  // are matched by the receiving module instead.
+  "local key": "delegates to handleTokenCommand (src/commands/localApi.js)",
+  "local token": "delegates to handleTokenCommand (src/commands/localApi.js)",
+  "local config": "delegates to handleLocalConfigCommand (src/commands/localApi.js)",
+  "local api": "delegates to handleLocalApiCommand (src/commands/localApi.js)",
+});
 
 const BY_NAME = new Map(COMMAND_CATALOG.map((entry) => [entry.name, entry]));
 

@@ -13,6 +13,8 @@ import { dirname, join } from "node:path";
 
 import {
   COMMAND_CATALOG,
+  INDIRECT_DISPATCH,
+  SUBSYSTEM_MODULE,
   allCommandPaths,
   findCommand,
   topLevelCommands,
@@ -22,6 +24,20 @@ import { getCompletionCandidates } from "../src/commands/completion.js";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const indexSource = readFileSync(join(root, "src/index.js"), "utf8");
 const helpSource = readFileSync(join(root, "src/commands/help.js"), "utf8");
+
+// Refuse to import a path that was not declared above, so a typo in the table
+// fails loudly here rather than silently reading nothing and passing.
+const moduleCache = new Map();
+function readModule(relativePath) {
+  assert(
+    relativePath.startsWith("src/") && relativePath.endsWith(".js"),
+    `SUBSYSTEM_MODULE must name a source file, got '${relativePath}'`,
+  );
+  if (!moduleCache.has(relativePath)) {
+    moduleCache.set(relativePath, readFileSync(join(root, relativePath), "utf8"));
+  }
+  return moduleCache.get(relativePath);
+}
 
 // Commands handled outside the `command === "..."` chain: flags parsed before
 // dispatch, and the hidden completion endpoint the shell scripts call.
@@ -130,5 +146,97 @@ assert.deepEqual(
   [],
   `runnable commands never mentioned in help: ${missingFromHelp.join(", ")}`,
 );
+
+// 8. Nested subcommands are dispatchable, not merely declared.
+//
+//    Checks 1 and 5 stop at the top level and at completion reachability, so a
+//    leaf could be declared, offered by TAB, and still be rejected by the CLI.
+//    That is exactly how `auth logout` shipped: declared in the catalog, but
+//    `handleAuthCommand` accepts only `status` and `verify`.
+//
+//    Dispatch is written several ways across the codebase, so collect every
+//    literal a module matches on and require the name to appear in one of them.
+//    Matching is by literal presence, not by parsing the condition: a
+//    subcommand may be compared with ===, listed in an array passed to
+//    .includes(), or held in a Set.
+function dispatchedLiterals(source) {
+  const literals = new Set();
+  // `x === "name"`, `x !== "name"`, `["a", "b"].includes(x)`,
+  // `new Set([...]).has(x)`, and object keys such as `{ "name": fn }`.
+  for (const match of source.matchAll(/"([a-z][a-z0-9-]*)"/g)) literals.add(match[1]);
+  return literals;
+}
+
+const unreachable = [];
+for (const path of allCommandPaths()) {
+  if (path.length < 2) continue; // top level is covered by check 1
+  const [top, ...rest] = path;
+  const fullPath = path.join(" ");
+  // An indirect entry is exempt only for its own prefix, and the reason is
+  // recorded next to the exemption.
+  const indirect = INDIRECT_DISPATCH[fullPath]
+    || (path.length > 2 && INDIRECT_DISPATCH[path.slice(0, 2).join(" ")] ? "covered by its parent's delegation" : null);
+  if (indirect) continue;
+
+  const modulePath = SUBSYSTEM_MODULE[top];
+  if (!modulePath) {
+    unreachable.push(`${fullPath} (no SUBSYSTEM_MODULE entry for '${top}')`);
+    continue;
+  }
+  // A three-part path is matched by its own name once its parent delegation is
+  // established, so check the leaf against the delegate that owns it.
+  const leafName = rest.at(-1);
+  const owner = path.length > 2 ? (SUBSYSTEM_MODULE[top] && modulePath) : modulePath;
+  if (!dispatchedLiterals(readModule(owner)).has(leafName)) {
+    unreachable.push(`${fullPath} ('${leafName}' absent from ${owner})`);
+  }
+}
+assert.deepEqual(
+  unreachable,
+  [],
+  `catalog declares subcommands the CLI cannot dispatch:\n  ${unreachable.join("\n  ")}`,
+);
+
+// 9. Subcommands must be listed where help documents their command, not just
+//    the command itself. Check 7 passes as long as the top-level name appears
+//    anywhere in the prose — `local` satisfied it while the entire `local api`
+//    family (including `local api pair`) went undocumented.
+//
+//    Help writes subcommands either one per line (`originrouter local api
+//    status`) or as an alternation (`originrouter update [status|check|
+//    install]`), so accept either form for the immediate child.
+const helpMentionsSubcommand = (top, sub) => {
+  if (new RegExp(`originrouter\\s+${top}\\s+${sub}\\b`).test(helpSource)) return true;
+  // Alternation on the same line as the parent, e.g. `update [status|check|install]`.
+  const line = new RegExp(`originrouter\\s+${top}\\b[^\\n]*`).exec(helpSource);
+  if (line && new RegExp(`\\b${sub}\\b`).test(line[0])) return true;
+  return false;
+};
+const undocumentedSubs = [];
+for (const entry of topLevelCommands({ includeHidden: false })) {
+  for (const child of entry.children || []) {
+    if (!helpMentionsSubcommand(entry.name, child.name)) {
+      undocumentedSubs.push(`${entry.name} ${child.name}`);
+    }
+  }
+}
+assert.deepEqual(
+  undocumentedSubs,
+  [],
+  `subcommands absent from the help text: ${undocumentedSubs.join(", ")}`,
+);
+
+// 10. `hidden` means "absent from completion", and that is the whole contract:
+//     a hidden command is internal, so help does not document it either. Assert
+//     the completion half, so a command that should be hidden and is not (or a
+//     hidden one leaking into TAB) fails here.
+for (const entry of COMMAND_CATALOG) {
+  if (!entry.hidden) continue;
+  const offered = getCompletionCandidates([""]);
+  assert(
+    !offered.includes(entry.name),
+    `'${entry.name}' is hidden but still offered by completion`,
+  );
+}
 
 console.log("command catalog tests ok");
