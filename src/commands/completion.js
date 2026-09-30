@@ -143,9 +143,29 @@ export function getCompletionCandidates(argv = []) {
 // Same candidate set, with the description the shell shows next to each
 // value. Cobra's wire format is `value\tdescription` with a trailing
 // `:<directive>` line, and every generated script below parses exactly that.
+// PowerShell 5.1 drops a trailing empty argument when it invokes a native
+// command, so `node x __complete provider ""` arrives as `__complete provider`
+// and `provider` is then mistaken for the word under completion (the CLI would
+// echo it back instead of offering `add`, `list`, `show`, ...). PowerShell
+// cannot pass an empty string at all — an empty variable, String.Empty, a
+// splat, and a literal all arrive as nothing, while `" "` survives — so the
+// generated PowerShell script sends this sentinel instead and the CLI maps it
+// back. Only the last word is translated: everything before it is complete
+// typed input, and a literal `__OR_EMPTY__` there would be a real (if odd)
+// command word the user typed.
+const EMPTY_WORD_SENTINEL = "__OR_EMPTY__";
+
+function translateEmptyWordSentinel(argv) {
+  if (argv.length === 0) return argv;
+  const words = argv.map(String);
+  if (words.at(-1) !== EMPTY_WORD_SENTINEL) return words;
+  return [...words.slice(0, -1), ""];
+}
+
 export function getCompletionRichCandidates(argv = []) {
-  const candidates = getCompletionCandidates(argv);
-  const completed = argv.map(String).slice(0, -1);
+  const words = translateEmptyWordSentinel(argv);
+  const candidates = getCompletionCandidates(words);
+  const completed = words.slice(0, -1);
   const path = catalogPathFor(completed);
   const { node, children } = resolveCommand(path);
 
@@ -243,6 +263,13 @@ $originrouterCompleter = {
     $words += $wordToComplete
   }
   $exe = $commandAst.CommandElements[0].Extent.Text
+  # PowerShell 5.1 drops a trailing empty argument when calling a native
+  # command, so an empty word here would vanish and the CLI would mistake the
+  # previous word for the one being completed. Send the sentinel the CLI maps
+  # back to an empty word instead; it survives @-splatting where '' does not.
+  if ($words.Count -eq 0 -or $words[-1] -eq '') {
+    $words = @($words | Where-Object { $_ -ne '' }) + '__OR_EMPTY__'
+  }
   # Each line is 'value<TAB>description'; the final line is ':directive'.
   # The backtick-t below is PowerShell's tab escape.
   & $exe __complete @words 2>$null | ForEach-Object {
@@ -304,6 +331,23 @@ function completionTarget(shell, { env = process.env, platformName = process.pla
   throw new Error("Usage: originrouter completion install|uninstall [--shell zsh|bash|fish|powershell]");
 }
 
+// Windows ships two PowerShells that read *different* profile paths: Windows
+// PowerShell 5.1 (the default powershell.exe) reads
+// Documents\WindowsPowerShell\ while PowerShell 7+ (pwsh) reads
+// Documents\PowerShell\. Writing only the 7+ path — as this did — leaves 5.1
+// users with completion that is installed yet never loaded, and 5.1 is what
+// plain `powershell` starts. Install into both so whichever the person uses
+// picks it up; on non-Windows there is only ever one.
+export function completionTargets(shell, options = {}) {
+  const { env = process.env, platformName = process.platform } = options;
+  const primary = completionTarget(shell, options);
+  if (shell !== "powershell" || platformName !== "win32") return [primary];
+  const documents = path.join(env.USERPROFILE || homeDirectory(env), "Documents");
+  const legacy = path.join(documents, "WindowsPowerShell", "Microsoft.PowerShell_profile.ps1");
+  if (legacy === primary.file) return [primary];
+  return [primary, { ...primary, file: legacy, legacyFor: "Windows PowerShell 5.1" }];
+}
+
 function managedBlock(shell) {
   if (shell === "fish") return COMPLETION_START + "\n" + FISH + "\n" + COMPLETION_END + "\n";
   if (shell === "powershell") return COMPLETION_START + "\noriginrouter completion powershell | Out-String | Invoke-Expression\n" + COMPLETION_END + "\n";
@@ -335,21 +379,70 @@ function removeManagedBlocks(content) {
   return remaining.replace(/\n{3,}/g, "\n\n").replace(/^\n+/, "");
 }
 
-export function installCompletion(shell = detectShell(), { env = process.env, platformName = process.platform, dryRun = false } = {}) {
-  const target = completionTarget(shell, { env, platformName });
+function installOne(target, shell, { dryRun, force = false }) {
   const existing = fs.existsSync(target.file) ? fs.readFileSync(target.file, "utf8") : "";
   const state = managedBlockState(existing);
-  if (state === "complete") return { ...target, changed: false, reason: "already-installed" };
+  // `force` rewrites a block that is already there, which is what an upgrade
+  // needs: the block's *contents* can change between CLI versions, so
+  // "complete" is not the same as "current".
+  if (state === "complete" && !force) return { ...target, changed: false, reason: "already-installed" };
   if (dryRun) return { ...target, changed: true, dryRun: true };
   fs.mkdirSync(path.dirname(target.file), { recursive: true });
   const block = managedBlock(shell);
   if (target.kind === "file") fs.writeFileSync(target.file, block, { mode: 0o644 });
   else {
-    const clean = state === "damaged" ? removeManagedBlocks(existing) : existing;
+    // Replacing means dropping the old block first, then appending the new one,
+    // so a refresh cannot leave two blocks (or stale text) behind.
+    const clean = (force || state === "damaged") ? removeManagedBlocks(existing) : existing;
     const prefix = clean && !clean.endsWith("\n") ? "\n" : "";
     fs.writeFileSync(target.file, clean + prefix + "\n" + block, { mode: 0o644 });
   }
+  // A no-op write (the block was already exactly right) reports the same
+  // reason the early return above does, so callers keep one code path.
+  if (existing === fs.readFileSync(target.file, "utf8")) {
+    return { ...target, changed: false, reason: "already-installed", repaired: false };
+  }
   return { ...target, changed: true, repaired: state === "damaged" };
+}
+
+export function installCompletion(shell = detectShell(), { env = process.env, platformName = process.platform, dryRun = false } = {}) {
+  const targets = completionTargets(shell, { env, platformName });
+  const results = targets.map((target) => installOne(target, shell, { dryRun }));
+  // The primary target drives the report. On Windows a second profile is
+  // written for the other PowerShell; it is reported so the person can see
+  // which files were touched rather than having one silently appear.
+  return {
+    ...results[0],
+    additionalTargets: results.slice(1).map((entry) => ({
+      file: entry.file,
+      legacyFor: entry.legacyFor,
+      changed: entry.changed,
+      reason: entry.reason,
+    })),
+  };
+}
+
+// Re-apply the managed block to a profile that already carries one, and do
+// nothing to a profile that does not. The generated script changes between CLI
+// versions, so a block being present is not the same as it being current — but
+// an upgrade is not consent to configure a shell the person never configured,
+// which is why a profile with no block is left alone rather than created.
+// On Windows this means one profile is refreshed and the other is still only
+// written by an explicit `completion install`.
+export function refreshCompletion(shell = detectShell(), { env = process.env, platformName = process.platform, dryRun = false } = {}) {
+  const targets = completionTargets(shell, { env, platformName });
+  const results = [];
+  for (const target of targets) {
+    const exists = fs.existsSync(target.file);
+    const state = exists ? managedBlockState(fs.readFileSync(target.file, "utf8")) : "absent";
+    if (state === "absent") continue;
+    results.push(installOne(target, shell, { dryRun, force: true }));
+  }
+  return {
+    refreshed: results.filter((entry) => entry.changed).map((entry) => entry.file),
+    unchanged: results.filter((entry) => !entry.changed).map((entry) => entry.file),
+    installed: results.length > 0,
+  };
 }
 
 function quotePosixShellPath(file) {
@@ -362,15 +455,14 @@ export function completionActivationCommand(shell, file) {
   return null;
 }
 
-export function printCompletionActivationHint(shell, file) {
+export function printCompletionActivationHint(shell, file, { lead = true } = {}) {
   const command = completionActivationCommand(shell, file);
   if (!command) return;
-  console.log("  Completion is saved for future terminals.");
+  if (lead) console.log("  Completion is saved for future terminals.");
   console.log(`  To enable it in this terminal now, run: ${command}`);
 }
 
-export function uninstallCompletion(shell = detectShell(), { env = process.env, platformName = process.platform, dryRun = false } = {}) {
-  const target = completionTarget(shell, { env, platformName });
+function uninstallOne(target, { dryRun }) {
   if (!fs.existsSync(target.file)) return { ...target, changed: false, reason: "not-installed" };
   const existing = fs.readFileSync(target.file, "utf8");
   if (managedBlockState(existing) === "absent") return { ...target, changed: false, reason: "not-managed" };
@@ -378,6 +470,27 @@ export function uninstallCompletion(shell = detectShell(), { env = process.env, 
   if (target.kind === "file") fs.unlinkSync(target.file);
   else fs.writeFileSync(target.file, removeManagedBlocks(existing));
   return { ...target, changed: true };
+}
+
+export function uninstallCompletion(shell = detectShell(), { env = process.env, platformName = process.platform, dryRun = false } = {}) {
+  const targets = completionTargets(shell, { env, platformName });
+  const results = targets.map((target) => uninstallOne(target, { dryRun }));
+  // Report the primary target, but let a failure to remove the other
+  // PowerShell's block surface instead of leaving it behind silently.
+  const primary = results[0];
+  if (primary.reason === "not-installed" || primary.reason === "not-managed") {
+    const removed = results.find((entry) => entry.changed);
+    if (removed) return { ...removed, reason: primary.reason, additionalTargets: [] };
+  }
+  return {
+    ...primary,
+    additionalTargets: results.slice(1).map((entry) => ({
+      file: entry.file,
+      legacyFor: entry.legacyFor,
+      changed: entry.changed,
+      reason: entry.reason,
+    })),
+  };
 }
 
 export function handleCompletionCommand(args = []) {
@@ -401,7 +514,28 @@ export function handleCompletionCommand(args = []) {
   else if (result.reason === "not-managed") console.log("The completion target is not managed by OriginRouter: " + result.file);
   else if (result.dryRun) console.log((action === "install" ? "Would configure " : "Would remove ") + shell + " completion: " + result.file);
   else console.log((action === "install" ? "Configured " : "Removed ") + shell + " completion: " + result.file);
-  if (action === "install" && !result.dryRun) printCompletionActivationHint(shell, result.file);
+  // Windows has a second PowerShell with its own profile path; say so, so a
+  // person who switched versions is not left wondering which file to check.
+  for (const extra of result.additionalTargets || []) {
+    const verb = action === "install"
+      ? (extra.changed ? "Configured " : "Already configured ")
+      : (extra.changed ? "Removed " : "No change ");
+    console.log("  " + verb + (extra.legacyFor ? extra.legacyFor + " at " : "") + extra.file);
+  }
+  if (action === "install" && !result.dryRun) {
+    // On Windows both profiles were written, and the CLI cannot tell which
+    // PowerShell the person is sitting in. Naming only the PowerShell 7 path
+    // would hand a 5.1 user a command that loads nothing, so print the
+    // activation line for each file actually written.
+    let lead = true;
+    const seen = new Set();
+    for (const file of [result.file, ...(result.additionalTargets || []).map((entry) => entry.file)]) {
+      if (!file || seen.has(file)) continue;
+      seen.add(file);
+      printCompletionActivationHint(shell, file, { lead });
+      lead = false;
+    }
+  }
 }
 
 export function printCompletion(shell) {

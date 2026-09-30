@@ -17,7 +17,7 @@ import {
   readUpdateState,
   writeUpdateState,
 } from "../src/update/state.js";
-import { handleStartupUpdate } from "../src/commands/update.js";
+import { handleStartupUpdate, refreshCompletionAfterUpdate } from "../src/commands/update.js";
 
 const root = mkdtempSync(join(tmpdir(), "originrouter-update-test-"));
 
@@ -382,6 +382,47 @@ try {
   assert.deepEqual(timeoutSignals, ["SIGTERM", "SIGKILL"]);
 } finally {
   rmSync(root, { recursive: true, force: true });
+}
+
+// After an upgrade the completion block is re-applied, because the generated
+// script changes between versions. The contract this must not break: a failure
+// here can never turn a successful upgrade into a failed command.
+const completionHome = mkdtempSync(join(tmpdir(), "originrouter-update-completion-"));
+try {
+  const env = { HOME: completionHome, SHELL: "/bin/zsh" };
+
+  // Nothing configured: report nothing, so `update` stays silent.
+  assert.equal(refreshCompletionAfterUpdate({ shell: "zsh", env }), null);
+
+  // Configured: the block is refreshed and reported.
+  mkdirSync(completionHome, { recursive: true });
+  writeFileSync(join(completionHome, ".zshrc"), "# mine\n# >>> originrouter completion >>>\nstale\n# <<< originrouter completion <<<\n");
+  const refreshed = refreshCompletionAfterUpdate({ shell: "zsh", env });
+  assert.equal(refreshed.shell, "zsh");
+  assert.equal(refreshed.installed, true);
+  assert.deepEqual(refreshed.refreshed, [join(completionHome, ".zshrc")]);
+  assert.match(readFileSync(join(completionHome, ".zshrc"), "utf8"), /originrouter completion zsh/);
+
+  // An undetectable shell is simply skipped, not an error.
+  assert.equal(refreshCompletionAfterUpdate({ shell: null, env: { HOME: completionHome } }), null);
+
+  // A failure inside the refresh must be swallowed: it runs after a successful
+  // upgrade, so throwing here would report a completed update as a failure.
+  // A profile path that is a directory (rather than a file) makes the read
+  // throw EISDIR — an input the refresh genuinely cannot handle.
+  const brokenHome = mkdtempSync(join(tmpdir(), "originrouter-update-broken-"));
+  try {
+    mkdirSync(join(brokenHome, ".zshrc"));
+    assert.doesNotThrow(
+      () => refreshCompletionAfterUpdate({ shell: "zsh", env: { HOME: brokenHome } }),
+      "completion refresh must never propagate an error",
+    );
+    assert.equal(refreshCompletionAfterUpdate({ shell: "zsh", env: { HOME: brokenHome } }), null);
+  } finally {
+    rmSync(brokenHome, { recursive: true, force: true });
+  }
+} finally {
+  rmSync(completionHome, { recursive: true, force: true });
 }
 
 console.log("update tests ok");

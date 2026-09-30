@@ -1,4 +1,5 @@
 import { VERSION } from "../constants.js";
+import { detectShell, refreshCompletion } from "./completion.js";
 import { getStateDir, readConfig } from "../persistence/state.js";
 import { cachedUpdateStatus, checkForUpdate, updateCheckIsDue } from "../update/checker.js";
 import { installLatestVersion } from "../update/coordinator.js";
@@ -28,8 +29,29 @@ function printStatus(status, { json = false } = {}) {
   if (status.blocked_reason) console.log(`Automatic update unavailable: ${status.blocked_reason}`);
 }
 
+// A new CLI can generate a different completion script, and on Windows an
+// older version may have installed it into a profile the running PowerShell
+// never reads. The block is loaded from the CLI on every shell start, so
+// refreshing it keeps completion in step with the upgrade. Only profiles that
+// already carry a block are touched — updating the CLI is not consent to
+// configure a shell that was never configured.
+export function refreshCompletionAfterUpdate({ shell = null, env, platformName } = {}) {
+  const resolved = shell || detectShell(env || process.env);
+  if (!resolved) return null;
+  try {
+    const result = refreshCompletion(resolved, { ...(env ? { env } : {}), ...(platformName ? { platformName } : {}) });
+    return result.installed ? { shell: resolved, ...result } : null;
+  } catch {
+    // Completion is a convenience; a failure here must not fail an upgrade.
+    return null;
+  }
+}
+
 function printUpdatedResult(result) {
   console.log(`OriginRouter CLI updated: ${result.from_version} → ${result.to_version}.`);
+  if (result.completion?.refreshed?.length) {
+    console.log(`Shell completion refreshed for ${result.completion.shell}.`);
+  }
   if (result.service_restarted) console.log("OriginRouter service restarted.");
   else if (result.service_restart_error) {
     console.log(`OriginRouter was updated, but its service configuration or restart failed: ${result.service_restart_error}`);
@@ -73,6 +95,13 @@ export async function handleUpdateCommand(args, dependencies = {}) {
       serviceInstalledFn: dependencies.serviceInstalledFn,
     });
     if (result.service_restart_error) process.exitCode = 1;
+    if (result.updated) {
+      result.completion = refreshCompletionAfterUpdate({
+        shell: dependencies.shell,
+        env: dependencies.env,
+        platformName: dependencies.platformName,
+      });
+    }
     if (json) {
       console.log(JSON.stringify(result, null, 2));
     } else if (result.updated) {
