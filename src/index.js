@@ -1,13 +1,17 @@
 import { startDaemon } from "./daemon/daemon.js";
 import {
   CLAUDE_CONFIG_KEYS,
+  CLAUDE_CREDENTIAL_SETTINGS_FIELDS,
+  CLAUDE_TRANSPORT_ENV_KEYS,
   buildAgentProviderEnv,
+  buildClaudeSettingsOverride,
   maskSecret,
   remoteCodingRouteTarget,
   setClaudeConfigValue,
   unsetClaudeConfigValue,
   willRouteRemoteCoding,
 } from "./config/claudeConfig.js";
+import { readClaudeForeignSettings } from "./adapters/claude/settingsConflicts.js";
 import {
   addProvider,
   applyProviderUpdate,
@@ -1012,11 +1016,69 @@ function maybeNoteLegacySmallFastModel(opts) {
 
 // ---------- env print ----------
 
-const ANTHROPIC_ENV_VARS = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"];
+// Derived from the single list the launchers pin, so this report cannot drift
+// out of sync with what a session actually overrides. It previously named five
+// keys by hand and therefore never inspected CLAUDE_CODE_SUBAGENT_MODEL or the
+// ANTHROPIC_DEFAULT_*_MODEL family — the keys a stale settings file is most
+// likely to hold.
+const ANTHROPIC_ENV_VARS = CLAUDE_TRANSPORT_ENV_KEYS;
 // Stage 9.1B: Codex uses OPENAI_* env vars, not ANTHROPIC_*.
 const OPENAI_ENV_VARS    = ["OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"];
 function envVarsFor(agent) {
   return agent === "codex" ? OPENAI_ENV_VARS : ANTHROPIC_ENV_VARS;
+}
+
+// Claude Code merges its own settings files *above* the subprocess environment,
+// so "System env" alone cannot explain what a session will really see: a
+// ~/.claude/settings.json env block outranks it. Reporting only process.env
+// made this report state "(unset)" for the very keys that were overriding the
+// resolved route. Sessions pin those keys through the --settings (flagSettings)
+// layer, which outranks every filesystem settings layer except enterprise
+// managed settings.
+export function claudeSettingsLayerReport(agent, providerResult, cwd = process.cwd()) {
+  if (agent !== "claude") return [];
+  const override = buildClaudeSettingsOverride(providerResult);
+  const layers = readClaudeForeignSettings(cwd);
+  if (layers.length === 0) return [];
+
+  const lines = ["\nClaude settings files (merged above the process environment):"];
+  for (const layer of layers) {
+    const layerEnv = layer.settings.env && typeof layer.settings.env === "object"
+      ? layer.settings.env
+      : {};
+    // Only transport keys matter here: a settings file may legitimately set
+    // unrelated variables, and those are the user's business.
+    const envKeys = CLAUDE_TRANSPORT_ENV_KEYS.filter((key) =>
+      Object.prototype.hasOwnProperty.call(layerEnv, key));
+    const credentialFields = CLAUDE_CREDENTIAL_SETTINGS_FIELDS.filter((field) =>
+      typeof layer.settings[field] === "string" && layer.settings[field].length > 0);
+    // `model` is a settings field in its own right, separate from
+    // ANTHROPIC_MODEL. Measured against Claude Code 2.1.283: an
+    // ANTHROPIC_MODEL pinned in the flagSettings env beats a `model` field in
+    // a lower layer, so it is reported for completeness rather than as a
+    // problem — but a reader needs to know it is there.
+    const hasModelField = typeof layer.settings.model === "string"
+      && layer.settings.model.length > 0;
+    if (envKeys.length === 0 && credentialFields.length === 0 && !hasModelField) continue;
+
+    lines.push(`  ${layer.source}`);
+    // Key names only, never values: these files hold live credentials. The
+    // model name is not a secret, so it is shown.
+    if (envKeys.length > 0) lines.push(`    env: ${envKeys.join(", ")}`);
+    if (credentialFields.length > 0) lines.push(`    ${credentialFields.join(", ")}`);
+    if (hasModelField) lines.push(`    model: ${layer.settings.model}`);
+    if (layer.outranksUs) {
+      lines.push("    -> enterprise-managed: outranks OriginRouter, these values win");
+    } else if (override) {
+      lines.push("    -> overridden by OriginRouter at launch");
+    } else {
+      // No route resolved, so nothing is pinned and this file decides.
+      lines.push("    -> in effect (no OriginRouter route to override it)");
+    }
+  }
+  // Every layer set only unrelated keys: say so rather than printing a bare header.
+  if (lines.length === 1) return [];
+  return lines;
 }
 
 async function handleEnvPrint(args) {
@@ -1169,6 +1231,13 @@ async function handleEnvPrint(args) {
     } else {
       console.log(`  ${key}  (unset)`);
     }
+  }
+
+  // The section above reports only the process environment. Claude Code's own
+  // settings files sit above it, so without this the report can say "(unset)"
+  // for a key a settings file is actively forcing.
+  for (const line of claudeSettingsLayerReport(agent, providerResult)) {
+    console.log(line);
   }
 }
 

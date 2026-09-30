@@ -89,6 +89,22 @@ function turnStateForEvent(event, fallback = "unknown") {
   return fallback;
 }
 
+// Turn activity is latched by turn events alone (see `turnStateForEvent`).
+// `session.status` describes the long-lived CLI process: a healthy idle Agent
+// sits at `running` for hours, so it must never imply an active turn. Pending
+// interactions are the authoritative source for the waiting states because the
+// latch cannot observe an approval that expired without an event.
+function resolveTurnState(session, publicStatus) {
+  if (publicStatus === "waiting_approval" || publicStatus === "waiting_input") {
+    return publicStatus;
+  }
+  if (publicStatus === "waiting_device") return "waiting_device";
+  // A process that is gone cannot own a turn, whatever the latch last saw.
+  if (publicStatus !== "running") return "idle";
+  const latched = safeText(session?.turnState, 32);
+  return latched === "running" ? "running" : "idle";
+}
+
 function isInternalTelemetryActivity(event) {
   if (event?.type !== "agent.activity") return false;
   return new Set([
@@ -286,7 +302,12 @@ export class ExternalAgentRegistry {
       currentStep: conversationChanged
         ? "Running locally"
         : existing?.currentStep || "Running locally",
-      turnState: conversationChanged ? "idle" : existing?.turnState || "idle",
+      // Registration means a freshly attached Agent process, so no turn can be
+      // in flight yet. Inheriting `running` here left a reconnected session
+      // showing a stop button until the next terminal event arrived — which
+      // never comes when the turn ended while the App was away. A genuinely
+      // running turn re-arms the latch on its next event.
+      turnState: "idle",
     };
     this.sessions.set(sessionId, session);
     try {
@@ -571,11 +592,15 @@ export class ExternalAgentRegistry {
     // Pending requests must outlive the bounded telemetry/event tail. An
     // App returning from Settings may subscribe after hundreds of events.
     const interactions = [...session.pendingInteractionRequests.values()];
+    const projected = this.project(session);
     return {
       interactions,
       events: session.events.slice(-100),
-      session: this.project(session),
-      turn_state: session.turnState,
+      session: projected,
+      // Must stay identical to `session.turn_state`. Publishing the raw latch
+      // here made the snapshot contradict the session projection, and the App
+      // alternated between them on every refresh.
+      turn_state: projected.turn_state,
       event_cursor: this.eventCursor,
       stream_id: this.eventStreamId,
       mode: session.mode,
@@ -613,16 +638,7 @@ export class ExternalAgentRegistry {
   project(session) {
     const status = this.publicStatus(session);
     const conversation = this.catalog?.getConversation?.(session.conversationId);
-    const turnState = [
-      "running",
-      "waiting_approval",
-      "waiting_input",
-      "waiting_device",
-    ].includes(status)
-      ? (status === "waiting_approval" || status === "waiting_input"
-        ? status
-        : session.turnState || "idle")
-      : "idle";
+    const turnState = resolveTurnState(session, status);
     return {
       session_id: session.sessionId,
       session_kind: session.sessionKind,

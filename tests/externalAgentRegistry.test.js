@@ -251,4 +251,46 @@ assert.equal(registry.list()[0].native_session_id, "native-session-3");
 now += 91_000;
 assert.equal(registry.list()[0].status, "stopped");
 
+{
+  // An online-but-idle Agent must never report an active turn: `status`
+  // describes the long-lived process, so treating it as turn activity opened
+  // the App with a stop button and flickered against every refresh.
+  let clock = 5_000_000;
+  const turns = new ExternalAgentRegistry({ now: () => clock });
+  turns.register({ sessionId: "turn-1", agent: "claude" });
+  assert.equal(turns.list()[0].status, "running");
+  assert.equal(turns.list()[0].turn_state, "idle");
+
+  turns.appendEvent("turn-1", { type: "agent.task.started" });
+  assert.equal(turns.list()[0].turn_state, "running");
+
+  // The snapshot must agree with the session projection. Publishing the raw
+  // latch alongside a gated projection is what made the App alternate.
+  const active = turns.controlSnapshot("turn-1");
+  assert.equal(active.turn_state, active.session.turn_state);
+  assert.equal(active.turn_state, "running");
+
+  // An interrupted turn is terminal even though the process stays online.
+  turns.appendEvent("turn-1", { type: "agent.task.aborted" });
+  assert.equal(turns.list()[0].status, "running");
+  assert.equal(turns.list()[0].turn_state, "idle");
+  const idle = turns.controlSnapshot("turn-1");
+  assert.equal(idle.turn_state, idle.session.turn_state);
+  assert.equal(idle.turn_state, "idle");
+
+  // Re-registration is a fresh attach: a turn that ended while the App was
+  // away must not be resurrected as an active turn.
+  turns.appendEvent("turn-1", { type: "agent.thinking" });
+  assert.equal(turns.list()[0].turn_state, "running");
+  turns.register({ sessionId: "turn-1", agent: "claude" });
+  assert.equal(turns.list()[0].turn_state, "idle");
+
+  // A process that is gone cannot own a turn.
+  turns.appendEvent("turn-1", { type: "agent.task.started" });
+  assert.equal(turns.list()[0].turn_state, "running");
+  clock += 91_000;
+  assert.equal(turns.list()[0].status, "stopped");
+  assert.equal(turns.list()[0].turn_state, "idle");
+}
+
 console.log("external agent registry tests ok");

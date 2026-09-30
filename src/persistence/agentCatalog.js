@@ -95,6 +95,7 @@ export class AgentCatalog {
         conversation_id TEXT NOT NULL,
         originrouter_session_id TEXT NOT NULL UNIQUE,
         device_id TEXT NOT NULL DEFAULT '',
+        device_name TEXT NOT NULL DEFAULT '',
         runtime TEXT NOT NULL DEFAULT '',
         provider TEXT NOT NULL DEFAULT '',
         model TEXT NOT NULL DEFAULT '',
@@ -168,6 +169,16 @@ export class AgentCatalog {
     if (!workspaceColumns.has("unattended_authorization_subject")) {
       this.db.exec("ALTER TABLE agent_workspaces ADD COLUMN unattended_authorization_subject TEXT NOT NULL DEFAULT ''");
     }
+    const runColumns = new Set(
+      this.db.prepare("PRAGMA table_info(agent_runs)").all()
+        .map((column) => column.name),
+    );
+    if (!runColumns.has("device_name")) {
+      // Local history only stored `device_id`, so a directly connected App had
+      // no device to show next to the workspace path even though the CLI knows
+      // its own name and already reports it to the bridge.
+      this.db.exec("ALTER TABLE agent_runs ADD COLUMN device_name TEXT NOT NULL DEFAULT ''");
+    }
     this.db.prepare(`
       INSERT INTO catalog_meta(key, value) VALUES ('schema_version', ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -236,6 +247,23 @@ export class AgentCatalog {
       iso(payload.createdAt || this.now()),
     );
     return this.getLaunchReceipt(launchId);
+  }
+
+  /// Fill in `device_name` for runs recorded before the column existed.
+  ///
+  /// Only rows belonging to `deviceId` are touched: this device is the one
+  /// whose name we can actually resolve, and stamping it onto a run that
+  /// happened on another machine would be worse than leaving it blank. Runs
+  /// from other devices keep an empty name until that device reports again.
+  backfillDeviceName({ deviceId, deviceName } = {}) {
+    const id = safeText(deviceId, 191);
+    const name = safeText(deviceName, 191);
+    if (!id || !name) return { updated: 0, skipped: true };
+    const result = this.db.prepare(`
+      UPDATE agent_runs SET device_name = @name
+      WHERE device_id = @id AND device_name = ''
+    `).run({ id, name });
+    return { updated: result.changes || 0, skipped: false };
   }
 
   migrateLegacySessions(records = []) {
@@ -386,13 +414,14 @@ export class AgentCatalog {
 
       this.db.prepare(`
         INSERT INTO agent_runs(
-          run_id, conversation_id, originrouter_session_id, device_id, runtime,
-          provider, model, permission_profile, started_by, pid, status,
+          run_id, conversation_id, originrouter_session_id, device_id, device_name,
+          runtime, provider, model, permission_profile, started_by, pid, status,
           started_at, exited_at, exit_code, exit_signal
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(originrouter_session_id) DO UPDATE SET
           conversation_id = excluded.conversation_id,
           device_id = CASE WHEN excluded.device_id <> '' THEN excluded.device_id ELSE agent_runs.device_id END,
+          device_name = CASE WHEN excluded.device_name <> '' THEN excluded.device_name ELSE agent_runs.device_name END,
           runtime = CASE WHEN excluded.runtime <> '' THEN excluded.runtime ELSE agent_runs.runtime END,
           provider = CASE WHEN excluded.provider <> '' THEN excluded.provider ELSE agent_runs.provider END,
           model = CASE WHEN excluded.model <> '' THEN excluded.model ELSE agent_runs.model END,
@@ -408,6 +437,7 @@ export class AgentCatalog {
         conversationId,
         sessionId,
         deviceId,
+        safeText(payload.deviceName, 191),
         safeText(payload.runtime, 64),
         safeText(payload.provider, 191),
         safeText(payload.model, 191),
@@ -442,6 +472,7 @@ export class AgentCatalog {
       title: current?.title,
       cwd: payload.cwd || current?.cwd,
       deviceId: payload.deviceId || current?.device_id,
+      deviceName: payload.deviceName || current?.device_name,
       runtime: payload.runtime || current?.runtime,
       provider: payload.provider || current?.provider,
       model: payload.model || current?.model,
@@ -647,7 +678,7 @@ export class AgentCatalog {
     const rows = this.db.prepare(`
       SELECT c.*, w.display_name AS workspace_name,
              w.canonical_path AS workspace_path, w.repo_root,
-             r.device_id, r.runtime, r.provider, r.model,
+             r.device_id, r.device_name, r.runtime, r.provider, r.model,
              r.permission_profile, r.status, r.started_at, r.exited_at,
              (SELECT COUNT(*) FROM agent_artifacts a
               WHERE a.conversation_id = c.conversation_id) AS artifact_count
@@ -748,7 +779,7 @@ export class AgentCatalog {
     const rows = this.db.prepare(`
       SELECT c.*, w.display_name AS workspace_name,
              w.canonical_path AS workspace_path, w.repo_root,
-             r.device_id, r.runtime, r.provider, r.model,
+             r.device_id, r.device_name, r.runtime, r.provider, r.model,
              r.permission_profile, r.status, r.started_at, r.exited_at,
              (SELECT COUNT(*) FROM agent_artifacts a
               WHERE a.conversation_id = c.conversation_id) AS artifact_count
@@ -807,9 +838,9 @@ export class AgentCatalog {
     return {
       ...conversation,
       runs: this.db.prepare(`
-        SELECT run_id, originrouter_session_id, device_id, runtime, provider,
-               model, permission_profile, started_by, pid, status, started_at,
-               exited_at, exit_code, exit_signal
+        SELECT run_id, originrouter_session_id, device_id, device_name, runtime,
+               provider, model, permission_profile, started_by, pid, status,
+               started_at, exited_at, exit_code, exit_signal
         FROM agent_runs WHERE conversation_id = ?
         ORDER BY started_at DESC, rowid DESC
       `).all(id),

@@ -208,6 +208,12 @@ export async function startDaemon(args) {
   });
   const agentCatalog = new AgentCatalog({ stateDir });
   agentCatalog.migrateLegacySessions(readSessions());
+  // History recorded before `device_name` existed has no device to show beside
+  // the workspace path. This device is the only one whose name we can resolve.
+  agentCatalog.backfillDeviceName({
+    deviceId: effectiveDeviceId,
+    deviceName: device.displayName || device.host,
+  });
   let agentActivitySyncInFlight = null;
   let agentHistorySyncInFlight = null;
   let lastAgentActivitySyncError = null;

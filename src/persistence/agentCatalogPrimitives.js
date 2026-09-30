@@ -178,6 +178,7 @@ function publicConversation(row) {
     workspace_display_path: workspaceDisplayPath(row.workspace_path),
     repo_root: row.repo_root || "",
     device_id: row.device_id || "",
+    device_name: row.device_name || "",
     runtime: row.runtime || "",
     provider: row.provider || "",
     model: row.model || "",

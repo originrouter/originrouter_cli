@@ -56,8 +56,12 @@ assert.equal(override.awsAuthRefresh, "");
 assert.equal(override.gcpAuthRefresh, "");
 assert.equal(override.forceLoginMethod, "");
 
-// An auth-token route with no explicit API key still shadows the key, so a
-// filesystem layer cannot supply one and re-trigger the dual-auth warning.
+// Both credential variables are always pinned, whichever one the route uses.
+// An absent one is supplied by a lower settings layer instead, and Claude Code
+// sends it: measured, a stale ANTHROPIC_AUTH_TOKEN in ~/.claude/settings.json
+// rides out as `Bearer` next to our own ANTHROPIC_API_KEY, and the bearer token
+// is the one Claude Code prefers — so the proxy gets the user's stale
+// credential and the user's key leaves the machine.
 const tokenOnly = buildClaudeSettingsOverride({
   source: "originrouter-coding",
   env: {
@@ -67,6 +71,23 @@ const tokenOnly = buildClaudeSettingsOverride({
   },
 });
 assert.equal(tokenOnly.env.ANTHROPIC_API_KEY, "");
+assert.equal(tokenOnly.env.ANTHROPIC_AUTH_TOKEN, "or_local_secret");
+
+// The mirror case: the proxy transports authenticate with ANTHROPIC_API_KEY and
+// never set a token, so the token is what must be shadowed.
+for (const source of ["routes", "remote-coding"]) {
+  const keyOnly = buildClaudeSettingsOverride({
+    source,
+    env: {
+      ANTHROPIC_BASE_URL: "http://127.0.0.1:2",
+      ANTHROPIC_API_KEY: "sk-noop-litellm-passthrough",
+      ANTHROPIC_MODEL: "claude-opus-5",
+    },
+  });
+  assert.equal(keyOnly.env.ANTHROPIC_AUTH_TOKEN, "", `${source} must shadow the auth token`);
+  // The route's own credential is never clobbered by that rule.
+  assert.equal(keyOnly.env.ANTHROPIC_API_KEY, "sk-noop-litellm-passthrough");
+}
 
 // No OriginRouter route means no override at all: native behavior byte for byte.
 assert.equal(buildClaudeSettingsOverride({
