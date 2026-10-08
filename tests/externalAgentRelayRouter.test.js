@@ -486,3 +486,81 @@ test("canonical E2EE JSON still rejects non-finite numbers", () => {
   assert.throws(() => canonicalJson({ value: Number.NaN }), /unsupported canonical JSON value/);
   assert.throws(() => canonicalJson({ value: Number.POSITIVE_INFINITY }), /unsupported canonical JSON value/);
 });
+
+test("a subscribe answers every session's snapshot without serializing the sends", async () => {
+  // One subscribe names every session the App knows about. Each snapshot used
+  // to be awaited before the next was issued, so a wide registry spent the sum
+  // of every round trip in the handler and the App repainted once per session.
+  // The sends are independent, so they must be in flight together.
+  const sent = [];
+  let inFlight = 0;
+  let peakInFlight = 0;
+  const sessionIds = Array.from({ length: 6 }, (_, index) => `session-${index}`);
+  const registry = {
+    has: (sessionId) => sessionIds.includes(sessionId),
+    controlSnapshot: (sessionId) => ({ interactions: [], events: [], mode: "default", sessionId }),
+    enqueueCommand: () => {},
+  };
+  const relayClient = {
+    send: async (type, payload) => {
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      await new Promise((resolve) => setImmediate(resolve));
+      sent.push({ type, payload });
+      inFlight -= 1;
+      return { accepted: true };
+    },
+  };
+  const router = new ExternalAgentRelayRouter({ registry, relayClient });
+
+  assert.equal(
+    await router.handle({
+      type: "agent.interactions.snapshot.request",
+      sessionIds,
+      requestId: "snapshot-1",
+    }),
+    true,
+  );
+  assert.equal(sent.length, sessionIds.length, "every session must be answered");
+  assert.equal(
+    peakInFlight,
+    sessionIds.length,
+    "the snapshots must overlap rather than run one after another",
+  );
+});
+
+test("one failed snapshot does not suppress the rest", async () => {
+  // A snapshot is self-contained: a registry that throws for one session must
+  // not cost the App the snapshots of every other session in the same subscribe.
+  const sent = [];
+  const sessionIds = ["ok-1", "boom", "ok-2"];
+  const registry = {
+    has: (sessionId) => sessionIds.includes(sessionId),
+    controlSnapshot: (sessionId) => {
+      if (sessionId === "boom") throw new Error("snapshot exploded");
+      return { interactions: [], events: [], mode: "default", sessionId };
+    },
+    enqueueCommand: () => {},
+  };
+  const relayClient = {
+    send: async (type, payload) => {
+      sent.push({ type, payload });
+      return { accepted: true };
+    },
+  };
+  const router = new ExternalAgentRelayRouter({ registry, relayClient });
+
+  assert.equal(
+    await router.handle({
+      type: "agent.interactions.snapshot.request",
+      sessionIds,
+      requestId: "snapshot-2",
+    }),
+    true,
+  );
+  assert.deepEqual(
+    sent.map((item) => item.payload.sessionId),
+    ["ok-1", "ok-2"],
+    "the healthy sessions must still be answered",
+  );
+});

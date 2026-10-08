@@ -509,8 +509,12 @@ export class AgentCatalog {
       safeText(payload.exitSignal, 32),
       id,
     );
+    // A conversation's activity stamp is a high-water mark: the catalog orders
+    // its list by it. A late duplicate finish for an older run used to move it
+    // backwards, which reordered the list and dragged the card's `status` onto
+    // the finished run that the picker then selected.
     this.db.prepare(`
-      UPDATE agent_conversations SET last_activity_at = ?
+      UPDATE agent_conversations SET last_activity_at = MAX(last_activity_at, ?)
       WHERE conversation_id = (
         SELECT conversation_id FROM agent_runs WHERE originrouter_session_id = ?
       )
@@ -687,7 +691,14 @@ export class AgentCatalog {
       LEFT JOIN agent_runs r ON r.run_id = (
         SELECT r2.run_id FROM agent_runs r2
         WHERE r2.conversation_id = c.conversation_id
-        ORDER BY r2.started_at DESC, r2.rowid DESC LIMIT 1
+        -- Prefer the run that is still open. A conversation can be resumed many
+        -- times, and picking purely by started_at made the card flip between
+        -- the live run and the previous, finished one on the next sync.
+        ORDER BY
+          CASE WHEN r2.status IN ('running', 'starting', 'waiting_approval',
+                                  'waiting_input', 'waiting_device')
+               THEN 0 ELSE 1 END,
+          r2.started_at DESC, r2.rowid DESC LIMIT 1
       )
       ${where}
       ORDER BY c.last_activity_at DESC

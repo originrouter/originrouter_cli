@@ -5,7 +5,8 @@ import { dirname, join, posix as posixPath, resolve, win32 as win32Path } from "
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { readApiToken } from "../persistence/authToken.js";
-import { getStateDir, readDaemonState } from "../persistence/state.js";
+import { liveDaemonPid } from "../daemon/daemonPrimitives.js";
+import { getStateDir, readDaemonState, readLocalApiConfig } from "../persistence/state.js";
 import { quoteWindowsArgument } from "../utils/spawn.js";
 
 const SERVICE_LABEL = "com.originrouter.daemon";
@@ -535,8 +536,38 @@ function installService({ dryRun = false } = {}) {
   }
 }
 
+/**
+ * Report when the daemon came up on a different port than the one it was asked
+ * for.
+ *
+ * The daemon writes this warning into its own log, which nobody sees: under a
+ * service manager the process is detached, so its stderr goes to
+ * `logs/daemon.err.log` and the terminal is long gone. But the port is exactly
+ * what the operator needs to hear about — a paired App or a saved direct address
+ * is still pointed at the old number — so the shift has to be reported by
+ * whichever command the user actually ran.
+ *
+ * `expected` is the port from the config the daemon read on the way in, before
+ * it wrote back where it landed.
+ */
+export function warnIfLocalApiPortMoved(expectedPort, localApiUrl) {
+  const actualPort = Number(localApiUrl?.split(":").pop());
+  if (!Number.isInteger(expectedPort) || !Number.isInteger(actualPort)) return;
+  if (actualPort === expectedPort) return;
+  console.warn([
+    `WARNING: local API port ${expectedPort} was in use; the daemon is on ${actualPort} instead.`,
+    `The Local API address has changed, so anything configured for port ${expectedPort}`,
+    "— a paired App, a saved direct address — will not reach this daemon until it",
+    "is updated.",
+    `To pin a port, stop the daemon and run: originrouter local api set-port <port>`,
+  ].join("\n"));
+}
+
 async function startService({ dryRun = false } = {}) {
   const currentPlatform = platform();
+  // Read before the daemon can rewrite it, so the comparison is against the port
+  // that was actually requested rather than the one it ended up on.
+  const expectedPort = dryRun ? null : readLocalApiConfig().port;
   if (currentPlatform === "darwin") {
     const paths = servicePaths(currentPlatform);
     if (!existsSync(paths.configPath) && !dryRun) {
@@ -546,12 +577,14 @@ async function startService({ dryRun = false } = {}) {
     tryRun("launchctl", ["bootstrap", target, paths.configPath], { dryRun });
     run("launchctl", ["kickstart", "-k", `${target}/${SERVICE_LABEL}`], { dryRun });
     const localApiUrl = await waitForLocalApiReady({ dryRun });
+    warnIfLocalApiPortMoved(expectedPort, localApiUrl);
     console.log(`OriginRouter service started${localApiUrl ? `: ${localApiUrl}` : "."}`);
     return;
   }
   if (currentPlatform === "linux") {
     run("systemctl", ["--user", "start", SYSTEMD_UNIT], { dryRun });
     const localApiUrl = await waitForLocalApiReady({ dryRun });
+    warnIfLocalApiPortMoved(expectedPort, localApiUrl);
     console.log(`OriginRouter service started${localApiUrl ? `: ${localApiUrl}` : "."}`);
     return;
   }
@@ -575,6 +608,7 @@ async function startService({ dryRun = false } = {}) {
       }
       throw new Error(`${error.message}\n${cleanupError ? `Service cleanup failed: ${cleanupError.message}` : "The failed service was stopped."}\n${diagnostics}`, { cause: error });
     }
+    warnIfLocalApiPortMoved(expectedPort, localApiUrl);
     console.log(`OriginRouter service started${localApiUrl ? `: ${localApiUrl}` : "."}`);
     return;
   }
@@ -608,6 +642,41 @@ function windowsServiceDiagnostics() {
     details.push(`${path}:\n${readLogTail(path)}`);
   }
   return details.join("\n");
+}
+
+/**
+ * Refuse a foreground start when a daemon is already running.
+ *
+ * `originrouter daemon` is a legitimate command — it is how you pass `--relay`,
+ * `--device` or `--local-port` for one run, and it is what the supervisor itself
+ * executes, so this must never block that path. What is never legitimate is a
+ * *second* daemon beside a running one. That is a silent trap rather than a
+ * feature: it cannot bind the API port, drifts to the next free one, sits on the
+ * terminal looking stuck, and rewrites the port App pairing reads.
+ *
+ * The test is the recorded daemon actually being alive, not a service definition
+ * existing. An installed service means a daemon is *usually* running, but the
+ * supervisor may be between restarts, and refusing then would leave the machine
+ * depending on launchd's retry to come back — so a stale or absent PID lets the
+ * start proceed.
+ */
+export function assertNoRunningDaemon({
+  state = readDaemonState(),
+  isAlive = liveDaemonPid,
+} = {}) {
+  const pid = isAlive(state);
+  if (pid == null) return;
+  throw new Error(
+    [
+      `A daemon is already running (pid ${pid}).`,
+      "A second, unmanaged instance would fail to bind the API port, drift to",
+      "another one, and rewrite the port App pairing reads.",
+      "",
+      "  originrouter service status     see it",
+      "  originrouter service restart    restart it",
+      "  originrouter service stop       stop it, then run a foreground daemon",
+    ].join("\n"),
+  );
 }
 
 export async function restartService({ dryRun = false } = {}) {
@@ -749,6 +818,33 @@ export function printServiceUsage() {
   originrouter service restart [--dry-run]
   originrouter service status [--dry-run]
   originrouter service uninstall [--dry-run]`);
+}
+
+/**
+ * Which `daemon` verbs are really service-manager verbs.
+ *
+ * `originrouter daemon` on its own starts a foreground daemon. Once
+ * `service install` has run, the daemon belongs to launchd / systemd / the
+ * scheduled task, and those supervisors restart it whenever it exits — so an
+ * unmanaged second instance cannot take over. It fails to bind the API port,
+ * drifts to the next free one, prints a startup banner, and then sits there
+ * forever. Reporting that as a successful restart is worse than refusing, so
+ * these verbs are routed to the component that actually owns the process.
+ */
+export function daemonServiceAction(args) {
+  const action = args.find((arg) => !arg.startsWith("-"));
+  // `start` belongs here for a different reason than the other three.
+  //
+  // stop / restart / status do not exist in `daemon`'s own grammar at all — a
+  // bare `originrouter daemon` is the foreground command, and there is nothing
+  // to stop or restart from inside it — so a user typing one can only mean the
+  // service. `start`, by contrast, is exactly what a bare `daemon` already does,
+  // so on its own it selects nothing; routing it to the supervisor is what makes
+  // it mean anything, and matches `service start` elsewhere.
+  return action === "stop" || action === "restart" || action === "status" ||
+    action === "start"
+    ? action
+    : null;
 }
 
 export async function handleServiceCommand(args) {

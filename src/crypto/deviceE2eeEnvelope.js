@@ -100,6 +100,135 @@ function verifyEnvelope(envelope, peer) {
   if (!valid) throw new Error("invalid E2EE envelope signature");
 }
 
+/**
+ * A sender-side group session: one symmetric key, many recipients.
+ *
+ * The pairwise design binds `target_device_id` into the HKDF context, so a
+ * pairwise key is readable by exactly one device by construction. That is the
+ * right default for request/response traffic but it forces live events — which
+ * are one publish to N viewers — into N encryptions.
+ *
+ * This class keeps everything the receiver must still be able to check and
+ * changes only what made the fan-out necessary:
+ *
+ *  * the Ed25519 signature is unchanged, so a recipient still learns exactly
+ *    which device authored the event;
+ *  * the AEAD is unchanged (ChaCha20-Poly1305, same AAD, same canonical
+ *    encoding), so the code paths stay comparable;
+ *  * the derivation, and with it the recipient binding, is replaced by a key
+ *    that every subscribed device holds.
+ *
+ * Losing the recipient binding in the key means the envelope can no longer
+ * carry a real `target_device_id`. It carries a session-scoped group address
+ * instead, which is what the relay uses to fan the single ciphertext out.
+ */
+export class DeviceE2eeGroupSession {
+  constructor({ local, sessionId, groupKeyId, key }) {
+    this.local = local;
+    this.sessionId = sessionId;
+    this.groupKeyId = groupKeyId;
+    this.key = key;
+    this.lastActivityAt = Date.now();
+    this.nextSend = 0;
+  }
+
+  /**
+   * Build the group address a relay can route on.
+   *
+   * `recipient_key_id` carries the group key id rather than a device key id,
+   * which is what tells a receiver it may open the envelope with its group key
+   * instead of looking for a pairwise session.
+   */
+  seal(type, payload, { routing = {} } = {}) {
+    this.lastActivityAt = Date.now();
+    const sequence = this.nextSend++;
+    const local = this.local.public_identity;
+    const base = {
+      type,
+      protocol: DEVICE_E2EE_ENVELOPE_PROTOCOL,
+      source_device_id: local.device_id,
+      target_device_id: targetDeviceIdForGroup(this.sessionId),
+      sender_key_id: local.key_id,
+      recipient_key_id: this.groupKeyId,
+      epoch: local.epoch,
+      session_id: `${this.sessionId}#group`,
+      direction: "request",
+      sequence,
+      routing,
+      ephemeral_public_key: groupPublicId(this.groupKeyId),
+    };
+    const nonce = randomBytes(12);
+    const cipher = createCipheriv("chacha20-poly1305", this.key, nonce, {
+      authTagLength: 16,
+    });
+    cipher.setAAD(Buffer.from(canonicalJson(header(base))));
+    const encrypted = Buffer.concat([
+      cipher.update(Buffer.from(canonicalJson(payload))),
+      cipher.final(),
+      cipher.getAuthTag(),
+    ]);
+    const envelope = {
+      ...base,
+      nonce: nonce.toString("base64url"),
+      ciphertext: encrypted.toString("base64url"),
+    };
+    return {
+      ...envelope,
+      signature: sign(
+        null,
+        Buffer.from(`${ENVELOPE_DOMAIN}${canonicalJson(signedEnvelope(envelope))}`),
+        privateKey(this.local.signing_private_jwk),
+      ).toString("base64url"),
+    };
+  }
+}
+
+const GROUP_TARGET_PREFIX = "grp-session:";
+const GROUP_EPHEMERAL_PREFIX = "grpkey:";
+
+function groupText(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/**
+ * The relay routes on `target_device_id`, so a fan-out needs an address that
+ * names the audience rather than one device. The prefix keeps it unambiguous
+ * against a real device id, which never contains a colon.
+ */
+export function targetDeviceIdForGroup(sessionId) {
+  return `${GROUP_TARGET_PREFIX}${sessionId}`;
+}
+
+export function sessionIdFromGroupTarget(targetDeviceId) {
+  const value = groupText(targetDeviceId);
+  return value.startsWith(GROUP_TARGET_PREFIX)
+    ? value.slice(GROUP_TARGET_PREFIX.length)
+    : "";
+}
+
+export function isGroupTarget(targetDeviceId) {
+  return groupText(targetDeviceId).startsWith(GROUP_TARGET_PREFIX);
+}
+
+export function isGroupKeyId(keyId) {
+  return groupText(keyId).startsWith("grp:");
+}
+
+/**
+ * `ephemeral_public_key` is part of the signed header and the relay validator
+ * requires a 32-byte value there. A group envelope has no DH ephemeral, so it
+ * carries a stable per-key identifier instead: deterministic, correctly sized,
+ * and it lets a receiver confirm the envelope was sealed for the key it holds
+ * before attempting decryption.
+ */
+function groupPublicId(groupKeyId) {
+  return createHash("sha256")
+    .update(`${GROUP_EPHEMERAL_PREFIX}${groupKeyId}`)
+    .digest()
+    .subarray(0, 32)
+    .toString("base64url");
+}
+
 export class DeviceE2eeSession {
   constructor({
     local,
@@ -284,4 +413,50 @@ export class DeviceE2eeSession {
     }
     return { type: envelope.type, payload };
   }
+}
+
+/**
+ * Open a group envelope with a group key.
+ *
+ * Deliberately *not* sequence-checked. A pairwise sequence is a single counter
+ * shared by two parties, which only works because there are exactly two. A
+ * group key is sealed once and fanned out to N independent receivers, so a
+ * strict per-recipient counter cannot exist: two subscribers legitimately
+ * observe the same sequence, and one that reconnects legitimately misses
+ * several. Replay is handled by the transport, which drops an envelope whose
+ * (session, sequence) it has already delivered.
+ *
+ * Returns null rather than throwing when the envelope is simply not for this
+ * key. A subscriber can hold a group key while a newer one is already in use —
+ * that is a race, not an error — and one unknown envelope must not be allowed
+ * to tear down the event stream.
+ */
+export function openGroupEnvelope(envelope, { key, groupKeyId, peer }) {
+  if (!envelope || envelope.protocol !== DEVICE_E2EE_ENVELOPE_PROTOCOL) return null;
+  if (envelope.recipient_key_id !== groupKeyId) return null;
+  if (!isGroupTarget(envelope.target_device_id)) return null;
+  if (sessionIdFromGroupTarget(envelope.target_device_id) !== envelope.session_id.replace(/#group$/, "")) {
+    return null;
+  }
+  if (envelope.ephemeral_public_key !== groupPublicId(groupKeyId)) return null;
+  verifyEnvelope(envelope, peer);
+  const combined = Buffer.from(envelope.ciphertext, "base64url");
+  if (combined.length < 17) return null;
+  const decipher = createDecipheriv(
+    "chacha20-poly1305",
+    key,
+    Buffer.from(envelope.nonce, "base64url"),
+    { authTagLength: 16 },
+  );
+  decipher.setAAD(Buffer.from(canonicalJson(header(envelope))));
+  decipher.setAuthTag(combined.subarray(combined.length - 16));
+  const plaintext = Buffer.concat([
+    decipher.update(combined.subarray(0, combined.length - 16)),
+    decipher.final(),
+  ]);
+  const payload = JSON.parse(plaintext.toString("utf8"));
+  if (!payload || Array.isArray(payload) || typeof payload !== "object") {
+    throw new Error("E2EE payload must be a JSON object");
+  }
+  return { type: envelope.type, payload };
 }

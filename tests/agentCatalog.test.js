@@ -275,6 +275,65 @@ catalog.upsertSession({
 catalog.upsertSession({ sessionId: "explicit-worker", startedBy: "local-app-server" });
 catalog.finishSession("collab-worker-1", { status: "completed" });
 catalog.finishSession("explicit-worker", { status: "completed" });
+
+// A long-lived session can be restarted after a shorter one on the same
+// conversation: the newest started_at is then the *finished* run while an
+// older run is still open. The card must describe the run that is open.
+catalog.upsertSession({
+  sessionId: "resumed-live-run",
+  conversationId: "resumed-conversation",
+  runId: "resumed-run-1",
+  agent: "claude",
+  title: "Resumed conversation",
+  deviceId: "server-2",
+  cwd: stateDir,
+  status: "running",
+  startedAt: "2026-07-19T00:00:00Z",
+});
+clock = Date.parse("2026-07-23T00:00:00Z");
+catalog.upsertSession({
+  sessionId: "resumed-done-run",
+  conversationId: "resumed-conversation",
+  runId: "resumed-run-2",
+  agent: "claude",
+  title: "Resumed conversation",
+  deviceId: "server-2",
+  cwd: stateDir,
+  status: "completed",
+  startedAt: "2026-07-23T00:00:00Z",
+  exitedAt: "2026-07-23T00:05:00Z",
+});
+const resumed = catalog.listConversations({ includeArchived: true })
+  .find((item) => item.conversation_id === "resumed-conversation");
+assert.equal(resumed.status, "running", "an open run describes the conversation");
+
+// The live run ends normally. With no run left open the card may describe any
+// of the conversation's runs; what it must never do is keep claiming the
+// conversation is still working.
+clock = Date.parse("2026-07-24T00:00:00Z");
+catalog.finishSession("resumed-live-run", { status: "stopped" });
+assert.equal(
+  ["running", "starting", "waiting_approval", "waiting_input", "waiting_device"]
+    .includes(
+      catalog.listConversations({ includeArchived: true })
+        .find((item) => item.conversation_id === "resumed-conversation").status,
+    ),
+  false,
+  "a finished conversation must not still read as active",
+);
+
+// The conversation activity stamp is a high-water mark: the catalog orders its
+// list by it, so a stale finish stamp must not rewind it.
+const activityBefore = catalog.getConversation("resumed-conversation").last_activity_at;
+catalog.finishSession("resumed-live-run", {
+  status: "stopped",
+  exitedAt: "2026-07-19T00:00:00Z",
+});
+assert.equal(
+  catalog.getConversation("resumed-conversation").last_activity_at,
+  activityBefore,
+  "a stale finish stamp must not rewind conversation activity",
+);
 // Simulate records persisted by the previous version, before provenance was
 // preserved. Query-side filtering must hide them without rewriting the DB.
 catalog.db.prepare("UPDATE agent_runs SET started_by = 'local-sdk' WHERE originrouter_session_id = ?")

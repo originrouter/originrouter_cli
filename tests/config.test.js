@@ -14,7 +14,7 @@ import {
   addProvider,
   setCurrentProvider,
 } from "../src/config/providers.js";
-import { setRoute, hashRoutes, getAllRoutes, getRoutes, MAIN_ALIAS, SMALL_ALIAS } from "../src/config/routes.js";
+import { setRoute, hashRoutes, getAllRoutes, getRoutes, MAIN_ALIAS, OPUS_ALIAS, SONNET_ALIAS, HAIKU_ALIAS, FABLE_ALIAS } from "../src/config/routes.js";
 import { readConfig, writeConfig } from "../src/persistence/state.js";
 
 const home = mkdtempSync(join(tmpdir(), "originrouter-config-test-"));
@@ -25,13 +25,17 @@ try {
   config = setClaudeConfigValue(config, "baseUrl", "https://api.easytransnote.com/coding");
   config = setClaudeConfigValue(config, "apiKey", "sk-v1-1234567890abcdef");
   config = setClaudeConfigValue(config, "model", "MiniMax-M3");
-  config = setClaudeConfigValue(config, "smallFastModel", "MiniMax-M2.7");
-
+  // `smallFastModel` is no longer a supported config.claude key, and the
+  // legacy block no longer maps it to ANTHROPIC_SMALL_FAST_MODEL — that
+  // variable is not part of the injected set at all.
+  assert.throws(
+    () => setClaudeConfigValue(config, "smallFastModel", "MiniMax-M2.7"),
+    /Unsupported Claude config key: smallFastModel/,
+  );
   assert.deepEqual(buildClaudeEnv(config), {
     ANTHROPIC_BASE_URL: "https://api.easytransnote.com/coding",
     ANTHROPIC_API_KEY: "sk-v1-1234567890abcdef",
     ANTHROPIC_MODEL: "MiniMax-M3",
-    ANTHROPIC_SMALL_FAST_MODEL: "MiniMax-M2.7",
   });
 
   assert.equal(maskSecret("sk-v1-1234567890abcdef"), "sk-v1-...cdef");
@@ -101,7 +105,7 @@ try {
     pid: 54321,
     version: "1.83.0",
     routesHash: hashRoutes(getAllRoutes(config)),
-    aliases: [MAIN_ALIAS, SMALL_ALIAS],
+    aliases: [MAIN_ALIAS, OPUS_ALIAS, SONNET_ALIAS, HAIKU_ALIAS, FABLE_ALIAS],
   };
   const routed = await buildAgentProviderEnv("claude", config, {
     provider: "deepseek",
@@ -110,7 +114,7 @@ try {
   assert.equal(routed.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:40123");
   assert.equal(routed.env.ANTHROPIC_API_KEY, "sk-noop-litellm-passthrough");
   assert.equal(routed.env.ANTHROPIC_MODEL, MAIN_ALIAS);
-  assert.equal(routed.env.ANTHROPIC_SMALL_FAST_MODEL, SMALL_ALIAS);
+  assert.equal(routed.env.ANTHROPIC_DEFAULT_OPUS_MODEL, OPUS_ALIAS);
   assert.equal(routed.proxy, runningRouteProbe);
   // No real provider credentials leak into the proxy-routed env.
   assert.equal(routed.env.ANTHROPIC_BASE_URL.includes("sk-ds-"), false);
@@ -141,18 +145,19 @@ try {
     (err) => err.code === "PROVIDER_UNSUPPORTED",
   );
 
-  // (e) Stage 7.6: smallFastModel on the provider no longer affects the
-  // injected env. Both aliases are always the fixed constants; the
-  // provider's smallFastModel is legacy metadata. This step is a regression
-  // guard: the env still
-  // contains the fixed SMALL_ALIAS even though the provider has
-  // smallFastModel set.
+  // (e) smallFastModel on the provider never affects the injected env: the
+  // per-family aliases are fixed constants and the provider's smallFastModel
+  // is inert legacy metadata. Regression guard: the removed fast-model
+  // variables must not reappear just because a provider still carries the
+  // field.
   config.providers.deepseek.smallFastModel = "deepseek-chat-small";
   const routedFast = await buildAgentProviderEnv("claude", config, {
     provider: "deepseek",
     proxyStatus: () => runningRouteProbe,
   });
-  assert.equal(routedFast.env.ANTHROPIC_SMALL_FAST_MODEL, SMALL_ALIAS);
+  assert.equal(routedFast.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, HAIKU_ALIAS);
+  assert.equal(routedFast.env.ANTHROPIC_SMALL_FAST_MODEL, undefined);
+  assert.equal(routedFast.env.CLAUDE_CODE_SUBAGENT_MODEL, undefined);
 } finally {
   rmSync(home, { recursive: true, force: true });
 }

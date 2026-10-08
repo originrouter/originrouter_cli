@@ -52,7 +52,7 @@ assert.deepEqual(getCompletionCandidates(["token", ""]), ["rotate", "show"]);
 assert(getCompletionCandidates(["remote", "--port", "8080", ""]).includes("setup"));
 
 // Positional value sets declared on the node.
-assert.deepEqual(getCompletionCandidates(["route", "set", ""]), ["claude.main", "claude.small", "codex.main"]);
+assert.deepEqual(getCompletionCandidates(["route", "set", ""]), ["claude.fable", "claude.haiku", "claude.main", "claude.opus", "claude.sonnet", "codex.main"]);
 assert.deepEqual(getCompletionCandidates(["agent", "detail", "s"]), ["set"]);
 
 // Cobra wire format: 'value<TAB>description' with a trailing ':4' directive.

@@ -99,17 +99,24 @@ test("SessionManager applies local-control route updates from relay events", asy
     });
     assert.deepEqual(restarts, [{ mode: "route", port: 40123 }]);
 
+    // A grouped replace sends every claude slot key; auxiliary slots left to
+    // inherit arrive as explicit nulls and must round-trip as "not present".
     await manager.handleLocalControlEvent({
       type: "local_control.routes.replace",
       agent: "claude",
       routes: {
         main: { provider: "deepseek", model: "deepseek-chat" },
-        small: { provider: "deepseek", model: "deepseek-chat" },
+        opus: { provider: "deepseek", model: "deepseek-chat" },
+        sonnet: null,
+        haiku: null,
+        fable: null,
       },
     });
     config = readConfig();
     assert.equal(config.routes.claude.main.provider, "deepseek");
-    assert.equal(config.routes.claude.small.provider, "deepseek");
+    assert.equal(config.routes.claude.opus.model, "deepseek-chat");
+    assert.equal(config.routes.claude.sonnet, undefined);
+    assert.equal(config.routes.claude.haiku, undefined);
 
     await assert.rejects(
       () => manager.handleLocalControlEvent({
@@ -117,7 +124,7 @@ test("SessionManager applies local-control route updates from relay events", asy
         agent: "claude",
         routes: {
           main: { provider: "deepseek", model: "deepseek-chat" },
-          small: { provider: "moonshot", model: "moonshot-v1-8k" },
+          opus: { provider: "moonshot", model: "moonshot-v1-8k" },
         },
       }),
       /must use the same provider/,

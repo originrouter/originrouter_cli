@@ -589,7 +589,10 @@ async function dispatch(ctx, req, res) {
       }
       return sendError(res, 405, `method ${req.method} not allowed on /routes/${agent}`);
     }
-    const routeSlotMatch = pathname.match(/^\/routes\/([a-z]+)\/(main|small)$/);
+    // Slot names are validated against ROUTE_DEFS by setRoute/clearRoute, so
+    // this pattern stays generic and the dispatch table remains the only
+    // source of truth for which slots exist.
+    const routeSlotMatch = pathname.match(/^\/routes\/([a-z]+)\/([a-z]+)$/);
     if (routeSlotMatch) {
       const agent = decodeURIComponent(routeSlotMatch[1]);
       const slot  = routeSlotMatch[2];

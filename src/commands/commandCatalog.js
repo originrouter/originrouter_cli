@@ -32,6 +32,8 @@
 //                    must stop offering OriginRouter's own flags after it
 //     hidden      -- runnable, but absent from completion
 
+import { ROUTE_TARGET_NAMES } from "../config/routes.js";
+
 const AGENT_NAMES = ["claude", "codex"];
 const SHELLS = ["bash", "zsh", "fish", "powershell"];
 const TEAM_MODES = [
@@ -40,7 +42,9 @@ const TEAM_MODES = [
 ];
 const AUTONOMY_PROFILES = ["manual", "guarded", "ai_review", "unrestricted", "custom"];
 const DETAIL_LEVELS = ["concise", "standard", "detailed"];
-const ROUTE_SLOTS = ["claude.main", "claude.small", "codex.main"];
+// Every `agent.slot` target, derived from the dispatch table so this list
+// cannot drift from the slots the CLI actually accepts.
+const ROUTE_SLOTS = ROUTE_TARGET_NAMES;
 
 // Flags accepted by the bare-objective entry point (`originrouter "..."`),
 // also used as completions on an empty command line.
@@ -50,7 +54,7 @@ export const WORKSPACE_OPTIONS = [
 
 const PROVIDER_FIELD_OPTIONS = [
   "--type", "--engine", "--litellm-provider", "--base-url", "--api-key",
-  "--auth-token", "--model", "--small-fast-model", "--agent", "--force",
+  "--auth-token", "--model", "--agent", "--force",
 ];
 
 const COLLABORATION_OPTIONS = [
@@ -214,7 +218,7 @@ export const COMMAND_CATALOG = [
     ],
   }),
   leaf("route", "Assign local, cloud, or remote models to agent slots", {
-    options: ["--provider", "--model", "--main-model", "--small-model", "--device"],
+    options: ["--provider", "--model", "--main-model", "--device"],
     children: [
       leaf("list", "Show every configured agent route"),
       leaf("show", "Show routes for one agent", {
@@ -223,7 +227,7 @@ export const COMMAND_CATALOG = [
       }),
       leaf("set", "Assign a Provider and model to a route slot", {
         valuesFor: { "(positional)": ROUTE_SLOTS },
-        options: ["--provider", "--model", "--main-model", "--small-model"],
+        options: ["--provider", "--model", "--main-model", "--opus", "--sonnet", "--haiku", "--fable"],
       }),
       leaf("clear", "Clear a route slot", { valuesFor: { "(positional)": ROUTE_SLOTS } }),
       leaf("cloud", "Use login-backed OriginRouter Cloud models", {
@@ -427,7 +431,7 @@ export const COMMAND_CATALOG = [
     passthrough: true,
   }),
   leaf("claude-config", "Write legacy config.claude values", {
-    options: ["--base-url", "--api-key", "--model", "--small-fast-model"],
+    options: ["--base-url", "--api-key", "--model"],
   }),
   leaf("agent-mcp-server", "Run the MCP gateway server (internal)", {
     hidden: true,
@@ -546,7 +550,7 @@ export const VALUE_FLAGS = new Set([
   "--originrouter-detail", "--originrouter-policy", "--page", "--page-size",
   "--participant", "--permission", "--port", "--preference", "--provider",
   "--providers", "--relay", "--relay-mode", "--relay-url", "--role", "--route",
-  "--search", "--shell", "--since", "--small-fast-model", "--small-model",
+  "--search", "--shell", "--since",
   "--spec", "--status", "--surety-url", "--task", "--template", "--text",
   "--timeout", "--token-limit", "--type", "--until", "--version",
   "--workspace",

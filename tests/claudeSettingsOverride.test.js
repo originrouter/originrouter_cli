@@ -20,8 +20,6 @@ const codingResult = {
     ANTHROPIC_AUTH_TOKEN: "or_local_secret",
     ANTHROPIC_API_KEY: "",
     ANTHROPIC_MODEL: "claude-opus-5",
-    ANTHROPIC_SMALL_FAST_MODEL: "claude-haiku-4-5",
-    CLAUDE_CODE_SUBAGENT_MODEL: "claude-opus-5",
     ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-5",
     ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-opus-5",
     ANTHROPIC_DEFAULT_HAIKU_MODEL: "claude-haiku-4-5",
@@ -40,7 +38,10 @@ assert.equal(override.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "claude-haiku-4-5");
 assert.equal(override.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "claude-opus-5");
 assert.equal(override.env.ANTHROPIC_DEFAULT_SONNET_MODEL, "claude-opus-5");
 assert.equal(override.env.ANTHROPIC_DEFAULT_FABLE_MODEL, "claude-opus-5");
-assert.equal(override.env.CLAUDE_CODE_SUBAGENT_MODEL, "claude-opus-5");
+// The removed variables are not pinned any more: they are no longer part of
+// the transport key set, so a settings-layer value would pass through.
+assert.equal("ANTHROPIC_SMALL_FAST_MODEL" in override.env, false);
+assert.equal("CLAUDE_CODE_SUBAGENT_MODEL" in override.env, false);
 
 // Only transport keys cross over.
 assert.equal("UNRELATED_SECRET" in override.env, false);

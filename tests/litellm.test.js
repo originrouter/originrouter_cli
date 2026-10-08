@@ -358,7 +358,8 @@ const ROUTE_PROVIDERS = {
 };
 
 {
-  // Main only — minimal valid route set; small is the fast fallback to main.
+  // Main only — every auxiliary inherits it, so all five aliases are emitted
+  // and the aux aliases point at the same upstream as main.
   const yaml = renderLitellmRoutesConfigYaml(
     { claude: { main: { provider: "deepseek", model: "deepseek-chat" } } },
     ROUTE_PROVIDERS,
@@ -367,35 +368,42 @@ const ROUTE_PROVIDERS = {
   assert.match(yaml, /model: deepseek\/deepseek-chat/);
   assert.match(yaml, /api_key: "sk-ds"/);
   assert.match(yaml, /drop_params: true/);
-  // Both aliases present (small falls back to main).
-  assert.match(yaml, /model_name: originrouter-claude-fast-model/);
-  // The fast alias has the same params as the main alias.
-  const fastStart = yaml.indexOf("originrouter-claude-fast-model");
-  const fastBlock = yaml.slice(fastStart);
-  assert.match(fastBlock, /model: deepseek\/deepseek-chat/);
-  assert.match(fastBlock, /api_key: "sk-ds"/);
+  for (const family of ["opus", "sonnet", "haiku", "fable"]) {
+    assert.match(yaml, new RegExp(`model_name: originrouter-claude-${family}`), family);
+  }
+  // An inherited auxiliary carries main's params.
+  const haikuStart = yaml.indexOf("originrouter-claude-haiku");
+  const haikuBlock = yaml.slice(haikuStart);
+  assert.match(haikuBlock, /model: deepseek\/deepseek-chat/);
+  assert.match(haikuBlock, /api_key: "sk-ds"/);
+  // The removed fast alias is gone.
+  assert.doesNotMatch(yaml, /originrouter-claude-fast-model/);
 }
 
 {
-  // Main + small use one Provider, while each alias can select a different
+  // Every family shares one Provider, while each alias can select a different
   // model exposed by that Provider.
   const yaml = renderLitellmRoutesConfigYaml(
     {
       claude: {
         main:  { provider: "deepseek", model: "deepseek-chat" },
-        small: { provider: "deepseek", model: "deepseek-chat-fast" },
+        haiku: { provider: "deepseek", model: "deepseek-chat-fast" },
       },
     },
     ROUTE_PROVIDERS,
   );
   assert.match(yaml, /model_name: originrouter-claude-model/);
   assert.match(yaml, /model: deepseek\/deepseek-chat/);
-  assert.match(yaml, /model_name: originrouter-claude-fast-model/);
+  assert.match(yaml, /model_name: originrouter-claude-haiku/);
   assert.match(yaml, /model: deepseek\/deepseek-chat-fast/);
-  // Both keys present, in the order main → fast.
+  // Keys are emitted in ROUTE_DEFS slot order: main first.
   const mainIdx = yaml.indexOf("originrouter-claude-model\n");
-  const smallIdx = yaml.indexOf("originrouter-claude-fast-model");
-  assert.ok(mainIdx >= 0 && smallIdx > mainIdx, "main must appear before fast");
+  const haikuIdx = yaml.indexOf("originrouter-claude-haiku");
+  assert.ok(mainIdx >= 0 && haikuIdx > mainIdx, "main must appear before the auxiliary aliases");
+  // The explicitly-set family is the only one that carries the fast model.
+  const opusIdx = yaml.indexOf("originrouter-claude-opus");
+  assert.ok(opusIdx >= 0);
+  assert.match(yaml.slice(opusIdx, haikuIdx), /model: deepseek\/deepseek-chat\n/);
 }
 
 {
@@ -404,12 +412,12 @@ const ROUTE_PROVIDERS = {
       {
         claude: {
           main: { provider: "deepseek", model: "deepseek-chat" },
-          small: { provider: "moonshot", model: "moonshot-v1-8k" },
+          opus: { provider: "moonshot", model: "moonshot-v1-8k" },
         },
       },
       ROUTE_PROVIDERS,
     ),
-    /Claude main and small routes must use the same provider/,
+    /Claude routes must use the same provider/,
   );
 }
 
@@ -615,7 +623,7 @@ const CODEX_PROVIDERS = {
   assert.match(yaml, /model_name: gpt-5.4/);
   assert.match(yaml, /model: openai\/gpt-5-codex/);
   assert.doesNotMatch(yaml, /originrouter-claude-model/);
-  assert.doesNotMatch(yaml, /originrouter-claude-fast-model/);
+  assert.doesNotMatch(yaml, /originrouter-claude-opus/);
 }
 
 {
@@ -624,7 +632,7 @@ const CODEX_PROVIDERS = {
     {
       claude: {
         main: { provider: "originrouter_cloud", model: "grok-4.5" },
-        small: { provider: "originrouter_cloud", model: "grok-4.5" },
+        opus: { provider: "originrouter_cloud", model: "grok-4.5" },
       },
       codex: { main: { provider: "openai_codex", model: "gpt-5-codex" } },
     },
@@ -632,7 +640,7 @@ const CODEX_PROVIDERS = {
   );
   assert.match(yaml, /model_name: gpt-5.4/);
   assert.doesNotMatch(yaml, /originrouter-claude-model/);
-  assert.doesNotMatch(yaml, /originrouter-claude-fast-model/);
+  assert.doesNotMatch(yaml, /originrouter-claude-opus/);
 }
 
 {
@@ -650,14 +658,14 @@ const CODEX_PROVIDERS = {
     {
       claude: {
         main:  { provider: "deepseek", model: "deepseek-chat" },
-        small: { provider: "deepseek", model: "deepseek-chat-fast" },
+        haiku: { provider: "deepseek", model: "deepseek-chat-fast" },
       },
       codex: { main: { provider: "openai_codex", model: "gpt-5-codex" } },
     },
     CODEX_PROVIDERS,
   );
   assert.match(yaml, /model_name: originrouter-claude-model/);
-  assert.match(yaml, /model_name: originrouter-claude-fast-model/);
+  assert.match(yaml, /model_name: originrouter-claude-haiku/);
   assert.match(yaml, /model_name: gpt-5.4/);
   // Codex alias appears after the Claude aliases (ROUTE_AGENTS order).
   const claudeMainIdx = yaml.indexOf("originrouter-claude-model");
@@ -677,8 +685,8 @@ const CODEX_PROVIDERS = {
 }
 
 {
-  // Codex never falls back: passing a small entry alongside main does NOT
-  // emit a Codex fast alias (Codex 8.0 has no small slot).
+  // Codex has exactly one slot. Keys outside ROUTE_DEFS.codex.slots are never
+  // read, so a stray entry cannot add a second Codex alias.
   const yaml = renderLitellmRoutesConfigYaml(
     {
       codex: {
@@ -688,9 +696,8 @@ const CODEX_PROVIDERS = {
     },
     CODEX_PROVIDERS,
   );
-  // Exactly one Codex alias; no Codex fast alias.
   const codexAliasMatches = yaml.match(/model_name: gpt-5.4/g) || [];
-  assert.equal(codexAliasMatches.length, 1, "Codex 8.0 emits exactly one alias; small is ignored");
+  assert.equal(codexAliasMatches.length, 1, "Codex emits exactly one alias; stray keys are ignored");
 }
 
 console.log("litellm tests ok");

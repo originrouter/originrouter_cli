@@ -144,7 +144,12 @@ export function handleLocalConfigCommand(args) {
       throw new Error("--relay-mode must be auto|cloud|local|custom");
     }
     const patch = {};
-    if (port !== undefined) patch.port = port;
+    // Mark operator intent: on a service install the supervisor starts the
+    // daemon with no flags, so this file is the only channel a chosen port has.
+    if (port !== undefined) {
+      patch.port = port;
+      patch.portSource = "operator";
+    }
     if (bindAddress) patch.bindAddress = bindAddress;
     if (allowLan !== undefined) patch.allowLan = allowLan;
     if (relayMode) patch.relayMode = relayMode;
@@ -207,7 +212,9 @@ export async function handleLocalApiCommand(args) {
   if (sub === "set-port") {
     const port = parseLocalConfigPort(rest[0]);
     if (port === undefined) throw new Error("Usage: originrouter local api set-port <int>");
-    writeLocalApiConfig({ port });
+    // See `local config set`: the operator marker is what makes the daemon
+    // honour this port on the next start instead of drifting back to the default.
+    writeLocalApiConfig({ port, portSource: "operator" });
     const existingState = readDaemonState();
     console.log(`port: ${port}`);
     if (existingState?.localApiPort && existingState.localApiPort !== port) {

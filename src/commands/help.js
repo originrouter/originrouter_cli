@@ -64,7 +64,7 @@ Agent collaboration:
 Local Proxy provider management:
   originrouter provider add <name> [--type proxy] [--base-url <u>] [--model <m>]
                                    [--engine <e>] [--litellm-provider <id>] [--api-key <k>] [--auth-token <k>]
-                                   [--organization <o>] [--small-fast-model <m> [legacy]] [--api-version <v>]
+                                   [--organization <o>] [--api-version <v>]
                                    [--aws-region <r>] [--aws-access-key-id <id>] [--aws-secret-access-key <k>]
                                    [--aws-session-token <t>] [--aws-profile-name <p>]
                                    [--aws-bedrock-runtime-endpoint <u>] [--aws-role-name <r>] [--aws-session-name <n>]
@@ -85,10 +85,10 @@ originrouter provider update <name> [same flags as add]
 Model routes:
   originrouter route list
   originrouter route show [claude|codex]
-  originrouter route set claude --provider <name> --main-model <m> --small-model <m>
+  originrouter route set claude --provider <name> --main-model <m> [--opus <m|inherit>] [--sonnet <m|inherit>] [--haiku <m|inherit>] [--fable <m|inherit>]
   originrouter route clear claude
   originrouter route set <agent>.<slot> --provider <name> [--model <m>]
-                                 claude slots: main, small; codex slot: main
+                                 claude slots: main, opus, sonnet, haiku, fable; codex slot: main
   originrouter route clear <agent>.<slot>
   originrouter route cloud models
   originrouter route cloud set <agent>.<slot> [--model <id>]
@@ -99,8 +99,9 @@ Model routes:
   originrouter remote share status|start|stop|restart [--providers <name[,name...]>] [--port <p>]
   originrouter remote workspace list|authorize <path>
   originrouter remote workspace request <path> --device <device-id>
-  Aliases are fixed: originrouter-claude-model, originrouter-claude-fast-model,
-                     and originrouter-codex-model.
+  Aliases are fixed: originrouter-claude-model (primary), originrouter-claude-opus,
+                     -sonnet, -haiku, -fable, and originrouter-codex-model.
+                     Omit an auxiliary flag (or pass "inherit") to inherit the primary.
 
 Proxy runtime:
   originrouter proxy install [--version <v>]      default version 1.83.0
@@ -155,7 +156,7 @@ Configuration:
   originrouter config set updates.mode prompt|auto|off
   originrouter config set claude.<key> <value>
   originrouter config unset claude.<key>
-  originrouter claude-config --base-url <url> --api-key <key> --model <model> --small-fast-model <model> [legacy]
+  originrouter claude-config --base-url <url> --api-key <key> --model <model>
 
 Other:
   originrouter daemon [--relay https://app.easytransnote.com] [--relay-mode auto|cloud|local|custom] [--device <device-id>] [--local-port <p>]
@@ -178,7 +179,7 @@ Examples:
   originrouter run -- bash
   # Proxy provider (via the local runtime). The --type litellm
   # alias and --engine litellm are equivalent to the canonical --type proxy.
-  originrouter provider add minimax --type proxy --engine litellm --litellm-provider anthropic --base-url https://api.easytransnote.com/coding --api-key sk-v1-xxx --model MiniMax-M3 --small-fast-model MiniMax-M2.7
+  originrouter provider add minimax --type proxy --engine litellm --litellm-provider anthropic --base-url https://api.easytransnote.com/coding --api-key sk-v1-xxx --model MiniMax-M3
   # Login-backed source selectors: Cloud presents the available models; Remote
   # presents the authorized CLI devices for the current account.
   originrouter route cloud set claude.main
@@ -275,8 +276,8 @@ Models and routing:
   compatibility          Inspect signed protocol compatibility updates
   update                 Check for and install OriginRouter CLI updates
 
-  Route aliases: originrouter-claude-model, originrouter-claude-fast-model,
-                 and originrouter-codex-model
+  Route aliases: originrouter-claude-model (primary), originrouter-claude-opus,
+                 -sonnet, -haiku, -fable, and originrouter-codex-model
 
 Sessions and control:
   sessions | devices     Inspect local sessions or authorized devices

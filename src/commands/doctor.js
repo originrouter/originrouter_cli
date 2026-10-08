@@ -221,7 +221,12 @@ function _checkRoutesConfig(config) {
   const codexRoutes = getAgentRoutes(config, "codex");
   const hasClaude = Boolean(routes.main);
   const hasCodex = Boolean(codexRoutes.main);
-  if (!hasClaude && !hasCodex) {
+  // Legacy slot: `claude.small` is no longer a route slot. It stops being read
+  // (and therefore stops driving ANTHROPIC_SMALL_FAST_MODEL /
+  // ANTHROPIC_DEFAULT_HAIKU_MODEL) the moment this version runs, so surface it
+  // once instead of letting a cheap fast model silently become the main model.
+  const hasLegacySmall = Boolean(getAgentRoutes(config, "claude").small);
+  if (!hasClaude && !hasCodex && !hasLegacySmall) {
     return {
       name: "Route config",
       status: "pass",
@@ -233,8 +238,13 @@ function _checkRoutesConfig(config) {
   if (hasCodex) summary.push("codex");
   return {
     name: "Route config",
-    status: "pass",
-    detail: `${summary.join(", ")} configured`,
+    status: hasLegacySmall ? "warn" : "pass",
+    detail: hasLegacySmall
+      ? `claude.small is no longer a route slot; that model is ignored — set claude.haiku explicitly if you relied on it`
+      : `${summary.join(", ")} configured`,
+    next: hasLegacySmall
+      ? "Run `originrouter route set claude --provider <name> --main-model <m> --haiku <m>` to keep a distinct fast model."
+      : undefined,
   };
 }
 

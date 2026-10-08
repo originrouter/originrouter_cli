@@ -3,7 +3,6 @@ import {
   MAIN_ALIAS,
   ROUTE_AGENTS,
   ROUTE_DEFS,
-  SMALL_ALIAS,
   effectiveRoutes,
   getAgentRoutes,
   getAllRoutes,
@@ -123,8 +122,13 @@ export function printProviderList(config) {
   }
   if (routes.main) {
     console.log("\nClaude routes:");
-    console.log(`  model ${MAIN_ALIAS.padEnd(30)} -> ${routes.main.provider} / ${routes.main.model}`);
-    console.log(`  fast  ${SMALL_ALIAS.padEnd(30)} -> ${routes.small.provider} / ${routes.small.model}${routes.small._fallback ? " (falls back to main)" : ""}`);
+    for (const slot of ROUTE_DEFS.claude.slots) {
+      const entry = routes[slot];
+      if (!entry) continue;
+      const alias = ROUTE_DEFS.claude.aliases[slot];
+      const suffix = slot !== "main" ? "  (inherits main)" : "";
+      console.log(`  ${slot.padEnd(6)}${alias.padEnd(30)} -> ${entry.provider} / ${entry.model}${suffix}`);
+    }
   } else {
     console.log("\nClaude routes: (unset)");
   }
@@ -151,7 +155,7 @@ export function printProviderShow(provider) {
   console.log(`  apiVersion:     ${value(provider.apiVersion)}`);
   console.log(`  azureAdToken:   ${mask("azureAdToken", provider.azureAdToken)}`);
   console.log(`  model:          ${value(provider.model)}`);
-  console.log(`  smallFastModel: ${value(provider.smallFastModel)}${provider.smallFastModel ? "  (legacy; routes.claude.small is source of truth)" : ""}`);
+  console.log(`  smallFastModel: ${value(provider.smallFastModel)}${provider.smallFastModel ? "  (legacy; ignored — Claude families route via routes.claude.<family>)" : ""}`);
   if (provider.litellmProvider) console.log(`  litellmProvider: ${provider.litellmProvider}`);
   if (provider.awsRegion) console.log(`  awsRegion:       ${provider.awsRegion}`);
   if (provider.awsAccessKeyId) console.log(`  awsAccessKeyId:  ${provider.awsAccessKeyId}`);

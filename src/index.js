@@ -28,7 +28,6 @@ import {
   MAIN_ALIAS,
   ROUTE_AGENTS,
   ROUTE_DEFS,
-  SMALL_ALIAS,
   clearRoute,
   effectiveRoutes,
   getAgentRoutes,
@@ -38,6 +37,7 @@ import {
   replaceAgentRoutes,
   setRoute,
 } from "./config/routes.js";
+import { claudeRoutesMigrationWarning } from "./config/migration.js";
 import { LITELLM_VERSION } from "./proxy/litellm.js";
 import { DEFAULT_ORIGINROUTER_CONTROL_BASE_URL } from "./config/providerRoutes.js";
 import { enabledProviderModelEntries } from "./config/providerModels.js";
@@ -65,7 +65,11 @@ import { handleCompatibility } from "./commands/compatibility.js";
 import { formatCliError, reportCliError } from "./runtime/cliErrors.js";
 // Stage 9.8: `originrouter doctor` 诊断命令。
 import { runDoctor, printDoctorResults } from "./commands/doctor.js";
-import { handleServiceCommand } from "./commands/service.js";
+import {
+  assertNoRunningDaemon,
+  daemonServiceAction,
+  handleServiceCommand,
+} from "./commands/service.js";
 import { handleSetupCommand } from "./commands/setup.js";
 import { handleAuthCommand, handleLogin, handleLogout } from "./commands/auth.js";
 import {
@@ -362,7 +366,6 @@ function handleClaudeConfig(args) {
     "--base-url": "baseUrl",
     "--api-key": "apiKey",
     "--model": "model",
-    "--small-fast-model": "smallFastModel",
   };
 
   for (const [option, key] of Object.entries(updates)) {
@@ -384,7 +387,7 @@ function parseProviderAddOptions(rest) {
     throw new Error(
       "Usage: originrouter provider add <name> [--type litellm] [--base-url <u>] [--model <m>] " +
       "[--engine <e>] [--litellm-provider <id>] [--api-key <k>] [--auth-token <k>] " +
-      "[--organization <o>] [--small-fast-model <m>] [--api-version <v>] [--aws-region <r>] " +
+      "[--organization <o>] [--api-version <v>] [--aws-region <r>] " +
       "[--aws-access-key-id <id>] [--aws-secret-access-key <k>] " +
       "[--aws-session-token <t>] [--aws-profile-name <p>] " +
       "[--aws-bedrock-runtime-endpoint <u>] [--aws-role-name <r>] " +
@@ -410,7 +413,6 @@ function parseProviderAddOptions(rest) {
     "--auth-token": "authToken",
     "--organization": "organization",
     "--model": "model",
-    "--small-fast-model": "smallFastModel",
     "--api-version": "apiVersion",
     "--aws-region": "awsRegion",
     "--aws-access-key-id": "awsAccessKeyId",
@@ -470,7 +472,6 @@ function handleProvider(args) {
     assertManualProviderWriteIsLocalProxy(config, opts, "add");
     const next = addProviderFromFlags(config, opts);
     writeConfig(next);
-    maybeNoteLegacySmallFastModel(opts);
     return printProviderShow(cliProviderForShow(readConfig(), opts.name));
   }
 
@@ -482,7 +483,6 @@ function handleProvider(args) {
     const warnings = takeUpdateWarnings(result);
     writeConfig(result);
     printProviderShow(cliProviderForShow(readConfig(), name));
-    maybeNoteLegacySmallFastModel(opts);
     if (warnings.length > 0) {
       console.error("\nWarnings:");
       for (const w of warnings) console.error(`  - ${w.field}: ${w.message}`);
@@ -505,14 +505,20 @@ function handleProvider(args) {
     if (!target) throw new Error(`unknown provider '${name}'`);
 
     if (agent === "claude") {
-      // Claude is one grouped routing profile: main and small always share
-      // the selected Provider. Model selection can still differ later.
+      // Claude is one grouped routing profile: every slot shares the selected
+      // Provider. The four auxiliary families inherit the primary model until
+      // the user gives one its own model.
       const { next } = setClaudeRouteFromProvider(config, name);
       writeConfig(next);
       const updated = getRoutes(next);
       console.log("Claude routes updated:");
-      console.log(`  model ${MAIN_ALIAS.padEnd(28)} -> ${updated.main.provider} / ${updated.main.model}`);
-      console.log(`  fast  ${SMALL_ALIAS.padEnd(28)} -> ${updated.small.provider} / ${updated.small.model}`);
+      for (const slot of ROUTE_DEFS.claude.slots) {
+        const entry = updated[slot];
+        if (!entry) continue;
+        const alias = ROUTE_DEFS.claude.aliases[slot];
+        const suffix = slot === "main" ? "" : "  (inherits main)";
+        console.log(`  ${slot.padEnd(6)}${alias.padEnd(28)} -> ${entry.provider} / ${entry.model}${suffix}`);
+      }
       return;
     }
 
@@ -643,18 +649,22 @@ async function handleRoute(args) {
     }
     if (target === "claude") {
       const mainModel = opts["--main-model"] || opts["--model"];
-      const smallModel = opts["--small-model"] || mainModel;
-      if (!mainModel || !smallModel) {
+      if (!mainModel) {
         throw new Error(
           "Usage: originrouter route set claude --provider <name> " +
-          "--main-model <model> [--small-model <model>]",
+          "--main-model <model> [--opus <model|inherit>] [--sonnet <model|inherit>] " +
+          "[--haiku <model|inherit>] [--fable <model|inherit>]",
         );
       }
       const provider = opts["--provider"];
-      const next = replaceAgentRoutes(config, "claude", {
-        main: { provider, model: mainModel },
-        small: { provider, model: smallModel },
-      });
+      const routes = { main: { provider, model: mainModel } };
+      // An auxiliary family omitted here — or given the literal `inherit` —
+      // follows the primary model. Only an explicit model id is written.
+      for (const slot of ROUTE_DEFS.claude.inheritsFromPrimary) {
+        const value = opts[`--${slot}`];
+        if (value && value !== "inherit") routes[slot] = { provider, model: value };
+      }
+      const next = replaceAgentRoutes(config, "claude", routes);
       writeConfig(next);
       console.log("Claude routes set.");
       printRouteShow(next, "claude");
@@ -975,7 +985,7 @@ function flagsToProviderPayload(opts) {
   const keys = [
     "name", "type", "litellmProvider",
     "baseUrl", "apiKey", "authToken", "organization",
-    "model", "smallFastModel", "apiVersion",
+    "model", "apiVersion",
     "awsRegion", "awsAccessKeyId", "awsSecretAccessKey",
     "awsSessionToken", "awsProfileName",
     "awsBedrockRuntimeEndpoint", "awsRoleName", "awsSessionName",
@@ -1002,16 +1012,6 @@ function updateProviderFromFlags(config, name, opts) {
   // record is preserved for any field not in the patch.
   const { name: _ignored, ...patch } = payload;
   return applyProviderUpdate(config, name, patch);
-}
-
-// Stage 7.8: --small-fast-model is [legacy]. Still accepted on add and
-// update (the field round-trips on disk) but no longer seeds
-// routes.claude.small. Print a one-line note so the user sees the
-// canonical way to set fast.
-function maybeNoteLegacySmallFastModel(opts) {
-  if (opts && opts.smallFastModel) {
-    console.log("Note: --small-fast-model is [legacy]; use `originrouter route set claude.small --provider <name>` instead.");
-  }
 }
 
 // ---------- env print ----------
@@ -1101,9 +1101,16 @@ async function handleEnvPrint(args) {
     const routes = getRoutes(config);
     const eff = effectiveRoutes(routes);
     console.log("Claude routes:");
-    if (eff.main)  console.log(`  model ${MAIN_ALIAS.padEnd(28)} -> ${eff.main.provider} / ${eff.main.model}`);
-    if (eff.small) console.log(`  fast  ${SMALL_ALIAS.padEnd(28)} -> ${eff.small.provider} / ${eff.small.model}${eff.small._fallback ? " (falls back to main)" : ""}`);
-    if (!eff.main) console.log("  (no routes — run `originrouter route set claude.main --provider <name> --model <model>`)");
+    const hasAnyRoute = ROUTE_DEFS.claude.slots.some((slot) => eff[slot]);
+    for (const slot of ROUTE_DEFS.claude.slots) {
+      const entry = eff[slot];
+      if (!entry) continue;
+      const alias = ROUTE_DEFS.claude.aliases[slot];
+      const marker = slot === ROUTE_DEFS.claude.primarySlot ? "model" : slot.padEnd(5);
+      const suffix = entry._fallback ? "  (inherits main)" : "";
+      console.log(`  ${marker} ${alias.padEnd(28)} -> ${entry.provider} / ${entry.model}${suffix}`);
+    }
+    if (!hasAnyRoute) console.log("  (no routes — run `originrouter route set claude.main --provider <name> --model <model>`)");
     if (flagName) {
       console.log(`\nNote: --provider ${flagName} is deprecated for claude. Routes are the source of truth.`);
     }
@@ -1204,6 +1211,11 @@ async function handleEnvPrint(args) {
   if (providerResult?.source) {
     console.log(`\nSource: ${providerResult.source}`);
   }
+  // One-shot advisory for the only behavioural regression of the slot change:
+  // a legacy claude.small (formerly a cheap fast model) is dropped, so the
+  // Haiku family now follows the primary model. Never persisted.
+  const routesWarning = agent === "claude" ? claudeRoutesMigrationWarning(config) : null;
+  if (routesWarning) console.log(`\nWarning: ${routesWarning}`);
 
   console.log(`\nEffective env (what ${agent} will see):`);
   const providerKeys = Object.keys(providerEnv);
@@ -1292,6 +1304,8 @@ async function printDoctor(args = []) {
   const config = readConfig();
   const cur = config.currentProvider || {};
   if (cur.claude) console.log(`Default provider (claude): ${cur.claude}`);
+  const routesWarning = claudeRoutesMigrationWarning(config);
+  if (routesWarning) console.log(`  warning: ${routesWarning}`);
 
   // Stage 9.8: 接入 auth / relay / connectivity 检查。
   // 不打印 banner 重复（已经在文件顶部），只追加新 section。
@@ -1460,6 +1474,31 @@ export async function main(argv) {
   }
 
   if (command === "daemon") {
+    // The daemon is managed by launchd (macOS), systemd (Linux) or a scheduled
+    // task (Windows) once `service install` has run — and those supervisors
+    // restart it on exit. Starting a second instance therefore cannot replace
+    // the running one: it just fails to bind the API port, drifts to the next
+    // free one and stays alive printing nothing. Delegating these verbs to the
+    // service manager is what actually stops and replaces the process.
+    const daemonAction = daemonServiceAction(args);
+    if (daemonAction) {
+      await handleServiceCommand([
+        daemonAction,
+        ...args.filter((arg) => arg !== daemonAction),
+      ]);
+      return;
+    }
+    // Everything below is a foreground daemon. It is a real command — it is how
+    // `--relay` / `--device` / `--local-port` are passed for one run, and it is
+    // what the service supervisor executes — so it must not be blocked outright.
+    // Only a *second* daemon beside a live one is refused: that one cannot take
+    // over, it just drifts to a free port and rewrites the port App pairing
+    // reads, while the terminal looks hung.
+    //
+    // Keyed on the recorded daemon being alive, not on a service being installed:
+    // the supervisor may be between restarts, and refusing then would leave the
+    // machine waiting on launchd instead of starting.
+    assertNoRunningDaemon();
     await startDaemon(args);
     return;
   }

@@ -188,6 +188,21 @@ export class ExternalAgentRegistry {
     }
   }
 
+  // Attachment is the CLI's first-class presence fact: an Agent process is
+  // attached from registration until it unregisters or goes stale. Cloud and
+  // App state are projections of this, never a second source of truth.
+  attachmentOf(sessionId) {
+    const session = this.sessions.get(String(sessionId || ""));
+    if (!session) return null;
+    return {
+      sessionId: session.sessionId,
+      attached: session.attached !== false,
+      attachedAtMs: Number(session.attachedAtMs) || null,
+      detachedAtMs: Number(session.detachedAtMs) || null,
+      lastSeenAtMs: Number(session.lastSeenAtMs) || null,
+    };
+  }
+
   register(payload) {
     const sessionId = safeText(payload?.sessionId, 64);
     if (!sessionId) throw new Error("sessionId is required");
@@ -226,6 +241,12 @@ export class ExternalAgentRegistry {
       startedAt:
         safeText(payload?.startedAt, 64) || existing?.startedAt || nowIso(),
       lastSeenAtMs: this.now(),
+      // Re-registration is a fresh attach. The previous detach (if any) is
+      // cleared so the cloud projection flips back to attached on one fact
+      // instead of inferring it from a later event.
+      attached: true,
+      attachedAtMs: this.now(),
+      detachedAtMs: null,
       events: conversationChanged ? [] : existing?.events || [],
       eventIds:
         (!conversationChanged && existing?.eventIds) ||
@@ -363,14 +384,24 @@ export class ExternalAgentRegistry {
     if (!session) return false;
     session.status = safeText(status, 32) || "stopped";
     session.lastSeenAtMs = this.now();
+    session.attached = false;
+    session.detachedAtMs = this.now();
     try {
       this.catalog?.finishSession(sessionId, {
         status: session.status,
         exitedAt: new Date(this.now()).toISOString(),
       });
     } catch {}
+    // Keep the session in the registry briefly so the detach notification can
+    // be forwarded before any later lookup fails. It is removed on the next
+    // pass once the projection has been emitted.
+    this.notify("unregistered", sessionId, {
+      status: session.status,
+      attached: false,
+      detachedAt: new Date(session.detachedAtMs).toISOString(),
+      session: this.project(session),
+    });
     this.sessions.delete(sessionId);
-    this.notify("unregistered", sessionId, { status: session.status });
     return true;
   }
 
@@ -625,12 +656,22 @@ export class ExternalAgentRegistry {
     for (const session of this.sessions.values()) {
       if (session.status === "running" && session.lastSeenAtMs < cutoff) {
         session.status = "stopped";
+        session.attached = false;
+        session.detachedAtMs = this.now();
         try {
           this.catalog?.finishSession(session.sessionId, {
             status: "stopped",
             exitedAt: new Date(this.now()).toISOString(),
           });
         } catch {}
+        // The detach is a fact the cloud must learn even though the local
+        // listener only runs while a relay connection is up; the next relay
+        // open replays it through the presence reconcile.
+        this.notify("updated", session.sessionId, {
+          status: "stopped",
+          attached: false,
+          detachedAt: new Date(session.detachedAtMs).toISOString(),
+        });
       }
     }
   }
@@ -661,6 +702,16 @@ export class ExternalAgentRegistry {
             ? session.currentStep
             : "Stopped",
       last_activity_at: new Date(session.lastSeenAtMs).toISOString(),
+      // Attachment is the authoritative presence fact. `status` describes the
+      // turn; `attached` describes whether the Agent process is still here.
+      // The cloud mirrors both and must never derive one from the other.
+      attached: session.attached !== false,
+      attached_at: session.attachedAtMs
+        ? new Date(session.attachedAtMs).toISOString()
+        : null,
+      detached_at: session.detachedAtMs
+        ? new Date(session.detachedAtMs).toISOString()
+        : null,
       pending_approval_count: session.pendingInteractions.size,
       control_path: "local",
       mode: session.mode,

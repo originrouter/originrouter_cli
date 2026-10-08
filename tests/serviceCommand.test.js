@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
 
 import {
+  assertNoRunningDaemon,
   buildLaunchdPlist,
   buildServiceEnvironmentPath,
   buildSystemdUnit,
   buildWindowsTaskXml,
   buildWindowsElevationCommand,
+  daemonServiceAction,
   waitForLocalApiReady,
   waitForLaunchdUnloaded,
+  warnIfLocalApiPortMoved,
 } from "../src/commands/service.js";
+import { liveDaemonPid } from "../src/daemon/daemonPrimitives.js";
 
 const common = {
   nodePath: "/usr/local/bin/node",
@@ -192,6 +196,110 @@ const common = {
     }),
   }), /not ready within 40ms/);
   assert.ok(Date.now() - startedAt < 500, "a stalled HTTP request must respect the readiness deadline");
+}
+
+// `originrouter daemon stop|restart|status` must reach the service manager.
+// Left as plain `startDaemon` they start a second, unmanaged instance that
+// cannot bind the port, drifts to the next one and hangs — which reads as a
+// successful restart while the real daemon keeps running the old code.
+{
+  assert.equal(daemonServiceAction(["restart"]), "restart");
+  assert.equal(daemonServiceAction(["stop"]), "stop");
+  assert.equal(daemonServiceAction(["status"]), "status");
+  assert.equal(daemonServiceAction(["restart", "--dry-run"]), "restart");
+  assert.equal(daemonServiceAction(["--dry-run", "stop"]), "stop");
+
+  // `daemon start` selects nothing on its own — a bare `daemon` already starts
+  // one in the foreground — so it routes to the supervisor and means what
+  // `service start` means everywhere else.
+  assert.equal(daemonServiceAction(["start"]), "start");
+  assert.equal(daemonServiceAction(["start", "--dry-run"]), "start");
+
+  // A bare `originrouter daemon` still starts a foreground daemon, and daemon
+  // flags that merely resemble verbs must not be hijacked.
+  assert.equal(daemonServiceAction([]), null);
+  assert.equal(daemonServiceAction(["--relay", "https://example.test"]), null);
+  assert.equal(daemonServiceAction(["--executor", "pty"]), null);
+}
+
+// A foreground `daemon` beside a running one is the trap the delegation above
+// exists to avoid — it cannot bind the port, drifts, and rewrites pairing state.
+// The guard keys on the recorded daemon being alive, never on a service merely
+// being installed: the supervisor may be between restarts, and refusing then
+// would leave the machine waiting on launchd instead of starting.
+{
+  const dead = { pid: 999_999 };
+  const stale = () => { const error = new Error("kill ESRCH"); error.code = "ESRCH"; throw error; };
+
+  // No recorded daemon, or one that is gone: a start is legitimate.
+  assert.doesNotThrow(() => assertNoRunningDaemon({ state: null, isAlive: liveDaemonPid }));
+  assert.doesNotThrow(() => assertNoRunningDaemon({ state: {}, isAlive: liveDaemonPid }));
+  assert.doesNotThrow(() => assertNoRunningDaemon({ state: { pid: 0 }, isAlive: liveDaemonPid }));
+  assert.doesNotThrow(() => assertNoRunningDaemon({ state: { pid: "nope" }, isAlive: liveDaemonPid }));
+  assert.doesNotThrow(
+    () => assertNoRunningDaemon({ state: dead, isAlive: (_s, kill) => liveDaemonPid(_s, kill) }),
+    "a stale record must not block a foreground start",
+  );
+
+  // A live daemon: refuse, and name the pid so the message is actionable.
+  assert.throws(
+    () => assertNoRunningDaemon({ state: { pid: 1234 }, isAlive: () => 1234 }),
+    /already running \(pid 1234\)/,
+  );
+}
+
+// `liveDaemonPid` probes with signal 0 so it never disturbs the daemon the
+// service manager owns — a stray signal would stop it.
+{
+  const calls = [];
+  const probe = (pid, signal) => {
+    calls.push([pid, signal]);
+    const error = new Error("ESRCH");
+    error.code = "ESRCH";
+    throw error;
+  };
+
+  assert.equal(liveDaemonPid({ pid: 4321 }, probe), null);
+  assert.deepEqual(calls, [[4321, 0]], "must probe with signal 0, not a real signal");
+
+  // EPERM means the process exists under another user; that still counts.
+  const eperm = () => { const error = new Error("EPERM"); error.code = "EPERM"; throw error; };
+  assert.equal(liveDaemonPid({ pid: 4321 }, eperm), 4321);
+
+  assert.equal(liveDaemonPid(null, probe), null);
+  assert.equal(liveDaemonPid({}, probe), null);
+  assert.equal(liveDaemonPid({ pid: -1 }, probe), null);
+}
+
+// A port that moved must be reported by the command the user ran. The daemon
+// writes the same warning into its own log, but under a service manager that log
+// is the only place it would exist — the process is detached and the terminal is
+// gone — so a shift has to surface here instead.
+{
+  const captured = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => captured.push(args.join(" "));
+  try {
+    // No shift: silent. A correct restart must not cry wolf.
+    warnIfLocalApiPortMoved(7437, "http://127.0.0.1:7437");
+
+    // Unparseable inputs must not produce a bogus warning either.
+    warnIfLocalApiPortMoved(null, "http://127.0.0.1:7437");
+    warnIfLocalApiPortMoved(7437, null);
+    warnIfLocalApiPortMoved(undefined, undefined);
+
+    assert.equal(captured.length, 0, "a normal start warns about nothing");
+
+    // A shift: exactly one message, naming both ports and the pinning command.
+    warnIfLocalApiPortMoved(7438, "http://127.0.0.1:7437");
+    assert.equal(captured.length, 1);
+    const message = captured[0];
+    assert.match(message, /port 7438 was in use/);
+    assert.match(message, /daemon is on 7437/);
+    assert.match(message, /originrouter local api set-port/);
+  } finally {
+    console.warn = originalWarn;
+  }
 }
 
 console.log("service command tests ok");

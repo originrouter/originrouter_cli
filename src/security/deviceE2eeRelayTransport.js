@@ -1,4 +1,9 @@
-import { DeviceE2eeSession } from "../crypto/deviceE2eeEnvelope.js";
+import {
+  DeviceE2eeGroupSession,
+  DeviceE2eeSession,
+  isGroupKeyId,
+  isGroupTarget,
+} from "../crypto/deviceE2eeEnvelope.js";
 import {
   cachedDeviceStatus,
   currentCachedDeviceIdentity,
@@ -10,6 +15,10 @@ import {
   storeDeviceE2eeDirectoryCache,
 } from "./deviceE2eeDirectoryCache.js";
 import { getCliDeviceE2eeDirectory } from "./deviceE2eeClient.js";
+import {
+  ensureSessionGroupKey,
+  readSessionGroupKey,
+} from "./sessionGroupKeyStore.js";
 
 export const PROTECTED_DEVICE_MESSAGE_TYPES = new Set([
   "agent.control.subscribe",
@@ -95,6 +104,52 @@ function withoutUndefined(value) {
     );
   }
   return value;
+}
+
+// The session ids a subscribe actually names.
+//
+// Deliberately narrower than `routeKeys`, which folds in requestId,
+// interactionId, target/source device ids and the like. Those name a *route*
+// — the address a reply travels back on — and a request id in particular is
+// fresh on every call, so treating one as a session mints a group key that
+// nothing ever publishes under and that no device will ever ask for again.
+//
+// Only a real session id may back a group key. A subscribe that names none
+// (a pure snapshot poll, say) mints nothing, which is correct: there is no
+// session for the key to belong to.
+function subscribeSessionIds(payload = {}) {
+  const values = [
+    text(payload.sessionId),
+    text(payload.session_id),
+    ...(Array.isArray(payload.sessionIds) ? payload.sessionIds.map(text) : []),
+  ];
+  return [...new Set(values.filter(Boolean))];
+}
+
+// The group keys a subscriber says it already holds, as { sessionId: keyId }.
+//
+// A subscribe is not a one-off: the App re-subscribes on every reconnect and on
+// every directory lifecycle event, and each subscribe names every session the
+// device knows about. Answering each one with the full key set turns a steady
+// state into a stream of redundant envelopes that saturates the per-session
+// send queue — one live event then waits behind hundreds of key deliveries that
+// carry no new information.
+//
+// The subscriber is the only party that knows what it holds, so it reports it
+// and the CLI skips what has not changed. A key that is absent, or whose id
+// differs from the current one, is still sent: that is rotation, and skipping
+// it would silently strand a subscriber on a key nothing publishes under.
+function knownGroupKeyIds(payload = {}) {
+  const raw = payload.knownGroupKeyIds || payload.known_group_key_ids;
+  const known = new Map();
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [sessionId, keyId] of Object.entries(raw)) {
+      const id = text(sessionId);
+      const value = text(keyId);
+      if (id && value) known.set(id, value);
+    }
+  }
+  return known;
 }
 
 function routeKeys(payload = {}, routing = {}) {
@@ -307,6 +362,83 @@ export class DeviceE2eeRelayTransport {
     }
   }
 
+  // Hand a subscriber the session group key over the pairwise session it just
+  // established. The server never sees this: the key is sealed the same way
+  // every other payload is, so the relay forwards one more opaque envelope.
+  async _deliverGroupKey(payload, session, sessionIds = null) {
+    // Deliberately narrower than `routeKeys`, which also folds in requestId and
+    // targetDeviceId. Only real session ids name a publish route; a group key
+    // minted for a request id would be a key nothing ever publishes under.
+    //
+    // The caller passes the set it already minted for, so delivery and minting
+    // can never disagree about which sessions this subscribe covers.
+    const targets = sessionIds ?? subscribeSessionIds(payload);
+    // A subscriber that already holds the current key for a session does not
+    // need it again. This is what makes a re-subscribe cheap: the steady state
+    // sends nothing at all, so a live event is never queued behind key
+    // deliveries it does not depend on.
+    const known = knownGroupKeyIds(payload);
+    // Collect first, send once. A subscribe carries every session the App
+    // knows about — dozens of them — and each key used to be its own awaited
+    // round trip on the same pairwise session. Because `_sendOnSession`
+    // serializes per session (and it must: the pairwise sequence has to
+    // advance in send order), those round trips could not overlap, so a
+    // 40-session subscribe spent ~6s here. Worse, this runs inside
+    // `_handleInboundSerial`, so every envelope behind it waited on the
+    // wire, not on the work: history pages arrived ~18s late and the App
+    // rendered a partial conversation until they caught up.
+    //
+    // Delivery is the only thing being batched — each session keeps its own
+    // key, and the frames are identical to the ones sent before.
+    const keys = [];
+    for (const sessionId of targets) {
+      const record = ensureSessionGroupKey(this.stateDir, sessionId);
+      if (!record) continue;
+      if (known.get(sessionId) === record.group_key_id) continue;
+      keys.push({
+        sessionId,
+        groupKeyId: record.group_key_id,
+        // The App reads `groupKey`; the field name is the wire contract.
+        groupKey: Buffer.from(record.key).toString("base64url"),
+      });
+    }
+    if (keys.length === 0) return;
+    await this._sendOnSession(session, "agent.groupkey.response", { keys });
+  }
+
+  async _publishGroup(type, payload, { routeKey, subscriberSessions = null }) {
+    const sessionId = text(routeKey) || text(payload.sessionId) || text(payload.session_id);
+    if (!sessionId) return null;
+    const record = readSessionGroupKey(this.stateDir, sessionId);
+    if (!record) return null;
+    // The caller may already hold the subscriber set — and in the targeted case
+    // it deliberately excludes the explicit recipient, which the relay does not
+    // know as a subscriber. Recomputing it here would put that recipient back
+    // in the fan-out and lose the sealed copy it needs.
+    const subscribers = subscriberSessions
+      ?? this._subscriberSessions(sessionId);
+    if (subscribers.length === 0) return { accepted: false, reason: "no_subscribers" };
+    const localIdentity = this._refreshLocalIdentity();
+    const group = new DeviceE2eeGroupSession({
+      local: localIdentity,
+      sessionId,
+      groupKeyId: record.group_key_id,
+      key: record.key,
+    });
+    const envelope = group.seal(type, withoutUndefined(payload), {
+      routing: { session_id: sessionId },
+    });
+    const result = await this.relayClient.sendEnvelope(envelope);
+    const delivery = result?.data || result || {};
+    return {
+      accepted: delivery.accepted !== false,
+      reason: delivery.accepted === false ? (delivery.reason || "relay_rejected") : "",
+      // Report the fan-out the relay performed so callers can log the real
+      // audience size; the wire carried exactly one ciphertext.
+      recipients: Number(delivery.recipients || 0) || undefined,
+    };
+  }
+
   _subscriberSessions(routeKey, { excludeSessionIds = null } = {}) {
     const subscribers = this.routeSubscribers.get(text(routeKey));
     if (!subscribers) return [];
@@ -334,6 +466,15 @@ export class DeviceE2eeRelayTransport {
 
   async _handleInboundSerial(envelope) {
     if (envelope?.protocol !== "e2ee-v2") return null;
+    // The CLI publishes group envelopes; it does not consume them. One arriving
+    // here is either a misrouted fan-out or an attempt to be read as pairwise,
+    // and pairwise acceptance would fail confusingly (no `target_device_id`
+    // match). Refuse it by shape, before the directory-head check, so the
+    // rejection is legible and does not depend on what routing the sender used.
+    if (isGroupTarget(envelope.target_device_id)
+        || isGroupKeyId(envelope.recipient_key_id)) {
+      return null;
+    }
     const localIdentity = this._refreshLocalIdentity();
     this._pruneSessions();
     await this._verifyPeerDirectoryHead(envelope?.routing?.directory_head);
@@ -362,7 +503,30 @@ export class DeviceE2eeRelayTransport {
       this.routes.set(key, session.sessionId);
     }
     if (payload.type === "agent.control.subscribe") {
+      // Subscribers are remembered against every route key — the request id is
+      // how a reply addressed to this poll is routed back, so it stays.
       this._rememberSubscribers(keys, session.sessionId);
+      // Group keys, by contrast, are minted only for real session ids. See
+      // `subscribeSessionIds` for why the two sets differ.
+      const sessionIds = subscribeSessionIds(payload);
+      // Mint synchronously, before the delivery is issued: a subscriber's own
+      // group key must exist by the time the next event publishes, or the
+      // first event after a subscribe would go out pairwise to everyone.
+      for (const sessionId of sessionIds) {
+        ensureSessionGroupKey(this.stateDir, sessionId);
+      }
+      // Deliver the key before returning this envelope's turn. This handler is
+      // serialized by `inboundTail`, so anything awaited here parks every
+      // envelope behind it — including the history page the App is waiting to
+      // render — and a subscribe that brings new sessions must not do that more
+      // than once: the key set is sent as one frame (see `_deliverGroupKey`),
+      // so a 40-session subscribe costs a single round trip rather than forty.
+      //
+      // It is awaited rather than fired and forgotten because the App drops a
+      // group event whose key it does not yet hold (`_openGroupIncoming`), and
+      // the first event after a subscribe can follow immediately. Ordering
+      // cannot be recovered later, so the key goes out first.
+      await this._deliverGroupKey(payload, session, sessionIds);
     }
     this._pruneRoutes();
     // Keep the origin metadata internal to the daemon. It is deliberately
@@ -571,8 +735,25 @@ export class DeviceE2eeRelayTransport {
   async sendBroadcast(type, payload = {}, { routeKey } = {}) {
     const key = text(routeKey) || text(payload.sessionId) || text(payload.session_id);
     const sessions = this._subscriberSessions(key);
-    if (sessions.length <= 1) return this.send(type, payload);
     const wirePayload = withoutUndefined(payload);
+    // No subscriber means the event went nowhere, and saying so is the useful
+    // answer. Falling through to `send` would fail on a route this session has
+    // no session for and raise a "no route" error for every streamed event,
+    // thousands per session, describing a situation that is not an error.
+    if (sessions.length === 0) return { accepted: false, reason: "no_subscribers" };
+    // Exactly one subscriber is a delivery, not a degenerate broadcast: that
+    // App must receive the event, and folding it into an early return would
+    // drop the only copy.
+    if (sessions.length === 1) {
+      return this._sendOnSession(sessions[0], type, wirePayload);
+    }
+    // One ciphertext for N viewers is the whole point of the group key: seal
+    // once under the session key and let the relay fan it out, instead of
+    // re-encrypting per subscriber. Only fall back to per-session encryption
+    // when there is no group key yet — a subscriber that has not finished its
+    // key delivery still has to receive the event.
+    const published = await this._publishGroup(type, wirePayload, { routeKey: key });
+    if (published?.accepted) return published;
     const results = await Promise.allSettled(
       sessions.map((session) => this._sendOnSession(session, type, wirePayload)),
     );
@@ -626,11 +807,26 @@ export class DeviceE2eeRelayTransport {
         excludeSessionIds: new Set([targetSession.sessionId]),
       }),
     ];
+    // The target's own sealed copy is what makes it authoritative, and it is
+    // sent on the pairwise session either way. The group publish is therefore
+    // an *additional* delivery for the other subscribers, worth its own
+    // ciphertext as soon as there is more than one of them. Dropping the target
+    // out of the count is the point: including it would make a two-viewer
+    // audience (target + one subscriber) pay two ciphertexts where one shared
+    // one plus the target's copy would do.
+    const subscribers = sessions.slice(1);
+    const published = subscribers.length > 1
+      ? await this._publishGroup(type, wirePayload, {
+        routeKey: key,
+        subscriberSessions: subscribers,
+      })
+      : null;
+    const pairwise = published ? [targetSession] : sessions;
     const results = await Promise.allSettled(
-      sessions.map((session) => this._sendOnSession(session, type, wirePayload)),
+      pairwise.map((session) => this._sendOnSession(session, type, wirePayload)),
     );
-    let accepted = false;
-    let reason = "";
+    let accepted = published ? published.accepted : false;
+    let reason = published ? published.reason : "";
     results.forEach((result, index) => {
       if (result.status === "fulfilled") {
         const delivery = result.value?.data || result.value || {};
@@ -638,7 +834,7 @@ export class DeviceE2eeRelayTransport {
         else reason ||= delivery.reason || "relay_rejected";
       } else {
         reason ||= result.reason?.code || result.reason?.message || "relay_error";
-        const session = sessions[index];
+        const session = pairwise[index];
         if (session) this._discardSession(session.sessionId);
       }
     });

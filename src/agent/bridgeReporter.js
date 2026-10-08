@@ -20,7 +20,6 @@ import {
   safeLocalControlRoutes,
   safeRemoteShareCatalog,
   safeText,
-  stripAnsi,
 } from "./bridgeProjections.js";
 
 export {
@@ -32,7 +31,6 @@ export {
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_APPROVAL_POLL_INTERVAL_MS = 2_000;
-const DEFAULT_TERMINAL_ACTIVITY_INTERVAL_MS = 2_000;
 const DEFAULT_AGENT_SESSION_HEARTBEAT_INTERVAL_MS = 30_000;
 
 function apiBase() {
@@ -68,6 +66,7 @@ async function resolveRelayAuth({
 export function buildRuntimeEventEnvelope({
   sessionId,
   agentType,
+  nativeSessionId = "",
   title,
   deviceName,
   workspaceDisplayPath,
@@ -80,9 +79,15 @@ export function buildRuntimeEventEnvelope({
 } = {}) {
   const projected = projectRuntimeEvent({ eventType, event, summary, riskLevel });
   if (!projected) return null;
+  const native = safeText(nativeSessionId, 191);
   return {
     session_id: safeText(sessionId, 64),
     agent_type: safeText(agentType, 32),
+    // Sent as "" until the provider hands us its conversation id (codex: at
+    // startup, claude: on the first `agent.session.start`). The server only
+    // writes it when non-empty, so the empty reports that precede it cannot
+    // erase a value recorded by an earlier run of the same session.
+    ...(native ? { native_session_id: native } : {}),
     title: safeText(title, 191),
     device_name: safeText(deviceName, 191),
     ...(safeText(workspaceDisplayPath, 4096)
@@ -111,6 +116,7 @@ export function buildRuntimeEventEnvelope({
 export function createRuntimeEventReporter({
   sessionId,
   agentType,
+  nativeSessionId = "",
   title,
   deviceName,
   workspaceDisplayPath = "",
@@ -157,6 +163,12 @@ export function createRuntimeEventReporter({
     const payload = buildRuntimeEventEnvelope({
       sessionId,
       agentType,
+      // A getter, because the native id for claude arrives partway through the
+      // run: reading the captured string would pin every later report to the
+      // empty value the reporter was created with.
+      nativeSessionId: typeof nativeSessionId === "function"
+        ? nativeSessionId()
+        : nativeSessionId,
       title,
       deviceName,
       workspaceDisplayPath,
@@ -684,89 +696,16 @@ export async function reportLocalControlRuntime(payload, {
   }
 }
 
-export function createTerminalActivityReporter({
-  sessionId,
-  agentType,
-  title,
-  deviceName,
-  stateDir = getStateDir(),
-  fetchFn = globalThis.fetch,
-  readCodingAuthFn = readCodingAuth,
-  timeoutMs = DEFAULT_TIMEOUT_MS,
-  flushIntervalMs = DEFAULT_TERMINAL_ACTIVITY_INTERVAL_MS,
-  reportRuntimeEventFn = reportRuntimeEvent,
-} = {}) {
-  let timer = null;
-  let stopped = false;
-  let stats = {
-    chunkCount: 0,
-    lineCount: 0,
-    byteCount: 0,
-  };
-
-  const flush = async () => {
-    if (stopped || stats.chunkCount <= 0) return;
-    const payload = buildRuntimeEventEnvelope({
-      sessionId,
-      agentType,
-      title,
-      deviceName,
-      eventType: "terminal.activity",
-      summary: "Terminal activity detected",
-      event: {
-        chunk_count: stats.chunkCount,
-        line_count: stats.lineCount,
-        byte_count: stats.byteCount,
-      },
-    });
-    stats = { chunkCount: 0, lineCount: 0, byteCount: 0 };
-    await reportRuntimeEventFn(payload, {
-      stateDir,
-      fetchFn,
-      readCodingAuthFn,
-      timeoutMs,
-    }).catch(() => {});
-  };
-
-  const schedule = () => {
-    if (timer || stopped) return;
-    timer = setTimeout(async () => {
-      timer = null;
-      await flush();
-    }, Math.max(50, flushIntervalMs));
-  };
-
-  return {
-    ingest(data) {
-      if (stopped) return;
-      const raw = String(data || "");
-      if (!raw) return;
-      const sanitized = stripAnsi(raw);
-      const lines = sanitized
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean);
-      stats.chunkCount += 1;
-      stats.lineCount += lines.length;
-      stats.byteCount += Buffer.byteLength(raw, "utf8");
-      schedule();
-    },
-    async flush() {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      await flush();
-    },
-    stop() {
-      stopped = true;
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    },
-  };
-}
+// `terminal.activity` was removed at the source (2026-10-07).
+//
+// The reporter counted PTY chunks/lines/bytes and posted a summary every 2 s
+// whenever the terminal produced ANY byte. No layer of the chain consumed it:
+// the CLI never read it back, the server registered a summary but kept it out
+// of `_STEP_BY_EVENT` so it could not move `current_step`, and the App had no
+// renderer or filter branch for it. Its only effect was 51k identical
+// "Terminal activity detected" rows that crowded real turn events out of the
+// App's most-recent-100 window — and, before the step tables above were fixed,
+// the send/stop button flicker.
 
 function approvalDecisionToRuntimeDecision(approval) {
   const decision = String(approval?.decision || "").trim().toLowerCase();

@@ -5,7 +5,6 @@ import {
   buildRuntimeEventEnvelope,
   buildAgentConversationMetadata,
   createRuntimeEventReporter,
-  createTerminalActivityReporter,
   pollResolvedApprovals,
   reportAgentConversationMetadata,
   reportAgentSessionHeartbeat,
@@ -456,32 +455,6 @@ test("startApprovalDecisionPolling retries when the adapter rejects delivery", a
   assert.equal(attempts, 2);
 });
 
-test("createTerminalActivityReporter emits display-safe terminal activity summaries", async () => {
-  const reported = [];
-  const reporter = createTerminalActivityReporter({
-    sessionId: "session-1",
-    agentType: "codex",
-    title: "Runtime session",
-    deviceName: "Mac Studio",
-    flushIntervalMs: 20,
-    reportRuntimeEventFn: async (payload) => {
-      reported.push(payload);
-      return { ok: true };
-    },
-  });
-
-  reporter.ingest("\u001b[31mRunning tests\u001b[0m\nline two\n");
-  reporter.ingest("line three");
-  await new Promise((resolve) => setTimeout(resolve, 60));
-  reporter.stop();
-
-  assert.equal(reported.length, 1);
-  assert.equal(reported[0].event_type, "terminal.activity");
-  assert.equal(reported[0].summary, "Terminal activity detected");
-  assert.equal(reported[0].event, undefined);
-  assert.equal(JSON.stringify(reported[0]).includes("Running tests"), false);
-});
-
 test("buildRuntimeEventEnvelope projects approvals without forwarding raw input", () => {
   const payload = buildRuntimeEventEnvelope({
     sessionId: "session-1",
@@ -846,4 +819,47 @@ test("disabled runtime reporter keeps collaboration workers out of ordinary serv
   await reporter.report("agent.event", { event: { type: "agent.text", text: "hidden" } });
   await reporter.flush();
   assert.equal(calls, 0);
+});
+
+test("runtime events omit native_session_id until the provider names the conversation", () => {
+  const before = buildRuntimeEventEnvelope({
+    sessionId: "s1",
+    agentType: "claude",
+    title: "Claude session",
+    eventType: "agent.ready",
+  });
+  assert.equal("native_session_id" in before, false);
+
+  const after = buildRuntimeEventEnvelope({
+    sessionId: "s1",
+    agentType: "claude",
+    nativeSessionId: "6f1c0e2a9d3b4a778e5f0b2c7d41a8e3",
+    title: "Claude session",
+    eventType: "agent.ready",
+  });
+  assert.equal(after.native_session_id, "6f1c0e2a9d3b4a778e5f0b2c7d41a8e3");
+});
+
+test("the reporter reads nativeSessionId per report, so a late id still travels", async () => {
+  const sent = [];
+  let nativeSessionId = "";
+  const reporter = createRuntimeEventReporter({
+    sessionId: "s1",
+    agentType: "claude",
+    nativeSessionId: () => nativeSessionId,
+    title: "Claude session",
+    enabled: true,
+    reportRuntimeEventFn: async (payload) => {
+      sent.push(payload);
+      return { ok: true };
+    },
+  });
+
+  await reporter.report("agent.ready");
+  assert.equal("native_session_id" in sent[0], false);
+
+  // The SDK names the conversation mid-run; later reports must carry it.
+  nativeSessionId = "6f1c0e2a9d3b4a778e5f0b2c7d41a8e3";
+  await reporter.report("agent.tool_call.start");
+  assert.equal(sent[1].native_session_id, "6f1c0e2a9d3b4a778e5f0b2c7d41a8e3");
 });

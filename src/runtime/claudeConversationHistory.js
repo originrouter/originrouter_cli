@@ -44,6 +44,26 @@ function cursorIndex(cursor, length) {
   return Math.max(0, Math.min(length, parsed));
 }
 
+// A transcript is parsed whole on every request, and paging back through a long
+// conversation re-reads and re-parses the entire file once per page. The file
+// only changes when the Agent appends to it, so the parsed timeline is kept
+// against the (mtime, size) it was built from and reused until either moves.
+// One entry: reading is per-session and requests for a transcript arrive
+// together, so a larger cache would only hold timestamps nothing asks for.
+let cachedTranscript = null;
+
+function parsedMessagesFor(transcriptPath, size, mtimeMs) {
+  if (cachedTranscript
+      && cachedTranscript.transcriptPath === transcriptPath
+      && cachedTranscript.size === size
+      && cachedTranscript.mtimeMs === mtimeMs) {
+    return cachedTranscript.messages;
+  }
+  const messages = parseMessages(readFileSync(transcriptPath, "utf8"));
+  cachedTranscript = { transcriptPath, size, mtimeMs, messages };
+  return messages;
+}
+
 export function claudeTranscriptPathForSession(cwd, sessionId) {
   const normalizedSessionId = String(sessionId || "").trim();
   if (!normalizedSessionId) return null;
@@ -59,13 +79,14 @@ export function readClaudeConversationHistory(
   if (!transcriptPath || !existsSync(transcriptPath)) {
     return { messages: [], nextCursor: null, hasMore: false };
   }
-  const size = statSync(transcriptPath).size;
+  const stat = statSync(transcriptPath);
+  const size = stat.size;
   if (size > MAX_TRANSCRIPT_BYTES) {
     const error = new Error("Claude transcript exceeds the local history size limit");
     error.code = "TRANSCRIPT_TOO_LARGE";
     throw error;
   }
-  const all = parseMessages(readFileSync(transcriptPath, "utf8"));
+  const all = parsedMessagesFor(transcriptPath, size, stat.mtimeMs);
   const end = cursorIndex(beforeCursor, all.length);
   const pageSize = Math.max(1, Math.min(MAX_LIMIT, Number(limit) || DEFAULT_LIMIT));
   const minimumStart = Math.max(0, end - pageSize);

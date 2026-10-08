@@ -529,8 +529,8 @@ try {
 
   // ---------- POST /providers/use ----------
   {
-    // Provider Use writes one coherent Claude profile. The legacy
-    // smallFastModel value does not pick a different Provider/model.
+    // Provider Use writes the primary slot only. The four auxiliary families
+    // stay unset, which is exactly "inherit the primary model".
     const { status, body } = await postJson("/providers/use", { name: "minimax", agent: "claude" });
     assert.equal(status, 200);
     assert.equal(body.ok, true);
@@ -538,49 +538,69 @@ try {
     assert.equal(body.setAgent, "claude");
     assert.equal(body.routes.claude.main.provider, "minimax");
     assert.equal(body.routes.claude.main.model,    "MiniMax-M3");
-    assert.deepEqual(body.routes.claude.small, body.routes.claude.main);
+    for (const slot of ["opus", "sonnet", "haiku", "fable"]) {
+      assert.equal(body.routes.claude[slot], null, slot);
+    }
     // The response carries proxy state (no proxy in this fixture).
     assert.equal(body.proxy.state, "not-installed");
   }
   {
-    // Switching Provider replaces both Claude aliases together.
+    // Switching Provider rewrites the primary slot.
     const { status, body } = await postJson("/providers/use", { name: "deepseek", agent: "claude" });
     assert.equal(status, 200);
     assert.equal(body.routes.claude.main.provider, "deepseek");
-    assert.equal(body.routes.claude.small.provider, "deepseek");
+    for (const slot of ["opus", "sonnet", "haiku", "fable"]) {
+      assert.equal(body.routes.claude[slot], null, slot);
+    }
   }
 
   // ---------- PUT /routes/claude is atomic and enforces one Provider ----------
   {
     const valid = await putJson("/routes/claude", {
       main: { provider: "deepseek", model: "deepseek-chat" },
-      small: { provider: "deepseek", model: "deepseek-chat" },
+      opus: { provider: "deepseek", model: "deepseek-chat" },
+      sonnet: null,
+      haiku: null,
+      fable: null,
     });
     assert.equal(valid.status, 200);
     assert.equal(valid.body.routes.claude.main.provider, "deepseek");
-    assert.equal(valid.body.routes.claude.small.provider, "deepseek");
+    assert.equal(valid.body.routes.claude.opus.provider, "deepseek");
+    assert.equal(valid.body.routes.claude.sonnet, null);
 
     const mixed = await putJson("/routes/claude", {
       main: { provider: "deepseek", model: "deepseek-chat" },
-      small: { provider: "minimax", model: "MiniMax-M3" },
+      opus: { provider: "minimax", model: "MiniMax-M3" },
     });
     assert.equal(mixed.status, 400);
     assert.match(mixed.body.error, /must use the same provider/);
 
+    // `small` is no longer a Claude slot: an un-upgraded client must get a
+    // diagnosable error rather than a silent no-op.
+    const legacySmall = await putJson("/routes/claude", {
+      main: { provider: "deepseek", model: "deepseek-chat" },
+      small: { provider: "deepseek", model: "deepseek-chat" },
+    });
+    assert.equal(legacySmall.status, 400);
+    assert.match(legacySmall.body.error, /unknown route slot 'small'/);
+
     const inherited = await putJson("/routes/claude", {
       main: null,
-      small: null,
+      sonnet: null,
+      haiku: null,
+      opus: null,
+      fable: null,
     });
     assert.equal(inherited.status, 200);
     assert.equal(inherited.body.routes.claude.main, null);
-    assert.equal(inherited.body.routes.claude.small, null);
+    assert.equal(inherited.body.routes.claude.haiku, null);
   }
   {
     // Stage 7.8+: Claude "current" markers in the browser must be derived
     // from routes.claude, not the legacy currentProvider.claude field.
     const restored = await putJson("/routes/claude", {
       main: { provider: "deepseek", model: "deepseek-chat" },
-      small: { provider: "deepseek", model: "deepseek-chat" },
+      opus: { provider: "deepseek", model: "deepseek-chat" },
     });
     assert.equal(restored.status, 200);
     writeConfig(setCurrentProvider(readConfig(), "claude", "minimax"));
@@ -632,7 +652,7 @@ try {
     assert.equal(body.routes.claude.main.provider, "deepseek");
     assert.equal(body.routes.codex.main.provider, "deepseek");
     assert.equal(body.aliases.main, undefined);
-    assert.equal(body.aliases.small, undefined);
+    assert.equal(body.aliases.opus, undefined);
     assert.equal(body.aliases.codex.main, "originrouter-codex-model");
     assert.equal(body.aliases.claude.main, "originrouter-claude-model");
   }
@@ -642,9 +662,9 @@ try {
     assert.equal(status, 200);
     assert.equal(body.agent, "codex");
     assert.equal(body.routes.main.provider, "deepseek");
-    // Codex has no small slot in Stage 8.0; the response shape is { main }
-    // without a `small` key.
+    // Codex has exactly one slot; the response shape is { main }.
     assert.equal(body.routes.small, undefined);
+    assert.equal(body.routes.opus, undefined);
   }
   {
     // POST /routes/codex/main works.
@@ -886,7 +906,7 @@ try {
       model: "deepseek-mini",
     });
     cfg = setRoute(cfg, "claude", "main",  { provider: "routed-main", model: "deepseek-chat" });
-    cfg = setRoute(cfg, "claude", "small", { provider: "routed-main", model: "deepseek-chat" });
+    cfg = setRoute(cfg, "claude", "haiku", { provider: "routed-main", model: "deepseek-chat" });
     writeConfig(cfg);
 
     // Remove an unrelated Provider: the grouped Claude profile is untouched.
@@ -894,18 +914,18 @@ try {
     assert.equal(r1.status, 200);
     assert.equal(r1.body.removed, "routed-fast");
     assert.equal(r1.body.routes.claude.main.provider,  "routed-main");
-    assert.equal(r1.body.routes.claude.small.provider, "routed-main");
+    assert.equal(r1.body.routes.claude.haiku.provider, "routed-main");
     assert.equal(r1.body.proxy && r1.body.proxy.state, "not-installed");
     const cfg1 = readConfig();
     assert.equal(cfg1.routes.claude.main.provider, "routed-main");
-    assert.equal(cfg1.routes.claude.small.provider, "routed-main");
+    assert.equal(cfg1.routes.claude.haiku.provider, "routed-main");
     assert.equal(cfg1.providers["routed-fast"], undefined);
 
     // Removing the selected Provider clears the whole Claude profile.
     const r2 = await deleteJson("/providers/routed-main");
     assert.equal(r2.status, 200);
     assert.equal(r2.body.routes.claude.main,  null);
-    assert.equal(r2.body.routes.claude.small, null);
+    assert.equal(r2.body.routes.claude.haiku, null);
     const cfg2 = readConfig();
     assert.equal(cfg2.routes, undefined, "all route slots cleared → routes object removed");
     assert.equal(cfg2.providers["routed-main"], undefined);
@@ -1329,7 +1349,7 @@ try {
     assert.match(body.error, /no longer supported/);
   }
 
-  // ---------- PUT smallFastModel on litellm -> warnings[] returned ----------
+  // ---------- PUT smallFastModel on litellm -> inert legacy metadata ----------
   {
     // Reset deepseek to a fresh litellm record.
     writeConfig(addProvider(readConfig(), {
@@ -1343,8 +1363,9 @@ try {
       smallFastModel: "fast",
     });
     assert.equal(status, 200);
-    // Stage 7.6: smallFastModel on litellm is allowed (it's a seed for
-    // routes.claude.small on provider use). No warning, no drop.
+    // The field is still accepted (and returned) so upgrading does not 500 on
+    // an existing record, but it no longer seeds any route: `provider use`
+    // only writes the primary slot now.
     assert.equal(body.provider.smallFastModel, "fast");
     assert.equal(body.warnings.length, 0);
   }

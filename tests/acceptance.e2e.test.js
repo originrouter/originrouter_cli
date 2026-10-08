@@ -123,7 +123,12 @@ try {
   assertStep("step 4: provider add exit 0", addResult.code === 0, `stderr=${addResult.stderr}`);
   const cfg = JSON.parse(readFileSync(configPath, "utf8"));
   assertStep("step 4: config.json has deepseek", !!cfg.providers?.deepseek);
-  assertStep("step 4: deepseek is type=litellm", cfg.providers.deepseek.type === "litellm");
+  // `--type litellm` is a CLI-input compatibility alias: it is normalized to
+  // type "proxy" + engine "litellm" on write (see normalizeProviderForWrite in
+  // src/config/providers.js). Asserting the alias itself was written never held
+  // after that rename — this step only passed while the daemon failed to start.
+  assertStep("step 4: deepseek is type=proxy", cfg.providers.deepseek.type === "proxy");
+  assertStep("step 4: deepseek engine=litellm", cfg.providers.deepseek.engine === "litellm");
   assertStep("step 4: deepseek.litellmProvider=deepseek", cfg.providers.deepseek.litellmProvider === "deepseek");
 
   // Step 4c: provider add --type openai-compatible exits non-zero (Stage 7 migration).
@@ -157,8 +162,13 @@ try {
   ], { env });
   assertStep("step 4b: provider update exit 0", updateResult.code === 0, `stderr=${updateResult.stderr}`);
   const cfgAfter = JSON.parse(readFileSync(configPath, "utf8"));
-  assertStep("step 4b: legacy auto-normalized to litellm",
-    cfgAfter.providers["legacy-deepseek"].type === "litellm");
+  // A legacy on-disk record is projected to the Stage 9.0 shape on write, the
+  // same way `--type litellm` is: the alias becomes type "proxy" + engine
+  // "litellm". Asserting the alias itself was persisted never held after that
+  // rename — this step only passed while the daemon failed to start.
+  assertStep("step 4b: legacy auto-normalized to proxy/litellm",
+    cfgAfter.providers["legacy-deepseek"].type === "proxy"
+    && cfgAfter.providers["legacy-deepseek"].engine === "litellm");
   assertStep("step 4b: litellmProvider=custom_openai",
     cfgAfter.providers["legacy-deepseek"].litellmProvider === "custom_openai");
   assertStep("step 4b: baseUrl preserved/updated",
@@ -210,8 +220,9 @@ try {
   assertStep("step 8: env print includes fixed model alias",
     envResult.stdout.includes("ANTHROPIC_MODEL=originrouter-claude-model"),
     `stdout=${envResult.stdout}`);
-  assertStep("step 8: env print includes fixed fast alias",
-    envResult.stdout.includes("ANTHROPIC_SMALL_FAST_MODEL=originrouter-claude-fast-model"),
+  assertStep("step 8: env print includes every auxiliary family alias",
+    envResult.stdout.includes("ANTHROPIC_DEFAULT_OPUS_MODEL=originrouter-claude-opus")
+    && envResult.stdout.includes("ANTHROPIC_DEFAULT_HAIKU_MODEL=originrouter-claude-haiku"),
     `stdout=${envResult.stdout}`);
   assertStep("step 8: env print masks the noop api key",
     envResult.stdout.includes("ANTHROPIC_API_KEY=sk-n...gh")
@@ -363,8 +374,9 @@ try {
   assertStep("step 15: env print shows ANTHROPIC_MODEL=originrouter-claude-model",
     /ANTHROPIC_MODEL=originrouter-claude-model\b/.test(envResult2.stdout),
     `stdout=${envResult2.stdout}`);
-  assertStep("step 15: env print shows ANTHROPIC_SMALL_FAST_MODEL=originrouter-claude-fast-model",
-    /ANTHROPIC_SMALL_FAST_MODEL=originrouter-claude-fast-model\b/.test(envResult2.stdout),
+  assertStep("step 15: env print shows the auxiliary family aliases",
+    /ANTHROPIC_DEFAULT_OPUS_MODEL=originrouter-claude-opus\b/.test(envResult2.stdout)
+    && /ANTHROPIC_DEFAULT_FABLE_MODEL=originrouter-claude-fable\b/.test(envResult2.stdout),
     `stdout=${envResult2.stdout}`);
   assertStep("step 15: env print shows ANTHROPIC_BASE_URL",
     envResult2.stdout.includes(`ANTHROPIC_BASE_URL=http://127.0.0.1:${proxyPort}`),

@@ -251,9 +251,11 @@ try {
   // type=anthropic on a legacy record still produces the direct env
   // (the read-side normalizeProviderForRead does not rewrite when this
   // helper is called directly).
+  // A provider-level smallFastModel never reaches the env: the field is inert
+  // legacy metadata now that the fast-model variable is out of the inject set.
   assert.deepEqual(
     buildProviderEnv({ name: "a", type: "anthropic", baseUrl: "https://x", apiKey: "sk", model: "m", smallFastModel: "fast" }),
-    { ANTHROPIC_BASE_URL: "https://x", ANTHROPIC_API_KEY: "sk", ANTHROPIC_MODEL: "m", ANTHROPIC_SMALL_FAST_MODEL: "fast" },
+    { ANTHROPIC_BASE_URL: "https://x", ANTHROPIC_API_KEY: "sk", ANTHROPIC_MODEL: "m" },
   );
   assert.deepEqual(buildProviderEnv({ name: "b", type: "proxy", engine: "litellm", apiKey: "sk", model: "m" }), {});
 
@@ -306,10 +308,9 @@ try {
   // proxy -> ok, no proxy warning (it's the wired path now).
   const docDs = doctorProvider(cfg.providers.deepseek);
   assert.equal(docDs.ok, true);
-  // Stage 7.6: smallFastModel on proxy is allowed (it's a seed for the
-  // routes.claude.small route). doctor does NOT warn about it. The
-  // warning is reserved for the legacy projection case (smallFastModel
-  // on a record that read-projects from type=anthropic without routes).
+  // smallFastModel on a proxy record is still accepted and still does NOT
+  // trigger a doctor warning: the field round-trips for backward compat even
+  // though nothing consumes it any more.
   const proxyWithFast = {
     name: "weird", type: "proxy", engine: "litellm", litellmProvider: "deepseek",
     apiKey: "sk", model: "m", smallFastModel: "fast",
@@ -412,8 +413,8 @@ try {
   assert.equal(warnings.length, 0);
 
   // ---------------- setClaudeRouteFromProvider grouped contract ----------------
-  // 1. Provider Use writes one coherent main + small profile. The legacy
-  //    smallFastModel field is ignored; both aliases seed from an enabled model.
+  // 1. Provider Use writes the primary slot only; all four auxiliary families
+  //    are left unset, which is exactly "inherit the primary model".
   {
     const cfg78 = {
       providers: {
@@ -422,19 +423,23 @@ try {
     };
     const { next } = setClaudeRouteFromProvider(cfg78, "p1");
     assert.equal(getRoutes(next).main.provider, "p1");
-    assert.deepEqual(getRoutes(next).small, getRoutes(next).main);
+    assert.equal(getRoutes(next).main.model, "m");
+    for (const slot of ["opus", "sonnet", "haiku", "fable"]) {
+      assert.equal(getRoutes(next)[slot], null, slot);
+    }
   }
-  // 2. An old inconsistent small route is replaced, not preserved.
+  // 2. A pre-existing auxiliary route pointing at another Provider is dropped,
+  //    not preserved: switching Provider replaces the whole profile.
   {
     const cfg78b = {
       providers: {
         p1: { name: "p1", type: "proxy", engine: "litellm", litellmProvider: "deepseek", model: "m" },
       },
-      routes: { claude: { small: { provider: "x", model: "y" } } },
+      routes: { claude: { main: { provider: "p1", model: "m" }, haiku: { provider: "x", model: "y" } } },
     };
     const { next: next2 } = setClaudeRouteFromProvider(cfg78b, "p1");
     assert.equal(getRoutes(next2).main.provider, "p1");
-    assert.equal(getRoutes(next2).small.provider, "p1");
+    assert.equal(getRoutes(next2).haiku, null);
   }
   // 3. Return shape no longer carries smallPreserved.
   {

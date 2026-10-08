@@ -26,7 +26,7 @@ export const RECOMMENDED_CLOUD_MODELS = Object.freeze({
     "claude-sonnet-4-5",
     "claude-opus-5",
   ]),
-  claudeSmall: Object.freeze([
+  claudeHaiku: Object.freeze([
     "claude-haiku-4-5",
     "claude-sonnet-4-6",
     "claude-sonnet-4-5",
@@ -44,7 +44,7 @@ export const RECOMMENDED_CLOUD_MODELS = Object.freeze({
 // to models currently available to the signed-in account.
 export const DEFAULT_CLOUD_ROUTE_MODELS = Object.freeze({
   claudeMain: RECOMMENDED_CLOUD_MODELS.claudeMain[0],
-  claudeSmall: RECOMMENDED_CLOUD_MODELS.claudeSmall[0],
+  claudeHaiku: RECOMMENDED_CLOUD_MODELS.claudeHaiku[0],
   codexMain: RECOMMENDED_CLOUD_MODELS.codexMain[0],
 });
 
@@ -65,9 +65,12 @@ export function recommendedCloudRouteModels(models) {
     RECOMMENDED_CLOUD_MODELS.claudeMain,
     (id) => id.startsWith("claude-"),
   );
-  const claudeSmall = firstAvailable(
+  // The auxiliary families inherit the primary model on a fresh install, so
+  // only the Haiku preference is resolved — it seeds the recommended
+  // `agent setup` route, not the default one.
+  const claudeHaiku = firstAvailable(
     models,
-    RECOMMENDED_CLOUD_MODELS.claudeSmall,
+    RECOMMENDED_CLOUD_MODELS.claudeHaiku,
     (id) => id.includes("haiku"),
     claudeMain,
   );
@@ -81,7 +84,7 @@ export function recommendedCloudRouteModels(models) {
       "The OriginRouter Cloud catalogue does not contain compatible Claude Code and Codex models.",
     );
   }
-  return { claudeMain, claudeSmall, codexMain };
+  return { claudeMain, claudeHaiku, codexMain };
 }
 
 export function originrouterCloudProviderNames(config) {
@@ -125,9 +128,9 @@ function applyCloudRoutes(config, selected) {
       },
     };
   }
+  // Only the primary route is pinned; opus/sonnet/haiku/fable inherit it.
   next = replaceAgentRoutes(next, "claude", {
     main: { provider: providerName, model: selected.claudeMain.id },
-    small: { provider: providerName, model: selected.claudeSmall.id },
   });
   next = replaceAgentRoutes(next, "codex", {
     main: { provider: providerName, model: selected.codexMain.id },
@@ -142,7 +145,6 @@ export function applyRecommendedCloudRoutes(config, models) {
 export function applyDefaultCloudRoutes(config = {}) {
   return applyCloudRoutes(config, {
     claudeMain: { id: DEFAULT_CLOUD_ROUTE_MODELS.claudeMain },
-    claudeSmall: { id: DEFAULT_CLOUD_ROUTE_MODELS.claudeSmall },
     codexMain: { id: DEFAULT_CLOUD_ROUTE_MODELS.codexMain },
   });
 }
@@ -219,7 +221,7 @@ async function confirm(question, {
 function printSelectedModels(selected, printFn) {
   printFn("OriginRouter Cloud Agent routes configured:");
   printFn(`  Claude Code core: ${selected.claudeMain.id}`);
-  printFn(`  Claude Code fast: ${selected.claudeSmall.id}`);
+  printFn(`  Claude Code aux:  inherits the core model (opus/sonnet/haiku/fable)`);
   printFn(`  Codex:            ${selected.codexMain.id}`);
 }
 

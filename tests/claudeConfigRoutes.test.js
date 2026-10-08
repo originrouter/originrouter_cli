@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAgentProviderEnv } from "../src/config/claudeConfig.js";
 import { addProvider, setCurrentProvider } from "../src/config/providers.js";
-import { setRoute, clearRoute, replaceAgentRoutes, CODEX_MAIN_ALIAS, getAllRoutes, hashRoutes, getRoutes, MAIN_ALIAS, SMALL_ALIAS } from "../src/config/routes.js";
+import { setRoute, clearRoute, replaceAgentRoutes, CODEX_MAIN_ALIAS, getAllRoutes, hashRoutes, getRoutes, MAIN_ALIAS, OPUS_ALIAS, SONNET_ALIAS, HAIKU_ALIAS, FABLE_ALIAS } from "../src/config/routes.js";
 import { writeCodingAuth } from "../src/persistence/codingAuth.js";
 import { makeOAuthCredential } from "./support/oauthCredential.js";
 
@@ -53,7 +53,7 @@ try {
     // Stage 8.0: hash uses the all-agent routes object (matches the
     // shape buildAgentProviderEnv hashes).
     routesHash: hashRoutes(getAllRoutes(cfg)),
-    aliases: [MAIN_ALIAS, SMALL_ALIAS],
+    aliases: [MAIN_ALIAS, OPUS_ALIAS, SONNET_ALIAS, HAIKU_ALIAS, FABLE_ALIAS],
   });
 
   // ---- (1) No routes → inherit the launch environment unchanged ----
@@ -69,18 +69,26 @@ try {
   // ---- (1b) Claude routes are one Provider profile at the CLI core ----
   {
     assert.throws(
-      () => setRoute(config, "claude", "small", {
+      () => setRoute(config, "claude", "opus", {
         provider: "deepseek",
         model: "deepseek-chat-fast",
       }),
       /require claude\.main/,
+    );
+    // `small` is no longer a Claude slot at all.
+    assert.throws(
+      () => setRoute(config, "claude", "small", {
+        provider: "deepseek",
+        model: "deepseek-chat-fast",
+      }),
+      /unknown route slot 'small'/,
     );
     const mainOnly = setRoute(config, "claude", "main", {
       provider: "deepseek",
       model: "deepseek-chat",
     });
     assert.throws(
-      () => setRoute(mainOnly, "claude", "small", {
+      () => setRoute(mainOnly, "claude", "opus", {
         provider: "moonshot",
         model: "moonshot-v1-8k",
       }),
@@ -88,12 +96,13 @@ try {
     );
     const grouped = replaceAgentRoutes(config, "claude", {
       main: { provider: "deepseek", model: "deepseek-chat" },
-      small: { provider: "deepseek", model: "deepseek-chat-fast" },
+      opus: { provider: "deepseek", model: "deepseek-chat" },
+      haiku: { provider: "deepseek", model: "deepseek-chat-fast" },
     });
     assert.equal(getRoutes(grouped).main.provider, "deepseek");
-    assert.equal(getRoutes(grouped).small.model, "deepseek-chat-fast");
+    assert.equal(getRoutes(grouped).haiku.model, "deepseek-chat-fast");
     assert.equal(getRoutes(clearRoute(grouped, "claude", "main")).main, null);
-    assert.equal(getRoutes(clearRoute(grouped, "claude", "main")).small, null);
+    assert.equal(getRoutes(clearRoute(grouped, "claude", "main")).haiku, null);
   }
 
   // ---- (2) Routes set, route-mode proxy running with matching hash: four fixed env vars ----
@@ -105,32 +114,39 @@ try {
     assert.equal(out.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:40123");
     assert.equal(out.env.ANTHROPIC_API_KEY, "sk-noop-litellm-passthrough");
     assert.equal(out.env.ANTHROPIC_MODEL, MAIN_ALIAS);
-    assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, SMALL_ALIAS);
-    assert.equal(out.env.CLAUDE_CODE_SUBAGENT_MODEL, MAIN_ALIAS);
-    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, MAIN_ALIAS);
-    assert.equal(out.env.ANTHROPIC_DEFAULT_SONNET_MODEL, MAIN_ALIAS);
-    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, SMALL_ALIAS);
-    assert.equal(out.env.ANTHROPIC_DEFAULT_FABLE_MODEL, MAIN_ALIAS);
+    // Each family gets its OWN alias even while inheriting the primary model:
+    // Claude Code resolves a declared `model: opus` family against its alias.
+    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, OPUS_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_SONNET_MODEL, SONNET_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, HAIKU_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_FABLE_MODEL, FABLE_ALIAS);
+    // Removed from the injected set entirely.
+    assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, undefined);
+    assert.equal(out.env.CLAUDE_CODE_SUBAGENT_MODEL, undefined);
   }
 
-  // ---- (3) Routes set, main + small: both fixed aliases (small explicit) ----
+  // ---- (3) Routes set, main + explicit auxiliary: that family still uses its
+  //          own alias in proxy mode (the model lives behind the alias).
   {
-    config = setRoute(config, "claude", "small", { provider: "deepseek", model: "deepseek-chat-fast" });
+    config = setRoute(config, "claude", "haiku", { provider: "deepseek", model: "deepseek-chat-fast" });
     const out = await buildAgentProviderEnv("claude", config, {
       proxyStatus: () => routeProbe(config),
     });
     assert.equal(out.env.ANTHROPIC_MODEL, MAIN_ALIAS);
-    assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, SMALL_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, HAIKU_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, OPUS_ALIAS);
   }
 
-  // ---- (4) Routes set, only main: small falls back to main; both aliases still present ----
+  // ---- (4) Routes set, only main: every auxiliary inherits it, and each one
+  //          still reports its OWN alias.
   {
-    const cfg2 = clearRoute(config, "claude", "small");
+    const cfg2 = clearRoute(config, "claude", "haiku");
     const out = await buildAgentProviderEnv("claude", cfg2, {
       proxyStatus: () => routeProbe(cfg2),
     });
     assert.equal(out.env.ANTHROPIC_MODEL, MAIN_ALIAS);
-    assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, SMALL_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, HAIKU_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_FABLE_MODEL, FABLE_ALIAS);
   }
 
   // ---- (5) currentProvider.claude is ignored: even if it points at "minimax" (which is
@@ -142,7 +158,7 @@ try {
       proxyStatus: () => routeProbe(config),
     });
     assert.equal(out.env.ANTHROPIC_MODEL, MAIN_ALIAS);
-    assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, SMALL_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, OPUS_ALIAS);
   }
 
   // ---- (6) Provider mode (legacy) proxy is rejected: Claude requires route mode. ----
@@ -171,7 +187,7 @@ try {
           host: "127.0.0.1",
           mode: "route",
           routesHash: "stale-hash",
-          aliases: [MAIN_ALIAS, SMALL_ALIAS],
+          aliases: [MAIN_ALIAS, OPUS_ALIAS, SONNET_ALIAS, HAIKU_ALIAS, FABLE_ALIAS],
         }),
       }),
       (err) => err.code === "PROVIDER_UNSUPPORTED",
@@ -266,10 +282,10 @@ try {
       ...config,
       providers: { ...(config.providers || {}), official },
     };
-    // Clear the proxy profile before switching the grouped Claude route to
-    // the OriginRouter Provider.
-    const configWithoutSmall = clearRoute(configWithOfficial, "claude", "small");
-    const configRouted = setRoute(configWithoutSmall, "claude", "main",
+    // Reset the grouped Claude route before switching it to the
+    // OriginRouter Provider.
+    const configBase = clearRoute(configWithOfficial, "claude", "main");
+    const configRouted = setRoute(configBase, "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
     seedOAuthCredential(home);
     // proxyStatus returning "stopped" must NOT block originrouter direct.
@@ -280,11 +296,13 @@ try {
     assert.equal(out.env.ANTHROPIC_BASE_URL, "https://api.easytransnote.com/coding");
     assert.equal(out.env.ANTHROPIC_API_KEY, "or_at_coding_test");
     assert.equal(out.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
-    // small falls back to main
-    assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, "claude-sonnet-4-6");
-    assert.equal(out.env.CLAUDE_CODE_SUBAGENT_MODEL, "claude-sonnet-4-6");
+    // Every auxiliary inherits the primary model, each injected separately.
     assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "claude-sonnet-4-6");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_SONNET_MODEL, "claude-sonnet-4-6");
     assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "claude-sonnet-4-6");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_FABLE_MODEL, "claude-sonnet-4-6");
+    assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, undefined);
+    assert.equal(out.env.CLAUDE_CODE_SUBAGENT_MODEL, undefined);
   }
 
   // ---- (14) codex originrouter direct smoke ----

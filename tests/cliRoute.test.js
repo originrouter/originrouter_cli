@@ -66,24 +66,61 @@ try {
   // ---- 3. atomic Claude profile set ----
   await runCli(["route", "set", "claude",
     "--provider", "deepseek",
-    "--main-model", "deepseek-chat",
-    "--small-model", "deepseek-chat"], { env });
+    "--main-model", "deepseek-chat"], { env });
   {
     const cfg = readConfig(home);
     assert.equal(cfg.routes.claude.main.provider, "deepseek");
     assert.equal(cfg.routes.claude.main.model,    "deepseek-chat");
-    assert.equal(cfg.routes.claude.small.provider, "deepseek");
+    // Omitted auxiliary flags mean "inherit the primary model" — the slot is
+    // simply not written.
+    assert.equal(cfg.routes.claude.opus, undefined);
+    assert.equal(cfg.routes.claude.haiku, undefined);
   }
 
-  // ---- 4. cross-Provider Claude small route is rejected ----
+  // ---- 3b. explicit auxiliary slots are written individually ----
+  await runCli(["route", "set", "claude",
+    "--provider", "deepseek",
+    "--main-model", "deepseek-chat",
+    "--opus", "deepseek-chat",
+    "--haiku", "deepseek-chat"], { env });
   {
-    const r = await runCli(["route", "set", "claude.small",
+    const cfg = readConfig(home);
+    assert.equal(cfg.routes.claude.opus.provider,  "deepseek");
+    assert.equal(cfg.routes.claude.haiku.provider, "deepseek");
+    assert.equal(cfg.routes.claude.sonnet, undefined, "unlisted families still inherit");
+  }
+
+  // ---- 3c. literal `inherit` clears a previously explicit slot ----
+  await runCli(["route", "set", "claude",
+    "--provider", "deepseek",
+    "--main-model", "deepseek-chat",
+    "--opus", "inherit"], { env });
+  {
+    const cfg = readConfig(home);
+    assert.equal(cfg.routes.claude.main.provider, "deepseek");
+    assert.equal(cfg.routes.claude.opus, undefined);
+  }
+
+  // ---- 4. cross-Provider Claude auxiliary route is rejected ----
+  {
+    const r = await runCli(["route", "set", "claude.opus",
       "--provider", "moonshot", "--model", "moonshot-v1-8k"], {
       env,
       expectFail: true,
     });
     assert.notEqual(r.code, 0);
     assert.match(r.stderr, /must use the same provider/);
+  }
+
+  // ---- 4b. claude.small is no longer a slot ----
+  {
+    const r = await runCli(["route", "set", "claude.small",
+      "--provider", "deepseek", "--model", "deepseek-chat"], {
+      env,
+      expectFail: true,
+    });
+    assert.notEqual(r.code, 0);
+    assert.match(r.stderr, /unknown route slot 'small' for agent 'claude'/);
   }
 
   // ---- 5. route show claude ----
@@ -117,12 +154,13 @@ try {
     assert.match(r.stderr, /unknown route slot 'small' for agent 'codex'/);
   }
 
-  // ---- 8. route clear claude.small removes the slot but leaves main ----
-  await runCli(["route", "clear", "claude.small"], { env });
+  // ---- 8. route clear on an auxiliary removes the slot but leaves main ----
+  await runCli(["route", "clear", "claude.haiku"], { env });
   {
     const cfg = readConfig(home);
     assert.equal(cfg.routes.claude.main.provider, "deepseek");
-    assert.equal(cfg.routes.claude.small, undefined);
+    assert.equal(cfg.routes.claude.haiku, undefined);
+    assert.equal(cfg.routes.claude.opus, undefined);
   }
 
   // ---- 9. provider use <litellm> replaces the grouped Claude profile ----
@@ -133,20 +171,22 @@ try {
     // Stage 7.6: currentProvider is no longer written for claude.
     assert.equal(cfg.routes.claude.main.provider, "moonshot");
     assert.equal(cfg.routes.claude.main.model,    "moonshot-v1-8k");
-    assert.equal(cfg.routes.claude.small.provider, "moonshot");
+    assert.equal(cfg.routes.claude.opus, undefined);
   }
 
-  // ---- 9b. Provider Use seeds both aliases from one enabled model ----
+  // ---- 9b. Provider Use leaves every auxiliary family inheriting ----
   {
     const cfg = readConfig(home);
-    assert.equal(cfg.routes.claude.small.model, "moonshot-v1-8k");
+    for (const slot of ["opus", "sonnet", "haiku", "fable"]) {
+      assert.equal(cfg.routes.claude[slot], undefined, slot);
+    }
   }
 
-  // ---- 9c. Provider Use reports both grouped aliases ----
+  // ---- 9c. Provider Use reports the primary route ----
   {
     const r = await runCli(["provider", "use", "deepseek", "--agent", "claude"], { env });
     assert.match(r.stdout, /Claude routes updated/);
-    assert.match(r.stdout, /fast\s+originrouter-claude-fast-model -> deepseek \/ deepseek-chat/);
+    assert.match(r.stdout, /main\s+originrouter-claude-model\s+-> deepseek \/ deepseek-chat/);
   }
 
   // ---- 10. provider use on a litellm/anthropic provider — also writes routes ----
@@ -179,7 +219,7 @@ try {
     assert.match(r.stdout, /route list/);
     assert.match(r.stdout, /route set/);
     assert.match(r.stdout, /originrouter-claude-model/);
-    assert.match(r.stdout, /originrouter-claude-fast-model/);
+    assert.match(r.stdout, /originrouter-claude-opus/);
   }
 
   // ---- 15. Stage 7.8: provider remove clears routes that point at it ----
@@ -187,11 +227,11 @@ try {
   await runCli(["route", "set", "claude",
     "--provider", "moonshot",
     "--main-model", "moonshot-v1-8k",
-    "--small-model", "moonshot-v1-8k"], { env });
+    "--haiku", "moonshot-v1-8k"], { env });
   {
     const cfg = readConfig(home);
     assert.equal(cfg.routes.claude.main.provider,  "moonshot");
-    assert.equal(cfg.routes.claude.small.provider, "moonshot");
+    assert.equal(cfg.routes.claude.haiku.provider, "moonshot");
   }
   {
     const r = await runCli(["provider", "remove", "moonshot"], { env });
@@ -206,7 +246,7 @@ try {
     await runCli(["route", "set", "claude",
       "--provider", "deepseek",
       "--main-model", "deepseek-chat",
-      "--small-model", "deepseek-chat"], { env });
+      "--sonnet", "deepseek-chat"], { env });
     const r = await runCli(["provider", "remove", "deepseek"], { env });
     assert.match(r.stdout, /cleared routes\.claude\.main/);
     const cfg = readConfig(home);
@@ -290,7 +330,6 @@ try {
     assert.deepEqual(cfg.routes, {
       claude: {
         main: { provider: "originrouter-cloud", model: "claude-sonnet-5" },
-        small: { provider: "originrouter-cloud", model: "claude-haiku-4-5" },
       },
     });
   }
@@ -305,7 +344,6 @@ try {
     assert.deepEqual(cfg.routes, {
       claude: {
         main: { provider: "originrouter-cloud", model: "claude-sonnet-5" },
-        small: { provider: "originrouter-cloud", model: "claude-haiku-4-5" },
       },
     });
     assert.equal(cfg.providers.openai_codex, undefined);
@@ -355,7 +393,13 @@ try {
       assert.match(r.stdout, /Source: originrouter-coding/);
       assert.match(r.stdout, /ANTHROPIC_BASE_URL=http:\/\/127\.0\.0\.1:<session-port>\/coding/);
       assert.match(r.stdout, /ANTHROPIC_MODEL=claude-sonnet-4-6/);
-      assert.match(r.stdout, /ANTHROPIC_SMALL_FAST_MODEL=claude-sonnet-4-6/);
+      // Each auxiliary family is injected separately and inherits main here.
+      assert.match(r.stdout, /ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-sonnet-4-6/);
+      assert.match(r.stdout, /ANTHROPIC_DEFAULT_OPUS_MODEL=claude-sonnet-4-6/);
+      assert.ok(!r.stdout.includes("ANTHROPIC_SMALL_FAST_MODEL="),
+        "the fast-model variable is no longer part of the inject set");
+      assert.ok(!r.stdout.includes("CLAUDE_CODE_SUBAGENT_MODEL="),
+        "the subagent-model variable is no longer part of the inject set");
       // Raw-key leak check: the masked key form must be present (mask
       // format is `sk-o...ey`), and the raw key value must never appear
       // in stdout.

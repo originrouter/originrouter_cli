@@ -323,7 +323,11 @@ export async function runClaudeSdkSession(rawArgs) {
   const device = ensureDevice(
     options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID,
   );
-  const sessionId = options.session || `claude-${Date.now()}`;
+  // Random hex, not a timestamp — see `localAgentSession` for the reasoning.
+  // The server's `UNIQUE (session_id)` has no `user_id` in it, so this id has
+  // to be globally unique, and a millisecond clock only makes it unique within
+  // one machine.
+  const sessionId = options.session || `claude-${randomUUID().replaceAll("-", "")}`;
   const cwd = process.cwd();
   const workspaceApprovalPolicy = readWorkspaceApprovalPolicySafe(cwd);
   let relayPlan = await buildAgentRelayPlan({
@@ -375,6 +379,9 @@ export async function runClaudeSdkSession(rawArgs) {
     enabled: !collaborationWorker,
     sessionId,
     agentType: "claude",
+    // Assigned on the first `agent.session.start` (line ~1143) — before that
+    // the SDK has not named the conversation yet.
+    nativeSessionId: () => claudeSessionId,
     title: sessionTitle,
     deviceName: device.displayName || device.host,
     workspaceDisplayPath: workspaceDisplayPath(cwd),

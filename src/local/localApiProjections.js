@@ -37,10 +37,10 @@ export function placeholderProxyStatus() {
 
 export function projectRoutesForApi(routes, agent = "claude") {
   // Project every slot defined for the agent, with missing slots becoming
-  // null. Older agents (Claude) return { main, small }; Codex returns
+  // null. Claude returns main plus the four auxiliary families; Codex returns
   // just { main } because that's all ROUTE_DEFS.codex.slots contains.
   const def = ROUTE_DEFS[agent];
-  const slots = def ? def.slots : ["main", "small"];
+  const slots = def ? def.slots : [];
   const out = {};
   for (const slot of slots) out[slot] = (routes && routes[slot]) || null;
   return out;

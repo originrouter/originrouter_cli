@@ -3,10 +3,14 @@ import {
   resolveProvider,
 } from "./providers.js";
 import {
+  AUX_ALIASES,
   CODEX_MAIN_ALIAS,
+  FABLE_ALIAS,
+  HAIKU_ALIAS,
   LEGACY_CODEX_MAIN_ALIAS,
   MAIN_ALIAS,
-  SMALL_ALIAS,
+  OPUS_ALIAS,
+  SONNET_ALIAS,
   assertAgentRouteConsistency,
   effectiveRoutes,
   getAgentRoutes,
@@ -39,8 +43,17 @@ const CLAUDE_ENV_MAP = {
   baseUrl: "ANTHROPIC_BASE_URL",
   apiKey: "ANTHROPIC_API_KEY",
   model: "ANTHROPIC_MODEL",
-  smallFastModel: "ANTHROPIC_SMALL_FAST_MODEL",
 };
+
+// Claude's auxiliary model-family slots, paired with the CLI-facing label
+// used in error text. One slot per ANTHROPIC_DEFAULT_*_MODEL key. Kept in
+// sync with ROUTE_DEFS.claude.inheritsFromPrimary.
+const CLAUDE_AUX_LABELS = Object.freeze([
+  ["opus", "opus"],
+  ["sonnet", "sonnet"],
+  ["haiku", "haiku"],
+  ["fable", "fable"],
+]);
 
 export const CLAUDE_CONFIG_KEYS = Object.freeze(Object.keys(CLAUDE_ENV_MAP));
 
@@ -155,17 +168,21 @@ function routeProvider(config, routeEntry) {
 
 function assertClaudeOriginrouterRoutes(config, eff) {
   const mainProvider = routeProvider(config, eff.main);
-  const smallProvider = eff.small ? routeProvider(config, eff.small) : null;
   if (!mainProvider || mainProvider.type !== "originrouter") return null;
-  if (smallProvider && smallProvider.type !== "originrouter") {
-    const err = new Error(
-      "Claude originrouter direct routing requires claude.small to use an originrouter provider too. " +
-      "Clear claude.small or point it at an originrouter provider.",
-    );
-    err.code = "PROVIDER_UNSUPPORTED";
-    throw err;
+  for (const [slot, label] of CLAUDE_AUX_LABELS) {
+    const entry = eff[slot];
+    if (!entry) continue;
+    const provider = routeProvider(config, entry);
+    if (provider && provider.type !== "originrouter") {
+      const err = new Error(
+        `Claude originrouter direct routing requires claude.${label} to use an originrouter provider too. ` +
+        `Clear claude.${label} or point it at an originrouter provider.`,
+      );
+      err.code = "PROVIDER_UNSUPPORTED";
+      throw err;
+    }
   }
-  return { mainProvider, smallProvider: smallProvider || mainProvider };
+  return { mainProvider };
 }
 
 // Stage 9.2: validate the type=remote branch on Claude routes. Returns
@@ -191,21 +208,25 @@ function assertClaudeRemoteRoutes(config, eff, remoteCodingProbe) {
     err.code = "PROVIDER_UNSUPPORTED";
     throw err;
   }
-  const smallProvider = eff.small ? routeProvider(config, eff.small) : null;
-  if (smallProvider && smallProvider.type !== "remote") {
-    const err = new Error(
-      "Claude remote routing requires claude.small to use a remote provider too. " +
-      "Clear claude.small or point it at a remote provider.",
-    );
-    err.code = "PROVIDER_UNSUPPORTED";
-    throw err;
-  }
-  if (smallProvider?.deviceId && smallProvider.deviceId !== mainProvider.deviceId) {
-    const err = new Error(
-      "Claude remote main and small routes must use the same target device.",
-    );
-    err.code = "PROVIDER_UNSUPPORTED";
-    throw err;
+  for (const [slot, label] of CLAUDE_AUX_LABELS) {
+    const entry = eff[slot];
+    if (!entry) continue;
+    const provider = routeProvider(config, entry);
+    if (provider && provider.type !== "remote") {
+      const err = new Error(
+        `Claude remote routing requires claude.${label} to use a remote provider too. ` +
+        `Clear claude.${label} or point it at a remote provider.`,
+      );
+      err.code = "PROVIDER_UNSUPPORTED";
+      throw err;
+    }
+    if (provider?.deviceId && provider.deviceId !== mainProvider.deviceId) {
+      const err = new Error(
+        `Claude remote routes must all use the same target device (claude.${label} differs).`,
+      );
+      err.code = "PROVIDER_UNSUPPORTED";
+      throw err;
+    }
   }
   if (!remoteCodingProbe || remoteCodingProbe.state !== "running") {
     const err = new Error(
@@ -216,7 +237,7 @@ function assertClaudeRemoteRoutes(config, eff, remoteCodingProbe) {
     err.code = "PROVIDER_UNSUPPORTED";
     throw err;
   }
-  return { mainProvider, smallProvider: smallProvider || mainProvider };
+  return { mainProvider };
 }
 
 // Stage 9.2: pure helper used by the local wrapper and env print to
@@ -277,24 +298,27 @@ export function unsetClaudeConfigValue(config, key) {
 }
 
 // Claude Code resolves built-in agent definitions independently from the
-// main-loop model. In particular, an agent declared with `model: opus`,
-// `model: sonnet`, or `model: haiku` consults the matching
-// ANTHROPIC_DEFAULT_* variable, while agents without an explicit model may
-// consult CLAUDE_CODE_SUBAGENT_MODEL. Keep every one of those paths inside
-// the configured OriginRouter route instead of allowing a subagent to fall
-// back to Claude Code's first-party defaults.
-function buildClaudeModelEnv(mainModel, smallModel = mainModel) {
+// main-loop model. An agent declared with `model: opus`, `sonnet`, `haiku`
+// or `fable` consults the matching ANTHROPIC_DEFAULT_* variable, so each of
+// those families gets its own routable slot. A slot left unset inherits the
+// primary model — `models[slot]` is already resolved by the caller, which is
+// where "inherit" is turned into a concrete model (or, on the proxy path,
+// into that family's own alias).
+//
+// ANTHROPIC_SMALL_FAST_MODEL and CLAUDE_CODE_SUBAGENT_MODEL are deliberately
+// NOT injected: the former is Claude Code's legacy two-tier knob, and the
+// latter would collapse every model-less subagent onto the main model, which
+// is exactly the escape hatch the per-family slots now close.
+function buildClaudeModelEnv(models) {
   return {
-    ANTHROPIC_MODEL: mainModel,
-    ANTHROPIC_SMALL_FAST_MODEL: smallModel,
-    CLAUDE_CODE_SUBAGENT_MODEL: mainModel,
-    ANTHROPIC_DEFAULT_OPUS_MODEL: mainModel,
-    ANTHROPIC_DEFAULT_SONNET_MODEL: mainModel,
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: smallModel,
+    ANTHROPIC_MODEL: models.main,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: models.opus,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: models.sonnet,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: models.haiku,
     // Claude Code 2.1.x also exposes the newer Fable family. Treat it as a
-    // primary-capability model so future built-in agents cannot escape the
-    // configured main route either.
-    ANTHROPIC_DEFAULT_FABLE_MODEL: mainModel,
+    // first-class slot so future built-in agents cannot escape the
+    // configured route either.
+    ANTHROPIC_DEFAULT_FABLE_MODEL: models.fable,
   };
 }
 
@@ -335,8 +359,6 @@ export const CLAUDE_TRANSPORT_ENV_KEYS = Object.freeze([
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_MODEL",
-  "ANTHROPIC_SMALL_FAST_MODEL",
-  "CLAUDE_CODE_SUBAGENT_MODEL",
   "ANTHROPIC_DEFAULT_OPUS_MODEL",
   "ANTHROPIC_DEFAULT_SONNET_MODEL",
   "ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -441,6 +463,40 @@ export function describeClaudeSettingsConflicts(override, foreignSettings) {
 
 // ---------- New unified entry point (Stage 7.6: single path) ----------
 
+// True when any Claude slot carries a route. A legacy `small`-only config
+// counts: it still means "the user asked OriginRouter to route Claude", so
+// the empty-env escape hatch must not swallow it.
+export function hasAnyClaudeRoute(routes) {
+  return Boolean(routes) && Object.values(routes).some((entry) => entry);
+}
+
+// Resolve the five slot models for the direct (remote / originrouter)
+// transports, where the env value is a concrete model id. `eff` is already
+// inherit-resolved, so a slot is present whenever main is. The provider's own
+// default model is the last resort, matching the OR-chain the two-tier code
+// used before per-family slots existed.
+function modelsFromRoutes(eff, provider) {
+  const modelFor = (slot) => eff[slot]?.model || provider?.model || eff.main?.model || null;
+  return {
+    main: modelFor("main"),
+    opus: modelFor("opus"),
+    sonnet: modelFor("sonnet"),
+    haiku: modelFor("haiku"),
+    fable: modelFor("fable"),
+  };
+}
+
+// Proxy mode injects aliases rather than model ids.
+function claudeAliasModels() {
+  return {
+    main: MAIN_ALIAS,
+    opus: OPUS_ALIAS,
+    sonnet: SONNET_ALIAS,
+    haiku: HAIKU_ALIAS,
+    fable: FABLE_ALIAS,
+  };
+}
+
 // Returns { env, provider, source } (or { env, routes, proxy, source } for claude).
 // Callers that only want the env map read `.env`. The richer shape lets
 // `env print`, the relay's `providerConfig` event field, and the launchers
@@ -459,8 +515,9 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
     assertAgentRouteConsistency("claude", routes);
     // No OriginRouter route means no OriginRouter override. The empty overlay
     // preserves the caller's ANTHROPIC_* variables and Claude Code's own
-    // Anthropic subscription/login behavior.
-    if (!routes.main && !routes.small) {
+    // Anthropic subscription/login behavior. A legacy `small`-only config is
+    // still an OriginRouter route, so it must not take this branch.
+    if (!hasAnyClaudeRoute(routes)) {
       return {
         env: {},
         routes,
@@ -474,18 +531,16 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
     // 127.0.0.1:<port>; the proxy bridges to the worker over the relay.
     const remoteRoutes = assertClaudeRemoteRoutes(config, eff, remoteCodingProbe);
     if (remoteRoutes) {
-      const mainModel = eff.main.model || remoteRoutes.mainProvider.model;
-      const smallModel = (eff.small && (eff.small.model || remoteRoutes.smallProvider.model))
-        || mainModel;
+      const provider = remoteRoutes.mainProvider;
       const env = {
         ANTHROPIC_BASE_URL: `http://${remoteCodingProbe.host || "127.0.0.1"}:${remoteCodingProbe.port}`,
         ANTHROPIC_API_KEY: NOOP_ANTHROPIC_API_KEY,
-        ...buildClaudeModelEnv(mainModel, smallModel),
+        ...buildClaudeModelEnv(modelsFromRoutes(eff, provider)),
       };
       return {
         env,
         routes: eff,
-        provider: remoteRoutes.mainProvider,
+        provider,
         source: "remote-coding",
       };
     }
@@ -493,18 +548,16 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
     if (originrouterRoutes) {
       const managed = await readManagedCodingKeyForRuntime(options);
       const apiKey = accessTokenFor(managed, OAUTH_RESOURCES.CODING)?.token;
-      const mainModel = eff.main.model || originrouterRoutes.mainProvider.model;
-      const smallModel = (eff.small && (eff.small.model || originrouterRoutes.smallProvider.model))
-        || mainModel;
+      const provider = originrouterRoutes.mainProvider;
       const env = {
-        ANTHROPIC_BASE_URL: originrouterBaseForRuntime(originrouterRoutes.mainProvider, "claude"),
+        ANTHROPIC_BASE_URL: originrouterBaseForRuntime(provider, "claude"),
         ANTHROPIC_API_KEY: apiKey,
-        ...buildClaudeModelEnv(mainModel, smallModel),
+        ...buildClaudeModelEnv(modelsFromRoutes(eff, provider)),
       };
       return {
         env,
         routes: eff,
-        provider: originrouterRoutes.mainProvider,
+        provider,
         source: "originrouter-coding",
       };
     }
@@ -519,10 +572,15 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
       && probe.mode === "route"
       && proxyHash === currentHash;
     if (hashMatches) {
+      // In proxy mode the env value is the *alias*, not a concrete model: the
+      // proxy owns the upstream mapping. Each family must name its own alias
+      // even when it inherits — asking the proxy for the main alias under the
+      // Opus family would erase the per-family distinction the slots exist to
+      // provide.
       const env = {
         ANTHROPIC_BASE_URL: `http://${probe.host || "127.0.0.1"}:${probe.port}`,
         ANTHROPIC_API_KEY: NOOP_ANTHROPIC_API_KEY,
-        ...buildClaudeModelEnv(MAIN_ALIAS, SMALL_ALIAS),
+        ...buildClaudeModelEnv(claudeAliasModels()),
       };
       return {
         env,

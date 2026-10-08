@@ -3,7 +3,7 @@
 //
 // The smoke cases 13-14 in tests/claudeConfigRoutes.test.js lock in the
 // happy-path contract alongside the proxy regression. This file covers
-// the rest: baseUrl override, small model fallback, mixed-provider
+// the rest: baseUrl override, auxiliary model inheritance, mixed-provider
 // rejection, missing / expired / malformed coding-key.json, and three
 // proxy regression cases so the suite is self-contained.
 //
@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAgentProviderEnv } from "../src/config/claudeConfig.js";
 import {
-  MAIN_ALIAS, SMALL_ALIAS, CODEX_MAIN_ALIAS,
+  MAIN_ALIAS, OPUS_ALIAS, SONNET_ALIAS, HAIKU_ALIAS, FABLE_ALIAS, CODEX_MAIN_ALIAS,
   getAllRoutes, hashRoutes, setRoute,
 } from "../src/config/routes.js";
 import { writeCodingAuth } from "../src/persistence/codingAuth.js";
@@ -91,8 +91,11 @@ cases.push({
       `${DEFAULT_ORIGINROUTER_BASE_URL}/coding`);
     assert.equal(out.env.ANTHROPIC_API_KEY, "or_at_coding_test");
     assert.equal(out.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
-    // small falls back to main when small slot not configured
-    assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, "claude-sonnet-4-6");
+    // Every auxiliary family inherits the primary model when unconfigured.
+    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "claude-sonnet-4-6");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "claude-sonnet-4-6");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_FABLE_MODEL, "claude-sonnet-4-6");
+    assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, undefined);
   },
 });
 
@@ -112,35 +115,38 @@ cases.push({
 });
 
 cases.push({
-  name: "claude originrouter direct: explicit small route model wins over main",
+  name: "claude originrouter direct: explicit auxiliary route model wins over main",
   run: async () => {
     clearCodingKeyFile(home);
     seedOAuthCredential(home);
     const cfg = { providers: { official: officialClaude } };
     const routed = setRoute(cfg, "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
-    const routed2 = setRoute(routed, "claude", "small",
+    const routed2 = setRoute(routed, "claude", "haiku",
       { provider: "official", model: "claude-haiku-4-5" });
     const out = await buildAgentProviderEnv("claude", routed2, {
       proxyStatus: () => ({ state: "stopped" }),
     });
     assert.equal(out.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
-    assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, "claude-haiku-4-5");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "claude-haiku-4-5");
+    // Families that were not given a model still inherit main.
+    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "claude-sonnet-4-6");
   },
 });
 
 cases.push({
-  name: "claude originrouter direct: small route model missing → fallback to main",
+  name: "claude originrouter direct: auxiliary route model missing → inherit main",
   run: async () => {
     clearCodingKeyFile(home);
     seedOAuthCredential(home);
     const cfg = setRoute(baseConfig(), "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
-    // explicitly no small slot
+    // No auxiliary slot configured on purpose.
     const out = await buildAgentProviderEnv("claude", cfg, {
       proxyStatus: () => ({ state: "stopped" }),
     });
-    assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, "claude-sonnet-4-6");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "claude-sonnet-4-6");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_FABLE_MODEL, "claude-sonnet-4-6");
   },
 });
 
@@ -153,7 +159,7 @@ cases.push({
     const routed = setRoute(cfg, "claude", "main",
       { provider: "official", model: "claude-sonnet-4-6" });
     assert.throws(
-      () => setRoute(routed, "claude", "small",
+      () => setRoute(routed, "claude", "opus",
         { provider: "moonshot-proxy", model: "moonshot-v1-8k" }),
       /must use the same provider/,
     );
@@ -368,14 +374,16 @@ cases.push({
         host: "127.0.0.1",
         mode: "route",
         routesHash: hashRoutes(getAllRoutes(routed)),
-        aliases: [MAIN_ALIAS, SMALL_ALIAS],
+        aliases: [MAIN_ALIAS, OPUS_ALIAS, SONNET_ALIAS, HAIKU_ALIAS, FABLE_ALIAS],
       }),
     });
     assert.equal(out.source, "routes");
     assert.equal(out.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:40123");
     assert.equal(out.env.ANTHROPIC_API_KEY, "sk-noop-litellm-passthrough");
     assert.equal(out.env.ANTHROPIC_MODEL, MAIN_ALIAS);
-    assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, SMALL_ALIAS);
+    // Proxy mode maps each family to its own alias.
+    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, OPUS_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, HAIKU_ALIAS);
   },
 });
 
@@ -410,7 +418,7 @@ cases.push({
           host: "127.0.0.1",
           mode: "route",
           routesHash: "stale-hash",
-          aliases: [MAIN_ALIAS, SMALL_ALIAS],
+          aliases: [MAIN_ALIAS, OPUS_ALIAS, SONNET_ALIAS, HAIKU_ALIAS, FABLE_ALIAS],
         }),
       }),
       (err) => err.code === "PROVIDER_UNSUPPORTED",

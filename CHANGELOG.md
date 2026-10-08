@@ -3,6 +3,109 @@
 All notable changes to OriginRouter CLI will be documented here. The project
 uses Semantic Versioning and follows the Keep a Changelog structure.
 
+## 0.5.0 - 2026-10-08
+
+### Added
+
+- Claude model routing now has five slots — one primary model plus one per
+  model family — instead of two. Claude Code resolves its built-in subagents by
+  family, so an agent declaring `model: opus` reads `ANTHROPIC_DEFAULT_OPUS_MODEL`
+  and one declaring `model: haiku` reads `ANTHROPIC_DEFAULT_HAIKU_MODEL`. With
+  only `main` and `small`, four of the five families had nowhere to point except
+  the primary model. The slots are `main`, `opus`, `sonnet`, `haiku` and `fable`,
+  each injected as its own environment variable, and each auxiliary slot may
+  **inherit the primary model** — the default, which keeps a family following the
+  primary even when the primary's provider is later changed.
+  `originrouter route set claude` takes `--opus`, `--sonnet`, `--haiku` and
+  `--fable`, each accepting a model id or the literal `inherit`.
+- Live events for a session with several subscribers are sealed once under a
+  per-session group key and fanned out by the relay, instead of being re-encrypted
+  for every recipient. Request and response traffic stays pairwise. Group keys
+  are stored under `<state-dir>/session-group-keys/` with directory mode `0700`
+  and file mode `0600`. Subscribing to 40 sessions no longer takes about six
+  seconds, and no longer delays the first history page by roughly eighteen:
+  subscribers get every key they are missing in one frame and report the keys
+  they already hold, so a re-subscribe in the steady state sends nothing.
+- Agent presence is reported explicitly (`agent.session.presence`) rather than
+  inferred from turn status, and is reconciled against the catalog on every relay
+  reconnect, so a session that stopped while the relay was down cannot linger as
+  active.
+- `originrouter daemon status|restart|stop` delegate to the service manager.
+
+### Changed
+
+- `ANTHROPIC_SMALL_FAST_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL` are no longer
+  injected. The first is replaced by the per-family defaults above;
+  `CLAUDE_CODE_SUBAGENT_MODEL` was removed because it collapsed every model-less
+  subagent onto the primary model. The `originrouter-claude-fast-model` alias no
+  longer exists.
+- All Claude slots must share one provider, and this is now enforced across every
+  slot rather than only between `main` and `small`.
+- When the Local API lands on a port other than the one requested, the daemon
+  says so loudly and names the command that pins a port — under a service manager
+  its own stderr goes to `logs/daemon.err.log`, where nobody reads it.
+- Session ids are `claude-<32 hex>` rather than `claude-<millisecond
+  timestamp>`. The server keys sessions with `UNIQUE (session_id)` and no account
+  column, so the old id was only unique within one machine: two devices starting
+  in the same millisecond collided and the second user's conversation was left
+  with no session row at all.
+- The provider's own conversation id is recorded as `native_session_id` instead
+  of being folded into the conversation id, which had split one run across two
+  unjoinable keys. An empty report never overwrites an id recorded earlier.
+- Shell completion for route targets is derived from the routing table rather
+  than hand-maintained.
+
+### Fixed
+
+- The Local API port no longer ratchets away from the default. `local-api.json`
+  records where the daemon last bound, not a port anyone asked to keep, but it
+  was treated as authoritative — so on a host where 7437 was taken the daemon
+  moved to 7438, wrote 7438 back, and then preferred 7438 permanently. Port
+  selection is now precedence-ordered and fallback-aware, and a port set with
+  `local api set-port` survives restarts.
+- `a ?? b != null ? x : y` parses as `(a ?? (b != null)) ? x : y`, so a port from
+  `local-api.json` counted as *explicitly requested* — and explicit ports never
+  fall back, which turned a busy port into a hard startup failure.
+- `--local-port 0` / `ORIGINROUTER_LOCAL_PORT=0` again ask the kernel for a free
+  port, as they did in 0.4.9, and that request now outranks the recorded and
+  default ports rather than being overridden by them.
+- Ports are parsed strictly. `Number.parseInt` stops at the first character it
+  cannot use, so `"80abc"`, `"80.5"` and `"0x10"` were read as 80, 80 and 0 —
+  a typo became a plausible wrong port instead of an error.
+- Sending and stopping no longer flicker. The CLI reported "terminal activity"
+  on a two-second timer whenever the terminal's rendered output changed, and
+  interactive TUIs redraw constantly: one measured session produced tens of
+  thousands of identical rows, which crowded real turn events out of the App's
+  most-recent-100 window. The reporter is gone; turn state comes only from turn
+  events.
+- Conversations no longer reorder or stick on "running". The activity timestamp
+  is a high-water mark (`MAX(last_activity_at, ?)`) so a late duplicate finish
+  cannot move it backwards; the latest-run join prefers a still-open run; and the
+  exit status sync runs first, bounded by a timeout, instead of being reaped
+  before it could run.
+- Long Claude conversations page back without re-reading and re-parsing the whole
+  transcript on every page; the parse is cached per file revision by
+  (path, size, mtime).
+- `originrouter daemon` refuses to start a second instance beside a live one,
+  instead of drifting to the next free port and rewriting the endpoint App
+  pairing reads.
+- `tests/acceptance.e2e.test.js` no longer asserts the pre-Stage-9.0 provider
+  wire shape. `--type litellm` has been a CLI-input alias normalized to
+  `type: "proxy"` + `engine: "litellm"` on write, so steps 4 and 4b had been
+  failing since that rename — they only appeared to pass because the daemon
+  failed to start first and the suite never reached them.
+
+### Upgrade notes
+
+- If you had set `claude.small` to a cheaper, faster model, the **Haiku family
+  now uses your primary model**, which is more expensive. There is no automatic
+  migration and the old value is dropped. Restore it explicitly with
+  `originrouter route set claude --provider <name> --haiku <cheap-model>`. The
+  CLI warns when it finds a leftover `claude.small` in `env print` and `doctor`,
+  and the key is left on disk, inert, so a rollback stays possible.
+- Your first run restarts the route-mode proxy once, because the slot set changed
+  and therefore the route hash changed. This is expected and self-corrects.
+
 ## 0.4.9 - 2026-09-30
 
 ### Fixed

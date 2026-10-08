@@ -77,7 +77,7 @@ import {
   httpHost,
   localControlProviderSnapshot,
   localControlRouteSnapshot,
-  parsePort,
+  resolveLocalPortCandidates,
   tryBuildRelayClientOptions,
 } from "./daemonPrimitives.js";
 
@@ -387,6 +387,40 @@ export async function startDaemon(args) {
         console.error(`[external-agent-relay] ${error.message}`);
       });
   });
+  // On every relay (re)connect, publish the attachment state of all sessions
+  // the catalog still believes might be live. Anything the CLI no longer has
+  // attached is explicitly detached, so a session that stopped during an
+  // outage cannot linger as "active" in the cloud.
+  const reconcileAgentPresence = async () => {
+    if (!relayConnected) return;
+    const attached = new Set(
+      externalAgentRegistry.list().map((item) => item.session_id),
+    );
+    try {
+      const conversations = agentCatalog
+        .listConversations({ limit: 50, includeArchived: false });
+      for (const conversation of conversations) {
+        const sessionId = String(
+          conversation.originrouter_session_id
+          || conversation.conversation_id
+          || "",
+        ).slice(0, 64);
+        if (!sessionId || attached.has(sessionId)) continue;
+        const status = String(conversation.status || "");
+        if (!["running", "starting", "waiting_approval", "waiting_input", "waiting_device"].includes(status)) {
+          continue;
+        }
+        await externalAgentRelayRouter
+          .forwardAttachment(
+            { sessionId },
+            { attached: false, detachedAt: conversation.exited_at || null },
+          )
+          .catch(() => {});
+      }
+    } catch (error) {
+      console.error(`[agent-presence] ${error.message}`);
+    }
+  };
   const localApiCtx = {
     stateDir,
     sessionManager,
@@ -440,54 +474,84 @@ export async function startDaemon(args) {
         port,
       }),
   };
-  const configuredLocalPort =
-    parsePort(process.env.ORIGINROUTER_LOCAL_PORT, "ORIGINROUTER_LOCAL_PORT") ??
-    parsePort(localApiConfig.port, "local-api.json port");
-  const requestedLocalPort =
-    options.localPort ?? configuredLocalPort ?? DEFAULT_LOCAL_API_PORT;
+  // Port selection is fallback-only. Precedence, highest first:
+  //
+  //   1. an explicit `--local-port` / `ORIGINROUTER_LOCAL_PORT`, which is a
+  //      direct instruction and never silently moves;
+  //   2. `local-api.json`, but only while its recorded port is still free;
+  //   3. DEFAULT_LOCAL_API_PORT, likewise only while free;
+  //   4. the first free port above the requested one.
+  //
+  // `local-api.json` records the port the daemon *last bound*, not a port the
+  // operator asked to keep. Treating it as authoritative made a busy port
+  // permanent: an unmanaged second daemon drifted to 7438, wrote 7438 back, and
+  // the real daemon then preferred 7438 for good — repeating until the port
+  // ratcheted away from the default that the App and the CLI's own commands
+  // expect. Falling back here hands the port back as soon as it is free again.
+  const { requested: requestedLocalPort, candidates } = resolveLocalPortCandidates({
+    cliPort: options.localPort,
+    envPort: process.env.ORIGINROUTER_LOCAL_PORT,
+    recordedPort: localApiConfig.port,
+    // A port the operator set through `local api set-port` is an instruction that
+    // has to survive restarts, not a note of where the daemon last landed.
+    portIsOperatorSet: localApiConfig.portSource === "operator",
+    defaultPort: DEFAULT_LOCAL_API_PORT,
+  });
+  const localApiStartArgs = {
+    apiTokenPath: apiTokenFile,
+    allowLan: allowLanControl,
+  };
+  // `startLocalApi` binds a fixed port; defer to the kernel only when nothing
+  // is pinned, so an unconfigured first run still lands on a free port.
+  const leadingPort = requestedLocalPort ?? candidates.find((port) => port != null) ?? 0;
   let localApi;
-  try {
-    localApi = await startLocalApi(localApiCtx, {
-      port: requestedLocalPort,
-      apiTokenPath: apiTokenFile,
-      allowLan: allowLanControl,
-    });
-  } catch (err) {
-    const canAutoSelectPort =
-      options.localPort == null &&
-      process.env.ORIGINROUTER_LOCAL_PORT == null &&
-      err?.code === "EADDRINUSE";
-    if (!canAutoSelectPort) throw err;
-
-    // Multiple OS users may install OriginRouter on the same host. Keep the
-    // familiar 7437 default, then choose and persist the first free port
-    // above it instead of using an ephemeral port that changes every boot.
-    let lastError = err;
-    for (let port = requestedLocalPort + 1; port <= 65535; port += 1) {
-      try {
-        localApi = await startLocalApi(localApiCtx, {
-          port,
-          apiTokenPath: apiTokenFile,
-          allowLan: allowLanControl,
-        });
-        console.warn(
-          `[daemon] local API port ${requestedLocalPort} is busy; using ${port}`,
-        );
-        break;
-      } catch (candidateError) {
-        lastError = candidateError;
-        if (candidateError?.code !== "EADDRINUSE") throw candidateError;
+  let lastError;
+  for (const port of (candidates.length > 0 ? candidates : [0])) {
+    try {
+      localApi = await startLocalApi(localApiCtx, { ...localApiStartArgs, port });
+      if (port !== leadingPort) {
+        // A port that moved is the one thing the operator must not miss: the
+        // Local API is what the App pairs against, so anything holding the old
+        // port — a direct address, a paired App on another device — is now
+        // pointing at nothing. On a service install this line is the only trace
+        // there is, so name the port to pin and the command that pins it.
+        console.warn([
+          `[daemon] local API port ${leadingPort} is in use; using ${port} instead.`,
+          `[daemon] The Local API address has changed, so anything configured for`,
+          `[daemon] port ${leadingPort} — a paired App, a saved direct address — will`,
+          `[daemon] not reach this daemon until it is updated.`,
+          `[daemon] To pin the port, stop the daemon and run:`,
+          `[daemon]   originrouter local api set-port ${leadingPort}`,
+        ].join("\n"));
       }
+      break;
+    } catch (err) {
+      lastError = err;
+      if (err?.code !== "EADDRINUSE") throw err;
     }
-    if (!localApi) throw lastError;
+  }
+  if (!localApi) {
+    // Every candidate was taken. Say which port was asked for, and how to
+    // resolve it, rather than surfacing a bare EADDRINUSE for the last try.
+    const detail = requestedLocalPort != null
+      ? `requested local API port ${requestedLocalPort} is busy and no fallback was free`
+      : "no local API port available";
+    throw new Error(`${detail} (${lastError?.message ?? "no candidates"})`);
   }
   // Patch the bound port onto the live ctx so /local/status reports it.
   localApiCtx.localApiPort = localApi.port;
-  // Persist the actual bound endpoint so App pairing and the next daemon
-  // restart use the same stable port. Explicit CLI/env overrides remain
-  // authoritative for the current run but are still reflected in state.
+  // Persist the actual bound endpoint so App pairing finds the daemon.
+  //
+  // The operator marker is carried over when the requested port is the one that
+  // got bound — otherwise a deliberate choice would survive exactly one restart
+  // before reverting to a mere record and drifting back to the default. Only
+  // when the daemon had to move for a busy port does the record lose the marker,
+  // so the next start is free to return once that port frees up.
+  const heldRequestedPort =
+    requestedLocalPort != null && requestedLocalPort === localApi.port;
   writeLocalApiConfig({
     port: localApi.port,
+    portSource: heldRequestedPort ? "operator" : "bound",
     bindAddress,
     allowLan: allowLanControl,
   });
@@ -953,6 +1017,11 @@ export async function startDaemon(args) {
               .catch((error) => {
                 console.error(`[daemon] device E2EE registration: ${error.code || error.message}`);
               });
+            // Reconcile presence before history: the cloud may still believe a
+            // session that stopped during the outage is attached, and an App
+            // opened right now would show it as active until a heartbeat
+            // arrives. Publishing the current attach/detach set settles it.
+            void reconcileAgentPresence();
             void syncAgentActivityHistory().then((result) => {
               if (result?.ok) return syncAgentHistoryContent();
               return null;

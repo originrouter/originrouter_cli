@@ -58,4 +58,36 @@ assert.equal(
 if (originalConfigDir == null) delete process.env.CLAUDE_CONFIG_DIR;
 else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
 
+// The parsed timeline is cached against the file it was built from. A second
+// read of an unchanged transcript must return the same page, and a transcript
+// that has grown must be re-parsed — a stale cache would hand the App a
+// conversation missing everything the Agent wrote since the first page.
+{
+  const cachedPath = join(dir, "cached.jsonl");
+  writeFileSync(cachedPath, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+  const first = readClaudeConversationHistory(cachedPath, { limit: 2 });
+  const second = readClaudeConversationHistory(cachedPath, { limit: 2 });
+  assert.deepEqual(second.messages.map((item) => item.text), first.messages.map((item) => item.text));
+  assert.equal(second.nextCursor, first.nextCursor);
+
+  // Paging back must stay consistent with the cached parse, not a re-parse.
+  const back = readClaudeConversationHistory(cachedPath, {
+    beforeCursor: first.nextCursor,
+    limit: 2,
+  });
+  assert.equal(back.hasMore, true);
+
+  // Appending moves both size and mtime, so the cache must miss and the new
+  // message must be visible in the next page.
+  const grown = [...rows, {
+    type: "assistant",
+    uuid: "a3",
+    timestamp: "2026-07-17T00:00:05Z",
+    message: { content: [{ type: "text", text: "five" }] },
+  }];
+  writeFileSync(cachedPath, `${grown.map((row) => JSON.stringify(row)).join("\n")}\n`);
+  const afterGrow = readClaudeConversationHistory(cachedPath, { limit: 1 });
+  assert.deepEqual(afterGrow.messages.map((item) => item.text), ["five"]);
+}
+
 console.log("claude conversation history tests ok");

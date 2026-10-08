@@ -140,7 +140,11 @@ export async function runCodexAppServerSession(rawArgs) {
   const device = ensureDevice(
     options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID,
   );
-  const sessionId = options.session || `codex-${Date.now()}`;
+  // Random hex, not a timestamp — see `localAgentSession` for the reasoning.
+  // The server's `UNIQUE (session_id)` has no `user_id` in it, so this id has
+  // to be globally unique, and a millisecond clock only makes it unique within
+  // one machine.
+  const sessionId = options.session || `codex-${randomUUID().replaceAll("-", "")}`;
   const cwd = process.cwd();
   const workspaceApprovalPolicy = readWorkspaceApprovalPolicySafe(cwd);
   const startedAt = Date.now();
@@ -217,6 +221,8 @@ export async function runCodexAppServerSession(rawArgs) {
     enabled: !collaborationWorker,
     sessionId,
     agentType: "codex",
+    // The app-server's thread id, once `thread/start` returns it (line ~985).
+    nativeSessionId: () => threadId || "",
     title: sessionTitle,
     deviceName: device.displayName || device.host,
     workspaceDisplayPath: workspaceDisplayPath(cwd),

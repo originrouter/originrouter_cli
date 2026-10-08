@@ -18,7 +18,6 @@ export function buildProviderConfigEvent(provider, source) {
       baseUrl: null,
       apiKey: "not set",
       model: null,
-      smallFastModel: null,
       source: source || "none",
     };
   }
@@ -28,7 +27,6 @@ export function buildProviderConfigEvent(provider, source) {
     baseUrl: provider.baseUrl ?? "(unset)",
     apiKey: maskSecret(provider.apiKey),
     model: provider.model ?? "(unset)",
-    smallFastModel: provider.smallFastModel ?? null,
     source: source || "none",
   };
 }

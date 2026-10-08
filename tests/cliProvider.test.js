@@ -103,9 +103,8 @@ try {
   assert.notEqual(legacyAdd.code, 0, "legacy add should fail");
   assert.match(legacyAdd.stderr, /openai-compatible.*no longer supported/);
 
-  // Stage 7.8: --small-fast-model is [legacy]. Still accepted on add
-  // (the field round-trips on disk) but the CLI prints a one-line note
-  // pointing at the routes layer.
+  // --small-fast-model has been removed outright (no deprecation shim): it is
+  // no longer a catalog flag, so there is no field for it to write.
   const addWithFast = run([
     "provider", "add", "legacy-fast",
     "--litellm-provider", "deepseek",
@@ -113,24 +112,17 @@ try {
     "--model", "deepseek-chat",
     "--small-fast-model", "deepseek-mini",
   ]);
-  assert.equal(addWithFast.code, 0, `legacy flag should still be accepted: ${addWithFast.stderr}`);
-  assert.match(addWithFast.stdout, /Note: --small-fast-model is \[legacy\]/);
-  // The note should hint at the canonical command.
-  assert.match(addWithFast.stdout, /originrouter route set claude\.small --provider <name>/);
+  assert.equal(addWithFast.code, 0, `add failed: ${addWithFast.stderr}`);
+  const showAfterAdd = run(["provider", "show", "legacy-fast"]);
+  assert.equal(showAfterAdd.code, 0, `show failed: ${showAfterAdd.stderr}`);
+  assert.match(showAfterAdd.stdout, /smallFastModel: \(unset\)/,
+    "the removed flag must not seed the legacy field");
 
-  // provider show still displays the field with the legacy annotation.
-  const showLegacy = run(["provider", "show", "legacy-fast"]);
-  assert.equal(showLegacy.code, 0, `show failed: ${showLegacy.stderr}`);
-  assert.match(showLegacy.stdout, /smallFastModel: deepseek-mini/);
-  assert.match(showLegacy.stdout, /legacy; routes\.claude\.small is source of truth/);
-
-  // Provider Use creates one coherent main + small profile. The legacy fast
-  // field is still ignored; both routes seed from the enabled model.
+  // Provider Use writes the primary slot only; the auxiliary families inherit.
   const useLegacy = run(["provider", "use", "legacy-fast"]);
   assert.equal(useLegacy.code, 0, `use failed: ${useLegacy.stderr}`);
   assert.match(useLegacy.stdout, /Claude routes updated:/);
-  assert.match(useLegacy.stdout, /model originrouter-claude-model\s+-> legacy-fast \/ deepseek-chat/);
-  assert.match(useLegacy.stdout, /fast\s+originrouter-claude-fast-model -> legacy-fast \/ deepseek-chat/);
+  assert.match(useLegacy.stdout, /main\s+originrouter-claude-model\s+-> legacy-fast \/ deepseek-chat/);
 
   const clearClaude = run(["route", "clear", "claude"]);
   assert.equal(clearClaude.code, 0, clearClaude.stderr);
@@ -140,7 +132,7 @@ try {
     "route", "set", "claude",
     "--provider", "legacy-fast",
     "--main-model", "deepseek-chat",
-    "--small-model", "deepseek-chat",
+    "--haiku", "deepseek-chat",
   ]);
   assert.equal(setClaude.code, 0, setClaude.stderr);
   assert.match(setClaude.stdout, /Claude routes set/);

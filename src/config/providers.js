@@ -618,10 +618,11 @@ export function takeUpdateWarnings(result) {
   return ws;
 }
 
-// Provider Use applies one coherent Claude routing profile. Main and small
-// share the same Provider; the first enabled model seeds both aliases. Users
-// can subsequently select two different models from that Provider through the
-// grouped route editor or PUT /routes/claude.
+// Provider Use applies one coherent Claude routing profile. Every slot shares
+// the same Provider; the first enabled model seeds the primary route and the
+// four auxiliary families are left to inherit it. Users can subsequently give
+// a family its own model from that Provider through the grouped route editor
+// or PUT /routes/claude.
 //
 // Cleanup of routes that point at a removed provider lives in
 // handleProviderRemove (localApi.js) and `provider remove` (index.js).
@@ -630,10 +631,8 @@ export function setClaudeRouteFromProvider(config, name) {
   if (!provider) throw new Error(`unknown provider '${name}'`);
   const model = enabledProviderModelEntries(provider)[0]?.id;
   if (!model) throw new Error(`provider '${name}' has no enabled model`);
-  const entry = { provider: name, model };
   const next = replaceAgentRoutes(config, "claude", {
-    main: entry,
-    small: entry,
+    main: { provider: name, model },
   });
   return { next };
 }
@@ -770,7 +769,6 @@ export function resolveProvider({ config, agent, flagName }) {
           baseUrl: legacy.baseUrl,
           apiKey: legacy.apiKey,
           model: legacy.model,
-          smallFastModel: legacy.smallFastModel,
         },
         source: "legacy",
       };
@@ -787,7 +785,9 @@ export function buildProviderEnv(provider) {
     if (provider.baseUrl) env.ANTHROPIC_BASE_URL = provider.baseUrl;
     if (provider.apiKey) env.ANTHROPIC_API_KEY = provider.apiKey;
     if (provider.model) env.ANTHROPIC_MODEL = provider.model;
-    if (provider.smallFastModel) env.ANTHROPIC_SMALL_FAST_MODEL = provider.smallFastModel;
+    // provider.smallFastModel is [legacy] and deliberately no longer emitted:
+    // ANTHROPIC_SMALL_FAST_MODEL is not part of the injected set. Claude's
+    // auxiliary models come from routes.claude.<family>, not the provider.
     return env;
   }
   // litellm -> no direct env; proxy handles routing.

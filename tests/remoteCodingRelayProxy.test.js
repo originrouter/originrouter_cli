@@ -108,7 +108,7 @@ function scriptedResponses(body, script) {
     routes: {
       claude: {
         main:  { provider: "remote1", model: "m" },
-        small: { provider: "proxy1",  model: "m" },
+        opus:  { provider: "proxy1",  model: "m" },
       },
     },
   };
@@ -117,7 +117,7 @@ function scriptedResponses(body, script) {
   try { await buildAgentProviderEnv("claude", config, { remoteCodingStatus: probe }); } catch (err) { threw = err; }
   assert.ok(threw);
   assert.equal(threw.code, "PROVIDER_UNSUPPORTED");
-  assert.match(threw.message, /main and small routes must use the same provider/);
+  assert.match(threw.message, /All Claude routes must use the same provider/);
 }
 
 {

@@ -26,7 +26,7 @@ const MODELS = [
 test("recommended Cloud setup chooses separate Claude and Codex defaults", () => {
   const selected = recommendedCloudRouteModels(MODELS);
   assert.equal(selected.claudeMain.id, "claude-sonnet-5");
-  assert.equal(selected.claudeSmall.id, "claude-haiku-4-5");
+  assert.equal(selected.claudeHaiku.id, "claude-haiku-4-5");
   assert.equal(selected.codexMain.id, "gpt-5.6-sol");
 });
 
@@ -36,17 +36,18 @@ test("recommended Cloud setup falls back within compatible model families", () =
     { id: "gpt-custom", name: "GPT Custom", origin: "OpenAI" },
   ]);
   assert.equal(selected.claudeMain.id, "claude-custom");
-  assert.equal(selected.claudeSmall.id, "claude-custom");
+  assert.equal(selected.claudeHaiku.id, "claude-custom");
   assert.equal(selected.codexMain.id, "gpt-custom");
 });
 
 test("applying recommended Cloud setup atomically configures every Agent slot", () => {
   const result = applyRecommendedCloudRoutes({}, MODELS);
   assert.equal(result.config.providers["originrouter-cloud"].type, "originrouter");
+  // Only the primary slot is written. The four auxiliary families are left
+  // unset on purpose: unset == "inherit the primary model".
   assert.deepEqual(result.config.routes, {
     claude: {
       main: { provider: "originrouter-cloud", model: "claude-sonnet-5" },
-      small: { provider: "originrouter-cloud", model: "claude-haiku-4-5" },
     },
     codex: {
       main: { provider: "originrouter-cloud", model: "gpt-5.6-sol" },
@@ -59,7 +60,6 @@ test("fresh CLI defaults are bundled exact Cloud route values", () => {
   assert.deepEqual(result.config.routes, {
     claude: {
       main: { provider: "originrouter-cloud", model: "claude-sonnet-5" },
-      small: { provider: "originrouter-cloud", model: "claude-haiku-4-5" },
     },
     codex: {
       main: { provider: "originrouter-cloud", model: "gpt-5.6-sol" },
@@ -95,7 +95,7 @@ test("default Cloud routes preserve an existing active-account config", (t) => {
     routes: {
       claude: {
         main: { provider: "originrouter-cloud", model: "deepseek-v4-flash" },
-        small: { provider: "originrouter-cloud", model: "deepseek-v4-flash" },
+        haiku: { provider: "originrouter-cloud", model: "deepseek-v4-flash" },
       },
     },
   }));

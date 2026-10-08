@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 
 import {
   createRuntimeEventReporter,
-  createTerminalActivityReporter,
   startAgentSessionHeartbeat,
   startApprovalDecisionPolling,
 } from "../agent/bridgeReporter.js";
@@ -569,9 +568,14 @@ export class SessionManager {
     };
     let resolvedProvider = null;
     let providerSource = "";
+    // The provider's own conversation id, learned from the adapter's
+    // `agent.session_id` frame (claude emits one on SDK init). Declared here,
+    // above the reporter, because the reporter's getter closes over it.
+    let nativeSessionId = "";
     const runtimeReporter = createRuntimeEventReporter({
       sessionId,
       agentType: agent,
+      nativeSessionId: () => nativeSessionId,
       title: payload.title || `${agent} session`,
       deviceName: payload.deviceName || "",
       telemetryQueue: this.telemetry?.queue,
@@ -597,7 +601,6 @@ export class SessionManager {
       }
       return runtimeReporter.report(type, extra);
     };
-    let terminalActivityReporter = null;
 
     const cleanupSession = () => {
       if (typeof session.stopSessionHeartbeat === "function") {
@@ -607,10 +610,6 @@ export class SessionManager {
       if (typeof session.stopApprovalPolling === "function") {
         session.stopApprovalPolling();
         session.stopApprovalPolling = null;
-      }
-      if (typeof session.stopTerminalActivityReporter === "function") {
-        session.stopTerminalActivityReporter();
-        session.stopTerminalActivityReporter = null;
       }
       if (session.scanTimer) {
         clearInterval(session.scanTimer);
@@ -630,11 +629,7 @@ export class SessionManager {
       if (session.finalized) return session.exitPromise;
       session.finalized = true;
       session.status = "exited";
-      const terminalFlush = terminalActivityReporter
-        ? terminalActivityReporter.flush().catch(() => {})
-        : Promise.resolve();
       cleanupSession();
-      await terminalFlush;
       try {
         patchSessionExit({
           sessionId,
@@ -727,19 +722,6 @@ export class SessionManager {
 
       const launch = adapter.buildLaunch();
       const metadata = adapter.describe();
-      terminalActivityReporter = createTerminalActivityReporter({
-        sessionId,
-        agentType: agent,
-        title: payload.title || `${agent} session`,
-        deviceName: this.deviceName || "",
-        reportRuntimeEventFn: (runtimePayload) => runtimeReporter.report(
-          "terminal.activity",
-          { summary: runtimePayload.summary },
-        ),
-      });
-      session.stopTerminalActivityReporter = () => {
-        terminalActivityReporter.stop();
-      };
 
       const started = await executor.start({
         command: launch.command,
@@ -750,8 +732,16 @@ export class SessionManager {
         rows: payload.rows,
         onOutput: (data) => {
           send("terminal.output", { data });
-          terminalActivityReporter.ingest(data);
           for (const event of adapter.handleOutput(data)) {
+            // Claude announces its id as `agent.session_id` (SDK init); the
+            // codex JSONL scanner announces it as `agent.session.start`
+            // (`session_meta`). Both are the provider's own conversation id.
+            if (
+              (event.type === "agent.session_id" || event.type === "agent.session.start")
+              && event.sessionId
+            ) {
+              nativeSessionId = String(event.sessionId).slice(0, 191);
+            }
             this.auditStore?.appendEvent({ sessionId, cwd, agent, runId: payload.runId || sessionId }, event);
             this.agentCatalog?.recordEvent(sessionId, event);
             send("agent.event", { event });

@@ -12,11 +12,19 @@ import {
   storeDeviceE2eeDirectoryCache,
 } from "../src/security/deviceE2eeDirectoryCache.js";
 import { DeviceE2eeRelayTransport } from "../src/security/deviceE2eeRelayTransport.js";
+import {
+  readSessionGroupKey,
+  sessionGroupKeyPath,
+} from "../src/security/sessionGroupKeyStore.js";
+import { existsSync } from "node:fs";
 
 const root = mkdtempSync(join(tmpdir(), "originrouter-e2ee-relay-"));
 const app = ensureDeviceE2eeIdentity(join(root, "app"), { deviceId: "app-device" });
 const app2 = ensureDeviceE2eeIdentity(join(root, "app-2"), { deviceId: "app-device-2" });
 const cli = ensureDeviceE2eeIdentity(join(root, "cli"), { deviceId: "cli-device" });
+// A device that is trusted and reachable but never subscribes: the shape of a
+// collaboration worker being targeted before any App has subscribed.
+const worker = ensureDeviceE2eeIdentity(join(root, "worker"), { deviceId: "worker-device" });
 const stateDir = join(root, "state");
 const credential = {
   sessionId: "or_ses_test",
@@ -28,6 +36,7 @@ const cachedDirectory = storeDeviceE2eeDirectoryCache(stateDir, {
     { ...app.public_identity, trust_status: "trusted" },
     { ...app2.public_identity, trust_status: "trusted" },
     { ...cli.public_identity, trust_status: "trusted" },
+    { ...worker.public_identity, trust_status: "trusted" },
   ],
 }, { namespace: credential.sessionId });
 const sent = [];
@@ -41,6 +50,29 @@ const transport = new DeviceE2eeRelayTransport({
   controlBaseUrl: "https://example.invalid",
   credentialProvider: async () => credential,
 });
+// A subscribe now also carries a group key response, so each App session's
+// receive counter advances by frames this test does not assert on. Open frames
+// by draining each session in order and remembering how far it has been read,
+// which keeps every later assertion independent of those extra deliveries.
+// A group key is persisted under a hash of its session id, so the only honest
+// question to ask of the key store is "does a key exist for this id" — not
+// what the file is called.
+function sessionGroupKeyExists(directory, id) {
+  return existsSync(sessionGroupKeyPath(directory, id));
+}
+const drains = new Map();
+function drain(session) {
+  const frames = sent.filter((item) => item.protocol === "e2ee-v2"
+    && item.session_id === session.sessionId);
+  const from = drains.get(session.sessionId) || 0;
+  const opened = frames.slice(from).map((frame) => session.open(frame));
+  drains.set(session.sessionId, frames.length);
+  return opened;
+}
+function latestFor(session) {
+  const opened = drain(session);
+  return opened.at(-1);
+}
 const appSession = DeviceE2eeSession.initiate({
   local: app,
   peer: cli.public_identity,
@@ -75,14 +107,35 @@ await transport.sendBroadcast("agent.stream.event", {
   sessionId: "agent-session-1",
   event: { text: "secret stream" },
 }, { routeKey: "agent-session-1" });
-assert.equal(sent.length, 2);
-assert.equal(sent[0].protocol, "e2ee-v2");
-assert.equal(sent[1].protocol, "e2ee-v2");
-assert.equal(JSON.stringify(sent[0]).includes("secret stream"), false);
-const opened = appSession.open(sent[0]);
-assert.equal(opened.payload.event.text, "secret stream");
-const openedForSecondApp = app2Session.open(sent[1]);
-assert.equal(openedForSecondApp.payload.event.text, "secret stream");
+// Each subscribe delivers its group key, and the publish then costs one
+// ciphertext instead of one per viewer. That is 2 key deliveries + 1 group
+// envelope, plus the subscribe acknowledgements the two subscribes also send —
+// which is why this counts 4, not 3.
+const groupFrames = sent.filter(
+  (item) => item.protocol === "e2ee-v2" && item.target_device_id?.startsWith("grp-session:"),
+);
+assert.equal(groupFrames.length, 1);
+assert.equal(groupFrames[0].target_device_id, "grp-session:agent-session-1");
+assert.equal(groupFrames[0].recipient_key_id.startsWith("grp:"), true);
+assert.equal(JSON.stringify(groupFrames[0]).includes("secret stream"), false);
+
+// A subscribe carries a fresh request id on every poll, and the App sends one
+// per device on every snapshot. That id names a *route*, not a session: a
+// group key minted for it would be persisted forever, delivered to nobody who
+// asks for it again, and — because the App re-polls on a timer — would grow the
+// key directory without bound, one dead file per poll, each costing a full
+// round trip to deliver. The second subscription above carries
+// `requestId: "subscribe-2"`; only a real session id may back a key.
+assert.equal(
+  sessionGroupKeyExists(stateDir, "agent-session-1"),
+  true,
+  "the real session id must still mint its group key",
+);
+assert.equal(
+  sessionGroupKeyExists(stateDir, "subscribe-2"),
+  false,
+  "a request id must not mint a group key",
+);
 
 // A failed subscriber must be removed from both the subscription index and
 // the route index. Otherwise a later single-subscriber broadcast can reuse
@@ -112,10 +165,11 @@ await failingTransport.sendBroadcast("agent.stream.event", {
 }, { routeKey: "agent-session-1" });
 assert.equal(failingTransport.routes.has("agent-session-1"), true);
 
-// A collaboration worker has an explicit coordinator target, but the same
-// session may also be visible in another App's ordinary Agent list. Those
-// subscribed Apps must receive the live event as well, while the coordinator
-// remains the guaranteed recipient when no subscription exists yet.
+// The coordinator is also a subscriber here, so it receives the shared group
+// ciphertext like any other viewer. What the target parameter adds is a second,
+// independent delivery: a copy sealed on the coordinator's own pairwise
+// session, which does not depend on the relay having registered it as a
+// subscriber. That redundancy is the contract, not an inefficiency to tune away.
 const beforeTargetedSubscribers = sent.length;
 await transport.sendTargetedAndSubscribers("agent.stream.event", {
   sessionId: "agent-session-1",
@@ -124,15 +178,144 @@ await transport.sendTargetedAndSubscribers("agent.stream.event", {
   targetDeviceId: "app-device-2",
   routeKey: "agent-session-1",
 });
-assert.equal(sent.length, beforeTargetedSubscribers + 2);
+const targetedFrames = sent.slice(beforeTargetedSubscribers);
 assert.equal(
-  app2Session.open(sent[beforeTargetedSubscribers]).payload.event.text,
-  "target plus subscribers",
+  targetedFrames.filter((frame) => frame.target_device_id === "app-device-2").length,
+  1,
+  "the explicit recipient always gets a copy sealed on its own session",
 );
-assert.equal(
-  appSession.open(sent[beforeTargetedSubscribers + 1]).payload.event.text,
-  "target plus subscribers",
-);
+
+// The case the method exists for: the coordinator has never subscribed. A
+// collaboration worker's first event is exactly this — the worker is targeted
+// before any App has subscribed, so it appears in no subscription the relay
+// knows about. A group envelope names no recipient, so it reaches only the
+// registered subscribers; the coordinator must therefore be sealed separately
+// or it would miss the event entirely while the call still reported success.
+{
+  const frames = [];
+  const targeted = new DeviceE2eeRelayTransport({
+    relayClient: {
+      send: async () => ({ accepted: true }),
+      sendEnvelope: async (envelope) => {
+        frames.push(envelope);
+        return { accepted: true };
+      },
+    },
+    localIdentity: cli,
+    stateDir,
+    controlBaseUrl: "https://example.invalid",
+    credentialProvider: async () => credential,
+  });
+  // Two ordinary viewers subscribe to the session. Neither is the target.
+  const viewerOne = DeviceE2eeSession.initiate({
+    local: app,
+    peer: cli.public_identity,
+    sessionId: "e2s_targeted_viewer_one",
+  });
+  await targeted.handleInbound(viewerOne.seal(
+    "agent.control.subscribe",
+    { requestId: "viewer-one", sessionIds: ["agent-session-1"] },
+    { routing: {
+      session_id: "agent-session-1",
+      request_id: "viewer-one",
+      directory_head: deviceE2eeDirectoryHead(cachedDirectory),
+    } },
+  ));
+  const viewerTwo = DeviceE2eeSession.initiate({
+    local: app2,
+    peer: cli.public_identity,
+    sessionId: "e2s_targeted_viewer_two",
+  });
+  await targeted.handleInbound(viewerTwo.seal(
+    "agent.control.subscribe",
+    { requestId: "viewer-two", sessionIds: ["agent-session-1"] },
+    { routing: {
+      session_id: "agent-session-1",
+      request_id: "viewer-two",
+      directory_head: deviceE2eeDirectoryHead(cachedDirectory),
+    } },
+  ));
+  frames.length = 0;
+  await targeted.sendTargetedAndSubscribers("agent.stream.event", {
+    sessionId: "agent-session-1",
+    event: { text: "coordinator must receive this" },
+  }, {
+    // A trusted device that never subscribed: the relay cannot route a group
+    // envelope to it, because a group envelope names no recipient.
+    targetDeviceId: "worker-device",
+    routeKey: "agent-session-1",
+  });
+  assert.equal(
+    frames.filter((frame) => frame.target_device_id === "worker-device").length,
+    1,
+    "an unsubscribed explicit recipient must still get its own sealed copy",
+  );
+  assert.equal(
+    frames.filter((frame) => frame.target_device_id === "grp-session:agent-session-1").length,
+    1,
+    "the two subscribers still share a single ciphertext",
+  );
+  assert.equal(JSON.stringify(frames).includes("coordinator must receive this"), false);
+}
+
+// No subscribed App is the ordinary case for an idle Agent — the App is open
+// but sitting on another conversation. The broadcast must report that plainly
+// instead of falling through to send(), which cannot route a payload that
+// carries no targetDeviceId and throws. That throw became a "no E2EE session
+// route" line for every streamed event, thousands per session, describing a
+// situation that is not an error at all.
+{
+  const isolated = new DeviceE2eeRelayTransport({
+    relayClient: {
+      send: async () => ({ accepted: true }),
+      sendEnvelope: async () => ({ accepted: true }),
+    },
+    localIdentity: cli,
+    stateDir,
+    controlBaseUrl: "https://example.invalid",
+    credentialProvider: async () => credential,
+  });
+  const result = await isolated.sendBroadcast("agent.stream.event", {
+    sessionId: "session-with-no-watchers",
+    event: { text: "nobody is subscribed" },
+  }, { routeKey: "session-with-no-watchers" });
+  assert.deepEqual(result, { accepted: false, reason: "no_subscribers" });
+}
+
+// Exactly one subscriber is a delivery, not a degenerate broadcast: that App
+// must receive the event. Folding it into the no-subscriber branch would drop
+// the only copy, and the caller would never learn the event went nowhere.
+{
+  const frames = [];
+  const isolatedRelay = {
+    send: async () => ({ accepted: true }),
+    sendEnvelope: async (envelope) => {
+      frames.push(envelope);
+      return { accepted: true };
+    },
+  };
+  const single = new DeviceE2eeRelayTransport({
+    relayClient: isolatedRelay,
+    localIdentity: cli,
+    stateDir,
+    controlBaseUrl: "https://example.invalid",
+    credentialProvider: async () => credential,
+  });
+  await single.handleInbound(subscribe);
+  frames.length = 0;
+  const result = await single.sendBroadcast("agent.stream.event", {
+    sessionId: "agent-session-1",
+    event: { text: "only watcher" },
+  }, { routeKey: "agent-session-1" });
+  assert.equal(result.accepted, true);
+  assert.equal(frames.length, 1, "the single subscriber must receive the event");
+  // Assert on the sealed frame, not a reopened payload: this transport holds
+  // its own session started at sequence 0, so the shared `appSession` — whose
+  // sequence has advanced through the earlier cases — cannot open it.
+  assert.equal(frames[0].protocol, "e2ee-v2");
+  assert.equal(frames[0].target_device_id, "app-device");
+  assert.equal(JSON.stringify(frames[0]).includes("only watcher"), false);
+}
 
 await transport.send("collaboration.control.response", {
   sessionId: "agent-session-1",
@@ -143,24 +326,31 @@ await transport.send("collaboration.control.response", {
     values: ["present", undefined, { absent: undefined, retained: "nested" }],
   },
 });
-const sanitized = app2Session.open(sent.at(-1)).payload.data;
+// Request/response traffic still uses one pairwise session per device. This
+// App's session is a single receive counter, so drain its new frames in order
+// and keep the opened results; re-opening an already-consumed sequence would
+// trip the counter. The transport may also hold a second, CLI-initiated
+// session to this device for an explicit target, which this App does not
+// receive on and is excluded here.
+const sanitized = latestFor(app2Session).payload.data;
 assert.equal("absent" in sanitized, false);
 assert.deepEqual(sanitized.nested, { retained: true });
 assert.deepEqual(sanitized.values, ["present", null, { retained: "nested" }]);
 
 // A conflict result carries both the logical session and the losing App's
 // device id. The explicit device target must win over the session's latest
-// subscriber route, otherwise the wrong App can receive the error.
+// subscriber route, otherwise the wrong App can receive the error. An explicit
+// target opens its own session to that device rather than reusing the
+// subscriber route, so read the frame on that session.
 await transport.send("agent.interaction.result", {
   sessionId: "agent-session-1",
   interactionId: "permission-1",
   status: "conflict",
   targetDeviceId: "app-device-2",
 });
+const conflictFrame = sent.at(-1);
 const targetedConflict = DeviceE2eeSession.accept({
-  local: app2,
-  peer: cli.public_identity,
-  firstEnvelope: sent.at(-1),
+  local: app2, peer: cli.public_identity, firstEnvelope: conflictFrame,
 }).firstPayload;
 assert.equal(targetedConflict.payload.targetDeviceId, "app-device-2");
 
@@ -189,7 +379,7 @@ await transport.send("agent.stream.event", {
   event: { text: "bound collaboration stream" },
 });
 assert.equal(
-  appSession.open(sent.at(-1)).payload.event.text,
+  latestFor(appSession).payload.event.text,
   "bound collaboration stream",
 );
 assert.equal(transport.bindRoute("orphan-session", ["missing-assignment"]), false);
@@ -265,13 +455,20 @@ const deferred = () => {
   return { promise, resolve };
 };
 const orderedSent = [];
+// Every stream envelope is gated so the test can prove they are serialized.
+// The subscribe's group key response is not gated: `handleInbound` awaits it,
+// so gating it here would deadlock the subscribe itself. Only stream sends
+// consume a gate.
 const sendGates = [deferred(), deferred()];
+let orderedGateIndex = 0;
 const orderedTransport = new DeviceE2eeRelayTransport({
   relayClient: {
     send: async () => {},
     sendEnvelope: async (envelope) => {
-      const index = orderedSent.push(envelope) - 1;
-      await sendGates[index].promise;
+      orderedSent.push(envelope);
+      if (envelope.type !== "agent.stream.event") return { accepted: true };
+      const index = orderedGateIndex++;
+      await sendGates[Math.min(index, sendGates.length - 1)].promise;
       return { accepted: true };
     },
   },
@@ -293,6 +490,9 @@ await orderedTransport.handleInbound(orderedAppSession.seal(
     directory_head: deviceE2eeDirectoryHead(cachedDirectory),
   } },
 ));
+// Frame 0 is the subscribe's group key response and has already flushed. Both
+// stream sends are issued before either is allowed to flush, which is what
+// proves the per-session send tail serializes them.
 const firstSend = orderedTransport.send("agent.stream.event", {
   sessionId: "agent-session-ordered",
   event: { text: "first" },
@@ -302,13 +502,18 @@ const secondSend = orderedTransport.send("agent.stream.event", {
   event: { text: "second" },
 });
 await new Promise((resolve) => setImmediate(resolve));
-assert.equal(orderedSent.length, 1);
-assert.equal(orderedSent[0].sequence, 0);
+assert.equal(orderedSent.length, 2);
+assert.equal(orderedSent[0].type, "agent.groupkey.response");
+assert.equal(orderedSent[1].type, "agent.stream.event");
+// Sequence 1, not 0: the group key response shares this pairwise session and
+// consumed sequence 0.
+assert.equal(orderedSent[1].sequence, 1);
 sendGates[0].resolve();
 await firstSend;
 await new Promise((resolve) => setImmediate(resolve));
-assert.equal(orderedSent.length, 2);
-assert.equal(orderedSent[1].sequence, 1);
+assert.equal(orderedSent.length, 3);
+assert.equal(orderedSent[2].type, "agent.stream.event");
+assert.equal(orderedSent[2].sequence, 2);
 sendGates[1].resolve();
 await secondSend;
 
@@ -360,6 +565,81 @@ const acceptedAfterRotation = DeviceE2eeSession.accept({
 assert.equal(
   acceptedAfterRotation.firstPayload.payload.prompt,
   "sealed after key rotation",
+);
+
+// A re-subscribe that already holds the current key must draw no key delivery
+// at all. The App re-subscribes on every reconnect and every directory event,
+// each naming every session it knows; answering each with the full key set is
+// what saturated the send queue and put a live event behind hundreds of
+// redundant envelopes.
+//
+// This runs last, on its own transport and its own session, because a subscribe
+// re-binds the route to the subscribing session — inserting it earlier would
+// re-point the route away from the session the earlier cases drain on.
+const dedupeSent = [];
+const dedupeTransport = new DeviceE2eeRelayTransport({
+  relayClient: {
+    send: async () => {},
+    sendEnvelope: async (envelope) => dedupeSent.push(envelope),
+  },
+  localIdentity: cli,
+  stateDir,
+  controlBaseUrl: "https://example.invalid",
+  credentialProvider: async () => credential,
+});
+const dedupeApp = DeviceE2eeSession.initiate({
+  local: app,
+  peer: cli.public_identity,
+  sessionId: "e2s_group_key_dedupe",
+});
+const dedupeSubscribe = (knownGroupKeyIds) => dedupeApp.seal(
+  "agent.control.subscribe",
+  {
+    sessionIds: ["dedupe-session"],
+    ...(knownGroupKeyIds ? { knownGroupKeyIds } : {}),
+  },
+  { routing: {
+    session_id: "dedupe-session",
+    directory_head: deviceE2eeDirectoryHead(cachedDirectory),
+  } },
+);
+const keyDeliveries = () => dedupeSent.filter(
+  (item) => item.type === "agent.groupkey.response",
+).length;
+
+// First subscribe: the App holds nothing, so the key is delivered.
+await dedupeTransport.handleInbound(dedupeSubscribe(null));
+assert.equal(keyDeliveries(), 1, "the first subscribe must deliver the key");
+const dedupeKeyId = readSessionGroupKey(stateDir, "dedupe-session").group_key_id;
+
+// Re-subscribe with the key it now holds: nothing to send.
+await dedupeTransport.handleInbound(
+  dedupeSubscribe({ "dedupe-session": dedupeKeyId }),
+);
+assert.equal(
+  keyDeliveries(),
+  1,
+  "a subscribe that already holds the current key must not re-draw it",
+);
+
+// An empty map is the same as absent: a subscriber that claims nothing may not
+// be used to suppress a delivery it needs.
+await dedupeTransport.handleInbound(dedupeSubscribe({}));
+assert.equal(
+  keyDeliveries(),
+  2,
+  "an empty known-key map must not suppress the delivery",
+);
+
+// A stale id means the key rotated under the subscriber, so it must be sent —
+// skipping it would strand that App on a key nothing publishes under.
+await dedupeTransport.handleInbound(
+  dedupeSubscribe({ "dedupe-session": "grp:stale-key-id" }),
+);
+assert.equal(
+  keyDeliveries(),
+  3,
+  "a stale key id must still be delivered",
 );
 
 console.log("device E2EE relay transport tests ok");
