@@ -128,6 +128,15 @@ const POLICY_AT = "2026-07-27T12:30:00.000Z";
 // The rotating App only becomes the policy signer once its successor key is
 // current, so those two cases need a later acceptance time.
 const ROTATING_POLICY_AT = at("2026-07-27T14:30:00.000Z");
+// The two-hop chain cases. Both admissions land after the roots are trusted
+// (12:00) and before anything is revoked (13:00), so what the chain cases
+// exercise is depth -- not a signature that falls outside a trust window,
+// which cases 2, 3 and 8 already cover.
+const SECOND_APP_ADMITTED_AT = at("2026-07-27T12:45:00.000Z");
+const LATE_CLI_ADMITTED_AT = at("2026-07-27T12:50:00.000Z");
+// `admissionProof` signs an ISO `created_at` while `row` stamps an epoch
+// `approved_at`; a case that quotes the same instant in both has to convert.
+const iso = (epoch) => new Date(epoch * 1000).toISOString();
 
 const verifiedPolicy = (approver, grandfathered, updatedAt = at(POLICY_AT)) => ({
   epoch: 1,
@@ -484,6 +493,84 @@ const cases = [
         row(revokedRootApp, "revoked", { revoked_at: REVOKED_AT }),
         row(lateCli, "trusted", {
           admission_proof: admissionProof(revokedRootApp, lateCli, "2026-07-27T13:00:00.000Z"),
+        }),
+      ],
+    },
+  },
+  {
+    // Depth two, which no other vector here reaches: `signerApp` is the only
+    // grandfathered root, `secondApp` is admitted by it, and `lateCli` is
+    // admitted by `secondApp`. Resolving `lateCli` takes two passes over the
+    // edge set, so a verifier that walks the edges once and stops would pass
+    // all eighteen vectors above this one and get this wrong. The fixpoint
+    // loop is the only reason the two implementations agree here, and nothing
+    // else in this file would notice it being replaced by a single pass.
+    name: "chain_two_levels_accepted",
+    expect: "accept",
+    why: "Trust resolves transitively: a device approved by an App that was itself approved resolves too.",
+    directory: {
+      policy: verifiedPolicy(signerApp, [signerApp.public_identity.key_id]),
+      identities: [
+        row(signerApp, "trusted"),
+        row(secondApp, "trusted", {
+          approved_at: SECOND_APP_ADMITTED_AT,
+          admission_proof: admissionProof(signerApp, secondApp, iso(SECOND_APP_ADMITTED_AT)),
+        }),
+        row(lateCli, "trusted", {
+          approved_at: LATE_CLI_ADMITTED_AT,
+          admission_proof: admissionProof(secondApp, lateCli, iso(LATE_CLI_ADMITTED_AT)),
+        }),
+      ],
+    },
+  },
+  {
+    // The same chain one hop deeper into the cascade, and the shape the App's
+    // removal confirmation quotes: `secondApp` is gone, so `lateCli` loses
+    // trust even though its own row never changed. Distinct from
+    // `admitted_then_approver_removed` in that the removed device is not a
+    // grandfathered root -- it was admitted like anything else, and removing it
+    // costs exactly what removing a root costs.
+    name: "chain_two_levels_middle_removed",
+    expect: "reject",
+    why: "Removing the middle of a chain costs the device below it its trust, two hops from the removal.",
+    directory: {
+      policy: verifiedPolicy(signerApp, [signerApp.public_identity.key_id]),
+      identities: [
+        row(signerApp, "trusted"),
+        row(secondApp, "revoked", {
+          approved_at: SECOND_APP_ADMITTED_AT,
+          revoked_at: REVOKED_AT,
+          admission_proof: admissionProof(signerApp, secondApp, iso(SECOND_APP_ADMITTED_AT)),
+        }),
+        row(lateCli, "trusted", {
+          approved_at: LATE_CLI_ADMITTED_AT,
+          admission_proof: admissionProof(secondApp, lateCli, iso(LATE_CLI_ADMITTED_AT)),
+        }),
+      ],
+    },
+  },
+  {
+    // The recovery, and the case that makes the two above tolerable to ship.
+    // The stranded device is approved again by a root that is still authorized
+    // and its row now carries that proof, which is what the server writes when
+    // the approval lands. Nothing here resets the epoch or re-enrolls anyone:
+    // a cascade costs trust, not the account, and one approval from a surviving
+    // trusted device puts it back. Without this vector the suite only pins the
+    // damage and never the repair.
+    name: "cascade_recovers_by_reapproval",
+    expect: "accept",
+    why: "A stranded device is restored by one approval from a still-authorized root; no epoch reset is involved.",
+    directory: {
+      policy: verifiedPolicy(signerApp, [
+        signerApp.public_identity.key_id,
+        revokedRootApp.public_identity.key_id,
+      ]),
+      identities: [
+        row(signerApp, "trusted"),
+        row(revokedRootApp, "revoked", { revoked_at: REVOKED_AT }),
+        row(lateCli, "trusted", {
+          approved_at: at("2026-07-27T15:00:00.000Z"),
+          admission_proof: admissionProof(signerApp, lateCli, "2026-07-27T15:00:00.000Z"),
         }),
       ],
     },
