@@ -20,6 +20,23 @@ import {
   readSessionGroupKey,
 } from "./sessionGroupKeyStore.js";
 
+/**
+ * "I have forgotten every pairwise session we shared."
+ *
+ * The relay is stateless about sessions, so neither side can tell the other
+ * that it dropped one. The CLI drops all of them on any trust event, and the
+ * App drops its own whenever it initiates a trust change. Without a signal the
+ * survivor keeps sealing onto a session the other end no longer has, and every
+ * later envelope is read as a first envelope and refused on `sequence !== 0`.
+ * The only self-heal left is `shouldRekey`'s 30-minute `maxAge`, so the user
+ * watches a spinner for half an hour. This message closes that gap.
+ *
+ * It is sent on a *fresh* session (`send()` initiates one when the target has
+ * none), which is why the receiver can always be told: establishing the channel
+ * to deliver the reset is itself the reset.
+ */
+export const DEVICE_E2EE_SESSION_RESET_TYPE = "e2ee.sessions.reset";
+
 export const PROTECTED_DEVICE_MESSAGE_TYPES = new Set([
   "agent.control.subscribe",
   "agent.interactions.snapshot.request",
@@ -79,6 +96,7 @@ export const PROTECTED_DEVICE_MESSAGE_TYPES = new Set([
   "collaboration.remote.cancel",
   "collaboration.mcp.request",
   "collaboration.mcp.response",
+  DEVICE_E2EE_SESSION_RESET_TYPE,
 ]);
 
 const ROUTE_SUBSCRIBER_TTL_MS = 2 * 60 * 1000;
@@ -487,16 +505,39 @@ export class DeviceE2eeRelayTransport {
         envelope.source_device_id,
         envelope.sender_key_id,
       );
-      const accepted = DeviceE2eeSession.accept({
-        local: localIdentity,
-        peer,
-        firstEnvelope: envelope,
-      });
+      let accepted;
+      try {
+        accepted = DeviceE2eeSession.accept({
+          local: localIdentity,
+          peer,
+          firstEnvelope: envelope,
+        });
+      } catch (error) {
+        // The sender still believes in a session this side has forgotten, so
+        // every request it makes from here on fails the same way and the user
+        // watches a spinner until `shouldRekey` expires the session. Answer it
+        // so the sender drops the session too and the next request opens a new
+        // one at sequence 0. Re-throwing here would leave that invisible: the
+        // daemon only logs the rejection.
+        await this._announceSessionReset(
+          envelope.source_device_id,
+          envelope.session_id,
+          error,
+        );
+        return null;
+      }
       session = accepted.session;
       opened = accepted.firstPayload;
       this.sessions.set(envelope.session_id, session);
     }
     const payload = { ...opened.payload, type: opened.type };
+    if (payload.type === DEVICE_E2EE_SESSION_RESET_TYPE) {
+      // The peer has forgotten us. Drop our half before anything else looks at
+      // the payload, so the very next envelope from it opens a clean session.
+      this.discardPeerSessions(session.peer?.device_id
+        || envelope.source_device_id);
+      return null;
+    }
     const keys = routeKeys(payload, envelope.routing);
     for (const key of keys) {
       this.routes.delete(key);
@@ -594,6 +635,58 @@ export class DeviceE2eeRelayTransport {
       subscribers.delete(id);
       if (subscribers.size === 0) this.routeSubscribers.delete(key);
     }
+  }
+
+  /**
+   * Forget every pairwise session held with one peer, and every route that
+   * pointed at one. Group sessions are keyed by audience rather than by device
+   * and are left alone: they are distributed per request id and a peer that
+   * forgot its pairwise sessions still receives the same fan-out.
+   */
+  discardPeerSessions(deviceId) {
+    const id = text(deviceId);
+    if (!id) return 0;
+    let dropped = 0;
+    for (const [sessionId, session] of this.sessions) {
+      if (session?.peer?.device_id !== id) continue;
+      this._discardSession(sessionId);
+      dropped += 1;
+    }
+    return dropped;
+  }
+
+  /**
+   * Tell `deviceId` to forget its side of every session with this CLI.
+   *
+   * Best effort by construction: the peer may already be untrusted (a
+   * `device.revoked` event means the directory will refuse to seal to it at
+   * all), and a device that has been revoked has nothing left worth telling.
+   * Failures are swallowed so a trust event can never be turned into an
+   * unhandled rejection by the notification it tries to send.
+   */
+  async _announceSessionReset(deviceId, staleSessionId, cause = null) {
+    const id = text(deviceId);
+    if (!id) return;
+    try {
+      await this.send(DEVICE_E2EE_SESSION_RESET_TYPE, {
+        target_device_id: id,
+        stale_session_id: text(staleSessionId),
+        reason: text(cause?.message) || "session_unusable",
+      });
+    } catch {
+      // Nothing to do: the peer keeps its stale session and ages out of it.
+    }
+  }
+
+  /**
+   * Announce that this CLI has dropped its sessions with `deviceId`.
+   *
+   * Called after a trust change, where the whole session map goes at once. The
+   * peer has no way to notice that on its own — the relay delivers envelopes
+   * happily, they simply stop being readable.
+   */
+  async announceSessionReset(deviceId, reason = "trust_changed") {
+    await this._announceSessionReset(deviceId, "", { message: reason });
   }
 
   async _verifyPeerDirectoryHead(peerHead) {

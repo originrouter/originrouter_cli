@@ -120,8 +120,20 @@ const vector = JSON.parse(readFileSync(
   new URL("./fixtures/e2ee_v2_dart_vector.json", import.meta.url),
   "utf8",
 ));
-const app = vector.app.public_identity;
-const cli = vector.cli.public_identity;
+// The directory endpoint serves these as epoch seconds; admission proofs are
+// only honoured when the approver was already trusted at the moment it signed,
+// so every fixture identity needs them.
+const at = (iso) => Math.floor(Date.parse(iso) / 1000);
+const app = {
+  ...vector.app.public_identity,
+  registered_at: at("2026-07-27T15:00:00.000Z"),
+  approved_at: at("2026-07-27T15:00:00.000Z"),
+};
+const cli = {
+  ...vector.cli.public_identity,
+  registered_at: at("2026-07-27T15:02:00.000Z"),
+  approved_at: at("2026-07-27T15:02:00.000Z"),
+};
 const signedProof = (domain, value) => ({
   ...value,
   signature: sign(
@@ -150,6 +162,10 @@ const policyValue = {
 const verifiedPolicy = {
   epoch: 1,
   new_device_approval_required: true,
+  // The approver's trust is evaluated at the moment the policy was accepted,
+  // which the server carries on the policy itself. Without it there is no
+  // time to evaluate against and a signed policy cannot be honoured.
+  updated_at: at("2026-07-27T15:01:00.000Z"),
   policy_proof: signedProof("originrouter/device-policy/v2\n", policyValue),
 };
 const approvalValue = {
@@ -486,6 +502,256 @@ assert.throws(
     }),
     null,
     "a cache beyond max-stale must not be adopted",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: a revoked grandfathered root is skipped, not fatal.
+//
+// `set_policy` freezes `grandfathered_key_ids` at signing time and never
+// re-signs, while `trust_status` is derived live from the binding. Removing
+// any device that was in that list therefore leaves behind a root the client
+// can no longer honour. Rejecting the whole snapshot over it failed every
+// inbound device-relay message, and because the failed cache write pinned the
+// client to the last pre-removal snapshot, it never recovered on its own.
+// Skipping the root keeps a revoked device from re-authorizing anything while
+// leaving the rest of the directory usable.
+// ---------------------------------------------------------------------------
+{
+  const approvedAt = at("2026-07-27T12:00:00.000Z");
+  const removedAt = at("2026-07-27T13:00:00.000Z");
+  const signProof = (domain, value, handle) => ({
+    ...value,
+    signature: sign(
+      null,
+      Buffer.from(`${domain}${canonicalJson(value)}`),
+      createPrivateKey({
+        key: handle.signing_private_jwk,
+        format: "jwk",
+      }),
+    ).toString("base64url"),
+  });
+  const approved = (identity, extra = {}) => ({
+    ...identity,
+    trust_status: "trusted",
+    registered_at: approvedAt,
+    approved_at: approvedAt,
+    ...extra,
+  });
+
+  const rootApp = ensureDeviceE2eeIdentity(join(root, "root-app"), {
+    deviceId: "root-app-device",
+    source: "originrouter_app",
+  });
+  const healthyCli = ensureDeviceE2eeIdentity(join(root, "root-cli"), {
+    deviceId: "root-cli-device",
+  });
+  const removedApp = ensureDeviceE2eeIdentity(join(root, "removed-root-app"), {
+    deviceId: "removed-root-app-device",
+    source: "originrouter_app",
+  });
+  const policyProofFor = (keyIds) => signProof(
+    "originrouter/device-policy/v2\n",
+    {
+      action: "set_new_device_approval_required",
+      account_epoch: 1,
+      device_id: rootApp.public_identity.device_id,
+      approver_key_id: rootApp.public_identity.key_id,
+      new_device_approval_required: true,
+      grandfathered_key_ids: keyIds,
+      created_at: "2026-07-27T12:00:00.000Z",
+    },
+    rootApp,
+  );
+  const revokedRoot = {
+    policy: {
+      epoch: 1,
+      new_device_approval_required: true,
+      updated_at: approvedAt,
+      policy_proof: policyProofFor([
+        rootApp.public_identity.key_id,
+        healthyCli.public_identity.key_id,
+        removedApp.public_identity.key_id,
+      ]),
+    },
+    identities: [
+      approved(rootApp.public_identity),
+      approved(healthyCli.public_identity),
+      {
+        ...removedApp.public_identity,
+        trust_status: "revoked",
+        registered_at: approvedAt,
+        approved_at: approvedAt,
+        revoked_at: removedAt,
+      },
+    ],
+  };
+
+  const stored = storeDeviceE2eeDirectoryCache(join(root, "revoked-root"), revokedRoot);
+  assert.equal(
+    currentCachedDeviceIdentity(stored, "root-app-device").key_id,
+    rootApp.public_identity.key_id,
+    "a revoked root must not cost the directory its other devices",
+  );
+  assert.equal(
+    currentCachedDeviceIdentity(stored, "root-cli-device").key_id,
+    healthyCli.public_identity.key_id,
+  );
+  assert.equal(
+    currentCachedDeviceIdentity(stored, "removed-root-app-device").trust_status,
+    "revoked",
+    "the removed device stays in the directory as revoked history",
+  );
+
+  // The counterpart: skipping a removed root must also stop it from anchoring
+  // other devices. A revoked approver is not in the authorized set, so a
+  // device it admitted no longer resolves to a live root.
+  const admittedCli = ensureDeviceE2eeIdentity(join(root, "admitted-cli"), {
+    deviceId: "admitted-cli-device",
+  });
+  assert.throws(
+    () => storeDeviceE2eeDirectoryCache(join(root, "revoked-approver"), {
+      policy: {
+        epoch: 1,
+        new_device_approval_required: true,
+        updated_at: approvedAt,
+        policy_proof: policyProofFor([
+          rootApp.public_identity.key_id,
+          removedApp.public_identity.key_id,
+        ]),
+      },
+      identities: [
+        approved(rootApp.public_identity),
+        {
+          ...removedApp.public_identity,
+          trust_status: "revoked",
+          registered_at: approvedAt,
+          approved_at: approvedAt,
+          revoked_at: removedAt,
+        },
+        approved(admittedCli.public_identity, {
+          admission_proof: signProof("originrouter/device-admission/v2\n", {
+            action: "approve_device",
+            account_epoch: 1,
+            approver_device_id: removedApp.public_identity.device_id,
+            approver_key_id: removedApp.public_identity.key_id,
+            candidate_device_id: admittedCli.public_identity.device_id,
+            candidate_key_id: admittedCli.public_identity.key_id,
+            request_id: "e2a_admitted",
+            created_at: "2026-07-27T12:30:00.000Z",
+          }, removedApp),
+        }),
+      ],
+    }),
+    /unverified trusted device in directory/,
+    "a revoked approver must not anchor the devices it admitted",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: an approval only counts if the approver was trusted when it
+// signed. A superseded key keeps its signature forever, so without checking
+// the approver's window at proof time an old key could keep admitting new
+// devices long after the device had rotated past it.
+// ---------------------------------------------------------------------------
+{
+  const rotatedAt = at("2026-07-27T14:00:00.000Z");
+  const approverDir = join(root, "rotating-approver");
+  const approverV1 = ensureDeviceE2eeIdentity(approverDir, {
+    deviceId: "rotating-approver-device",
+    source: "originrouter_app",
+  });
+  const approverV2 = prepareDeviceE2eeRotation(approverDir, {
+    deviceId: "rotating-approver-device",
+    now: new Date("2026-07-27T14:00:00.000Z"),
+  }).next;
+  const signProof = (domain, value, handle) => ({
+    ...value,
+    signature: sign(
+      null,
+      Buffer.from(`${domain}${canonicalJson(value)}`),
+      createPrivateKey({
+        key: handle.signing_private_jwk,
+        format: "jwk",
+      }),
+    ).toString("base64url"),
+  });
+  const approvedAt = at("2026-07-27T12:00:00.000Z");
+  const row = (identity, extra = {}) => ({
+    ...identity,
+    trust_status: "trusted",
+    registered_at: approvedAt,
+    approved_at: approvedAt,
+    ...extra,
+  });
+  const directoryWith = (candidate, approvedAtSeconds) => ({
+    policy: {
+      epoch: 1,
+      new_device_approval_required: true,
+      updated_at: approvedAt,
+      policy_proof: signProof("originrouter/device-policy/v2\n", {
+        action: "set_new_device_approval_required",
+        account_epoch: 1,
+        device_id: approverV2.public_identity.device_id,
+        approver_key_id: approverV2.public_identity.key_id,
+        new_device_approval_required: true,
+        grandfathered_key_ids: [approverV2.public_identity.key_id],
+        created_at: "2026-07-27T12:00:00.000Z",
+      }, approverV2),
+    },
+    identities: [
+      // A superseded key is reported as `revoked`, has its approval fields
+      // cleared, and carries `revoked_at` stamped at the moment of rotation —
+      // that stamp is what closes its trust window. Leaving it off here made
+      // the key's window unbounded and the out-of-window case unverifiable.
+      row(approverV1.public_identity, {
+        trust_status: "revoked",
+        approved_by_device_id: null,
+        approved_at: null,
+        revoked_at: rotatedAt,
+      }),
+      row(approverV2.public_identity, { registered_at: rotatedAt }),
+      row(candidate.public_identity, {
+        approved_at: approvedAtSeconds,
+        admission_proof: signProof("originrouter/device-admission/v2\n", {
+          action: "approve_device",
+          account_epoch: 1,
+          approver_device_id: approverV1.public_identity.device_id,
+          approver_key_id: approverV1.public_identity.key_id,
+          candidate_device_id: candidate.public_identity.device_id,
+          candidate_key_id: candidate.public_identity.key_id,
+          request_id: "e2a_rotation_window",
+          created_at: "2026-07-27T13:00:00.000Z",
+        }, approverV1),
+      }),
+    ],
+  });
+
+  // Approved while the signing key was still the device's current one.
+  const inWindow = ensureDeviceE2eeIdentity(join(root, "in-window-candidate"), {
+    deviceId: "in-window-candidate-device",
+  });
+  const accepted = storeDeviceE2eeDirectoryCache(
+    join(root, "rotation-in-window"),
+    directoryWith(inWindow, at("2026-07-27T13:00:00.000Z")),
+  );
+  assert.equal(
+    currentCachedDeviceIdentity(accepted, "in-window-candidate-device").key_id,
+    inWindow.public_identity.key_id,
+    "an approval signed while the approver's key was current must still count",
+  );
+
+  // Approved after the device rotated past that key.
+  const outOfWindow = ensureDeviceE2eeIdentity(join(root, "out-window-candidate"), {
+    deviceId: "out-window-candidate-device",
+  });
+  assert.throws(
+    () => storeDeviceE2eeDirectoryCache(
+      join(root, "rotation-out-of-window"),
+      directoryWith(outOfWindow, at("2026-07-27T15:00:00.000Z")),
+    ),
+    /unverified trusted device in directory/,
+    "a key that was already superseded when it signed must not admit devices",
   );
 }
 

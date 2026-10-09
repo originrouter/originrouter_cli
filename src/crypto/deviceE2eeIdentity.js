@@ -151,7 +151,7 @@ function writePrivate(path, value) {
   chmodSync(path, FILE_MODE);
 }
 
-function generateIdentity({ deviceId, epoch, keyVersion, previous = null, now = new Date(), signPrevious = true }) {
+function generateIdentity({ deviceId, epoch, keyVersion, previous = null, now = new Date(), signPrevious = true, source = "originrouter_cli" }) {
   const signing = generateKeyPairSync("ed25519");
   const agreement = generateKeyPairSync("x25519");
   const signingPrivateJwk = exportJwk(signing.privateKey);
@@ -159,7 +159,7 @@ function generateIdentity({ deviceId, epoch, keyVersion, previous = null, now = 
   const base = {
     protocol: DEVICE_E2EE_PROTOCOL,
     device_id: String(deviceId),
-    source: "originrouter_cli",
+    source: String(source),
     epoch: DEVICE_E2EE_IDENTITY_EPOCH,
     key_version: Number(keyVersion),
     signing_algorithm: "Ed25519",
@@ -250,7 +250,7 @@ export function isUsableDeviceE2eeIdentity(identity) {
   }
 }
 
-export function ensureDeviceE2eeIdentity(stateDir, { deviceId, epoch = 1, accountScope } = {}) {
+export function ensureDeviceE2eeIdentity(stateDir, { deviceId, epoch = 1, accountScope, source = "originrouter_cli" } = {}) {
   const existing = readDeviceE2eeIdentity(stateDir, { accountScope });
   if (existing) {
     if (existing.public_identity.device_id !== deviceId) {
@@ -260,7 +260,7 @@ export function ensureDeviceE2eeIdentity(stateDir, { deviceId, epoch = 1, accoun
     // replace the local private key when the user switches accounts.
     return existing;
   }
-  const created = generateIdentity({ deviceId, epoch: DEVICE_E2EE_IDENTITY_EPOCH, keyVersion: 1 });
+  const created = generateIdentity({ deviceId, epoch: DEVICE_E2EE_IDENTITY_EPOCH, keyVersion: 1, source });
   writePrivate(identityPath(stateDir, accountScope), created);
   return created;
 }
@@ -349,6 +349,7 @@ export function prepareDeviceE2eeRotation(stateDir, { deviceId, now = new Date()
     keyVersion: previous.public_identity.key_version + 1,
     previous,
     now,
+    source: previous.public_identity.source,
   });
   return {
     previous,

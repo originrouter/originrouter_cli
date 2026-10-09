@@ -977,6 +977,15 @@ export async function startDaemon(args) {
               await syncDeviceE2eeIdentity();
               await deviceE2eeRelay.refreshDirectory({ clearSessions: true });
               deviceE2eeLocalGateway.clearTrustSessions();
+              // The sender still holds the session this event arrived on, and
+              // its next envelope will be read as a first one and refused.
+              // Tell it to drop its side, or the conversation stays wedged
+              // until `shouldRekey` expires the App's session half an hour
+              // later.
+              await deviceE2eeRelay.announceSessionReset(
+                routed.__originrouterSourceDeviceId,
+                routed.type,
+              );
               return;
             }
             if (routed.type === "agent.control.subscribe") {

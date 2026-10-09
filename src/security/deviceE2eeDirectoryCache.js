@@ -217,6 +217,71 @@ function verifyProof(proof, signer, domain) {
   }
 }
 
+/**
+ * Server timestamps arrive as epoch seconds; cached round-trips store ISO
+ * strings. Normalize both to epoch milliseconds so comparisons never depend on
+ * which representation a row happens to carry.
+ */
+function serverTime(value) {
+  if (value === null || value === undefined || value === "" || value === 0) {
+    return null;
+  }
+  if (typeof value === "number") return value * 1000;
+  const parsed = Date.parse(String(value));
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+/**
+ * Was `signer` already trusted at `eventAt`?  A signature only carries weight
+ * if the key that made it had already been vouched for when it was made, and it
+ * stops counting from the moment that key is revoked or superseded — not from
+ * the moment that is observed in the directory.
+ *
+ * Both ends of the window come from the row itself, and both had to be read off
+ * `revoked_at` and the chain head rather than the more obvious fields:
+ *
+ *  - The end is `revoked_at`, which the server stamps on a key at the moment it
+ *    is revoked *or* superseded by a rotation. The successor's `registered_at`
+ *    looks like an alternative and is not: it carries the installation's
+ *    binding time, which predates the rotation and so closes the window before
+ *    it opens. Reading it that way made every signature by a superseded key
+ *    unverifiable.
+ *  - The start is the installation's approval. Only the bound key reports
+ *    `approved_at`; the chain projection hard-clears it on every older key.
+ */
+function wasTrustedAt(signer, eventAt, identities) {
+  if (signer.trust_status === "pending") return false;
+
+  const chain = identities
+    .filter((entry) => entry.device_id === signer.device_id
+      && entry.source === signer.source
+      && entry.epoch === signer.epoch)
+    .sort((left, right) => (left.key_version ?? 0) - (right.key_version ?? 0));
+  const signerIndex = chain.findIndex((entry) => entry.key_id === signer.key_id);
+  if (signerIndex < 0) return false;
+
+  // `list_account_identity_chains` hard-clears `approved_at` on every key
+  // except the bound one, so a superseded key never carries one. Demanding it
+  // anyway would mean that rotating a device's key retroactively invalidated
+  // every signature that key ever made — including the policy every other
+  // device vouches for — which wedges a perfectly healthy account until the
+  // rotation is undone. The approval belongs to the installation, and the
+  // bound key is the one row that still reports it, so fall back to the head.
+  const approvedAt = serverTime(signer.approved_at)
+    ?? serverTime(chain[chain.length - 1].approved_at);
+  if (approvedAt === null || eventAt < approvedAt) return false;
+
+  let inactiveAt = serverTime(signer.revoked_at);
+  if (inactiveAt !== null && eventAt >= inactiveAt) return false;
+  if (signerIndex === chain.length - 1) {
+    // The chain head carries no successor, so its own trust status is the
+    // only thing that can end its window — and "revoked" is a later state of
+    // a key that was trusted until it was taken away.
+    return signer.trust_status === "trusted" || signer.trust_status === "revoked";
+  }
+  return true;
+}
+
 function verifyTrustProofs(policy, identities) {
   const proof = policy.policy_proof;
   const grandfathered = proof?.grandfathered_key_ids;
@@ -230,8 +295,19 @@ function verifyTrustProofs(policy, identities) {
   }
   const byKey = new Map(identities.map((item) => [item.key_id, item]));
   const policyApprover = byKey.get(proof.approver_key_id);
+  // Ask whether the approver was trusted *when it signed*, not whether it is
+  // trusted now. A signature does not stop verifying because the signer was
+  // revoked afterwards, and `set_policy` freezes the proof rather than
+  // re-signing it — so requiring present-tense trust means revoking any device
+  // that ever signed the policy invalidates the entire directory, on this
+  // side only. The App has always made the time-scoped check, so the two
+  // halves disagreed about which devices exist and the CLI alone stopped
+  // relaying. This is the same over-strict shape already handled for a revoked
+  // grandfathered root below.
+  const policyAcceptedAt = serverTime(policy.updated_at);
   if (!policyApprover || policyApprover.source !== KEY_SOURCE.ORIGINROUTER_APP
-      || policyApprover.trust_status !== "trusted"
+      || policyAcceptedAt === null
+      || !wasTrustedAt(policyApprover, policyAcceptedAt, identities)
       || proof.device_id !== policyApprover.device_id
       || !verifyProof(proof, policyApprover, "originrouter/device-policy/v2\n")) {
     throw new Error("invalid verified-device policy signature");
@@ -250,9 +326,14 @@ function verifyTrustProofs(policy, identities) {
   for (const keyId of grandfatheredSet) {
     const identity = byKey.get(keyId);
     const head = identity ? chains.get(identity.device_id)?.at(-1) : null;
-    if (!identity || head?.trust_status !== "trusted") {
-      throw new Error("unknown grandfathered device key");
-    }
+    // A grandfathered key is a historical record of what the approver
+    // vouched for when the policy was set.  It stays in the signed list
+    // forever, but an installation that is no longer trusted contributes
+    // nothing as a trust root: skipping it here is what keeps a revoked
+    // device from re-authorizing anything through the admission chain
+    // below.  Demanding that every root is still trusted would instead let
+    // removing one device invalidate the whole snapshot.
+    if (!identity || !head || head.trust_status !== "trusted") continue;
     authorizedDevices.add(identity.device_id);
   }
   const unresolved = new Set(
@@ -267,11 +348,12 @@ function verifyTrustProofs(policy, identities) {
     progressed = false;
     for (const deviceId of [...unresolved]) {
       const chain = chains.get(deviceId);
-      const admission = chain.at(-1)?.admission_proof
-        || chain[0]?.admission_proof;
+      const proofHolder = chain.at(-1)?.admission_proof ? chain.at(-1) : chain[0];
+      const admission = proofHolder?.admission_proof;
       const approver = byKey.get(admission?.approver_key_id);
       const candidateMatches = chain.some((item) =>
         item.key_id === admission?.candidate_key_id);
+      const proofAcceptedAt = serverTime(proofHolder?.approved_at);
       if (admission?.action !== "approve_device"
           || admission.account_epoch !== policy.epoch
           || admission.candidate_device_id !== deviceId
@@ -279,6 +361,8 @@ function verifyTrustProofs(policy, identities) {
           || !approver
           || approver.source !== KEY_SOURCE.ORIGINROUTER_APP
           || admission.approver_device_id !== approver.device_id
+          || proofAcceptedAt === null
+          || !wasTrustedAt(approver, proofAcceptedAt, identities)
           || !authorizedDevices.has(approver.device_id)
           || !verifyProof(
             admission,

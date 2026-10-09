@@ -1,0 +1,1457 @@
+{
+  "_comment": [
+    "Shared trust-evaluation vectors. Both the Node and the Dart directory",
+    "cache verifiers must return `expect` for each `directory`. Regenerate with",
+    "scripts/generate-device-e2ee-trust-fixtures.mjs."
+  ],
+  "cases": [
+    {
+      "name": "grandfathered_roots_accepted",
+      "expect": "accept",
+      "why": "A policy signed by a trusted App, with every root grandfathered, is the ordinary case.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785155400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "signer-app-device",
+            "approver_key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+              "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "4m-GJHBtdC5IAPGeluZ3e2hubY8GEbQBCS_VbBwib9LWmsP8FlFj28LllAmZlDe3sUqlfsPrnSJSYVly2KZrBQ"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "grandfathered-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "BXQganvVMCfhFO8hhKFt6evfvzUG4w6RnN2pkqTa0j4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "aU8vMavP-NPItqQ0n7M-1OJ0HIcLk6r2tzrv6MaOcAI",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.860Z",
+            "key_id": "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U",
+            "self_signature": "VBVFSjocIQ9dYQDWjo_M_ufoOd6fblvwrhYQpuGPDnRQL8KNiN2tWjcVKH_Q1AVrPZUKAV2kVMbMF5ZRMFjmAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          }
+        ]
+      }
+    },
+    {
+      "name": "policy_signer_revoked_after_signing",
+      "expect": "accept",
+      "why": "A signature does not stop verifying because the signer was revoked later; only the signer's window at signing time matters.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785155400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "signer-app-device",
+            "approver_key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+              "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "4m-GJHBtdC5IAPGeluZ3e2hubY8GEbQBCS_VbBwib9LWmsP8FlFj28LllAmZlDe3sUqlfsPrnSJSYVly2KZrBQ"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "revoked",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600,
+            "revoked_at": 1785157200
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "grandfathered-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "BXQganvVMCfhFO8hhKFt6evfvzUG4w6RnN2pkqTa0j4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "aU8vMavP-NPItqQ0n7M-1OJ0HIcLk6r2tzrv6MaOcAI",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.860Z",
+            "key_id": "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U",
+            "self_signature": "VBVFSjocIQ9dYQDWjo_M_ufoOd6fblvwrhYQpuGPDnRQL8KNiN2tWjcVKH_Q1AVrPZUKAV2kVMbMF5ZRMFjmAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          }
+        ]
+      }
+    },
+    {
+      "name": "policy_signer_revoked_before_signing",
+      "expect": "reject",
+      "why": "A signer that was already revoked when it signed the policy carries no weight.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785164400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "second-app-device",
+            "approver_key_id": "sha256:dyByH_mflYMVYn_MX5LySIoLa8Ox3UHcfQGbFh23vaM",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:dyByH_mflYMVYn_MX5LySIoLa8Ox3UHcfQGbFh23vaM"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "PxgIpa-S979ufXcuUf-eXAZ6TryiFwWgHVwbhKxoI5B9cbETxDIEJhBcP9r9efhKX2OIvRTL0MoinZfwi2kTCA"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "second-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "x9cIlPF0zrydz1g2EUXYtFfCLyV_DGj0MidWqnF-8IU",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mipvt0VHf5SSH5OicOFEUkSreg-rcFy9nBgypJmOlEA",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.859Z",
+            "key_id": "sha256:dyByH_mflYMVYn_MX5LySIoLa8Ox3UHcfQGbFh23vaM",
+            "self_signature": "ZAzmPujBOopBh3WYxlkpTLZ_q9Mo7trs4koDhfH0zG20HnHX_r-heMEP9SCx9wvfnIVENILw0VVxNPXGYytEBw",
+            "trust_status": "revoked",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600,
+            "revoked_at": 1785157200
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "grandfathered-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "BXQganvVMCfhFO8hhKFt6evfvzUG4w6RnN2pkqTa0j4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "aU8vMavP-NPItqQ0n7M-1OJ0HIcLk6r2tzrv6MaOcAI",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.860Z",
+            "key_id": "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U",
+            "self_signature": "VBVFSjocIQ9dYQDWjo_M_ufoOd6fblvwrhYQpuGPDnRQL8KNiN2tWjcVKH_Q1AVrPZUKAV2kVMbMF5ZRMFjmAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          }
+        ]
+      }
+    },
+    {
+      "name": "policy_signer_approved_after_signing",
+      "expect": "reject",
+      "why": "A signer that had not yet been vouched for when it signed cannot authorize a policy.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785155400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "second-app-device",
+            "approver_key_id": "sha256:dyByH_mflYMVYn_MX5LySIoLa8Ox3UHcfQGbFh23vaM",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:dyByH_mflYMVYn_MX5LySIoLa8Ox3UHcfQGbFh23vaM"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "PxgIpa-S979ufXcuUf-eXAZ6TryiFwWgHVwbhKxoI5B9cbETxDIEJhBcP9r9efhKX2OIvRTL0MoinZfwi2kTCA"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "second-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "x9cIlPF0zrydz1g2EUXYtFfCLyV_DGj0MidWqnF-8IU",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mipvt0VHf5SSH5OicOFEUkSreg-rcFy9nBgypJmOlEA",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.859Z",
+            "key_id": "sha256:dyByH_mflYMVYn_MX5LySIoLa8Ox3UHcfQGbFh23vaM",
+            "self_signature": "ZAzmPujBOopBh3WYxlkpTLZ_q9Mo7trs4koDhfH0zG20HnHX_r-heMEP9SCx9wvfnIVENILw0VVxNPXGYytEBw",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785160800
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "grandfathered-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "BXQganvVMCfhFO8hhKFt6evfvzUG4w6RnN2pkqTa0j4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "aU8vMavP-NPItqQ0n7M-1OJ0HIcLk6r2tzrv6MaOcAI",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.860Z",
+            "key_id": "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U",
+            "self_signature": "VBVFSjocIQ9dYQDWjo_M_ufoOd6fblvwrhYQpuGPDnRQL8KNiN2tWjcVKH_Q1AVrPZUKAV2kVMbMF5ZRMFjmAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          }
+        ]
+      }
+    },
+    {
+      "name": "policy_signature_forged",
+      "expect": "reject",
+      "why": "The approver's signature is what makes the policy a policy; a tampered body must not verify.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785155400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "signer-app-device",
+            "approver_key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "4m-GJHBtdC5IAPGeluZ3e2hubY8GEbQBCS_VbBwib9LWmsP8FlFj28LllAmZlDe3sUqlfsPrnSJSYVly2KZrBQ"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "grandfathered-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "BXQganvVMCfhFO8hhKFt6evfvzUG4w6RnN2pkqTa0j4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "aU8vMavP-NPItqQ0n7M-1OJ0HIcLk6r2tzrv6MaOcAI",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.860Z",
+            "key_id": "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U",
+            "self_signature": "VBVFSjocIQ9dYQDWjo_M_ufoOd6fblvwrhYQpuGPDnRQL8KNiN2tWjcVKH_Q1AVrPZUKAV2kVMbMF5ZRMFjmAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          }
+        ]
+      }
+    },
+    {
+      "name": "admission_signed_inside_rotation_window",
+      "expect": "accept",
+      "why": "A key that signed while it was still the device's current one keeps its approvals.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785162600,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "rotating-app-device",
+            "approver_key_id": "sha256:D2Q87l8Vo0iLl4m_2Jdt5IkXChkcJ8xRUsLQFbP6hpc",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:D2Q87l8Vo0iLl4m_2Jdt5IkXChkcJ8xRUsLQFbP6hpc"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "HAsFdgJ3qpsvWNykWTN-kSvePzslqc3Ymnqxmyvj08mlMoycDNZwhYPuKjghrOD-pOR9CL7d2Trbl6tkc6OjDA"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "rotating-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "7EEvzVQF9PxbbL7DVD1nDAGcZkveV8AVILAqTFZQ4MY",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "YDAUvqliU26kklJlep4kl06dSx3HndKcqaXOlsIpunY",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.861Z",
+            "key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+            "self_signature": "7svi0AuotVVpKcRcXAYSB9on_ZZzioYk2QmkvuOwtXYMb4d5Eb8maOHvXTOxJ6qLxDfbOm5ygMVlh6bekjiuCA",
+            "trust_status": "revoked",
+            "registered_at": 1785150000,
+            "approved_at": null,
+            "approved_by_device_id": null,
+            "revoked_at": 1785160800
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "rotating-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 2,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "HP81QZZNldeJ5SAw1R-SSGKhIzMr2-W4NMOQ274Lq9A",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "ncVscKbWBiDWGhlj687GdiwqnWQQJnU4q4FbASKAFFE",
+            "previous_key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+            "created_at": "2026-07-27T14:00:00.000Z",
+            "key_id": "sha256:D2Q87l8Vo0iLl4m_2Jdt5IkXChkcJ8xRUsLQFbP6hpc",
+            "previous_key_signature": "8jbmZWikDtNchrpUB6NXnYnjjqBPnlA3VBuM1ls7SOFRhuupb6zmnUKZ3OkL2VyGDKCzAPJPesZVP1iQENv-Bg",
+            "self_signature": "qoDTzqfuis-ak6RVc4A7cDawb3C64F22r66FH-_galrrAW2NtTVFg8ZFUaV2MkU-bsncxVWJ0FJLMGiFKnVzAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "window-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "jEBaZNvaPRM484REFsacTAUwThbnBsjBlPIf5b9Lczc",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "3mprYwpv6kl_gpkFrjWYcagQ--OA2bx3lTtn9ADJals",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.863Z",
+            "key_id": "sha256:V2hy9Gd7R_tUF4AS2BZYWNjHkd5yMR36hAtndyCv-bw",
+            "self_signature": "cYxWD5llF76OaTtntU7eE1BIe2rPuCmwje3HCoJ-_7GfJqte1zMYs4kYfbLFq-RtuPVRjIYb_TD6fRi2g9wSDQ",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785157200,
+            "admission_proof": {
+              "action": "approve_device",
+              "account_epoch": 1,
+              "approver_device_id": "rotating-app-device",
+              "approver_key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+              "candidate_device_id": "window-cli-device",
+              "candidate_key_id": "sha256:V2hy9Gd7R_tUF4AS2BZYWNjHkd5yMR36hAtndyCv-bw",
+              "request_id": "req_window-cli-device",
+              "created_at": "2026-07-27T13:00:00.000Z",
+              "signature": "uVgObBz3-t9BlTZZ7m-DWOFlN4dHSmOfFAEUr56jKTqVHcE0dGEOPe4yV42icKfhfmPAN5Cd2bbWb4bHpwprBg"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "policy_signer_rotated_after_signing",
+      "expect": "accept",
+      "why": "Rotating a signing device's key leaves its old key as chain history with no approval timestamp; the signature it made while current still stands.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785155400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "rotating-app-device",
+            "approver_key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:D2Q87l8Vo0iLl4m_2Jdt5IkXChkcJ8xRUsLQFbP6hpc",
+              "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "jBODNpMbPKPLsTUpaAo7cod4qWuaMz7j-ONsfe12siBdNi13pbIkA6eTA9wGEt_Ht1YXIiWxBz7EU2tsrurIAA"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "rotating-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "7EEvzVQF9PxbbL7DVD1nDAGcZkveV8AVILAqTFZQ4MY",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "YDAUvqliU26kklJlep4kl06dSx3HndKcqaXOlsIpunY",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.861Z",
+            "key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+            "self_signature": "7svi0AuotVVpKcRcXAYSB9on_ZZzioYk2QmkvuOwtXYMb4d5Eb8maOHvXTOxJ6qLxDfbOm5ygMVlh6bekjiuCA",
+            "trust_status": "revoked",
+            "registered_at": 1785150000,
+            "approved_at": null,
+            "approved_by_device_id": null,
+            "revoked_at": 1785160800
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "rotating-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 2,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "HP81QZZNldeJ5SAw1R-SSGKhIzMr2-W4NMOQ274Lq9A",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "ncVscKbWBiDWGhlj687GdiwqnWQQJnU4q4FbASKAFFE",
+            "previous_key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+            "created_at": "2026-07-27T14:00:00.000Z",
+            "key_id": "sha256:D2Q87l8Vo0iLl4m_2Jdt5IkXChkcJ8xRUsLQFbP6hpc",
+            "previous_key_signature": "8jbmZWikDtNchrpUB6NXnYnjjqBPnlA3VBuM1ls7SOFRhuupb6zmnUKZ3OkL2VyGDKCzAPJPesZVP1iQENv-Bg",
+            "self_signature": "qoDTzqfuis-ak6RVc4A7cDawb3C64F22r66FH-_galrrAW2NtTVFg8ZFUaV2MkU-bsncxVWJ0FJLMGiFKnVzAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "grandfathered-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "BXQganvVMCfhFO8hhKFt6evfvzUG4w6RnN2pkqTa0j4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "aU8vMavP-NPItqQ0n7M-1OJ0HIcLk6r2tzrv6MaOcAI",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.860Z",
+            "key_id": "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U",
+            "self_signature": "VBVFSjocIQ9dYQDWjo_M_ufoOd6fblvwrhYQpuGPDnRQL8KNiN2tWjcVKH_Q1AVrPZUKAV2kVMbMF5ZRMFjmAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          }
+        ]
+      }
+    },
+    {
+      "name": "admission_signed_after_rotation",
+      "expect": "reject",
+      "why": "A superseded key keeps its signature forever, so without a window check it could keep admitting devices long after the device rotated past it.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785162600,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "rotating-app-device",
+            "approver_key_id": "sha256:D2Q87l8Vo0iLl4m_2Jdt5IkXChkcJ8xRUsLQFbP6hpc",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:D2Q87l8Vo0iLl4m_2Jdt5IkXChkcJ8xRUsLQFbP6hpc"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "HAsFdgJ3qpsvWNykWTN-kSvePzslqc3Ymnqxmyvj08mlMoycDNZwhYPuKjghrOD-pOR9CL7d2Trbl6tkc6OjDA"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "rotating-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "7EEvzVQF9PxbbL7DVD1nDAGcZkveV8AVILAqTFZQ4MY",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "YDAUvqliU26kklJlep4kl06dSx3HndKcqaXOlsIpunY",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.861Z",
+            "key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+            "self_signature": "7svi0AuotVVpKcRcXAYSB9on_ZZzioYk2QmkvuOwtXYMb4d5Eb8maOHvXTOxJ6qLxDfbOm5ygMVlh6bekjiuCA",
+            "trust_status": "revoked",
+            "registered_at": 1785150000,
+            "approved_at": null,
+            "approved_by_device_id": null,
+            "revoked_at": 1785160800
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "rotating-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 2,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "HP81QZZNldeJ5SAw1R-SSGKhIzMr2-W4NMOQ274Lq9A",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "ncVscKbWBiDWGhlj687GdiwqnWQQJnU4q4FbASKAFFE",
+            "previous_key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+            "created_at": "2026-07-27T14:00:00.000Z",
+            "key_id": "sha256:D2Q87l8Vo0iLl4m_2Jdt5IkXChkcJ8xRUsLQFbP6hpc",
+            "previous_key_signature": "8jbmZWikDtNchrpUB6NXnYnjjqBPnlA3VBuM1ls7SOFRhuupb6zmnUKZ3OkL2VyGDKCzAPJPesZVP1iQENv-Bg",
+            "self_signature": "qoDTzqfuis-ak6RVc4A7cDawb3C64F22r66FH-_galrrAW2NtTVFg8ZFUaV2MkU-bsncxVWJ0FJLMGiFKnVzAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "window-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "jEBaZNvaPRM484REFsacTAUwThbnBsjBlPIf5b9Lczc",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "3mprYwpv6kl_gpkFrjWYcagQ--OA2bx3lTtn9ADJals",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.863Z",
+            "key_id": "sha256:V2hy9Gd7R_tUF4AS2BZYWNjHkd5yMR36hAtndyCv-bw",
+            "self_signature": "cYxWD5llF76OaTtntU7eE1BIe2rPuCmwje3HCoJ-_7GfJqte1zMYs4kYfbLFq-RtuPVRjIYb_TD6fRi2g9wSDQ",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785164400,
+            "admission_proof": {
+              "action": "approve_device",
+              "account_epoch": 1,
+              "approver_device_id": "rotating-app-device",
+              "approver_key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+              "candidate_device_id": "window-cli-device",
+              "candidate_key_id": "sha256:V2hy9Gd7R_tUF4AS2BZYWNjHkd5yMR36hAtndyCv-bw",
+              "request_id": "req_window-cli-device",
+              "created_at": "2026-07-27T15:00:00.000Z",
+              "signature": "oh2AR1A7fxhD9L4Sv64yYm8jRyEackW5fTgAVu5qKroAlCBLlr7NXw-HKYAS2Aw2cO3ltKFlxqSi8m2jlC0qDA"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "admitted_by_revoked_grandfathered_root",
+      "expect": "reject",
+      "why": "Skipping a revoked root keeps the rest of the directory usable, but the root must then anchor nothing — the device it admitted no longer resolves to a live root.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785155400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "signer-app-device",
+            "approver_key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+              "sha256:mjkh7cfGIxdRUtA0ewy0oTFAsEfC1QBmelmG1Oywjts"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "mTtjzuPeEZ1XNSChzGrN12t3vWuwaaJjydci26JOkrjs5IEpQj8gZL5lEotPg3b9KnXbq5JovaR7vW26WyIiDw"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "revoked-root-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "rR71RPzxRknhuFjZSHzodLWayDDWjrM4Ft7vDde40gw",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "1pjaEprpvq-zrYOq3bou_itK3XyrAdHTTiItsE7UGH0",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.862Z",
+            "key_id": "sha256:mjkh7cfGIxdRUtA0ewy0oTFAsEfC1QBmelmG1Oywjts",
+            "self_signature": "wkKgV6XbHEct8Iz9OmiKUDrqzU3ca2rKWDNKM3lZARIC5f9xQ7GKtkZMNeKQmidCbFc47SyAZXHaGJWccqcyAA",
+            "trust_status": "revoked",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600,
+            "revoked_at": 1785157200
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "admitted-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "TamlXRwYEFTTFEszE8WOG_PhyHV61vV5mly-ddjlY0o",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "vAEeY_oC4r00wcmWXU9hYzqL62ooch0c-WfQhTlFm2g",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.862Z",
+            "key_id": "sha256:AQkHke0MqBR89Xu1vPR16Mc7Yp2Ih8icU4Li_Mc3AKo",
+            "self_signature": "AICsMHMR5KrBKbIrsWkA3jQxBMzNFmUPIH2ryjiUGyNtmEUXMoQJo9ds47-lN8paQbC-ij3I2IviHuDHQHYnDg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600,
+            "admission_proof": {
+              "action": "approve_device",
+              "account_epoch": 1,
+              "approver_device_id": "revoked-root-app-device",
+              "approver_key_id": "sha256:mjkh7cfGIxdRUtA0ewy0oTFAsEfC1QBmelmG1Oywjts",
+              "candidate_device_id": "admitted-cli-device",
+              "candidate_key_id": "sha256:AQkHke0MqBR89Xu1vPR16Mc7Yp2Ih8icU4Li_Mc3AKo",
+              "request_id": "req_admitted-cli-device",
+              "created_at": "2026-07-27T15:00:00.000Z",
+              "signature": "F2mKbEF1o71P8P_4Mmm0n7jVqbhRel1QnqnxGZB4AwzXB80WqxqShBRSjdZi06skGwCcTbLLFO5nE-Ptbt53DA"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "admitted_by_live_grandfathered_root",
+      "expect": "accept",
+      "why": "The counterpart: an admission from a root that is still trusted resolves, and its device joins the directory.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785155400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "signer-app-device",
+            "approver_key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "YKr1QBFfJ3LNXDek1ELizn5lWBWRqR_0Tu-3b57uOg2SLmhzpZKe9SdCGaR-g5h6-Zy69iMYEr9v1Z8VmJOMDQ"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "late-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "-cMUeX5uT9KFYtFDaEIRyBKgLlvowxrrNaFIduRQr_4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "03mFhxbQ8YSAGFZRZb5CP1QodVLFn5uUT4d6Yv7wCxE",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.861Z",
+            "key_id": "sha256:bYLQEmmWSRhmsThhT28a3mPyhQt4cgqDXFjtltRglsc",
+            "self_signature": "ihporCHSKKuRyzj-QMA-rYdqH1G5cTWrPiFtMydgUiaSTql-6Nrh7fTGvLfikS8laE6T9kwyRY1iwWliBONxDg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600,
+            "admission_proof": {
+              "action": "approve_device",
+              "account_epoch": 1,
+              "approver_device_id": "signer-app-device",
+              "approver_key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+              "candidate_device_id": "late-cli-device",
+              "candidate_key_id": "sha256:bYLQEmmWSRhmsThhT28a3mPyhQt4cgqDXFjtltRglsc",
+              "request_id": "req_late-cli-device",
+              "created_at": "2026-07-27T15:00:00.000Z",
+              "signature": "f5022d8Dc7Avr52UxR7nNNyns_m3KBoav1MuewuuvbpmWFOqccoDcoIWV-gmexLPq1-NJeCuIHen_iV4eO9vBg"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "grandfathered_key_anchors_rotated_device",
+      "expect": "accept",
+      "why": "Rotation is not a new device: the snapshot names the pre-rotation key, and that key still anchors the device through its current head.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785155400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "signer-app-device",
+            "approver_key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+              "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+              "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "P9ERgsGysTsofHd5jOAg9LeqHiI0sDfE9QUvp8UjLAmlDYYITTh0SE_uxpDIHxBh75_McFtj_FaLrsQwPvevDg"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "rotating-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "7EEvzVQF9PxbbL7DVD1nDAGcZkveV8AVILAqTFZQ4MY",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "YDAUvqliU26kklJlep4kl06dSx3HndKcqaXOlsIpunY",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.861Z",
+            "key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+            "self_signature": "7svi0AuotVVpKcRcXAYSB9on_ZZzioYk2QmkvuOwtXYMb4d5Eb8maOHvXTOxJ6qLxDfbOm5ygMVlh6bekjiuCA",
+            "trust_status": "revoked",
+            "registered_at": 1785150000,
+            "approved_at": null,
+            "approved_by_device_id": null,
+            "revoked_at": 1785160800
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "rotating-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 2,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "HP81QZZNldeJ5SAw1R-SSGKhIzMr2-W4NMOQ274Lq9A",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "ncVscKbWBiDWGhlj687GdiwqnWQQJnU4q4FbASKAFFE",
+            "previous_key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+            "created_at": "2026-07-27T14:00:00.000Z",
+            "key_id": "sha256:D2Q87l8Vo0iLl4m_2Jdt5IkXChkcJ8xRUsLQFbP6hpc",
+            "previous_key_signature": "8jbmZWikDtNchrpUB6NXnYnjjqBPnlA3VBuM1ls7SOFRhuupb6zmnUKZ3OkL2VyGDKCzAPJPesZVP1iQENv-Bg",
+            "self_signature": "qoDTzqfuis-ak6RVc4A7cDawb3C64F22r66FH-_galrrAW2NtTVFg8ZFUaV2MkU-bsncxVWJ0FJLMGiFKnVzAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "grandfathered-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "BXQganvVMCfhFO8hhKFt6evfvzUG4w6RnN2pkqTa0j4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "aU8vMavP-NPItqQ0n7M-1OJ0HIcLk6r2tzrv6MaOcAI",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.860Z",
+            "key_id": "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U",
+            "self_signature": "VBVFSjocIQ9dYQDWjo_M_ufoOd6fblvwrhYQpuGPDnRQL8KNiN2tWjcVKH_Q1AVrPZUKAV2kVMbMF5ZRMFjmAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          }
+        ]
+      }
+    },
+    {
+      "name": "reapproved_grandfathered_root",
+      "expect": "accept",
+      "why": "Removing and re-approving a device returns the same key, so it resolves through the snapshot it was always in.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785155400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "signer-app-device",
+            "approver_key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+              "sha256:bYLQEmmWSRhmsThhT28a3mPyhQt4cgqDXFjtltRglsc"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "MneeAkJTfpd8Y9l4I8QfeQI13vKM2w_sn9lTDfnR7W60AkuVTnVs9Ml2l4EDtpMc6TQDluUm8hRxAR0WClM8CQ"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "late-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "-cMUeX5uT9KFYtFDaEIRyBKgLlvowxrrNaFIduRQr_4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "03mFhxbQ8YSAGFZRZb5CP1QodVLFn5uUT4d6Yv7wCxE",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.861Z",
+            "key_id": "sha256:bYLQEmmWSRhmsThhT28a3mPyhQt4cgqDXFjtltRglsc",
+            "self_signature": "ihporCHSKKuRyzj-QMA-rYdqH1G5cTWrPiFtMydgUiaSTql-6Nrh7fTGvLfikS8laE6T9kwyRY1iwWliBONxDg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785175200
+          }
+        ]
+      }
+    },
+    {
+      "name": "one_revoked_root_among_live_ones",
+      "expect": "accept",
+      "why": "A revoked root contributes nothing but must not disturb the roots around it.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785155400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "signer-app-device",
+            "approver_key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+              "sha256:mjkh7cfGIxdRUtA0ewy0oTFAsEfC1QBmelmG1Oywjts",
+              "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "_v1_PDxWaSKfAVSgCxSeTmd5dh6Amj6IE3HG5wkUShVOFiNIYOf0DUOcMtfLrkBObi5_AvL0AYeLDVlz1r5aDw"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "revoked-root-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "rR71RPzxRknhuFjZSHzodLWayDDWjrM4Ft7vDde40gw",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "1pjaEprpvq-zrYOq3bou_itK3XyrAdHTTiItsE7UGH0",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.862Z",
+            "key_id": "sha256:mjkh7cfGIxdRUtA0ewy0oTFAsEfC1QBmelmG1Oywjts",
+            "self_signature": "wkKgV6XbHEct8Iz9OmiKUDrqzU3ca2rKWDNKM3lZARIC5f9xQ7GKtkZMNeKQmidCbFc47SyAZXHaGJWccqcyAA",
+            "trust_status": "revoked",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600,
+            "revoked_at": 1785157200
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "grandfathered-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "BXQganvVMCfhFO8hhKFt6evfvzUG4w6RnN2pkqTa0j4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "aU8vMavP-NPItqQ0n7M-1OJ0HIcLk6r2tzrv6MaOcAI",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.860Z",
+            "key_id": "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U",
+            "self_signature": "VBVFSjocIQ9dYQDWjo_M_ufoOd6fblvwrhYQpuGPDnRQL8KNiN2tWjcVKH_Q1AVrPZUKAV2kVMbMF5ZRMFjmAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          }
+        ]
+      }
+    },
+    {
+      "name": "grandfathered_key_absent_from_directory",
+      "expect": "accept",
+      "why": "A root the directory no longer carries is skipped, not treated as a policy failure.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785155400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "signer-app-device",
+            "approver_key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+              "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+              "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "Jrxn04iuAhNOHsY-EyE3fNrT4VohxZ7EZU8jwmqYfn2fLcmkWL5XaCB-P5xKQBLs-xOXJq-fXhUBI5FliKDBBw"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "grandfathered-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "BXQganvVMCfhFO8hhKFt6evfvzUG4w6RnN2pkqTa0j4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "aU8vMavP-NPItqQ0n7M-1OJ0HIcLk6r2tzrv6MaOcAI",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.860Z",
+            "key_id": "sha256:rrhzVYrNE3grLkwukq-tfJmyCRRaIxWHWBD_Fsny7-U",
+            "self_signature": "VBVFSjocIQ9dYQDWjo_M_ufoOd6fblvwrhYQpuGPDnRQL8KNiN2tWjcVKH_Q1AVrPZUKAV2kVMbMF5ZRMFjmAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          }
+        ]
+      }
+    },
+    {
+      "name": "pending_device_alongside_live_roots",
+      "expect": "accept",
+      "why": "A device awaiting approval is neither authorized nor unresolved.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785155400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "signer-app-device",
+            "approver_key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "YKr1QBFfJ3LNXDek1ELizn5lWBWRqR_0Tu-3b57uOg2SLmhzpZKe9SdCGaR-g5h6-Zy69iMYEr9v1Z8VmJOMDQ"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "window-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "jEBaZNvaPRM484REFsacTAUwThbnBsjBlPIf5b9Lczc",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "3mprYwpv6kl_gpkFrjWYcagQ--OA2bx3lTtn9ADJals",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.863Z",
+            "key_id": "sha256:V2hy9Gd7R_tUF4AS2BZYWNjHkd5yMR36hAtndyCv-bw",
+            "self_signature": "cYxWD5llF76OaTtntU7eE1BIe2rPuCmwje3HCoJ-_7GfJqte1zMYs4kYfbLFq-RtuPVRjIYb_TD6fRi2g9wSDQ",
+            "trust_status": "pending",
+            "registered_at": 1785153600,
+            "approved_at": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "policy_disabled_needs_no_proof",
+      "expect": "accept",
+      "why": "With the gate off there is no admission graph to evaluate.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": false
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "late-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "-cMUeX5uT9KFYtFDaEIRyBKgLlvowxrrNaFIduRQr_4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "03mFhxbQ8YSAGFZRZb5CP1QodVLFn5uUT4d6Yv7wCxE",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.861Z",
+            "key_id": "sha256:bYLQEmmWSRhmsThhT28a3mPyhQt4cgqDXFjtltRglsc",
+            "self_signature": "ihporCHSKKuRyzj-QMA-rYdqH1G5cTWrPiFtMydgUiaSTql-6Nrh7fTGvLfikS8laE6T9kwyRY1iwWliBONxDg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          }
+        ]
+      }
+    },
+    {
+      "name": "policy_reset_to_unsigned",
+      "expect": "accept",
+      "why": "An epoch reset clears the proof and the gate together; nothing is left to verify.",
+      "directory": {
+        "policy": {
+          "epoch": 2,
+          "new_device_approval_required": false
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "late-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "-cMUeX5uT9KFYtFDaEIRyBKgLlvowxrrNaFIduRQr_4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "03mFhxbQ8YSAGFZRZb5CP1QodVLFn5uUT4d6Yv7wCxE",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.861Z",
+            "key_id": "sha256:bYLQEmmWSRhmsThhT28a3mPyhQt4cgqDXFjtltRglsc",
+            "self_signature": "ihporCHSKKuRyzj-QMA-rYdqH1G5cTWrPiFtMydgUiaSTql-6Nrh7fTGvLfikS8laE6T9kwyRY1iwWliBONxDg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          }
+        ]
+      }
+    },
+    {
+      "name": "admitted_by_app_that_then_rotated",
+      "expect": "accept",
+      "why": "An approval made while the App's key was current survives that App rotating afterwards.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785162600,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "signer-app-device",
+            "approver_key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+              "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "AKQVzSkYKMK-MTCTkcKQ7ih9esoSBjDX5fC-Dd8zu2mLutS-D4zrLuu2o_Dqwb6aPOz4PGoru4v_Qa3iOmk-DQ"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "rotating-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "7EEvzVQF9PxbbL7DVD1nDAGcZkveV8AVILAqTFZQ4MY",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "YDAUvqliU26kklJlep4kl06dSx3HndKcqaXOlsIpunY",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.861Z",
+            "key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+            "self_signature": "7svi0AuotVVpKcRcXAYSB9on_ZZzioYk2QmkvuOwtXYMb4d5Eb8maOHvXTOxJ6qLxDfbOm5ygMVlh6bekjiuCA",
+            "trust_status": "revoked",
+            "registered_at": 1785150000,
+            "approved_at": null,
+            "approved_by_device_id": null,
+            "revoked_at": 1785160800
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "rotating-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 2,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "HP81QZZNldeJ5SAw1R-SSGKhIzMr2-W4NMOQ274Lq9A",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "ncVscKbWBiDWGhlj687GdiwqnWQQJnU4q4FbASKAFFE",
+            "previous_key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+            "created_at": "2026-07-27T14:00:00.000Z",
+            "key_id": "sha256:D2Q87l8Vo0iLl4m_2Jdt5IkXChkcJ8xRUsLQFbP6hpc",
+            "previous_key_signature": "8jbmZWikDtNchrpUB6NXnYnjjqBPnlA3VBuM1ls7SOFRhuupb6zmnUKZ3OkL2VyGDKCzAPJPesZVP1iQENv-Bg",
+            "self_signature": "qoDTzqfuis-ak6RVc4A7cDawb3C64F22r66FH-_galrrAW2NtTVFg8ZFUaV2MkU-bsncxVWJ0FJLMGiFKnVzAA",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "window-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "jEBaZNvaPRM484REFsacTAUwThbnBsjBlPIf5b9Lczc",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "3mprYwpv6kl_gpkFrjWYcagQ--OA2bx3lTtn9ADJals",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.863Z",
+            "key_id": "sha256:V2hy9Gd7R_tUF4AS2BZYWNjHkd5yMR36hAtndyCv-bw",
+            "self_signature": "cYxWD5llF76OaTtntU7eE1BIe2rPuCmwje3HCoJ-_7GfJqte1zMYs4kYfbLFq-RtuPVRjIYb_TD6fRi2g9wSDQ",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785157200,
+            "admission_proof": {
+              "action": "approve_device",
+              "account_epoch": 1,
+              "approver_device_id": "rotating-app-device",
+              "approver_key_id": "sha256:VhkifatoR1njz97dSDrVXGyuTS56tiFr1atl7jQzkqY",
+              "candidate_device_id": "window-cli-device",
+              "candidate_key_id": "sha256:V2hy9Gd7R_tUF4AS2BZYWNjHkd5yMR36hAtndyCv-bw",
+              "request_id": "req_window-cli-device",
+              "created_at": "2026-07-27T13:00:00.000Z",
+              "signature": "uVgObBz3-t9BlTZZ7m-DWOFlN4dHSmOfFAEUr56jKTqVHcE0dGEOPe4yV42icKfhfmPAN5Cd2bbWb4bHpwprBg"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "admitted_then_approver_removed",
+      "expect": "reject",
+      "why": "An admission only counts while its approver is still an authorized root, so removing the App strands the device it admitted.",
+      "directory": {
+        "policy": {
+          "epoch": 1,
+          "new_device_approval_required": true,
+          "updated_at": 1785155400,
+          "created_at": 1785155400,
+          "policy_proof": {
+            "action": "set_new_device_approval_required",
+            "account_epoch": 1,
+            "device_id": "signer-app-device",
+            "approver_key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "new_device_approval_required": true,
+            "grandfathered_key_ids": [
+              "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+              "sha256:mjkh7cfGIxdRUtA0ewy0oTFAsEfC1QBmelmG1Oywjts"
+            ],
+            "created_at": "2026-07-27T12:30:00.000Z",
+            "signature": "mTtjzuPeEZ1XNSChzGrN12t3vWuwaaJjydci26JOkrjs5IEpQj8gZL5lEotPg3b9KnXbq5JovaR7vW26WyIiDw"
+          }
+        },
+        "identities": [
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "signer-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "LI7Aio3zwh6H7uPQs3dzV3KKgO58tUQXTlrKGB0WAC4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "mx35-4L2PCFFre7ELNRI0kMPY47CShWW5htiOAPuoho",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.857Z",
+            "key_id": "sha256:qGlUeBINNkn-pgN1zjTY_9vk7ztsjuaelGa_NeKwBxY",
+            "self_signature": "hIpO787qg4fvUI9tup3zGY1gfr7WhHq1yf6MOJTj-GG4TAuW1cIhJQP6WgkP3mYuuwCoMEOqG0qPxBEUlYwBBg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "revoked-root-app-device",
+            "source": "originrouter_app",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "rR71RPzxRknhuFjZSHzodLWayDDWjrM4Ft7vDde40gw",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "1pjaEprpvq-zrYOq3bou_itK3XyrAdHTTiItsE7UGH0",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.862Z",
+            "key_id": "sha256:mjkh7cfGIxdRUtA0ewy0oTFAsEfC1QBmelmG1Oywjts",
+            "self_signature": "wkKgV6XbHEct8Iz9OmiKUDrqzU3ca2rKWDNKM3lZARIC5f9xQ7GKtkZMNeKQmidCbFc47SyAZXHaGJWccqcyAA",
+            "trust_status": "revoked",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600,
+            "revoked_at": 1785157200
+          },
+          {
+            "protocol": "originrouter-device-e2ee-v2",
+            "device_id": "late-cli-device",
+            "source": "originrouter_cli",
+            "epoch": 1,
+            "key_version": 1,
+            "signing_algorithm": "Ed25519",
+            "signing_public_key": "-cMUeX5uT9KFYtFDaEIRyBKgLlvowxrrNaFIduRQr_4",
+            "agreement_algorithm": "X25519",
+            "agreement_public_key": "03mFhxbQ8YSAGFZRZb5CP1QodVLFn5uUT4d6Yv7wCxE",
+            "previous_key_id": null,
+            "created_at": "2026-10-09T11:23:32.861Z",
+            "key_id": "sha256:bYLQEmmWSRhmsThhT28a3mPyhQt4cgqDXFjtltRglsc",
+            "self_signature": "ihporCHSKKuRyzj-QMA-rYdqH1G5cTWrPiFtMydgUiaSTql-6Nrh7fTGvLfikS8laE6T9kwyRY1iwWliBONxDg",
+            "trust_status": "trusted",
+            "registered_at": 1785153600,
+            "approved_at": 1785153600,
+            "admission_proof": {
+              "action": "approve_device",
+              "account_epoch": 1,
+              "approver_device_id": "revoked-root-app-device",
+              "approver_key_id": "sha256:mjkh7cfGIxdRUtA0ewy0oTFAsEfC1QBmelmG1Oywjts",
+              "candidate_device_id": "late-cli-device",
+              "candidate_key_id": "sha256:bYLQEmmWSRhmsThhT28a3mPyhQt4cgqDXFjtltRglsc",
+              "request_id": "req_late-cli-device",
+              "created_at": "2026-07-27T13:00:00.000Z",
+              "signature": "6mf0r4DVU34d204iwi-nal8ZqfpV66byOH4LB9iLip1sahooSn2Qwd2m4ImvKJ-ZXsdZYuKyI9MRYVtoHQelBw"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

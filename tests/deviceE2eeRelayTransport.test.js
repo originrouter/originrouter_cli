@@ -642,4 +642,156 @@ assert.equal(
   "a stale key id must still be delivered",
 );
 
+// A trust event makes the CLI drop every session, including the one the App is
+// still sealing onto. The App cannot see that happen: the relay keeps
+// delivering, the envelopes just stop being readable, and `accept()` refuses
+// them all on `sequence !== 0`. That refusal used to propagate out of
+// `handleInbound`, where the daemon only logged it — so the App kept sending
+// into a dead session and the conversation spun until `shouldRekey` expired it
+// half an hour later. The CLI now answers the refusal instead.
+{
+  const resetSent = [];
+  const resetTransport = new DeviceE2eeRelayTransport({
+    relayClient: {
+      send: async () => {},
+      sendEnvelope: async (envelope) => {
+        resetSent.push(envelope);
+        return { accepted: true };
+      },
+    },
+    localIdentity: cli,
+    stateDir,
+    controlBaseUrl: "https://example.invalid",
+    credentialProvider: async () => credential,
+  });
+  const orphan = DeviceE2eeSession.initiate({
+    local: app,
+    peer: cli.public_identity,
+    sessionId: "e2s_orphaned_by_trust_event",
+  });
+  // The App gets two envelopes out on this session, so its sequence is past 0.
+  const head = { routing: { directory_head: deviceE2eeDirectoryHead(cachedDirectory) } };
+  const first = orphan.seal("agent.message", { message: "one" }, head);
+  await resetTransport.handleInbound(first);
+  const second = orphan.seal("agent.message", { message: "two" }, head);
+  await resetTransport.handleInbound(second);
+  assert.equal(resetSent.length, 0);
+
+  // The trust event arrives and the CLI forgets the session.
+  resetTransport.clearSessions();
+  resetSent.length = 0;
+
+  // The App has no way to know, and sends again on the session it still holds.
+  const third = orphan.seal("agent.message", { message: "three" }, head);
+  assert.equal(third.sequence, 2);
+  const routed = await resetTransport.handleInbound(third);
+  assert.equal(routed, null, "an unusable envelope must be dropped, not thrown");
+
+  const resetFrame = resetSent.at(-1);
+  assert.ok(resetFrame, "the CLI must answer an envelope it cannot read");
+  assert.equal(resetFrame.protocol, "e2ee-v2");
+  assert.equal(resetFrame.target_device_id, "app-device");
+  // Sequence 0 on a session of its own: `send()` initiates when the target has
+  // none, so delivering the reset is itself a fresh, readable session.
+  assert.equal(resetFrame.sequence, 0);
+  assert.notEqual(resetFrame.session_id, orphan.sessionId);
+  const resetPayload = DeviceE2eeSession.accept({
+    local: app,
+    peer: cli.public_identity,
+    firstEnvelope: resetFrame,
+  }).firstPayload;
+  assert.equal(resetPayload.type, "e2ee.sessions.reset");
+  assert.equal(resetPayload.payload.stale_session_id, orphan.sessionId);
+  assert.equal(resetTransport.rejectsPlaintext({ type: "e2ee.sessions.reset" }), true);
+
+  // And the App's next request, now on the new session it just accepted, is
+  // readable again — which is the whole point of the exchange.
+  const healed = await resetTransport.handleInbound(
+    DeviceE2eeSession.initiate({
+      local: app,
+      peer: cli.public_identity,
+      sessionId: "e2s_healed_after_reset",
+    }).seal("agent.message", { message: "four" }, head),
+  );
+  assert.equal(healed.message, "four");
+}
+
+// The other direction: the App clears its sessions when it makes a trust
+// change, and says so. The CLI drops its half before anything else reads the
+// payload, so the very next envelope opens a clean session rather than failing
+// the sequence-0 check against a session it no longer has.
+{
+  const inbound = new DeviceE2eeRelayTransport({
+    relayClient: {
+      send: async () => {},
+      sendEnvelope: async () => ({ accepted: true }),
+    },
+    localIdentity: cli,
+    stateDir,
+    controlBaseUrl: "https://example.invalid",
+    credentialProvider: async () => credential,
+  });
+  const live = DeviceE2eeSession.initiate({
+    local: app,
+    peer: cli.public_identity,
+    sessionId: "e2s_inbound_reset",
+  });
+  await inbound.handleInbound(live.seal("agent.control.subscribe", {
+    sessionIds: ["agent-session-inbound-reset"],
+  }, { routing: { directory_head: deviceE2eeDirectoryHead(cachedDirectory) } }));
+  assert.equal(inbound.sessions.has(live.sessionId), true);
+
+  const dropped = await inbound.handleInbound(DeviceE2eeSession.initiate({
+    local: app,
+    peer: cli.public_identity,
+    sessionId: "e2s_inbound_reset_signal",
+  }).seal("e2ee.sessions.reset", {
+    target_device_id: "cli-device",
+    reason: "trust_changed",
+  }, { routing: { directory_head: deviceE2eeDirectoryHead(cachedDirectory) } }));
+  assert.equal(dropped, null, "the reset is consumed by the transport");
+  assert.equal(inbound.sessions.size, 0, "the peer's sessions must be gone");
+
+  // The App re-initiates; the CLI must accept it rather than see a mid-stream
+  // sequence and refuse.
+  const resumed = await inbound.handleInbound(DeviceE2eeSession.initiate({
+    local: app,
+    peer: cli.public_identity,
+    sessionId: "e2s_inbound_resumed",
+  }).seal("agent.message", { message: "resumed" }, {
+    routing: { directory_head: deviceE2eeDirectoryHead(cachedDirectory) },
+  }));
+  assert.equal(resumed.message, "resumed");
+}
+
+// `announceSessionReset` is what the daemon calls after a trust event, where
+// the whole map goes at once and the sender is known. It must not throw when
+// the peer has just become untrusted — a `device.revoked` event means the
+// directory will refuse to seal to it at all, and the event itself must still
+// be handled rather than turning into an unhandled rejection.
+{
+  const revoked = new DeviceE2eeRelayTransport({
+    relayClient: {
+      send: async () => {},
+      sendEnvelope: async () => ({ accepted: true }),
+    },
+    localIdentity: cli,
+    stateDir,
+    controlBaseUrl: "https://example.invalid",
+    credentialProvider: async () => credential,
+  });
+  const frame = await revoked.send("collaboration.remote.dispatch", {
+    targetDeviceId: "worker-device",
+    sourceDeviceId: "cli-device",
+    protocolVersion: "1",
+    assignmentId: "warm",
+    runId: "warm",
+    taskId: "warm",
+    role: "worker",
+    prompt: "warm the directory",
+  });
+  assert.ok(frame, "a trusted target is reachable");
+  await revoked.announceSessionReset("worker-device", "device.revoked");
+}
+
 console.log("device E2EE relay transport tests ok");
