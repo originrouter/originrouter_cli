@@ -278,10 +278,27 @@ assert.equal(registry.list()[0].status, "stopped");
   assert.equal(idle.turn_state, idle.session.turn_state);
   assert.equal(idle.turn_state, "idle");
 
+  // A thinking block is content inside an assistant message, not a turn
+  // boundary. The SDK's result message can land before it, so the CLI emits
+  // `agent.task.started → task_result_ready → agent.thinking → agent.text`
+  // within one turn. Reading that trailing thinking as a fresh turn start
+  // re-latched a finished turn to "running" and left the App offering a stop
+  // button for an idle Agent. It may EXTEND a turn, never open one.
+  turns.appendEvent("turn-1", { type: "agent.thinking" });
+  assert.equal(turns.list()[0].turn_state, "idle");
+
+  // ...but it must extend a turn that is genuinely still open.
+  turns.appendEvent("turn-1", { type: "agent.task.started" });
+  assert.equal(turns.list()[0].turn_state, "running");
+  turns.appendEvent("turn-1", { type: "agent.thinking" });
+  assert.equal(turns.list()[0].turn_state, "running");
+  turns.appendEvent("turn-1", { type: "agent.task.aborted" });
+  assert.equal(turns.list()[0].turn_state, "idle");
+
   // Re-registration is a fresh attach: a turn that ended while the App was
   // away must not be resurrected as an active turn.
   turns.appendEvent("turn-1", { type: "agent.thinking" });
-  assert.equal(turns.list()[0].turn_state, "running");
+  assert.equal(turns.list()[0].turn_state, "idle");
   turns.register({ sessionId: "turn-1", agent: "claude" });
   assert.equal(turns.list()[0].turn_state, "idle");
 

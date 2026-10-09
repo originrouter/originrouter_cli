@@ -49,7 +49,6 @@ function turnStateForEvent(event, fallback = "unknown") {
   }
   if ([
     "agent.task.started",
-    "agent.thinking",
     "agent.tool_call.start",
     "tool_call",
   ].includes(type)) return "running";
@@ -78,12 +77,23 @@ function turnStateForEvent(event, fallback = "unknown") {
     "interaction_canceled",
     "interaction_failed",
     "agent.interaction.result",
+    // `agent.thinking` may only LIFT an active turn, never open one. A thinking
+    // block is content inside an assistant message, not a turn boundary, and
+    // the SDK's result message can land before it, so a turn routinely looks
+    // like `agent.task.started → task_result_ready → agent.thinking →
+    // agent.text`. Reading that trailing thinking as a fresh turn start
+    // re-latched a finished turn to "running" and left the App showing a stop
+    // button for an idle Agent. Production agrees it never opens a turn: of 198
+    // `agent.thinking` rows, 0 lacked an earlier `agent.task.started` in the
+    // same session.
+    "agent.thinking",
   ].includes(type)) {
     if (type === "agent.interaction.result" &&
         !["applied", "expired", "canceled", "failed", "not_found"].includes(event?.status)) {
       return fallback;
     }
     // A delayed permission timeout/result must not restart a completed turn.
+    // Same rule for a trailing thinking block.
     return fallback === "idle" ? "idle" : "running";
   }
   return fallback;
