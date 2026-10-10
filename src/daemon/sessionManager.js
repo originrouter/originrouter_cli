@@ -33,6 +33,7 @@ import { setAgentDetailDefault } from "../runtime/agentDetailProfile.js";
 import { buildAuditEvidenceBundle } from "../inquiry/auditEvidenceAdapter.js";
 import { AiAuditQueryPlanner } from "../runtime/aiAuditQueryPlanner.js";
 import { browseAgentWorkspaces } from "./workspaceBrowser.js";
+import { isForeignRelayFrame } from "../collaboration/collaborationRuntimeUtils.js";
 import {
   approvalPolicyCapabilities,
   evaluateApprovalRequest,
@@ -972,6 +973,16 @@ export class SessionManager {
       return false;
     }
     if (payload.type === "agent.workspace.browse") {
+      // The relay's envelope decided this frame was delivered here; the
+      // payload's own `targetDeviceId` is the sender restating it, and it is
+      // absent from every frame the App sends. A peer name still gets a log
+      // line — it means a sender or routing bug, and without it those look
+      // exactly like a device that simply never answers.
+      //
+      // Logged but not acted on: these are replies to a request someone is
+      // holding a pending promise for, so staying quiet turns a sender bug
+      // into the 30-second timeout this whole path was rewritten to avoid.
+      isForeignRelayFrame(payload, this.deviceId);
       const requestId = String(payload.requestId || "").slice(0, 96);
       if (!requestId || !this.agentCatalog) return false;
       Promise.resolve().then(() => {
@@ -999,6 +1010,9 @@ export class SessionManager {
       return true;
     }
     if (payload.type === "agent.workspace.trust") {
+      // As with browse: a foreign `targetDeviceId` is worth a trace, but the
+      // caller is waiting on this answer, so answer it.
+      isForeignRelayFrame(payload, this.deviceId);
       const requestId = String(payload.requestId || "").slice(0, 96);
       if (!requestId || !this.agentCatalog) return false;
       Promise.resolve().then(() => {

@@ -23,6 +23,7 @@ import {
   decision,
   expectedRole,
   isAgentResumeBindingError,
+  isForeignRelayFrame,
   latestContent,
   retryableDeliveryError,
   safeText,
@@ -1664,36 +1665,15 @@ export class CollaborationRuntime {
   }
 
   async handleRelayEvent(payload = {}) {
-    if (payload.type === "agent.workspace.browse") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
-      let page = null;
-      let errorPayload = null;
-      try {
-        // Workspace browse was requested over the device relay. Refuse known
-        // interactive locations before touching the filesystem so no target
-        // machine can be left behind an invisible OS authorization dialog.
-        requireRemoteWorkspacePathPreflight(payload.path);
-        page = await browseAgentWorkspaces({
-          path: payload.path,
-          query: payload.query,
-          limit: payload.limit,
-          catalog: this.catalog,
-          deviceId: this.deviceId,
-        });
-      } catch (error) {
-        errorPayload = {
-          error: safeText(error?.message, 2048) || "workspace browse failed",
-          reason: safeText(error?.code, 96) || "workspace_browse_failed",
-        };
-      }
-      await this.relayClient?.send?.("agent.workspace.page", {
-        requestId: safeText(payload.requestId, 64),
-        sourceDeviceId: this.deviceId,
-        targetDeviceId: safeText(payload.sourceDeviceId, 191),
-        ...(errorPayload || page || {}),
-      });
-      return true;
-    }
+    // `agent.workspace.browse` has no branch here on purpose. sessionManager
+    // answers it, and it used to be answered from this file as well — the
+    // copy added in 89ce5d3 sat ahead of sessionManager in the dispatch chain
+    // and returned `true` for every frame whose payload lacked
+    // `targetDeviceId`, which is every frame the App sends (the App puts the
+    // device in the relay's addressing argument, and under E2EE the payload is
+    // sealed ciphertext the CLI cannot read the envelope from). Remote
+    // workspace browsing therefore died silently: no response, no log, and a
+    // 30-second timeout on the phone. One type, one owner.
     if (payload.type === "agent.workspace.page") {
       const requestId = safeText(payload.requestId, 64);
       const pending = this.workspaceBrowseRequests.get(requestId);
@@ -1716,7 +1696,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.control.request") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       let data = null;
       let errorPayload = null;
       try {
@@ -1740,7 +1720,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.capabilities.request") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       let capabilities = null;
       let errorPayload = null;
       try {
@@ -1762,7 +1742,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.capabilities.response") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const requestId = safeText(payload.requestId, 64);
       const pending = this.capabilityRequests.get(requestId);
       if (!pending) return true;
@@ -1785,7 +1765,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.workspace.trust.request") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       let workspace = null;
       let errorPayload = null;
       try {
@@ -1826,7 +1806,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.workspace.trust.response") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const requestId = safeText(payload.requestId, 64);
       const pending = this.workspaceTrustRequests.get(requestId);
       if (!pending) return true;
@@ -1842,7 +1822,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.budget.status") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const blocked = Boolean(payload.blocked);
       this.accountBudgetBlocked = blocked;
       const requestedRunId = safeText(payload.run_id ?? payload.runId, 195);
@@ -1892,7 +1872,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.mcp.request") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const requestId = safeText(payload.requestId, 64);
       let result = null;
       let errorPayload = null;
@@ -1923,7 +1903,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.mcp.response") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const requestId = safeText(payload.requestId, 64);
       const pending = this.mcpRequests.get(requestId);
       if (!pending) return true;
@@ -1964,7 +1944,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.remote.result") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const run = this.store.getRun(payload.runId);
       if (!run || !run.task_ids.includes(payload.taskId)) return true;
       const role = safeText(payload.role, 32);
@@ -1997,7 +1977,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.remote.event") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const run = this.store.getRun(payload.runId, { includeMessages: false });
       const role = safeText(payload.role, 32);
       if (!run || !run.agents[role] || !run.task_ids.includes(payload.taskId)) return true;
@@ -2081,7 +2061,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.remote.interaction.resolve") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const assignment = this.store.findRemoteAssignmentBySession(payload.sessionId);
       if (!assignment
           || assignment.run_id !== safeText(payload.runId, 195)
@@ -2099,7 +2079,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.remote.pause") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const assignment = this.store.getRemoteAssignment(payload.assignmentId)
         || this.store.findRemoteAssignmentBySession(payload.sessionId);
       if (!assignment
@@ -2117,7 +2097,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.remote.usage") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const run = this.store.getRun(payload.runId, { includeMessages: false });
       const role = safeText(payload.role, 32);
       if (!run || !run.agents[role] || !run.task_ids.includes(payload.taskId)) return true;
@@ -2153,7 +2133,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.remote.cancel") {
-      if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return true;
+      if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const budgetExhausted = safeText(payload.reason, 96) === "budget_exhausted";
       if (!budgetExhausted) this.store.recordRemoteCancellation(payload);
       const assignment = this.store.getRemoteAssignment(payload.assignmentId);
@@ -2174,7 +2154,7 @@ export class CollaborationRuntime {
       return true;
     }
     if (payload.type === "collaboration.remote.error") {
-      if (safeText(payload.targetDeviceId, 191) === this.deviceId && payload.runId) {
+      if (!isForeignRelayFrame(payload, this.deviceId) && payload.runId) {
         const run = this.store.getRun(payload.runId, { includeMessages: false });
         const role = safeText(payload.role, 32);
         if (!run || !this.acceptsFencing(run, role, payload)) return true;
@@ -2195,7 +2175,7 @@ export class CollaborationRuntime {
 
   async receiveRemoteDispatch(payload) {
     if (safeText(payload.protocolVersion, 8) !== "1") throw new Error("unsupported collaboration protocol");
-    if (safeText(payload.targetDeviceId, 191) !== this.deviceId) return;
+    if (isForeignRelayFrame(payload, this.deviceId)) return;
     if (safeText(payload.sourceDeviceId, 191) === this.deviceId) throw new Error("invalid collaboration source device");
     const prompt = safeText(payload.prompt, 32_768);
     if (!prompt) throw new Error("remote collaboration prompt is required");

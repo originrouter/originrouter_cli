@@ -9,6 +9,8 @@ import { CollaborationRuntime } from "../src/collaboration/collaborationRuntime.
 import { ensureDeviceE2eeIdentity } from "../src/crypto/deviceE2eeIdentity.js";
 import { storeDeviceE2eeDirectoryCache } from "../src/security/deviceE2eeDirectoryCache.js";
 import { DeviceE2eeRelayTransport } from "../src/security/deviceE2eeRelayTransport.js";
+import { SessionManager } from "../src/daemon/sessionManager.js";
+import { createRelayDispatch } from "../src/daemon/relayDispatch.js";
 
 class Registry {
   constructor() { this.sessions = new Map(); this.listeners = new Set(); this.commands = []; }
@@ -69,7 +71,11 @@ function node(deviceId, network, { stateDir, identity, identities, envelopes, co
           return { data: { accepted: false, queued: false, reason: "target_offline" } };
         }
         const clear = await target.transport.handleInbound(envelope);
-        await target.runtime.handleRelayEvent(clear);
+        // The real dispatch chain, not a direct handler call. Calling
+        // `runtime.handleRelayEvent` here skips the ordering that caused the
+        // outage this test never caught: a type answered by two handlers, the
+        // earlier one claiming every frame it was not meant to see.
+        await target.dispatchRoutedRelayEvent(clear);
         return { data: { accepted: true, queued: false, reason: "" } };
       },
     },
@@ -89,7 +95,22 @@ function node(deviceId, network, { stateDir, identity, identities, envelopes, co
     }),
     registrationTimeoutMs: 100, pollIntervalMs: 1,
   });
-  const value = { store, coordinator, registry, launches, runtime, transport: relayClient };
+  const sessionManager = new SessionManager({
+    relayClient,
+    deviceId,
+    defaultExecutor: null,
+    agentCatalog: catalog,
+    stateDir,
+  });
+  const dispatchRoutedRelayEvent = createRelayDispatch({
+    collaborationRuntime: runtime,
+    externalAgentRelayRouter: { async handle() { return false; } },
+    sessionManager,
+  });
+  const value = {
+    store, coordinator, registry, launches, runtime, transport: relayClient,
+    sessionManager, dispatchRoutedRelayEvent,
+  };
   network.set(deviceId, value);
   return value;
 }

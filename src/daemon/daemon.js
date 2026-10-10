@@ -37,6 +37,7 @@ import { RelayClient } from "../relay/relayClient.js";
 import { resolveRelayEndpoint } from "../relay/relayEndpointSelector.js";
 import { parseOptions } from "../utils/options.js";
 import { SessionManager } from "./sessionManager.js";
+import { createRelayDispatch } from "./relayDispatch.js";
 import { agentDetailDefaultFromConfig } from "../runtime/agentDetailProfile.js";
 import { remoteShareModelEntries } from "../config/providerModels.js";
 import { normalizeProviderForRead } from "../config/providers.js";
@@ -333,6 +334,16 @@ export async function startDaemon(args) {
     telemetry,
     compatibilityAutomaticUpdates:
       relayMode !== "local" && process.env.ORIGINROUTER_COMPATIBILITY_UPDATES !== "off",
+  });
+  // The order of these three is the relay contract: the first handler that
+  // claims a frame ends the chain. Two handlers answering one type makes the
+  // later one dead code and the earlier one silently swallow everything it was
+  // not meant to see, which is how remote workspace browsing used to time out
+  // on the phone with no error anywhere.
+  const dispatchRoutedRelayEvent = createRelayDispatch({
+    collaborationRuntime,
+    externalAgentRelayRouter,
+    sessionManager,
   });
   operationReviewer.onTelemetry = (fact, context) => sessionManager.enqueueAiTelemetryFact(fact, context);
 
@@ -994,11 +1005,7 @@ export async function startDaemon(args) {
                 type: "agent.interactions.snapshot.request",
               };
             }
-            const collaborationHandled = await collaborationRuntime
-              .handleRelayEvent(routed);
-            if (collaborationHandled) return;
-            const externalHandled = await externalAgentRelayRouter.handle(routed);
-            if (!externalHandled) sessionManager.handleEvent(routed);
+            await dispatchRoutedRelayEvent(routed);
           })().catch((error) => {
             console.error(`[device-relay] ${error.code || error.message}`);
           });
