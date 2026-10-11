@@ -1,4 +1,5 @@
-// A permission prompt needs an identity.
+// A permission prompt needs an identity, and the client holding it open needs
+// to stay connected.
 //
 // Claude Code 2.1.283 does not put a `tool_use_id` on `PermissionRequest`, so
 // an adapter that keys permissions off that field has no id to mint — and the
@@ -8,6 +9,12 @@
 // permissions: three cards for a single `Write`, each with its own expiry and
 // its own denial sent back to the terminal.
 //
+// Fixing the identity is not sufficient on its own. The card then still
+// vanished after exactly five seconds, because the hook forwarder inherited
+// `http.globalAgent`, which Node 19+ gives a 5s socket timeout — a deadline
+// nobody asked for and nobody could configure. The last section here holds a
+// real permission open past that deadline through the real forwarder.
+//
 // The fixtures below are the real payloads, captured from Claude Code 2.1.283
 // by dumping the hook's stdin verbatim. They are the point of the file: the
 // property under test is about what that version actually sends, and a
@@ -16,6 +23,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const repo = dirname(here);
+const require = createRequire(resolve(repo, "package.json"));
+const { postHookBody } = require("./scripts/claude-session-hook-forwarder-impl.cjs");
 
 import {
   permissionCallId,
@@ -301,5 +316,51 @@ test("the hold still expires on its own when nobody answers", async (t) => {
   assert.equal(
     JSON.parse(answer.body).hookSpecificOutput.decision.message,
     "OriginRouter remote approval timed out. Please retry or approve locally.",
+  );
+});
+// ---------- the forwarder's hold must outlive any deadline nobody chose ----------
+
+test("a permission stays open past the global agent's socket timeout", async (t) => {
+  // The bug this reproduces: every card vanished after exactly 5s while the
+  // terminal sat on its own prompt. `http.globalAgent` has carried a 5s socket
+  // timeout since Node 19, and the forwarder's `http.request` inherited it
+  // without ever asking for it — so `permissionRequestTimeoutMs: 0` ("no
+  // deadline of ours") still died at 5s, and the retry budget burned through in
+  // ~15s before Claude Code fell back to its own prompt.
+  //
+  // The real forwarder HTTP path runs in-process here so the global agent's
+  // timeout is this process's own. Shrinking it to 500ms is what keeps the
+  // test fast; the mechanism under test is inheritance, not the number 5000.
+  // Undoing `agent: false` puts the hold on that inherited deadline and this
+  // fails with the hold reported gone at ~500ms.
+  const original = http.globalAgent.options.timeout;
+  http.globalAgent.options.timeout = 500;
+  t.after(() => { http.globalAgent.options.timeout = original; });
+
+  const { server, requests, timeouts } = await startServer();
+  t.after(() => server.stop());
+
+  const diagnostics = [];
+  const pending = postHookBody(JSON.stringify(PERMISSION_REQUEST), server.port, {
+    logger: (line) => diagnostics.push(line),
+    permissionRequestTimeoutMs: 0,
+  });
+  t.after(() => server.stop());
+
+  // Sit well past the inherited deadline. Anything shorter is the bug.
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+
+  assert.deepEqual(timeouts, [], "the hold must still be open, not reported as gone");
+  assert.equal(requests.length, 1, "and it must not have been re-requested as a retry");
+
+  // And the answer still reaches Claude Code.
+  assert.ok(server.resolvePermission({ callId: requests[0].callId, decision: "approved" }));
+  const result = await pending;
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(diagnostics, [], "the forwarder must not have logged a failure");
+  assert.equal(
+    JSON.parse(result.responseBody).hookSpecificOutput.decision.behavior,
+    "allow",
   );
 });

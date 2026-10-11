@@ -83,6 +83,15 @@ function postOnce(body, port, path, perAttemptTimeoutMs, requestFn) {
         "Content-Type": "application/json",
         "Content-Length": Buffer.byteLength(body),
       },
+      // Node 19+ gives `http.globalAgent` a built-in 5-second socket
+      // timeout. An unset `agent` inherits it, so every permission hold was
+      // cut off at exactly 5s no matter what `permissionRequestTimeoutMs`
+      // said — the config comment above promises "one value, computed once"
+      // and the pool was quietly supplying a second one underneath it.
+      // `false` makes Node build a one-off Agent with no timeout of its own,
+      // leaving `req.setTimeout` below as the only deadline. This process
+      // makes a single request and exits, so there is no pooling to lose.
+      agent: false,
     }, (response) => {
       const chunks = [];
       response.on("data", (c) => chunks.push(c));
