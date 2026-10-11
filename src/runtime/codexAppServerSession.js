@@ -3,9 +3,7 @@ import process from "node:process";
 import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import {
-  CODEX_APPROVAL_TIMEOUT_MS,
   CodexAppServerClient,
-  REMOTE_INTERACTION_DECISION_TIMEOUT_MS,
   isCodexAppServerAvailable,
 } from "../adapters/codex/appServerClient.js";
 import { mapCodexAppServerEvent } from "../adapters/codex/eventMapper.js";
@@ -28,6 +26,10 @@ import {
   willRouteRemoteCoding,
 } from "../config/claudeConfig.js";
 import { DEFAULT_DEVICE_ID } from "../constants.js";
+import {
+  agentInteractionGraceMs,
+  agentInteractionTimeoutMsFromConfig,
+} from "../config/agentInteractionTimeout.js";
 import {
   appendSessionStart,
   patchSessionExit,
@@ -215,7 +217,14 @@ export async function runCodexAppServerSession(rawArgs) {
   const sessionTitle = String(options.title || "Codex session")
     .trim()
     .slice(0, 191);
-  const client = new CodexAppServerClient();
+  const client = new CodexAppServerClient({
+    // The RPC-level backstop for an unanswered approval, derived from the same
+    // config value that stamps the interaction's own deadline plus the grace
+    // between them. `0` arms no timer — see withApprovalTimeout.
+    approvalTimeoutMs: agentInteractionGraceMs(
+      agentInteractionTimeoutMsFromConfig(config),
+    ),
+  });
   const recentEvents = [];
   const runtimeReporter = createRuntimeEventReporter({
     enabled: !collaborationWorker,

@@ -154,6 +154,9 @@ Local API inspection and App pairing:
 Configuration:
   originrouter config show
   originrouter config set updates.mode prompt|auto|off
+  originrouter config set agent.interactionTimeoutMs 0|5m|2h
+                                      How long a blocking request waits for an answer before
+                                      expiring. 0 (default) waits indefinitely.
   originrouter config set claude.<key> <value>
   originrouter config unset claude.<key>
   originrouter claude-config --base-url <url> --api-key <key> --model <model>

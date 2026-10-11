@@ -11,10 +11,20 @@ import { createServer } from "node:http";
 // The hook server holds a `pendingPermissions` map keyed by `callId`. When
 // a PermissionRequest arrives, we generate a callId, hand the structured
 // event to the adapter, and suspend the HTTP response until the remote
-// client sends a decision. The generated hook config explicitly grants six
-// minutes, so this five-minute decision window leaves one minute for hook
-// transport and process cleanup.
+// client sends a decision.
+//
+// How long that hold lasts is `permissionTimeoutMs`, passed in by the adapter
+// from `agent.interactionTimeoutMs`. It only has to outlive the decision
+// window — its job is to answer Claude Code when no answer is coming, not to
+// be the deadline anyone decided on. `0` means no deadline of ours at all;
+// Claude Code's own hook timeout is then what finally ends the wait, which is
+// the correct owner for that decision. See config/agentInteractionTimeout.js.
 
+// Kept as named constants because they are the fallback when a caller passes
+// nothing, and because the hook forwarder and the hook settings file are sized
+// against them. `CLAUDE_PERMISSION_TIMEOUT_MS` is deliberately longer than
+// `CLAUDE_INTERACTION_DECISION_TIMEOUT_MS`: the inner window decides, and this
+// is only the backstop.
 export const CLAUDE_INTERACTION_DECISION_TIMEOUT_MS = 300_000;
 export const CLAUDE_PERMISSION_TIMEOUT_MS = 315_000;
 
@@ -126,10 +136,18 @@ export function startClaudeHookServer({
   onElicitationRequest,
   onElicitationTimeout,
   onHookEvent,
+  permissionTimeoutMs = CLAUDE_PERMISSION_TIMEOUT_MS,
 } = {}) {
   return new Promise((resolve, reject) => {
     const pendingPermissions = new Map();
     const pendingElicitations = new Map();
+
+    // `0` — and any non-positive value — means "hold until someone answers".
+    // armHold() then returns null and every `clearTimeout(entry.timer)` below
+    // is a no-op on null, so the rest of the file needs no null checks.
+    // Normalized once here rather than at each of the two call sites.
+    const holdMs = Number(permissionTimeoutMs) > 0 ? Number(permissionTimeoutMs) : 0;
+    const armHold = (onFire) => (holdMs > 0 ? setTimeout(onFire, holdMs) : null);
 
     const resolvePermission = ({ callId, decision, reason, updatedInput }) => {
       const pending = pendingPermissions.get(callId);
@@ -199,7 +217,7 @@ export function startClaudeHookServer({
             || `claude-perm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
           const event = buildPermissionRequestEvent(callId, payload);
 
-          let timer;
+          let timer = null;
           let settled = false;
           // Stage 8.0A: carry permissionSuggestions on the entry so
           // resolvePermission can pass them to decisionToHookJson.
@@ -215,7 +233,7 @@ export function startClaudeHookServer({
             timer: null,
           };
 
-          timer = setTimeout(() => {
+          timer = armHold(() => {
             if (pendingPermissions.has(callId)) {
               pendingPermissions.delete(callId);
               entry.responseBody = JSON.stringify(decisionToHookJson("timeout", { permissionSuggestions: entry.permissionSuggestions }));
@@ -224,7 +242,7 @@ export function startClaudeHookServer({
                 try { onPermissionTimeout(callId, event); } catch {}
               }
             }
-          }, CLAUDE_PERMISSION_TIMEOUT_MS);
+          });
 
           entry.timer = timer;
           pendingPermissions.set(callId, entry);
@@ -270,7 +288,7 @@ export function startClaudeHookServer({
               response.end(entry.responseBody || JSON.stringify(decisionToElicitationHookJson("decline")));
             },
           };
-          entry.timer = setTimeout(() => {
+          entry.timer = armHold(() => {
             if (!pendingElicitations.has(interactionId)) return;
             pendingElicitations.delete(interactionId);
             entry.responseBody = JSON.stringify(decisionToElicitationHookJson("decline"));
@@ -278,7 +296,7 @@ export function startClaudeHookServer({
             if (typeof onElicitationTimeout === "function") {
               try { onElicitationTimeout(interactionId, event); } catch {}
             }
-          }, CLAUDE_PERMISSION_TIMEOUT_MS);
+          });
           pendingElicitations.set(interactionId, entry);
           if (typeof onElicitationRequest === "function") {
             try {

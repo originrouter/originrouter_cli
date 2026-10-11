@@ -22,8 +22,13 @@ const DEFAULTS = {
   retryDelaysMs: [50, 150],
   // Per-attempt timeout is event-conditional and resolved inside
   // postHookBody (SessionStart: perAttemptTimeoutMs; PermissionRequest:
-  // permissionRequestTimeoutMs to safely cover the hook server's five-minute
-  // hold-open while staying below the six-minute Claude hook deadline).
+  // permissionRequestTimeoutMs, which must cover the hook server's hold-open
+  // while staying below Claude Code's own hook deadline).
+  //
+  // `permissionRequestTimeoutMs` is 0 when the user set
+  // `agent.interactionTimeoutMs` to 0 — no deadline of ours — in which case
+  // the socket waits as long as the server does. It is passed in by the
+  // caller; 330_000 here is only the fallback for one that passes nothing.
   perAttemptTimeoutMs: 5_000,
   permissionRequestTimeoutMs: 330_000,
   retryableHttpStatuses: new Set([429, 500, 502, 503, 504]),
@@ -100,7 +105,12 @@ function postOnce(body, port, path, perAttemptTimeoutMs, requestFn) {
     // the promise; setting only `settled = true` and calling
     // req.destroy() would leave the promise pending forever because
     // the 'error' handler would see `settled` and bail.
-    req.setTimeout(perAttemptTimeoutMs);
+    //
+    // A non-positive timeout means "wait as long as the server does" — the
+    // user asked for no deadline, so this socket must not become one. Not
+    // calling setTimeout at all is the way to say that: `setTimeout(0)` would
+    // fire on the next tick and abort every permission immediately.
+    if (perAttemptTimeoutMs > 0) req.setTimeout(perAttemptTimeoutMs);
     req.on("timeout", () => {
       if (settled) return;
       settled = true;
@@ -126,9 +136,11 @@ async function postHookBody(body, port, options = {}) {
 
   const eventName = parseEventName(body);
   const path = pickPath(eventName);
-  // PermissionRequest is held open by the server for up to five minutes;
-  // the forwarder's per-attempt timeout must safely exceed that,
-  // otherwise a normal remote approval would be aborted.
+  // PermissionRequest is held open by the server until someone answers; the
+  // forwarder's per-attempt timeout must safely exceed that, otherwise a
+  // normal remote approval would be aborted by us rather than by the user's
+  // own decision. It comes from `agent.interactionTimeoutMs` via the caller,
+  // and is 0 when that setting asks for no deadline at all.
   const perAttemptTimeoutMs = eventName === "PermissionRequest" || eventName === "Elicitation"
     ? opts.permissionRequestTimeoutMs
     : opts.perAttemptTimeoutMs;

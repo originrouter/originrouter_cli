@@ -87,6 +87,19 @@ import {
 } from "./commands/update.js";
 import { setUpdateMode, updateModeFromConfig } from "./update/settings.js";
 import {
+  agentInteractionTimeoutMsFromConfig,
+  setAgentInteractionTimeoutMs,
+  unsetAgentInteractionTimeoutMs,
+} from "./config/agentInteractionTimeout.js";
+
+// Phrased in minutes because that is the unit the old hard-coded value was
+// described in, and "300000ms" is not something anyone reads at a glance.
+function printInteractionTimeout(config) {
+  const ms = agentInteractionTimeoutMsFromConfig(config);
+  const value = ms > 0 ? `${(ms / 60_000).toFixed(ms % 60_000 ? 1 : 0)} minutes` : "no deadline (waits for you)";
+  console.log(`Blocking request deadline: ${value}`);
+}
+import {
   cliProviderForShow,
   printAgentHistory,
   printClaudeConfig,
@@ -201,17 +214,24 @@ function handleConfig(args) {
   if (!action || action === "show") {
     printClaudeConfig(config);
     console.log(`Update mode: ${updateModeFromConfig(config)}`);
+    printInteractionTimeout(config);
     return;
   }
 
   if (action === "set") {
     if (!path || value === undefined) {
-      throw new Error("Usage: originrouter config set updates.mode prompt|auto|off | originrouter config set claude.<key> <value>");
+      throw new Error("Usage: originrouter config set updates.mode prompt|auto|off | originrouter config set agent.interactionTimeoutMs <duration> | originrouter config set claude.<key> <value>");
     }
     if (path === "updates.mode") {
       const next = setUpdateMode(config, value);
       writeConfig(next);
       console.log(`Update mode: ${updateModeFromConfig(next)}`);
+      return;
+    }
+    if (path === "agent.interactionTimeoutMs") {
+      const next = setAgentInteractionTimeoutMs(config, value);
+      writeConfig(next);
+      printInteractionTimeout(next);
       return;
     }
     const key = parseClaudePath(path);
@@ -222,13 +242,19 @@ function handleConfig(args) {
 
   if (action === "unset") {
     if (!path) {
-      throw new Error("Usage: originrouter config unset claude.<key>");
+      throw new Error("Usage: originrouter config unset claude.<key> | originrouter config unset agent.interactionTimeoutMs");
     }
     if (path === "updates.mode") {
       const next = { ...config, updates: { ...(config.updates || {}) } };
       delete next.updates.mode;
       writeConfig(next);
       console.log(`Update mode: ${updateModeFromConfig(next)}`);
+      return;
+    }
+    if (path === "agent.interactionTimeoutMs") {
+      const next = unsetAgentInteractionTimeoutMs(config);
+      writeConfig(next);
+      printInteractionTimeout(next);
       return;
     }
     const key = parseClaudePath(path);

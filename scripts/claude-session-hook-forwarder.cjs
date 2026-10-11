@@ -25,6 +25,21 @@ const { postHookBody } = require("./claude-session-hook-forwarder-impl.cjs");
 const port = Number(process.argv[2]);
 if (!port) process.exit(1);
 
+// Socket timeout for a held-open permission, in ms, written into the hook
+// config by generateClaudeHookSettings. It arrives here rather than being
+// read from config.json because this script is CommonJS on purpose — reading
+// it from an ESM module would need require(esm), which only exists on Node
+// >=22.12, while the package supports >=22. Passing it also guarantees the
+// socket and the hook server agree: one value, computed once, written into the
+// same file that spawns us.
+//
+// Absent (older hook config, or a hand-run of this script) leaves it
+// undefined, and postHookBody falls back to its own default.
+const permissionArg = Number(process.argv[3]);
+const permissionRequestTimeoutMs = Number.isFinite(permissionArg) && permissionArg >= 0
+  ? permissionArg
+  : undefined;
+
 let body = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -32,7 +47,10 @@ process.stdin.on("data", (chunk) => {
 });
 
 process.stdin.on("end", async () => {
-  const result = await postHookBody(body, port, { logger: console.error });
+  const result = await postHookBody(body, port, {
+    logger: console.error,
+    permissionRequestTimeoutMs,
+  });
   // For PermissionRequest, the hook server's response body is the JSON
   // Claude Code expects. Write it to stdout verbatim. For SessionStart
   // the body is just "ok" and is irrelevant — drop it.

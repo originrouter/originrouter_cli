@@ -1,12 +1,19 @@
-import { REMOTE_INTERACTION_DECISION_TIMEOUT_MS } from "../adapters/codex/appServerClient.js";
+import {
+  agentInteractionExpiresAt,
+  agentInteractionTimeoutMsFromConfig,
+} from "../config/agentInteractionTimeout.js";
+import { readConfig } from "../persistence/state.js";
 
 const CODEX_MODES = Object.freeze([
   { id: "default", label: "Default" },
   { id: "plan", label: "Plan" },
 ]);
 
-const codexApprovalExpiresAt = () =>
-  Math.ceil((Date.now() + REMOTE_INTERACTION_DECISION_TIMEOUT_MS) / 1000);
+// Read per request rather than captured once at import: `originrouter config
+// set agent.interactionTimeoutMs` should take effect on the next approval
+// without a daemon restart, and this is called a handful of times a turn.
+const codexApprovalExpiresAt = (config = readConfig()) =>
+  agentInteractionExpiresAt(agentInteractionTimeoutMsFromConfig(config));
 
 export function createSerialAgentEventQueue(handler) {
   let tail = Promise.resolve();

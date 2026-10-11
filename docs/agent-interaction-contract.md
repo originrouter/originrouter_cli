@@ -20,6 +20,12 @@ interrupt/stop, lifecycle, and supported hook interactions.
   runtime consumes it, then `applied`, `expired`, `failed`, `canceled`, or
   `not_found`. Terminal results are retained as five-minute idempotency
   tombstones.
+- A request carries an optional `expiresAt` (epoch seconds). It is absent when
+  `agent.interactionTimeoutMs` is `0`, which is the default: the request waits
+  for a person for as long as it takes, and nothing expires it. Setting a
+  duration expires the request once that window elapses. The App only displays
+  the deadline it is given — it never invents one, and shows no countdown when
+  there is none.
 - After an App, Server, or WebSocket reconnect, the App requests a snapshot.
   Each active CLI session returns its pending/applying interactions and up to
   100 recent transient events.

@@ -1,8 +1,5 @@
 import { TerminalAdapter } from "./terminalAdapter.js";
-import {
-  CLAUDE_INTERACTION_DECISION_TIMEOUT_MS,
-  startClaudeHookServer,
-} from "./claude/hookServer.js";
+import { startClaudeHookServer } from "./claude/hookServer.js";
 import { cleanupClaudeHookSettings, generateClaudeHookSettings } from "./claude/hookSettings.js";
 import { ClaudeJsonlScanner, getClaudeProjectPath } from "./claude/jsonlScanner.js";
 import {
@@ -11,7 +8,13 @@ import {
   permissionEventToInteraction,
   INTERACTION_SOURCES,
 } from "../runtime/agentInteractionContract.js";
+import {
+  agentInteractionExpiresAt,
+  agentInteractionGraceMs,
+  agentInteractionTimeoutMsFromConfig,
+} from "../config/agentInteractionTimeout.js";
 import { readClaudeConversationHistory } from "../runtime/claudeConversationHistory.js";
+import { readConfig } from "../persistence/state.js";
 
 const CLAUDE_NATIVE_MODES = Object.freeze([
   { id: "default", label: "Default" },
@@ -36,8 +39,12 @@ const CLAUDE_SHIFT_TAB = "\x1b[Z";
 const DEFAULT_MODE_CHANGE_TIMEOUT_MS = 3_000;
 const DEFAULT_MODE_CHANGE_MAX_STEPS = 8;
 const DEFAULT_MODE_OUTPUT_SETTLE_MS = 160;
+// Read per request rather than captured once at import, so
+// `originrouter config set agent.interactionTimeoutMs` takes effect on the
+// next permission without restarting the daemon. See
+// config/agentInteractionTimeout.js for what 0 means.
 const claudeInteractionExpiresAt = () =>
-  Math.ceil((Date.now() + CLAUDE_INTERACTION_DECISION_TIMEOUT_MS) / 1000);
+  agentInteractionExpiresAt(agentInteractionTimeoutMsFromConfig(readConfig()));
 
 function normalizeClaudeMode(value) {
   const mode = safeText(value, 32);
@@ -523,6 +530,14 @@ export class ClaudeAdapter extends TerminalAdapter {
     this.startedAt = Date.now();
     this.scanner = new ClaudeJsonlScanner({ transcriptPath: null, startedAt: this.startedAt });
     this.hookServer = await this.hookServerFactory({
+      // How long the hook server may hold a permission open before answering
+      // Claude Code with a timeout. Derived from the same config value that
+      // stamps the interaction's own deadline, plus the grace in between, so
+      // the request's window always closes first and this only catches an
+      // answer that never arrives. `0` disables it entirely.
+      permissionTimeoutMs: agentInteractionGraceMs(
+        agentInteractionTimeoutMsFromConfig(readConfig()),
+      ),
       onSessionStart: (sessionId, payload) => {
         this.sessionReady = true;
         this.taskActive = false;
@@ -710,6 +725,14 @@ export class ClaudeAdapter extends TerminalAdapter {
       registerPermissionRequest: true,
       registerElicitation: true,
       settingsOverride: this.settingsOverride,
+      // Same value the hook server was started with above. Read again rather
+      // than held in a field so a config change between the two is not
+      // possible to half-apply — both are written from one expression, and a
+      // config change between them lands on the next session, not between two
+      // halves of this one.
+      permissionTimeoutMs: agentInteractionGraceMs(
+        agentInteractionTimeoutMsFromConfig(readConfig()),
+      ),
     });
   }
 

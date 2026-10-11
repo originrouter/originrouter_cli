@@ -24,10 +24,16 @@ const sessionStartHook = hooksOnly.hooks.SessionStart[0].hooks[0];
 assert.equal(sessionStartHook.type, "command");
 assert.equal(sessionStartHook.command, process.execPath);
 assert.ok(Array.isArray(sessionStartHook.args));
-assert.equal(sessionStartHook.args.length, 2);
+// argv is [forwarder, port, permissionHoldMs]. The third is the hook server's
+// hold for this session, written here so the forwarder sizes its own socket
+// timeout from the same number — the wrapper is CommonJS and cannot read the
+// config module (that needs require(esm), i.e. Node >=22.12).
+assert.equal(sessionStartHook.args.length, 3);
 assert.match(sessionStartHook.args[0], /claude-session-hook-forwarder\.cjs$/);
 // The forwarder reads the port from process.argv[2], as a string.
 assert.equal(sessionStartHook.args[1], "43210");
+// The default hold, passed as a string like the port.
+assert.equal(sessionStartHook.args[2], "315000");
 // No shell metacharacter quoting anywhere: nothing is concatenated.
 assert.equal(sessionStartHook.command.includes('"'), false);
 assert.equal(sessionStartHook.args[0].includes('"'), false);

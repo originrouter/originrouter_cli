@@ -12,6 +12,12 @@ const CODEX_MIN_MINOR = 100;
 
 // Ordinary RPCs remain short, while approvals allow enough time for a mobile
 // notification, app resume, WebSocket reconnect, and a deliberate user choice.
+//
+// Both approval constants are fallbacks now. The real values come from
+// `agent.interactionTimeoutMs` (see config/agentInteractionTimeout.js) and are
+// passed in by the session. `CODEX_APPROVAL_TIMEOUT_MS` is the RPC-level
+// backstop: it must outlive the decision window so the window is what the user
+// configured, not this timer. `0` disables it — see withApprovalTimeout.
 const CODEX_RPC_TIMEOUT_MS = 30_000;
 export const REMOTE_INTERACTION_DECISION_TIMEOUT_MS = 300_000;
 export const CODEX_APPROVAL_TIMEOUT_MS = 315_000;
@@ -479,21 +485,31 @@ export class CodexAppServerClient {
     // are both no-ops.
     const epoch = this.processEpoch;
     let responded = false;
-    const timer = setTimeout(() => {
-      if (responded) return;
-      if (!this._isCurrentEpoch(epoch)) {
-        this._approvalTimers.delete(id);
-        return;
-      }
-      responded = true;
-      this.eventHandler?.({
-        type: "codex.approval.timeout",
-        method,
-        callId, // same callId the UI used to create the permission card
-        approvalType,
-      });
-      this.respond(id, this.denyPayloadFor(approvalType, legacy));
-    }, this.approvalTimeoutMs);
+    // `approvalTimeoutMs` of 0 means "no backstop of our own": the user asked
+    // for no deadline on this request, so arming one here would deny a
+    // permission they never refused. Codex's own `autoResolutionMs` still
+    // applies — that deadline is the upstream runtime's, not ours.
+    //
+    // A null timer flows through the rest of this function unchanged:
+    // `clearTimeout(null)` is a no-op and `_clearApprovalTimers` already
+    // guards on `if (timer)`.
+    const timer = this.approvalTimeoutMs > 0
+      ? setTimeout(() => {
+        if (responded) return;
+        if (!this._isCurrentEpoch(epoch)) {
+          this._approvalTimers.delete(id);
+          return;
+        }
+        responded = true;
+        this.eventHandler?.({
+          type: "codex.approval.timeout",
+          method,
+          callId, // same callId the UI used to create the permission card
+          approvalType,
+        });
+        this.respond(id, this.denyPayloadFor(approvalType, legacy));
+      }, this.approvalTimeoutMs)
+      : null;
     this._approvalTimers.set(id, { timer, epoch });
     try {
       const result = await fn();
