@@ -1,5 +1,6 @@
 import { TerminalAdapter } from "./terminalAdapter.js";
 import { startClaudeHookServer } from "./claude/hookServer.js";
+import { permissionRequestIdentity } from "./claude/hookIdentity.js";
 import { cleanupClaudeHookSettings, generateClaudeHookSettings } from "./claude/hookSettings.js";
 import { ClaudeJsonlScanner, getClaudeProjectPath } from "./claude/jsonlScanner.js";
 import {
@@ -292,6 +293,12 @@ export class ClaudeAdapter extends TerminalAdapter {
     // server and event mapper never see sessionId; we enrich here.
     this.sessionId = null;
     this.pendingInteractionInputs = new Map();
+    // Ask identity -> callId. `pendingInteractionInputs` is keyed by call id,
+    // which is what the App sends back when a card is answered; this index is
+    // what lets a `PostToolUse` / `PermissionDenied` find that same request
+    // again. Claude Code only puts `tool_use_id` on the outcome events, never
+    // on `PermissionRequest`, so the two cannot be joined on it.
+    this.pendingInteractionIdsByIdentity = new Map();
     this.currentMode = initialPermissionMode(args);
     this.modeControl = this.isNonInteractive(args) ? "unsupported" : "supported";
     this.modeChangeTimeoutMs = Math.max(10, Number(modeChangeTimeoutMs) || DEFAULT_MODE_CHANGE_TIMEOUT_MS);
@@ -554,7 +561,7 @@ export class ClaudeAdapter extends TerminalAdapter {
         });
         this.observeMode(payload.permission_mode || payload.permissionMode);
       },
-      onPermissionRequest: (callId, event) => {
+      onPermissionRequest: (callId, event, meta = {}) => {
         this.observeMode(event.permissionMode);
         // Stage 8.9: dual-emit. Legacy event first (the relay and
         // downstream consumers expect it); then the new
@@ -569,7 +576,9 @@ export class ClaudeAdapter extends TerminalAdapter {
           permissionSuggestions: Array.isArray(event.permissionSuggestions)
             ? event.permissionSuggestions
             : [],
+          identity: meta.identity || null,
         });
+        if (meta.identity) this.pendingInteractionIdsByIdentity.set(meta.identity, callId);
         try {
           const interaction = event.tool === "AskUserQuestion"
             ? buildInteractionRequest({
@@ -616,18 +625,18 @@ export class ClaudeAdapter extends TerminalAdapter {
           console.error(`[claudeAdapter] dual-emit failed: ${err.message}`);
         }
       },
-      onPermissionTimeout: (callId, event) => {
-        this.pendingInteractionInputs.delete(callId);
-        // The hook server's five-minute timer fired without a remote decision. Tell
-        // the front end explicitly so it can show "Remote approval timed
-        // out" rather than waiting for an agent.permission.resolved that
-        // will never come.
+      onPermissionTimeout: (callId, event, meta = {}) => {
+        this.forgetPendingInteraction(callId);
+        // The hook server's hold ended without a remote decision — either its
+        // timer fired or every client waiting for the answer hung up. Tell the
+        // front end explicitly so it can show why rather than waiting for an
+        // agent.permission.resolved that will never come.
         this.pendingEvents.push({
           type: "agent.permission.resolved",
           provider: "claude",
           callId,
           decision: "denied",
-          reason: "timeout",
+          reason: meta.reason || "timeout",
         });
       },
       onElicitationRequest: (interactionId, event) => {
@@ -652,7 +661,7 @@ export class ClaudeAdapter extends TerminalAdapter {
         }));
       },
       onElicitationTimeout: (interactionId) => {
-        this.pendingInteractionInputs.delete(interactionId);
+        this.forgetPendingInteraction(interactionId);
         this.pendingEvents.push({
           type: "agent.permission.resolved",
           provider: "claude",
@@ -671,10 +680,21 @@ export class ClaudeAdapter extends TerminalAdapter {
           hookEvent === "PostToolUseFailure" ||
           hookEvent === "PermissionDenied"
         ) {
-          const interactionId = safeText(
+          // `PostToolUse` / `PermissionDenied` carry a `tool_use_id`; the
+          // `PermissionRequest` that produced them never did. Joining on
+          // `tool_use_id` alone therefore never matched anything, and a
+          // decision taken in the terminal left the App's card hanging until
+          // its hold expired. Resolve the call id from `tool_use_id` when it
+          // is the key we actually hold, and otherwise from the identity the
+          // two events do share.
+          const nativeToolUseId = safeText(
             payload.tool_use_id || payload.toolUseId,
             191,
           );
+          const identity = permissionRequestIdentity(payload);
+          const interactionId = this.pendingInteractionInputs.has(nativeToolUseId)
+            ? nativeToolUseId
+            : (identity && this.pendingInteractionIdsByIdentity.get(identity)) || "";
           const pending = interactionId
             ? this.pendingInteractionInputs.get(interactionId)
             : null;
@@ -687,7 +707,7 @@ export class ClaudeAdapter extends TerminalAdapter {
               reason: "handled_in_terminal",
             });
             if (settled) {
-              this.pendingInteractionInputs.delete(interactionId);
+              this.forgetPendingInteraction(interactionId);
               this.pendingEvents.push({
                 type: "agent.interaction.result",
                 provider: "claude",
@@ -748,6 +768,14 @@ export class ClaudeAdapter extends TerminalAdapter {
     return readClaudeConversationHistory(this.getTranscriptPath(), options);
   }
 
+  // Both pending indexes have to move together, or a resolved call id would
+  // leave a dangling identity that a later `PostToolUse` could resolve again.
+  forgetPendingInteraction(callId) {
+    const pending = this.pendingInteractionInputs.get(callId);
+    if (pending?.identity) this.pendingInteractionIdsByIdentity.delete(pending.identity);
+    this.pendingInteractionInputs.delete(callId);
+  }
+
   resolvePermission(payload) {
     if (!this.hookServer) return false;
     const callId = payload.callId || payload.interactionId || payload.id;
@@ -773,7 +801,7 @@ export class ClaudeAdapter extends TerminalAdapter {
         content: payload.response?.values || payload.response || {},
       });
       if (!ok) return false;
-      this.pendingInteractionInputs.delete(callId);
+      this.forgetPendingInteraction(callId);
       this.pendingEvents.push({
         type: "agent.permission.resolved",
         provider: "claude",
@@ -801,7 +829,7 @@ export class ClaudeAdapter extends TerminalAdapter {
       });
       return false;
     }
-    this.pendingInteractionInputs.delete(callId);
+    this.forgetPendingInteraction(callId);
     this.pendingEvents.push({
       type: "agent.permission.resolved",
       provider: "claude",
@@ -829,5 +857,6 @@ export class ClaudeAdapter extends TerminalAdapter {
     this.hookServer?.stop();
     cleanupClaudeHookSettings(this.hookSettingsPath);
     this.pendingInteractionInputs.clear();
+    this.pendingInteractionIdsByIdentity.clear();
   }
 }

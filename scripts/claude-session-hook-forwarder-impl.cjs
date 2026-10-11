@@ -131,7 +131,15 @@ function postOnce(body, port, path, perAttemptTimeoutMs, requestFn) {
 }
 
 async function postHookBody(body, port, options = {}) {
-  const opts = { ...DEFAULTS, ...options };
+  // Spread `options` over DEFAULTS only where it actually supplied something.
+  // A plain spread copies explicit `undefined` too, and the wrapper passes
+  // `permissionRequestTimeoutMs: undefined` whenever argv carried no hold —
+  // which silently replaced the 330s backstop with `undefined`, leaving
+  // `req.setTimeout` uncalled and the socket with no timeout at all.
+  const opts = { ...DEFAULTS };
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== undefined) opts[key] = value;
+  }
   const logger = options.logger ?? (() => {});
 
   const eventName = parseEventName(body);
