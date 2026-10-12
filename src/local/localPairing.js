@@ -34,16 +34,6 @@ const MAX_TICKETS = 256;
 const FAILURE_WINDOW_MS = 60_000;
 const MAX_SOURCE_FAILURES = 5;
 const MAX_GLOBAL_FAILURES = 30;
-// Short pairing code: 8 Crockford Base32 characters = 40 bits. That is well
-// inside what the existing gates cover — a ticket lives 5 minutes and each
-// source gets 5 failures per minute (30 globally), so the whole 2^40 space
-// cannot be swept in the ticket's lifetime even by a distributed attacker.
-// Crockford omits I/L/O/U to remove the glyphs people misread as 1/0, which
-// is the whole reason a typed code is offered at all.
-const SHORT_CODE_LENGTH = 8;
-const CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-const SHORT_TICKET_BYTES = 5;
-
 
 export class LocalPairingError extends Error {
   constructor(code, message, status = 400) {
@@ -73,39 +63,26 @@ function ticketHash(ticket) {
   return createHash("sha256").update(ticket, "utf8").digest("base64url");
 }
 
-export function encodeShortCode(bytes) {
-  let value = 0;
-  for (const byte of bytes) value = (value * 256) + byte;
-  let code = "";
-  for (let i = 0; i < SHORT_CODE_LENGTH; i += 1) {
-    const shift = 5 * (SHORT_CODE_LENGTH - 1 - i);
-    code += CROCKFORD_ALPHABET[Math.floor(value / (2 ** shift)) % 32];
-  }
-  return code;
-}
-
-export function decodeShortCode(code) {
-  const normalized = String(code || "")
-    .trim()
-    .toUpperCase()
-    .replace(/[^0-9A-Z]/g, "")
-    // Crockford's whole promise: these four read as other characters.
-    .replace(/[IL]/g, "1")
-    .replace(/O/g, "0")
-    .replace(/U/g, "V");
-  if (normalized.length !== SHORT_CODE_LENGTH) return null;
-  let value = 0;
-  for (const char of normalized) {
-    const digit = CROCKFORD_ALPHABET.indexOf(char);
-    if (digit < 0) return null;
-    value = (value * 32) + digit;
-  }
-  const bytes = [];
-  for (let i = SHORT_TICKET_BYTES - 1; i >= 0; i -= 1) {
-    bytes.unshift(value % 256);
-    value = Math.floor(value / 256);
-  }
-  return bytes;
+/**
+ * The QR payload for a pairing line.
+ *
+ * A pairing line is the only thing the App redeems, and it is far too long to
+ * type, so it travels in a QR code. Wrapping it in a URL rather than encoding
+ * the bare line buys three things: the shared scanner accepts `originrouter:`
+ * and nothing else, so a bare line cannot be scanned at all; `?v=` names a
+ * format instead of leaving an App to guess at one; and the container has room
+ * to carry other things later.
+ *
+ * Only the base64 payload travels. The `ORIGINROUTER_LOCAL_PAIR_V1:` prefix is
+ * a constant the App puts back, and leaving it out keeps the code exactly as
+ * large as the line would have been on its own.
+ *
+ * Total by design: the caller owns validating that [pairingLine] is a line.
+ */
+export function pairingDeepLink(pairingLine) {
+  return `originrouter://pair?v=2&l=${
+    encodeURIComponent(String(pairingLine).slice(PAIRING_PREFIX.length))
+  }`;
 }
 
 function responseHeader(value) {
@@ -274,91 +251,14 @@ export class LocalPairingManager {
     };
   }
 
-  // The short-code sibling of `issue`. It registers a ticket under the same
-  // one-time machinery but returns an 8-character code instead of a signed
-  // binary blob, because the App is expected to receive it by scanning a QR
-  // code or by typing it — neither of which can carry 190 base64 characters,
-  // and neither of which should have to.
-  //
-  // Deliberately unsigned: the code is a routing hint, not a credential. The
-  // App may point it at whatever address the user actually typed, which is
-  // the point — localhost, a LAN address, a public host or a domain are all
-  // legitimate and the CLI cannot know which. Authenticity is established
-  // downstream by the redeem response, which this process signs with its
-  // Ed25519 device key; a spoofed endpoint cannot forge that.
-  issueShort({ endpoint }) {
-    this._prune();
-    this._identity();
-    const parsedEndpoint = new URL(String(endpoint || ""));
-    if (!["http:", "https:"].includes(parsedEndpoint.protocol)
-        || !parsedEndpoint.hostname
-        || parsedEndpoint.pathname !== "/"
-        || parsedEndpoint.search
-        || parsedEndpoint.hash) {
-      throw new LocalPairingError(
-        "pair_endpoint_invalid",
-        "local pairing endpoint is invalid",
-      );
-    }
-    const codeBytes = randomBytes(SHORT_TICKET_BYTES);
-    const code = encodeShortCode(codeBytes);
-    const expiresAtMs = this.clock() + LOCAL_PAIRING_TTL_MS;
-    const ticket = Buffer.from(codeBytes).toString("base64url");
-    const identity = this._identity();
-    if (Buffer.from(
-      identity.public_identity.signing_public_key,
-      "base64url",
-    ).length !== PAIRING_SIGNING_KEY_BYTES) {
-      throw new LocalPairingError(
-        "pair_identity_unavailable",
-        "CLI signing key is unavailable",
-        503,
-      );
-    }
-    this.tickets.set(ticketHash(ticket), {
-      ticket_hash: ticketHash(ticket),
-      endpoint: parsedEndpoint.toString().replace(/\/$/, ""),
-      expires_at_ms: expiresAtMs,
-      signing_public_key: identity.public_identity.signing_public_key,
-      app_public_key: null,
-      request_nonce: null,
-      response: null,
-    });
-    this._trimTickets();
-    return {
-      code,
-      expires_at: new Date(expiresAtMs).toISOString(),
-      // The App has no signed line to read a key out of, so the device signing
-      // key travels alongside the code. It is what lets the App verify the
-      // redeem response and thereby bind the token to this CLI.
-      signing_public_key: identity.public_identity.signing_public_key,
-    };
-  }
-
   redeem({ ticket, appEphemeralPublicKey, requestNonce, sourceAddress }) {
     this._prune();
     const source = normalizeSource(sourceAddress);
     this._assertRateAllowed(source);
     try {
-      // A ticket reaches this method in one of two encodings: the 22-character
-      // base64url value a signed pairing line carries, or the 8-character
-      // Crockford code a scanned or typed short code carries. Both normalize to
-      // the same ticket string here, so nothing past this point differs.
-      //
-      // The full-length form is tested first, and deliberately: base64url
-      // contains `-` and `_`, which are not Crockford characters, so a genuine
-      // ticket can in principle collapse to 8 characters when normalized.
-      // Checking the established encoding first makes that ambiguous input
-      // resolve the same way it always has.
-      const shortBytes = validBase64Url(ticket, PAIRING_TICKET_BYTES)
-        ? null
-        : decodeShortCode(ticket);
-      const normalizedTicket = shortBytes
-        ? Buffer.from(shortBytes).toString("base64url")
-        : ticket;
-      if (!validBase64Url(normalizedTicket, PAIRING_TICKET_BYTES)
-          && !(shortBytes
-            && validBase64Url(normalizedTicket, SHORT_TICKET_BYTES))
+      // One encoding, because there is one credential. A ticket is the
+      // base64url value the signed pairing line carries, verbatim.
+      if (!validBase64Url(ticket, PAIRING_TICKET_BYTES)
           || !validBase64Url(appEphemeralPublicKey, 32)
           || !validBase64Url(requestNonce, 24)) {
         throw new LocalPairingError(
@@ -366,7 +266,7 @@ export class LocalPairingManager {
           "pairing request is invalid",
         );
       }
-      const hash = ticketHash(normalizedTicket);
+      const hash = ticketHash(ticket);
       const entry = this.tickets.get(hash);
       if (!entry) {
         throw new LocalPairingError(

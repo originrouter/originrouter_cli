@@ -115,8 +115,9 @@ export const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1
 // The address to suggest to a phone pairing with this machine. The bind
 // address is the wrong source for it: a daemon that binds 127.0.0.1 (the
 // default) or the 0.0.0.0 wildcard says nothing about how a *different*
-// device should reach it, and both are what the pairing line used to
-// advertise — which sent every phone to its own loopback.
+// device should reach it, and both are what the pairing line advertised
+// before this function was used for it — which sent every phone to its own
+// loopback.
 //
 // This is only a default. The App exposes it as an editable field, because
 // the user may be on the same machine (localhost), on the LAN, reaching a
@@ -326,34 +327,18 @@ async function dispatch(ctx, req, res) {
           reason: "pairing_unavailable",
         });
       }
-      const rawHost = String(ctx.bindAddress || "127.0.0.1");
-      const host = rawHost === "0.0.0.0" || rawHost === "::"
-        ? "127.0.0.1"
-        : rawHost;
-      try {
-        return sendOk(res, ctx.localPairingManager.issue({
-          endpoint: `http://${httpHost(host)}:${req.socket.localPort}`,
-        }));
-      } catch (error) {
-        return sendError(res, Number(error.status || 400), error.message, {
-          reason: error.code || "pair_issue_failed",
-        });
-      }
-    }
-    if (req.method === "POST" && pathname === "/local/pair/short") {
-      if (!ctx.localPairingManager?.issueShort) {
-        return sendError(res, 503, "local pairing is unavailable", {
-          reason: "pairing_unavailable",
-        });
-      }
       // Suggested only. The App treats it as an editable default, so a user on
       // the same machine, on the LAN, or behind a domain can all override it.
       const host = suggestLanHost(ctx.bindAddress);
       try {
         return sendOk(res, {
-          ...ctx.localPairingManager.issueShort({
+          ...ctx.localPairingManager.issue({
             endpoint: `http://${httpHost(host)}:${req.socket.localPort}`,
           }),
+          // The address the line carries, restated. The CLI cannot know how
+          // the phone reaches this machine, so it does not pretend to: this is
+          // what it *would* tell the App, and the App shows it for the user to
+          // check.
           suggested_host: host,
           port: req.socket.localPort,
         });
