@@ -350,8 +350,8 @@ export const COMMAND_CATALOG = [
       leaf("api", "Inspect or pair the Local API", {
         children: [
           leaf("status", "Print Local API status"),
-          leaf("pair", "Pair a client with this Local API"),
-          leaf("connect", "Alias for pair"),
+          leaf("pair", "Pair a client with this Local API", { options: ["--line"] }),
+          leaf("connect", "Alias for pair", { options: ["--line"] }),
           leaf("set-host", "Change the Local API bind address", { positional: ["<addr>"] }),
           leaf("set-port", "Change the Local API port", { positional: ["<int>"] }),
         ],

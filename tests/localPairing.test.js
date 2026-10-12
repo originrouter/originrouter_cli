@@ -20,6 +20,7 @@ import {
   LOCAL_PAIRING_PROTOCOL,
   LOCAL_PAIRING_TTL_MS,
   LocalPairingManager,
+  decodeShortCode,
 } from "../src/local/localPairing.js";
 
 const TICKET_DOMAIN = "originrouter/local-pair-ticket/v1\n";
@@ -249,6 +250,140 @@ try {
   );
 } finally {
   rmSync(stateDir, { recursive: true, force: true });
+}
+
+// The short-code path: 8 Crockford characters instead of a 190-character
+// signed line, redeemable by typing or scanning it and by pointing the App at
+// whatever address the user actually reaches the CLI on.
+{
+  const shortStateDir = mkdtempSync(
+    join(tmpdir(), "originrouter-short-pairing-test-"),
+  );
+  try {
+    const identity = ensureDeviceE2eeIdentity(shortStateDir, { deviceId });
+    let clock = Date.parse("2026-09-19T12:00:00.000Z");
+    const manager = new LocalPairingManager({
+      identityProvider: () => identity,
+      accessTokenProvider: () => token,
+      deviceNameProvider: () => "Pairing test CLI",
+      clock: () => clock,
+    });
+
+    const issued = manager.issueShort({ endpoint: "http://192.168.1.42:7437" });
+    assert.match(issued.code, /^[0-9A-HJKMNP-TV-Z]{8}$/);
+    assert.equal(
+      issued.signing_public_key,
+      identity.public_identity.signing_public_key,
+    );
+    assert.equal(
+      new Date(issued.expires_at).getTime(),
+      clock + LOCAL_PAIRING_TTL_MS,
+    );
+
+    const appKeyPair = generateKeyPairSync("x25519");
+    const appPublicKey = appKeyPair.publicKey.export({ format: "jwk" }).x;
+    const requestNonce = Buffer.alloc(24, 9).toString("base64url");
+    const redeemed = manager.redeem({
+      ticket: issued.code,
+      appEphemeralPublicKey: appPublicKey,
+      requestNonce,
+      sourceAddress: "192.168.1.42",
+    });
+    const clear = decryptResponse(redeemed, appKeyPair);
+    assert.equal(clear.bearer_token, token);
+    assert.equal(clear.endpoint, "http://192.168.1.42:7437");
+    assert.equal(clear.device_name, "Pairing test CLI");
+    // The response is signed by the same device key the code advertised, which
+    // is the only thing binding a redeemed token to this CLI.
+    assert.equal(
+      verifySignature(
+        RESPONSE_DOMAIN,
+        responseSignedValue(redeemed),
+        Buffer.from(redeemed.signature, "base64url"),
+        issued.signing_public_key,
+      ),
+      true,
+    );
+    assert.equal(
+      redeemed.ticket_hash,
+      createHash("sha256")
+        .update(Buffer.from(decodeShortCode(issued.code)).toString("base64url"), "utf8")
+        .digest("base64url"),
+    );
+
+    // One-time: the same code cannot mint a second token. A different nonce is
+    // what distinguishes a second claimant from the retry below.
+    assert.throws(
+      () => manager.redeem({
+        ticket: issued.code,
+        appEphemeralPublicKey: appPublicKey,
+        requestNonce: Buffer.alloc(24, 21).toString("base64url"),
+        sourceAddress: "192.168.1.42",
+      }),
+      (error) => error?.code === "pair_already_redeemed",
+    );
+
+    // A retry of the identical request replays the cached response rather than
+    // failing, so a dropped reply does not burn the ticket.
+    const retried = manager.issueShort({ endpoint: "http://192.168.1.42:7437" });
+    const retryNonce = Buffer.alloc(24, 11).toString("base64url");
+    const first = manager.redeem({
+      ticket: retried.code,
+      appEphemeralPublicKey: appPublicKey,
+      requestNonce: retryNonce,
+      sourceAddress: "192.168.1.42",
+    });
+    const second = manager.redeem({
+      ticket: retried.code,
+      appEphemeralPublicKey: appPublicKey,
+      requestNonce: retryNonce,
+      sourceAddress: "192.168.1.42",
+    });
+    assert.equal(first.ciphertext, second.ciphertext);
+
+    // Typed input is folded before lookup: lower case, separators and the four
+    // glyphs Crockford exists to remove all resolve to the same ticket.
+    const folded = manager.issueShort({ endpoint: "http://192.168.1.42:7437" });
+    const typed = folded.code
+      .split("")
+      .map((char) => ({ 0: "O", 1: "I", V: "U" })[char] || char)
+      .join("")
+      .toLowerCase();
+    const foldedResponse = manager.redeem({
+      ticket: typed,
+      appEphemeralPublicKey: appPublicKey,
+      requestNonce: Buffer.alloc(24, 13).toString("base64url"),
+      sourceAddress: "192.168.1.42",
+    });
+    assert.equal(
+      decryptResponse(foldedResponse, appKeyPair).bearer_token,
+      token,
+    );
+
+    // A short code expires on the same clock as a signed line.
+    const shortExpiring = manager.issueShort({
+      endpoint: "http://192.168.1.42:7437",
+    });
+    clock += LOCAL_PAIRING_TTL_MS + 1;
+    assert.throws(
+      () => manager.redeem({
+        ticket: shortExpiring.code,
+        appEphemeralPublicKey: appPublicKey,
+        requestNonce: Buffer.alloc(24, 15).toString("base64url"),
+        sourceAddress: "192.168.1.42",
+      }),
+      (error) => error?.code === "pair_expired",
+    );
+
+    // Codes carry no address, so an unusable one is still accepted as a code:
+    // the App decides where to point it.
+    assert.equal(
+      typeof manager.issueShort({ endpoint: "http://127.0.0.1:7437" }).code,
+      "string",
+    );
+  } finally {
+    rmSync(shortStateDir, { recursive: true, force: true });
+  }
 }
 
 console.log("local pairing tests ok");

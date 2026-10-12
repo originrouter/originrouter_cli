@@ -18,6 +18,7 @@
 // same process as the session manager.
 
 import http from "node:http";
+import { networkInterfaces } from "node:os";
 import { resolve as resolvePath } from "node:path";
 import {
   ROUTE_AGENTS,
@@ -110,6 +111,40 @@ export { projectSession } from "./localApiProjections.js";
 // the same gating as the runtime auth layer. Keep the set in lock-
 // step with the bind-address check in `startLocalApi` above.
 export const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"]);
+
+// The address to suggest to a phone pairing with this machine. The bind
+// address is the wrong source for it: a daemon that binds 127.0.0.1 (the
+// default) or the 0.0.0.0 wildcard says nothing about how a *different*
+// device should reach it, and both are what the pairing line used to
+// advertise — which sent every phone to its own loopback.
+//
+// This is only a default. The App exposes it as an editable field, because
+// the user may be on the same machine (localhost), on the LAN, reaching a
+// public host, or using a domain — and none of those can be guessed from
+// here. Prefer private ranges, then link-local; skip loopback and anything
+// that looks virtual (Docker/VPN bridges add noise but never the address a
+// phone on the same network would use).
+export function suggestLanHost(bindAddress, interfaces = networkInterfaces()) {
+  const bind = String(bindAddress || "");
+  if (bind && !["0.0.0.0", "::", "::0"].includes(bind) && !LOOPBACK_ADDRESSES.has(bind)) {
+    return bind;
+  }
+  const candidates = [];
+  for (const [name, addresses] of Object.entries(interfaces)) {
+    for (const address of addresses || []) {
+      if (address.internal) continue;
+      if (address.family !== "IPv4" && address.family !== 4) continue;
+      if (/^(docker|br-|veth|utun|vmnet|vboxnet|tailscale|tun|tap)/i.test(name)) continue;
+      candidates.push(address.address);
+    }
+  }
+  const privateFirst = candidates.find((value) => (
+    /^10\./.test(value)
+    || /^192\.168\./.test(value)
+    || /^172\.(1[6-9]|2\d|3[01])\./.test(value)
+  ));
+  return privateFirst || candidates[0] || "127.0.0.1";
+}
 
 // Bearer-token regex: case-insensitive 64 hex chars.
 const BEARER_RE = /^Bearer\s+([a-f0-9]{64})$/i;
@@ -299,6 +334,29 @@ async function dispatch(ctx, req, res) {
         return sendOk(res, ctx.localPairingManager.issue({
           endpoint: `http://${httpHost(host)}:${req.socket.localPort}`,
         }));
+      } catch (error) {
+        return sendError(res, Number(error.status || 400), error.message, {
+          reason: error.code || "pair_issue_failed",
+        });
+      }
+    }
+    if (req.method === "POST" && pathname === "/local/pair/short") {
+      if (!ctx.localPairingManager?.issueShort) {
+        return sendError(res, 503, "local pairing is unavailable", {
+          reason: "pairing_unavailable",
+        });
+      }
+      // Suggested only. The App treats it as an editable default, so a user on
+      // the same machine, on the LAN, or behind a domain can all override it.
+      const host = suggestLanHost(ctx.bindAddress);
+      try {
+        return sendOk(res, {
+          ...ctx.localPairingManager.issueShort({
+            endpoint: `http://${httpHost(host)}:${req.socket.localPort}`,
+          }),
+          suggested_host: host,
+          port: req.socket.localPort,
+        });
       } catch (error) {
         return sendError(res, Number(error.status || 400), error.message, {
           reason: error.code || "pair_issue_failed",

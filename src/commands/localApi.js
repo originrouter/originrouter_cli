@@ -12,6 +12,7 @@ import {
   writeLocalApiConfig,
 } from "../persistence/state.js";
 import { readApiToken, rotateApiToken } from "../persistence/authToken.js";
+import qrcode from "qrcode-terminal";
 import { optionValue } from "./shared/cliArgs.js";
 
 function resolveDaemonPort(portOverride) {
@@ -225,10 +226,48 @@ export async function handleLocalApiCommand(args) {
     return;
   }
   if (sub === "pair" || sub === "connect") {
-    const pairing = await remoteLocalRequest("/local/pair/tickets", { method: "POST", body: {} });
-    const pairingLine = String(pairing?.pairing_line || "").trim();
-    const expiresAt = String(pairing?.expires_at || "").trim();
-    if (!pairingLine.startsWith("ORIGINROUTER_LOCAL_PAIR_V1:") || !expiresAt) {
+    // `--line` keeps the original 190-character signed pairing line for
+    // anything that still expects it; the default is the short code, which is
+    // the only form that survives being scanned or typed by hand.
+    if (args.includes("--line")) {
+      const pairing = await remoteLocalRequest("/local/pair/tickets", { method: "POST", body: {} });
+      const pairingLine = String(pairing?.pairing_line || "").trim();
+      const expiresAt = String(pairing?.expires_at || "").trim();
+      if (!pairingLine.startsWith("ORIGINROUTER_LOCAL_PAIR_V1:") || !expiresAt) {
+        throw new Error("OriginRouter service returned invalid pairing details.");
+      }
+      const credentialFiles = {
+        access_key: join(stateDir, "local-api.token"),
+        device_identity: join(stateDir, "device.json"),
+        active_endpoint: join(stateDir, "daemon.state.json"),
+      };
+      if (args.includes("--json")) {
+        console.log(JSON.stringify({ version: 1, pairing_line: pairingLine, expires_at: expiresAt, credential_files: credentialFiles }, null, 2));
+        return;
+      }
+      console.log("OriginRouter App pairing");
+      console.log("For safety, the access key is not printed or embedded in the pairing line.");
+      console.log("This pairing request expires in 5 minutes and can be used by one App only.");
+      console.log("They are stored locally at:");
+      console.log(`Access key:      ${credentialFiles.access_key}`);
+      console.log(`Device identity: ${credentialFiles.device_identity}`);
+      console.log(`Active endpoint: ${credentialFiles.active_endpoint}`);
+      console.log("");
+      console.log("Copy the pairing line below and paste it into Add direct address > CLI pairing:");
+      console.log(pairingLine);
+      console.log("");
+      console.log("The pairing line grants short-lived access to retrieve the key. Keep it private.");
+      return;
+    }
+
+    const short = await remoteLocalRequest("/local/pair/short", { method: "POST", body: {} });
+    const code = String(short?.code || "").trim().toUpperCase();
+    const expiresAt = String(short?.expires_at || "").trim();
+    const host = String(short?.suggested_host || "").trim();
+    const port = Number(short?.port || 0);
+    const signingPublicKey = String(short?.signing_public_key || "").trim();
+    if (!code || !expiresAt || !host || !signingPublicKey
+        || !Number.isInteger(port) || port < 1) {
       throw new Error("OriginRouter service returned invalid pairing details.");
     }
     const credentialFiles = {
@@ -236,22 +275,40 @@ export async function handleLocalApiCommand(args) {
       device_identity: join(stateDir, "device.json"),
       active_endpoint: join(stateDir, "daemon.state.json"),
     };
+    // The address is a suggestion, not a claim: the user may be on this
+    // machine, on the LAN, or reaching a domain, and the App lets them edit it
+    // either way. Nothing but the code is load-bearing here.
+    const deepLink = `originrouter://pair?v=1&h=${encodeURIComponent(host)}`
+      + `&p=${encodeURIComponent(String(port))}`
+      + `&c=${encodeURIComponent(code)}`
+      + `&k=${encodeURIComponent(String(short.signing_public_key))}`
+      + `&e=${encodeURIComponent(String(Math.floor(new Date(expiresAt).getTime() / 1000)))}`;
     if (args.includes("--json")) {
-      console.log(JSON.stringify({ version: 1, pairing_line: pairingLine, expires_at: expiresAt, credential_files: credentialFiles }, null, 2));
+      console.log(JSON.stringify({
+        version: 2,
+        code,
+        suggested_host: host,
+        suggested_port: port,
+        expires_at: expiresAt,
+        signing_public_key: signingPublicKey,
+        deep_link: deepLink,
+        credential_files: credentialFiles,
+      }, null, 2));
       return;
     }
     console.log("OriginRouter App pairing");
-    console.log("For safety, the access key is not printed or embedded in the pairing line.");
-    console.log("This pairing request expires in 5 minutes and can be used by one App only.");
-    console.log("They are stored locally at:");
-    console.log(`Access key:      ${credentialFiles.access_key}`);
-    console.log(`Device identity: ${credentialFiles.device_identity}`);
-    console.log(`Active endpoint: ${credentialFiles.active_endpoint}`);
+    console.log("Expires in 5 minutes. Usable by one App only.");
+    console.log("The access key is never printed — the App retrieves it over an encrypted channel.");
     console.log("");
-    console.log("Copy the pairing line below and paste it into Add direct address > CLI pairing:");
-    console.log(pairingLine);
+    console.log(`  Address  ${host}:${port}`);
+    console.log(`  Code     ${code}`);
     console.log("");
-    console.log("The pairing line grants short-lived access to retrieve the key. Keep it private.");
+    console.log("Open the App → Add direct address → pairing import, then scan:");
+    console.log("");
+    qrcode.generate(deepLink, { small: true });
+    console.log("");
+    console.log(`Or type the address and code above. Edit the address if this is not how`);
+    console.log("your device reaches the CLI (same machine, LAN address, or a domain).");
     return;
   }
   throw new Error("Usage: originrouter local api status|pair|set-host <addr>|set-port <int>");
