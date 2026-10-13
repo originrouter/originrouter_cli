@@ -246,26 +246,26 @@ export async function handleLocalApiCommand(args) {
       active_endpoint: join(stateDir, "daemon.state.json"),
     };
     console.log("OriginRouter App pairing");
-    console.log("Expires in 5 minutes. Usable by one App only.");
-    console.log("The access key is never printed — the App retrieves it over an encrypted channel.");
+    console.log("Expires in 5 minutes. Single use.");
+    console.log("The access key is never printed or embedded; the App redeems it over the pairing endpoint.");
     console.log("");
-    console.log("They are stored locally at:");
-    console.log(`Access key:      ${credentialFiles.access_key}`);
-    console.log(`Device identity: ${credentialFiles.device_identity}`);
-    console.log(`Active endpoint: ${credentialFiles.active_endpoint}`);
+    // The labels are the keys as they appear inside those files, so a reader
+    // grepping one of them knows where it lives without a translation table.
+    console.log(`  access_key       ${credentialFiles.access_key}`);
+    console.log(`  device_identity  ${credentialFiles.device_identity}`);
+    console.log(`  active_endpoint  ${credentialFiles.active_endpoint}`);
     console.log("");
     console.log(`  Address  ${host}:${port}`);
     console.log("");
-    console.log("Open the App → Add direct address → pairing import, then scan:");
+    console.log("App → Add direct address → pairing import, then scan:");
     console.log("");
     qrcode.generate(pairingDeepLink(pairingLine), { small: true });
     console.log("");
-    console.log("Or paste the pairing line below instead of scanning — it is the same thing.");
+    console.log("Or paste the line below instead of scanning.");
     console.log(pairingLine);
     console.log("");
-    console.log("Edit the address in the App if this is not how your device reaches the CLI");
-    console.log("(same machine, LAN address, or a domain).");
-    console.log("The pairing line grants short-lived access to retrieve the key. Keep it private.");
+    console.log(`Edit the address in the App if this device does not reach the CLI at ${host}.`);
+    console.log("Treat the pairing line as a credential.");
     return;
   }
   throw new Error("Usage: originrouter local api status|pair|set-host <addr>|set-port <int>");

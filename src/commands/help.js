@@ -144,15 +144,11 @@ Local API inspection and App pairing:
   originrouter local api set-host <addr> [--allow-lan on]   Change the bind address
   originrouter local api set-port <int>              Change the Local API port
 
-  "local api pair" asks the running daemon for a short-lived pairing ticket and
-  prints it as a QR code and as text — one credential, two ways to hand it
-  over. Scanning is only a convenience for typing it; the App treats the two
-  identically. The access key is never printed or embedded in it: the App
-  redeems the line by proving possession of an ephemeral key, so the credential
-  is never handed over in the clear. The ticket expires in 5 minutes and can be
-  used by one App only. The address the line carries is a suggestion — edit it
-  in the App if your device reaches the CLI some other way. The daemon must be
-  running.
+  "local api pair" asks the running daemon for a single-use pairing ticket and
+  prints it as a QR code and as the same line in text. The access key is never
+  printed or embedded in either; the App redeems the ticket for it over the
+  pairing endpoint. The ticket expires in 5 minutes. The address it carries is
+  inferred from this machine's interfaces, so it is editable in the App.
 
 Configuration:
   originrouter config show
