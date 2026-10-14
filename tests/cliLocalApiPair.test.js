@@ -134,15 +134,27 @@ try {
   const decoded = decodePairingLine(pairingLine);
   assert.equal(decoded.version, 1);
   assert.equal(decoded.protocol, "originrouter-local-pair-v1");
-  // The daemon is bound to loopback here, which is exactly the case the
-  // suggested-host logic exists to work around: read literally, a loopback bind
-  // says the line should point a phone at its own loopback, where nothing is
-  // listening. The line carries whatever the CLI would suggest instead.
+  // The daemon in this fixture is bound to loopback, so the line must say
+  // loopback: it is the only address that answers, and a ticket pointing a
+  // phone at a LAN address with no listener behind it fails at the scan with
+  // nothing on screen explaining why. The suggestion follows the bind, which
+  // is the whole contract — the old code overrode a loopback bind with a
+  // scanned LAN address, and pairing then worked only from the host itself.
   assert.equal(
     decoded.endpoint,
     `http://${suggestLanHost("127.0.0.1")}:${server.port}`,
   );
+  assert.equal(
+    suggestLanHost("127.0.0.1"),
+    "127.0.0.1",
+    "a loopback bind must not be advertised as a reachable LAN address",
+  );
   assert.match(output, new RegExp(`Address\\s+${suggestLanHost("127.0.0.1")}:${server.port}`));
+  // And because that address cannot serve a phone, the command says so and
+  // names the one that would. Without this the user is left holding a code
+  // that cannot work and no indication that a single command fixes it.
+  assert.match(output, /only this machine can reach it/i);
+  assert.match(output, /set-host 0\.0\.0\.0 --allow-lan on/);
   assert.match(decoded.ticket, /^[A-Za-z0-9_-]{22}$/);
   assert.equal(Object.hasOwn(decoded, "bearer_token"), false);
 
@@ -207,6 +219,56 @@ try {
     },
   );
   assert.equal(foreignRedeem.status, 403);
+
+  // ---------------------------------------------------------------
+  // The shipped default: a wildcard bind.
+  //
+  // This is the posture a fresh install runs in, and it is the one that makes
+  // pairing work from a phone at all. The loopback fixture above cannot say
+  // anything about it — a loopback daemon and a wildcard one advertise
+  // different addresses by design, which is the distinction the old code got
+  // wrong when it treated both as "unknown, so scan".
+  //
+  // A real second server on `0.0.0.0`, because the address the line carries is
+  // derived from the bind the socket actually took.
+  const lanServer = await startLocalApi({
+    stateDir,
+    sessionManager: {},
+    bindAddress: "0.0.0.0",
+    allowLanControl: true,
+    deviceId,
+    localPairingManager: new LocalPairingManager({
+      identityProvider: () => identity,
+      accessTokenProvider: () => readApiToken(stateDir),
+      deviceNameProvider: () => "Test machine · CLI",
+    }),
+  }, { port: 0, apiTokenPath: apiTokenPath(stateDir) });
+  try {
+    writeDaemonState({
+      pid: process.pid,
+      localApiPort: lanServer.port,
+      localApiBindAddress: "0.0.0.0",
+      localApiBaseUrl: `http://127.0.0.1:${lanServer.port}`,
+    });
+    const lanOutput = await run(["local", "api", "pair"]);
+    const lanDecoded = decodePairingLine(pairingLineFrom(lanOutput));
+    const lanHost = suggestLanHost("0.0.0.0");
+    assert.equal(
+      lanDecoded.endpoint,
+      `http://${lanHost}:${lanServer.port}`,
+      "a wildcard bind must advertise the address a phone can reach",
+    );
+    assert.match(lanOutput, new RegExp(`Address\\s+${lanHost.replace(/\./g, "\\.")}:${lanServer.port}`));
+    // The warning is for a bind that cannot serve a phone. Printing it here
+    // would train the user to ignore it on the one screen where it matters.
+    assert.doesNotMatch(
+      lanOutput,
+      /only this machine can reach it/i,
+      "a LAN-reachable bind must not warn that only this machine can reach it",
+    );
+  } finally {
+    await lanServer.close();
+  }
 } finally {
   await server?.close();
   rmSync(stateDir, { recursive: true, force: true });

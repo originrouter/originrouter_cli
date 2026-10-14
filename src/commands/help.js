@@ -141,7 +141,7 @@ Local API inspection and App pairing:
   originrouter local api status                      Print bind, port, allowLan, tokenSet, and running state
   originrouter local api pair                        Pair an App with this Local API (alias: connect)
   originrouter local api connect                     Alias for pair
-  originrouter local api set-host <addr> [--allow-lan on]   Change the bind address
+  originrouter local api set-host <addr> [--allow-lan on|off]  Change the bind address
   originrouter local api set-port <int>              Change the Local API port
 
   "local api pair" asks the running daemon for a single-use pairing ticket and
@@ -162,7 +162,9 @@ Configuration:
 
 Other:
   originrouter daemon [--relay https://app.easytransnote.com] [--relay-mode auto|cloud|local|custom] [--device <device-id>] [--local-port <p>]
-                      [--bind 127.0.0.1|0.0.0.0] [--allow-lan]
+                      [--bind 0.0.0.0|127.0.0.1|<addr>] [--allow-lan]
+                                      Default 0.0.0.0: the App pairs from a phone, and the
+                                      LAN needs the bearer token to reach anything else.
   originrouter daemon-port                           Print the running daemon's local API URL (reads daemon.state.json)
   originrouter service install|start|stop|restart|status|uninstall
   originrouter services install|start|stop|restart|status|uninstall

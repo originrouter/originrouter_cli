@@ -5,6 +5,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { readApiToken } from "../persistence/authToken.js";
+import { DEFAULT_BIND_ADDRESS } from "../local/localApi.js";
+import { loopbackDialHost } from "../local/localApiHttp.js";
 import { ensureStateDir, readDaemonState } from "../persistence/state.js";
 import { optionValue } from "../commands/shared/cliArgs.js";
 
@@ -15,8 +17,7 @@ function localApi() {
   if (!state?.localApiPort || !token) {
     throw new Error("OriginRouter daemon is unavailable; start it before using Agent collaboration tools.");
   }
-  const bind = state.localApiBindAddress || "127.0.0.1";
-  const host = bind === "0.0.0.0" || bind === "::" ? "127.0.0.1" : bind;
+  const host = loopbackDialHost(state.localApiBindAddress || DEFAULT_BIND_ADDRESS);
   const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   return { baseUrl: `http://${urlHost}:${state.localApiPort}`, token };
 }

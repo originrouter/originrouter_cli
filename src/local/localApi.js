@@ -1,9 +1,10 @@
 // Stage 3: Daemon local HTTP API.
 //
-// Bound to 127.0.0.1 by default. The browser-facing control surface for OriginRouter
-// local sessions. Read paths delegate to existing modules; write paths call
-// sessionManager.handleEvent() directly — the same entry point the daemon
-// already uses when handling events from the relay.
+// Bound to 0.0.0.0 by default — see [DEFAULT_BIND_ADDRESS]. The browser-facing
+// control surface for OriginRouter local sessions. Read paths delegate to
+// existing modules; write paths call sessionManager.handleEvent() directly —
+// the same entry point the daemon already uses when handling events from the
+// relay.
 //
 // Wire summary:
 //
@@ -65,6 +66,8 @@ import { buildCollaborationCapabilities } from "../collaboration/collaborationCa
 import { normalizeCollaborationCreateRequest } from "../collaboration/createRunRequest.js";
 import {
   httpHost,
+  LOOPBACK_ADDRESSES,
+  WILDCARD_ADDRESSES,
   readJsonBody,
   requireAuth,
   sendError,
@@ -107,27 +110,65 @@ import {
 
 export { projectSession } from "./localApiProjections.js";
 
-// Exported so CLI subcommands (e.g. `local api set-host`) can apply
-// the same gating as the runtime auth layer. Keep the set in lock-
-// step with the bind-address check in `startLocalApi` above.
-export const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"]);
+// The address vocabulary lives in `localApiHttp.js` beside `httpHost`, which
+// is the other place that has to know what a bind address means. Re-exported
+// here because the CLI subcommands reach for it through this module, and
+// keeping two exported names for one set is the kind of thing that drifts.
+export { LOOPBACK_ADDRESSES, WILDCARD_ADDRESSES };
 
-// The address to suggest to a phone pairing with this machine. The bind
-// address is the wrong source for it: a daemon that binds 127.0.0.1 (the
-// default) or the 0.0.0.0 wildcard says nothing about how a *different*
-// device should reach it, and both are what the pairing line advertised
-// before this function was used for it — which sent every phone to its own
-// loopback.
+// What the daemon listens on unless an operator says otherwise.
 //
-// This is only a default. The App exposes it as an editable field, because
-// the user may be on the same machine (localhost), on the LAN, reaching a
-// public host, or using a domain — and none of those can be guessed from
-// here. Prefer private ranges, then link-local; skip loopback and anything
-// that looks virtual (Docker/VPN bridges add noise but never the address a
-// phone on the same network would use).
+// The wildcard, not loopback. Three of this API's routes skip the bearer token
+// on purpose — `/local/e2ee/session`, `/local/e2ee/messages` and
+// `/local/pair/redeem` — because the device they exist for is a phone that
+// cannot read `~/.originrouter/local-api.token`, which is 0600 and never
+// leaves this machine. A loopback bind puts those three routes where no phone
+// can reach them, which leaves them reachable only from the host itself: the
+// E2EE gateway and pairing stop working for every device that is not this one.
+//
+// The token is still the wall. Everything else on this socket answers 401
+// without it, so the LAN sees a port it can try a ticket against and nothing
+// else — a ticket is single-use and expires in five minutes.
+//
+// This constant is the only default. The daemon, `startLocalApi`, and the
+// `local api` / `local config` subcommands all read it, because a second copy
+// of "127.0.0.1" anywhere in this path is how the advertised address and the
+// listening address drifted apart in the first place.
+export const DEFAULT_BIND_ADDRESS = "0.0.0.0";
+
+// Paired with [DEFAULT_BIND_ADDRESS]: a LAN bind is the default posture, so
+// the consent flag that guards it defaults on. It still has to default on —
+// `startLocalApi` refuses a non-loopback bind without it, and a default that
+// cannot boot its own server is not a default.
+export const DEFAULT_ALLOW_LAN = true;
+
+// The address to suggest to a phone pairing with this machine.
+//
+// The bind address answers this exactly, and it is the only thing that can:
+// an address nobody is listening on is not a suggestion, it is a dead end
+// dressed as a convenience. So each bind is read for what it actually admits.
+//
+//   wildcard (0.0.0.0)  → every interface answers, so scan for the one a
+//                         phone on the same network would use
+//   concrete (10.0.0.5) → an operator picked this interface; keep it
+//   loopback (127.0.0.1)→ only this machine can reach it, which is a definite
+//                         answer, not a missing one. Say loopback.
+//
+// The loopback case used to fall through to the scan, on the reasoning that a
+// loopback bind says nothing about how a different device should connect. It
+// says the opposite: it says no different device can. That sent every pairing
+// line to a LAN address with no listener behind it, so pairing worked only
+// from the host itself and failed from every phone.
+//
+// A loopback answer is still worth having: it tells the user the truth about
+// what this daemon is reachable at, and the App takes it as an editable
+// default, so a user with a domain or a tunnel still has somewhere to type it.
 export function suggestLanHost(bindAddress, interfaces = networkInterfaces()) {
   const bind = String(bindAddress || "");
-  if (bind && !["0.0.0.0", "::", "::0"].includes(bind) && !LOOPBACK_ADDRESSES.has(bind)) {
+  if (LOOPBACK_ADDRESSES.has(bind.toLowerCase())) {
+    return bind;
+  }
+  if (bind && !WILDCARD_ADDRESSES.has(bind)) {
     return bind;
   }
   const candidates = [];
@@ -147,6 +188,87 @@ export function suggestLanHost(bindAddress, interfaces = networkInterfaces()) {
   return privateFirst || candidates[0] || "127.0.0.1";
 }
 
+// Which bind address this daemon should use, and whether anyone chose it.
+//
+// Precedence, highest first:
+//
+//   1. an explicit `--bind` / `ORIGINROUTER_LOCAL_BIND`, which is a direct
+//      instruction for this run and nothing more;
+//   2. `local-api.json`, but only when it is marked as an operator's choice;
+//   3. [DEFAULT_BIND_ADDRESS].
+//
+// The marker is what makes this migrate. The daemon records the address it
+// bound into the same file on every start, so an unmarked record is just a
+// note of where we happened to land — treating it as authoritative made the
+// first daemon's default permanent, and no later upgrade could move it. A
+// config written before the marker existed has no field at all, and absent
+// reads as "nobody chose this", so an existing install picks up the shipped
+// default on its own instead of needing to be told.
+//
+// `--bind` and the env var deliberately do not mark the config. A flag passed
+// to one run stays a fact about that run; writing it back would turn a
+// one-shot into a permanent change nobody asked for.
+export function resolveBindAddress({ flag, env, config } = {}) {
+  // `source` says who decided, which is also who is allowed to write the
+  // answer back. A flag applies to one run and must not be persisted: writing
+  // it back would turn a one-shot into a permanent change, and would overwrite
+  // an operator's earlier choice to boot with it.
+  if (String(flag || "").trim()) {
+    return { bindAddress: String(flag).trim(), isOperatorSet: true, source: "flag" };
+  }
+  if (String(env || "").trim()) {
+    return { bindAddress: String(env).trim(), isOperatorSet: true, source: "env" };
+  }
+  const recorded = String(config?.bindAddress || "").trim();
+  if (recorded && config?.bindAddressSource === "operator") {
+    return { bindAddress: recorded, isOperatorSet: true, source: "config" };
+  }
+  return { bindAddress: DEFAULT_BIND_ADDRESS, isOperatorSet: false, source: "default" };
+}
+
+// Whether this daemon may be reachable from off this machine.
+//
+// Consent is not independent of the address: a loopback bind exposes nothing,
+// so the question does not arise and the answer is no. Reading the two
+// independently is what let them contradict — a non-loopback address with
+// consent off, which is not a policy but a server that refuses to start.
+//
+// Where the question does arise the shipped answer is [DEFAULT_ALLOW_LAN], and
+// an explicit `--allow-lan`, `ORIGINROUTER_ALLOW_LAN` or `local-api.json`
+// value overrides it in either direction.
+export function resolveAllowLan({ bindAddress, flag, env, config } = {}) {
+  if (LOOPBACK_ADDRESSES.has(String(bindAddress || "").toLowerCase())) {
+    return false;
+  }
+  if (flag === true) return true;
+  if (flag === false) return false;
+  const envValue = String(env ?? "").trim();
+  if (envValue === "1" || envValue.toLowerCase() === "true") return true;
+  if (envValue === "0" || envValue.toLowerCase() === "false") return false;
+  // Only a setting a human made counts, for the same reason the bind address
+  // needs a marker: the daemon writes this field on every start, so a bare
+  // `false` in the file is a note of the default that was in force when it was
+  // written. Every install that has ever run the old default has one — reading
+  // it as an instruction would bring the new default up against a stored "no"
+  // and refuse to start.
+  if (config?.allowLanSource === "operator" && typeof config?.allowLan === "boolean") {
+    return config.allowLan;
+  }
+  return DEFAULT_ALLOW_LAN;
+}
+
+// Raised when the address and the consent disagree.
+//
+// Both are real settings, and a combination that cannot be honoured should say
+// so where a person can read it rather than at the next daemon start, where it
+// presents as a service that will not come up.
+export function bindAddressConflict(bindAddress, allowLan) {
+  if (LOOPBACK_ADDRESSES.has(String(bindAddress || "").toLowerCase())) return null;
+  if (allowLan) return null;
+  return `bindAddress ${bindAddress} is reachable from other machines but LAN access is off.`
+    + " Either bind 127.0.0.1, or allow LAN.";
+}
+
 // Bearer-token regex: case-insensitive 64 hex chars.
 const BEARER_RE = /^Bearer\s+([a-f0-9]{64})$/i;
 // Hard cap on the log-tail response body so a runaway proxy log doesn't OOM
@@ -156,10 +278,25 @@ const BEARER_RE = /^Bearer\s+([a-f0-9]{64})$/i;
 // constant) so tests can override.
 // ---------- Lifecycle ----------
 
-export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathOpt, allowLan = false } = {}) {
-  const bindAddress = ctx.bindAddress || "127.0.0.1";
-  const lanAllowed = Boolean(ctx.allowLanControl || allowLan);
-  const isLoopback = LOOPBACK_ADDRESSES.has(bindAddress);
+export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathOpt, allowLan } = {}) {
+  // The bind address and the consent to expose it are one decision, so they
+  // are taken together.
+  //
+  // A caller that names an address has made that decision and must also say
+  // it consents to the exposure — which is what keeps this gate worth having
+  // now that the shipped default is a LAN bind. A caller that names nothing
+  // gets the shipped pair, [DEFAULT_BIND_ADDRESS] with [DEFAULT_ALLOW_LAN],
+  // because those two are consistent with each other by construction and an
+  // absent choice is not a choice to be overruled.
+  //
+  // Reading them independently is what made the old default unshippable: the
+  // address defaulted to loopback and the consent defaulted off, so any change
+  // to either could leave the pair contradicting itself and the server unable
+  // to start on its own defaults.
+  const bindAddress = ctx.bindAddress || DEFAULT_BIND_ADDRESS;
+  const inheritedConsent = ctx.bindAddress ? undefined : DEFAULT_ALLOW_LAN;
+  const lanAllowed = Boolean(ctx.allowLanControl ?? allowLan ?? inheritedConsent);
+  const isLoopback = LOOPBACK_ADDRESSES.has(bindAddress.toLowerCase());
   if (!isLoopback && !lanAllowed) {
     throw new Error(`non-loopback bindAddress requires --allow-lan (got "${bindAddress}")`);
   }

@@ -6,6 +6,8 @@ import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { readApiToken } from "../persistence/authToken.js";
 import { liveDaemonPid } from "../daemon/daemonPrimitives.js";
+import { DEFAULT_BIND_ADDRESS } from "../local/localApi.js";
+import { loopbackDialHost } from "../local/localApiHttp.js";
 import { getStateDir, readDaemonState, readLocalApiConfig } from "../persistence/state.js";
 import { quoteWindowsArgument } from "../utils/spawn.js";
 
@@ -412,8 +414,7 @@ function serviceConfigForPlatform(currentPlatform = platform()) {
 
 function localApiUrlFromState(state) {
   if (!state?.localApiPort) return null;
-  const bind = state.localApiBindAddress || "127.0.0.1";
-  const host = bind === "0.0.0.0" ? "127.0.0.1" : bind;
+  const host = loopbackDialHost(state.localApiBindAddress || DEFAULT_BIND_ADDRESS);
   const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   return `http://${urlHost}:${state.localApiPort}`;
 }
@@ -773,8 +774,7 @@ function statusService({ dryRun = false } = {}) {
 
   const state = readDaemonState();
   if (state?.localApiPort) {
-    const bind = state.localApiBindAddress || "127.0.0.1";
-    const host = bind === "0.0.0.0" ? "127.0.0.1" : bind;
+    const host = loopbackDialHost(state.localApiBindAddress || DEFAULT_BIND_ADDRESS);
     console.log(`Local API: http://${host}:${state.localApiPort}`);
     console.log(`Daemon state: ${state.status || "unknown"} updatedAt=${state.updatedAt || "unknown"}`);
   }

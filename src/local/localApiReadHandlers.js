@@ -5,7 +5,7 @@ import { AGENT_DETAIL_PROFILES, agentDetailDefaultFromConfig } from "../runtime/
 import { cachedUpdateStatus } from "../update/checker.js";
 import { detectInstallContext } from "../update/installContext.js";
 import { getStateDir, readConfig, readProxyState } from "../persistence/state.js";
-import { httpHost, sendError, sendOk } from "./localApiHttp.js";
+import { httpHost, loopbackDialHost, sendError, sendOk } from "./localApiHttp.js";
 
 const LOG_TAIL_MAX_BYTES = 1_048_576;
 const LOG_TAIL_MAX_LINES = 2000;
@@ -23,7 +23,13 @@ export async function handleLocalStatus(ctx) {
       uptimeSeconds,
       port: ctx.localApiPort,
       bindAddress: ctx.bindAddress,
-      baseUrl: `http://${httpHost(ctx.bindAddress)}:${ctx.localApiPort}`,
+      // What a client on this machine dials, which is not always what the
+      // server binds: a wildcard bind reports `0.0.0.0` above and is reached
+      // at loopback below. Every other module that talks to the daemon already
+      // substitutes; this one did not, which was invisible while the default
+      // was loopback and would have started reporting `http://0.0.0.0:<port>`
+      // the moment it was not.
+      baseUrl: `http://${httpHost(loopbackDialHost(ctx.bindAddress))}:${ctx.localApiPort}`,
       authMode: "bearer",
       lanEnabled: !ctx.isLoopback,
     },

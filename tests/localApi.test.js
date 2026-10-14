@@ -314,9 +314,13 @@ try {
     assert.equal(body.daemon.pid, 99999);
     assert.equal(body.daemon.deviceId, "local-dev");
     assert.equal(body.daemon.version, "test-0.1.0");
-    assert.equal(body.daemon.bindAddress, "127.0.0.1");
+    assert.equal(body.daemon.bindAddress, "0.0.0.0");
     assert.equal(body.daemon.authMode, "bearer");
-    assert.equal(body.daemon.lanEnabled, false);
+    assert.equal(body.daemon.lanEnabled, true);
+    // The bind is the wildcard, the URL a local client dials is not. This
+    // handler used to format `baseUrl` straight from the bind address, which
+    // was invisible while the default was loopback and reported
+    // `http://0.0.0.0:<port>` the moment it was not.
     assert.equal(body.daemon.baseUrl, `http://127.0.0.1:${serverHandle.port}`);
     assert.ok(body.daemon.uptimeSeconds >= 4, "uptime should reflect the seeded 5s start");
     assert.equal(body.relay.url, "https://app.easytransnote.com");
@@ -1148,10 +1152,15 @@ try {
     assert.equal(r.headers.get("access-control-allow-headers"), "Content-Type, Authorization");
   }
 
-  // Bind safety: refuses non-loopback addresses BEFORE attempting to listen
-  // unless the caller explicitly opts into LAN control.
-  // We construct the ctx with bindAddress: "0.0.0.0" and assert the throw —
-  // no second server is started.
+  // Bind safety: a caller who *names* a non-loopback address must also consent
+  // to it, and is refused BEFORE anything tries to listen.
+  //
+  // The shipped default is a LAN bind, but that default is consented to as a
+  // pair — see `startLocalApi`. Naming an address is a decision, and a
+  // decision to expose this API past this machine has to be explicit. So the
+  // gate still fires here even though a bare `startLocalApi(ctx)` now boots on
+  // `0.0.0.0`: the ctx below chooses the address, and choosing it without
+  // consenting is the case being guarded.
   let bindError = null;
   try {
     await startLocalApi({

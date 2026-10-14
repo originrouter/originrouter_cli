@@ -17,6 +17,30 @@ export function httpHost(address) {
     : address;
 }
 
+// Addresses that mean "every interface", used as bind targets.
+export const WILDCARD_ADDRESSES = new Set(["0.0.0.0", "::", "::0"]);
+
+// Addresses that mean "this machine only", used as bind targets.
+export const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"]);
+
+// The address a client *on this machine* dials to reach a server bound to
+// `bindAddress`.
+//
+// A wildcard accepts on every interface including loopback, and loopback is
+// the only one of them that unambiguously means "this machine" — so it is what
+// the daemon dials to talk to itself. A concrete bind is returned unchanged:
+// an operator who pinned one interface meant it, and that interface answers on
+// its own address too.
+//
+// This existed as a hand-rolled `bind === "0.0.0.0" ? "127.0.0.1" : bind` in
+// six modules, two of which forgot the IPv6 wildcard. It is one rule and it
+// lives here now.
+export function loopbackDialHost(bindAddress) {
+  const bind = String(bindAddress || "").trim();
+  if (!bind) return "127.0.0.1";
+  return WILDCARD_ADDRESSES.has(bind) ? "127.0.0.1" : bind;
+}
+
 export function readJsonBody(req, maxBytes = 1_000_000) {
   return new Promise((resolve, reject) => {
     let received = 0;

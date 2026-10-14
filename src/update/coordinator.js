@@ -1,6 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { readApiToken } from "../persistence/authToken.js";
+import { DEFAULT_BIND_ADDRESS } from "../local/localApi.js";
+import { loopbackDialHost } from "../local/localApiHttp.js";
 import { getStateDir, readDaemonState } from "../persistence/state.js";
 import { isServiceInstalled } from "../commands/service.js";
 import { spawnCommand } from "../utils/spawn.js";
@@ -15,8 +17,7 @@ const TERMINAL_SESSION_STATES = new Set(["completed", "failed", "cancelled", "st
 
 function localApiBaseUrl(state) {
   if (!state?.localApiPort) return null;
-  const bind = state.localApiBindAddress || "127.0.0.1";
-  const host = bind === "0.0.0.0" ? "127.0.0.1" : bind;
+  const host = loopbackDialHost(state.localApiBindAddress || DEFAULT_BIND_ADDRESS);
   const formatted = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   return `http://${formatted}:${state.localApiPort}`;
 }

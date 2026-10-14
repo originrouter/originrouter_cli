@@ -4,7 +4,14 @@ import {
   DEFAULT_LOCAL_API_PORT,
   DEFAULT_RELAY_URL,
 } from "../constants.js";
-import { LOOPBACK_ADDRESSES } from "../local/localApi.js";
+import {
+  LOOPBACK_ADDRESSES,
+  DEFAULT_BIND_ADDRESS,
+  resolveBindAddress,
+  resolveAllowLan,
+  bindAddressConflict,
+} from "../local/localApi.js";
+import { loopbackDialHost } from "../local/localApiHttp.js";
 import { pairingDeepLink } from "../local/localPairing.js";
 import {
   ensureStateDir,
@@ -32,8 +39,7 @@ function buildApiUrl(stateDir, token, portOverride) {
   let host = "127.0.0.1";
   try {
     const state = readDaemonState();
-    const bind = state?.localApiBindAddress;
-    if (bind && bind !== "0.0.0.0") host = bind;
+    host = loopbackDialHost(state?.localApiBindAddress || DEFAULT_BIND_ADDRESS);
   } catch {}
   const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   if (!port) {
@@ -49,8 +55,8 @@ export function remoteLocalApi() {
   if (!state?.localApiPort || !token) {
     throw new Error("OriginRouter service is not running. Run `originrouter service start` first.");
   }
-  const bind = state.localApiBindAddress || "127.0.0.1";
-  const host = bind === "0.0.0.0" || bind === "::" ? "127.0.0.1" : bind;
+  const bind = state.localApiBindAddress || DEFAULT_BIND_ADDRESS;
+  const host = loopbackDialHost(bind);
   const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   return { baseUrl: `http://${urlHost}:${state.localApiPort}`, token };
 }
@@ -91,6 +97,28 @@ function parseOnOff(raw, flag) {
   throw new Error(`${flag} must be on|off`);
 }
 
+// What the daemon would bind with the config as it stands.
+//
+// The same resolution `startDaemon` performs, so `show` reports the address in
+// force rather than whatever the file happens to record. Printing the record
+// was how a stale default kept looking deliberate after the default moved.
+function effectiveBindAddress(config) {
+  return resolveBindAddress({ config }).bindAddress;
+}
+
+// Whether the daemon would expose itself, with the config as it stands.
+//
+// Derived from the effective bind rather than read off the file, so the pair
+// on screen is always one the daemon could actually start with. Printing the
+// stored field is how a config ends up showing `bindAddress: 0.0.0.0` beside
+// `allowLan: off` — a combination that is not a setting but a refusal to boot.
+function effectiveAllowLan(config) {
+  return resolveAllowLan({
+    bindAddress: effectiveBindAddress(config),
+    config,
+  });
+}
+
 export function handleTokenCommand(args) {
   const stateDir = ensureStateDir();
   const [action] = args;
@@ -126,8 +154,8 @@ export function handleLocalConfigCommand(args) {
     console.log(`Config file: ${stateDir}/local-api.json`);
     console.log(`Token file:  ${stateDir}/local-api.token`);
     console.log(`port:        ${config.port ?? DEFAULT_LOCAL_API_PORT}`);
-    console.log(`bindAddress: ${config.bindAddress || "127.0.0.1"}`);
-    console.log(`allowLan:    ${config.allowLan === true ? "on" : "off"}`);
+    console.log(`bindAddress: ${effectiveBindAddress(config)}`);
+    console.log(`allowLan:    ${effectiveAllowLan(config) ? "on" : "off"}`);
     console.log(`relayMode:   ${config.relayMode || "auto"}`);
     console.log(`relayUrl:    ${config.relayUrl || DEFAULT_RELAY_URL}`);
     if (state?.localApiPort) {
@@ -152,18 +180,39 @@ export function handleLocalConfigCommand(args) {
       patch.port = port;
       patch.portSource = "operator";
     }
-    if (bindAddress) patch.bindAddress = bindAddress;
-    if (allowLan !== undefined) patch.allowLan = allowLan;
+    if (bindAddress) {
+      patch.bindAddress = bindAddress;
+      // Same marker `set-host` writes, and for the same reason: without it the
+      // daemon would read this back as a record of where it landed rather than
+      // as a choice, and quietly move off it on the next start.
+      patch.bindAddressSource = "operator";
+    }
+    if (allowLan !== undefined) {
+      patch.allowLan = allowLan;
+      // Marks this as a decision rather than the record of a default that the
+      // daemon writes on every start — see `resolveAllowLan`.
+      patch.allowLanSource = "operator";
+    }
     if (relayMode) patch.relayMode = relayMode;
     if (relayUrl) patch.relayUrl = relayUrl;
     if (Object.keys(patch).length === 0) {
       throw new Error("Usage: originrouter local config set [--port <p>] [--bind <addr>] [--allow-lan on|off] [--relay-mode auto|cloud|local|custom] [--relay-url <url>]");
     }
+    // Refuse a combination the daemon cannot honour, here rather than at the
+    // next start. The address and the consent are separate settings and can
+    // contradict each other; discovering that as a service that will not come
+    // up is a much worse place to find out.
+    const pending = { ...readLocalApiConfig(), ...patch };
+    const conflict = bindAddressConflict(
+      resolveBindAddress({ config: pending }).bindAddress,
+      resolveAllowLan({ config: pending }),
+    );
+    if (conflict) throw new Error(conflict);
     const next = writeLocalApiConfig(patch);
     console.log("Local API config updated.");
     console.log(`port:        ${next.port ?? DEFAULT_LOCAL_API_PORT}`);
-    console.log(`bindAddress: ${next.bindAddress || "127.0.0.1"}`);
-    console.log(`allowLan:    ${next.allowLan === true ? "on" : "off"}`);
+    console.log(`bindAddress: ${effectiveBindAddress(next)}`);
+    console.log(`allowLan:    ${effectiveAllowLan(next) ? "on" : "off"}`);
     console.log(`relayMode:   ${next.relayMode || "auto"}`);
     console.log(`relayUrl:    ${next.relayUrl || DEFAULT_RELAY_URL}`);
     console.log("Restart `originrouter daemon` for changes to take effect.");
@@ -181,8 +230,8 @@ export async function handleLocalApiCommand(args) {
     const tokenSet = Boolean(readApiToken(stateDir));
     console.log(`Config file: ${stateDir}/local-api.json`);
     console.log(`port:        ${config.port ?? DEFAULT_LOCAL_API_PORT}`);
-    console.log(`bindAddress: ${config.bindAddress || "127.0.0.1"}`);
-    console.log(`allowLan:    ${config.allowLan === true ? "on" : "off"}`);
+    console.log(`bindAddress: ${effectiveBindAddress(config)}`);
+    console.log(`allowLan:    ${effectiveAllowLan(config) ? "on" : "off"}`);
     console.log(`tokenSet:    ${tokenSet ? "yes" : "no"}`);
     if (state?.localApiPort) {
       console.log(`running:     ${state.localApiBaseUrl || `http://127.0.0.1:${state.localApiPort}`}`);
@@ -193,22 +242,49 @@ export async function handleLocalApiCommand(args) {
   }
   if (sub === "set-host") {
     const host = rest[0];
-    if (!host) throw new Error("Usage: originrouter local api set-host <address> [--allow-lan on]");
+    if (!host) throw new Error("Usage: originrouter local api set-host <address> [--allow-lan on|off]");
     const trimmed = String(host).trim();
     const allowLanFlag = parseOnOff(optionValue(args, "allow-lan"), "--allow-lan");
     const existing = readLocalApiConfig();
-    const allowLan = allowLanFlag !== undefined ? allowLanFlag : (existing.allowLan === true);
     const isLoopback = LOOPBACK_ADDRESSES.has(trimmed.toLowerCase());
+
+    // Two directions, and only the widening one needs consent.
+    //
+    // Narrowing to loopback removes the LAN surface, so it is always allowed
+    // and it withdraws the LAN consent it makes unnecessary — which means the
+    // next widening has to ask again, at the moment it actually widens.
+    //
+    // Widening reaches past this machine, and it still needs the bearer token
+    // minted: the token is what makes the rest of this API unreachable
+    // without it, and an unauthenticated LAN socket is not a thing to set up
+    // on the way to something else.
+    const allowLan = allowLanFlag !== undefined
+      ? allowLanFlag
+      : (isLoopback ? false : true);
     if (!isLoopback) {
       if (!readApiToken(stateDir)) {
         throw new Error(`Refusing to bind "${trimmed}" without a bearer token. Run \`originrouter daemon\` first to mint one, then retry.`);
       }
       if (!allowLan) throw new Error(`Refusing to bind "${trimmed}" without --allow-lan on.`);
     }
-    writeLocalApiConfig({ bindAddress: trimmed, allowLan });
+    // The operator marker, or the daemon records this as its own doing and
+    // the next start is free to replace it — see `resolveBindAddress`.
+    writeLocalApiConfig({
+      bindAddress: trimmed,
+      bindAddressSource: "operator",
+      allowLan,
+      allowLanSource: "operator",
+    });
     console.log(`bindAddress: ${trimmed}`);
+    console.log(`allowLan:    ${allowLan ? "on" : "off"}`);
     console.log(`tokenSet:    ${readApiToken(stateDir) ? "yes" : "no"}`);
     console.log("Restart `originrouter daemon` for the change to take effect.");
+    if (isLoopback) {
+      console.log("");
+      console.log("The local API will be reachable only from this machine. Phone pairing");
+      console.log("over the LAN needs it bound wider again:");
+      console.log(`  originrouter local api set-host ${DEFAULT_BIND_ADDRESS} --allow-lan on`);
+    }
     return;
   }
   if (sub === "set-port") {
@@ -266,6 +342,18 @@ export async function handleLocalApiCommand(args) {
     console.log("");
     console.log(`Edit the address in the App if this device does not reach the CLI at ${host}.`);
     console.log("Treat the pairing line as a credential.");
+    // Only when the address cannot work. A loopback `Address` on a pairing
+    // ticket is not a suggestion that might be wrong — it is the truth about
+    // this daemon, and a phone scanning the code above will be refused. Saying
+    // so here is the difference between a user who knows to run one command
+    // and a user who concludes the App is broken.
+    if (LOOPBACK_ADDRESSES.has(host.toLowerCase())) {
+      console.log("");
+      console.log(`This daemon is bound to ${host}, so only this machine can reach it.`);
+      console.log("A phone on the same network cannot. To pair from one:");
+      console.log(`  originrouter local api set-host ${DEFAULT_BIND_ADDRESS} --allow-lan on`);
+      console.log("  originrouter daemon    # restart to apply");
+    }
     return;
   }
   throw new Error("Usage: originrouter local api status|pair|set-host <addr>|set-port <int>");

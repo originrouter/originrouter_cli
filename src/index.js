@@ -1,4 +1,6 @@
 import { startDaemon } from "./daemon/daemon.js";
+import { DEFAULT_BIND_ADDRESS } from "./local/localApi.js";
+import { loopbackDialHost } from "./local/localApiHttp.js";
 import {
   CLAUDE_CONFIG_KEYS,
   CLAUDE_CREDENTIAL_SETTINGS_FIELDS,
@@ -1538,8 +1540,7 @@ export async function main(argv) {
       process.exitCode = 1;
       return;
     }
-    const bind = state.localApiBindAddress || "127.0.0.1";
-    const host = bind === "0.0.0.0" ? "127.0.0.1" : bind;
+    const host = loopbackDialHost(state.localApiBindAddress || DEFAULT_BIND_ADDRESS);
     const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
     console.log(`http://${urlHost}:${state.localApiPort}`);
     return;

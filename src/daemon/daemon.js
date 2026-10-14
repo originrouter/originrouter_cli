@@ -74,6 +74,13 @@ import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import { refreshCompatibilityPack } from "../compatibility/updater.js";
 import { loadCliDeviceDirectory } from "../commands/routeSources.js";
 import {
+  resolveBindAddress,
+  resolveAllowLan,
+  bindAddressConflict,
+  LOOPBACK_ADDRESSES,
+} from "../local/localApi.js";
+import { loopbackDialHost } from "../local/localApiHttp.js";
+import {
   buildProxyBaseUrl,
   httpHost,
   localControlProviderSnapshot,
@@ -109,16 +116,46 @@ export async function startDaemon(args) {
     options.device || process.env.ORIGINROUTER_DEVICE || DEFAULT_DEVICE_ID,
   );
   const executor = normalizeExecutor(options.executor || DEFAULT_EXECUTOR);
-  const bindAddress =
-    options.bind ||
-    process.env.ORIGINROUTER_LOCAL_BIND ||
-    localApiConfig.bindAddress ||
-    "127.0.0.1";
-  const allowLanControl = Boolean(
-    options.allowLan ||
-    process.env.ORIGINROUTER_ALLOW_LAN === "1" ||
-    localApiConfig.allowLan === true,
-  );
+
+  // Which bind address applies, and whether anyone asked for it.
+  //
+  // The daemon writes the resolved bind back into `local-api.json` on every
+  // start (below), which is what keeps a chosen port across restarts — and is
+  // exactly why the value has to carry a marker saying whether a human chose
+  // it. Without one, the first daemon to run persists its own default as if it
+  // were an instruction, and the default becomes unchangeable by any later
+  // upgrade.
+  //
+  // The marker is `portSource`'s sibling, so the rule is the same one already
+  // used for the port: an operator's choice is `"operator"`, a record of what
+  // we happened to bind is `"default"`. A config written before this marker
+  // existed has no field at all, and absent is read as "not an operator
+  // choice" — which is what lets an existing install pick up the new default
+  // without the user having to know this file exists. See
+  // `resolveBindAddress`.
+  const resolvedBind = resolveBindAddress({
+    flag: options.bind,
+    env: process.env.ORIGINROUTER_LOCAL_BIND,
+    config: localApiConfig,
+  });
+  const bindAddress = resolvedBind.bindAddress;
+  const allowLanControl = resolveAllowLan({
+    bindAddress,
+    flag: options.allowLan,
+    env: process.env.ORIGINROUTER_ALLOW_LAN,
+    config: localApiConfig,
+  });
+  // Say the disagreement here, where the operator is looking at the daemon
+  // they just started, instead of letting `startLocalApi` raise it as an
+  // unexpected throw from three layers down.
+  const bindConflict = bindAddressConflict(bindAddress, allowLanControl);
+  if (bindConflict) {
+    throw new Error(bindConflict);
+  }
+  // Whether this run's answer is worth recording. A flag or an env var speaks
+  // for one run only; persisting it would both freeze a one-shot and overwrite
+  // whatever the operator had actually configured. See `resolveBindAddress`.
+  const bindAddressIsOperatorSet = resolvedBind.source === "config";
 
   // The daemon is a local-first service. It must be able to boot and expose
   // the Local API before the user logs in. Relay auth is acquired in the
@@ -563,7 +600,19 @@ export async function startDaemon(args) {
   writeLocalApiConfig({
     port: localApi.port,
     portSource: heldRequestedPort ? "operator" : "bound",
-    bindAddress,
+    // The bind is only recorded when this run's answer is the one that should
+    // outlive it. A `--bind` run leaves the file's bind fields untouched
+    // rather than overwriting an operator's choice with a one-shot flag —
+    // `writeLocalApiConfig` merges, so omitting the keys preserves them.
+    ...(resolvedBind.source === "flag" || resolvedBind.source === "env"
+      ? {}
+      : {
+          bindAddress,
+          // An operator's choice survives restarts; everything else is a
+          // record of where we landed, which the next start is free to change.
+          // See `resolveBindAddress`.
+          bindAddressSource: bindAddressIsOperatorSet ? "operator" : "default",
+        }),
     allowLan: allowLanControl,
   });
   void collaborationRuntime.recover().catch((error) => {
@@ -668,11 +717,16 @@ export async function startDaemon(args) {
     relayMode,
     localApiPort: localApi.port,
     localApiBindAddress: localApi.bindAddress,
-    localApiBaseUrl: `http://${httpHost(localApi.bindAddress)}:${localApi.port}`,
+    // What the CLI and the App dial on this machine, which is loopback when
+    // the daemon is on the wildcard. The bind address itself is kept above,
+    // unchanged — this is the address to *use*, not the address being listened
+    // on, and conflating the two is what put `http://0.0.0.0:<port>` into
+    // every consumer of this file.
+    localApiBaseUrl: `http://${httpHost(loopbackDialHost(localApi.bindAddress))}:${localApi.port}`,
     localApiTokenPath: apiTokenFile,
     localApiAuthMode: "bearer",
-    localApiLanEnabled: !["127.0.0.1", "::1", "localhost"].includes(
-      localApi.bindAddress,
+    localApiLanEnabled: !LOOPBACK_ADDRESSES.has(
+      String(localApi.bindAddress || "").toLowerCase(),
     ),
     localApiDefaultPort: DEFAULT_LOCAL_API_PORT,
   });
