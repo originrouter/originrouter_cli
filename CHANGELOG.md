@@ -3,6 +3,135 @@
 All notable changes to OriginRouter CLI will be documented here. The project
 uses Semantic Versioning and follows the Keep a Changelog structure.
 
+## 0.5.1 - 2026-10-15
+
+### Added
+
+- `agent.interactionTimeoutMs` decides how long a request for permission may
+  wait. It used to be whichever of five hard-coded deadlines fired first, and
+  the outermost was 315s — so a phone in a pocket produced a permission decision
+  nobody made: the request expired while the screen was off, the registry
+  recorded `expired` / `auto_resolution_timeout`, and the agent was told the
+  user had declined. Whether a request should ever expire is the user's call.
+  The setting takes a millisecond count or `5m` / `2h` / `1d`, defaults to `0` —
+  wait as long as it takes, and the App shows no countdown — and is read per
+  request, so `config set` takes effect on the next approval without a daemon
+  restart. All five layers move together, each one outward getting a fixed 15s
+  grace, so the window you configured is always what fires first and the layer
+  above it only covers an answer that never arrives. Claude Code insists on a
+  finite hook deadline; that one keeps an 86400s ceiling and is documented as
+  the thing that finally gives up.
+
+### Changed
+
+- **The Local API now binds `0.0.0.0` by default, and LAN access is on by
+  default.** 0.5.0 bound loopback, which made the daemon unreachable from every
+  device but this one — including the three routes that exist precisely for a
+  device that cannot read a 0600 file on this machine: `/local/e2ee/session`,
+  `/local/e2ee/messages` and `/local/pair/redeem`. The bearer token is unmoved
+  and is still the wall; everything else on the socket answers 401. See
+  **Upgrade notes** below.
+- The bind address follows the binding instead of second-guessing it. It is the
+  answer to "how do you reach me", so a concrete bind is kept, a loopback bind
+  says loopback, and only the wildcard is scanned for a LAN address to suggest —
+  the one bind whose LAN address is real. Before this, `suggestLanHost` scanned
+  the interfaces for a bind address it treated as unknown, and a wildcard bind
+  got a LAN address every phone was told to use.
+- Consent and address resolve together, because they are one decision. A caller
+  that names an address must also consent to exposing it; a caller that names
+  nothing gets the shipped pair. Reading the two independently is what let them
+  contradict — a loopback address with consent off is not a policy, it is a
+  server that refuses to start on its own defaults.
+- `local api pair` issues one credential instead of two ways in. The
+  8-character code and the signed pairing line handed over the same ticket, and
+  the code path was the weaker one: it signed nothing, so what it handed out was
+  a routing hint rather than a credential — while the App kept two input fields,
+  two error vocabularies and a mode switch for the privilege. The code, `--line`
+  and `--json` are gone; a command that prints one thing should not have a flag
+  for asking for that thing. The signed line prints as a terminal QR and as
+  text, wrapped as `originrouter://pair?v=2&l=<payload>` because the shared
+  scanner admits `originrouter:` and nothing else.
+- `local api pair` output and its `--help` paragraph state facts instead of
+  briefing. Someone who typed `local api pair` has already decided to pair, and
+  both were answering questions that reader does not have. The output block now
+  labels its fields the way `status` does — `bindAddress`, `tokenSet` — because
+  those are the keys inside the files they point at.
+
+### Fixed
+
+- The pairing code named an address nothing was listening on. The daemon bound
+  `127.0.0.1` while `suggestLanHost` returned the LAN address, so the pairing
+  line, the QR and the `Address` line all carried an address with no socket
+  behind it. Every phone scanned a code pointing at nothing; pairing worked only
+  from the host itself, and the CLI printed "Edit the address in the App"
+  underneath, so the failure looked like the App's.
+- `local api status` reported `baseUrl` formatted straight from the bind, and
+  would have printed `http://0.0.0.0:<port>` under the new wildcard default — a
+  base URL that is not a URL you can fetch.
+- Opening the workspace picker on a phone spun for 30 seconds and then reported
+  that the device had not answered. The device had answered; the CLI threw the
+  answer away. `agent.workspace.browse` had two responders, and the one ahead in
+  the dispatch chain opened with a device check that compared the target in the
+  relay payload against this device's id — a field the App never puts there. An
+  absent field yields `""`, which is never the device id, so every such frame
+  was claimed and dropped, before any log line, on both ends. One type now has
+  one owner. `collaboration.remote.error` had the same guard inverted, so
+  App-sent error frames skipped error handling entirely.
+- One permission ask is one card. Claude Code 2.1.283 does not put
+  `tool_use_id` on `PermissionRequest`, so the hook server minted a fresh id per
+  delivery, and every repeat delivery became its own independent permission:
+  three cards for one Write, three expiries, three denials back to the terminal.
+  The ask is now identified by what it actually carries on both ends —
+  `(session_id, prompt_id, tool_name, canonical(tool_input))` — with a repeat
+  delivery joining the open hold and receiving the same answer. A payload
+  missing any field falls back to the old random id, since merging two
+  looks-alike asks is worse than two cards.
+- A remote permission no longer vanishes after exactly five seconds. The hook
+  forwarder's `http.request` named no agent, so it inherited `http.globalAgent`
+  — which Node 19+ gives a 5s socket timeout — and overrode
+  `permissionRequestTimeoutMs: 0`, the setting that means "hold until someone
+  answers", with a deadline nobody chose and nobody could configure. Claude Code
+  then fell back to its own terminal prompt. Measured on the live session: three
+  attempts, 1934→1939, 1940→1944, 1944→1949, `client_disconnected` every time.
+- A trailing thinking block no longer re-opens a finished turn. A turn routinely
+  arrives as `agent.task.started → task_result_ready → agent.thinking →
+  agent.text`, and reading that last block as a fresh turn start re-latched a
+  finished turn to "running" — so the App showed a stop button for an idle
+  Agent. `agent.thinking` may now lift an active turn, never open one.
+- Revoking a device or rotating its key no longer invalidates signatures that
+  device had already made. Trust is judged at signing time — was the signer
+  trusted *when it signed* — rather than whether it is trusted now, which had
+  retroactively voided the admission policy every other device vouches for: the
+  CLI alone stopped relaying while the App kept working.
+- A trust event no longer wedges the conversation silently. The sender still
+  holds the session an `e2ee.sessions.reset` arrived on, so its next envelope was
+  read as a first one and refused, and the session stayed stuck until the App's
+  half was reaped half an hour later. The sender is now told to drop its half
+  instead.
+
+### Upgrade notes
+
+- **The daemon listens on all interfaces after upgrading.** 0.5.0 bound
+  `127.0.0.1`; 0.5.1 binds `0.0.0.0` with LAN access on. This is deliberate —
+  a loopback bind put the three token-free E2EE routes where no device but this
+  one could reach them, which is why pairing from a phone never worked — but it
+  is a real change in posture, so: the bearer token is still the wall and
+  everything else on the socket answers 401, and the token-free routes
+  (`/local/e2ee/session`, `/local/e2ee/messages`, `/local/pair/redeem`) are
+  authenticated cryptographically by device identity, not by possession of the
+  file. To go back to loopback, set the bind address explicitly —
+  `originrouter local config set --bind 127.0.0.1 --allow-lan off` — which is
+  now recorded as your choice rather than as a note of what the default
+  happened to be, so a later upgrade will not undo it. An install that never
+  chose anything picks up the new default on its own and needs no action.
+- `local api pair` no longer accepts `--line`, `--json`, and no longer prints an
+  8-character code. Scan the QR or paste the printed line; the App's pairing
+  import field takes the line, and the code field is gone from both sides.
+- `agent.interactionTimeoutMs` defaults to `0`, which is a change from the 315s
+  ceiling it replaces. If you relied on that ceiling to unstick a request whose
+  device had gone away, set it explicitly — but note the old behaviour it
+  replaced also told the agent you had declined.
+
 ## 0.5.0 - 2026-10-08
 
 ### Added
