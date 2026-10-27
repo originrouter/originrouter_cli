@@ -61,6 +61,13 @@ function turnStateForEvent(event, fallback = "unknown") {
     "session_failed",
     "session_stopped",
     "session_terminated",
+    // The process itself ended. The turn is over with it — there is nothing
+    // left to interrupt — and the App reads this projection to decide
+    // whether to show the stop button. Without these two the session kept
+    // saying `running` after its runtime was gone.
+    "session.exited",
+    "session.error",
+    "session_runtime_error",
   ].includes(type)) return "idle";
   if ([
     "agent.interaction.applied",

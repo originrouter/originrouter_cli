@@ -716,6 +716,27 @@ export async function runLocalAgentSession(agent, rawArgs) {
     await drainStructuredEvents().catch(() => {});
     await interactions.cancelAll("session_stopped");
     cleanup();
+    // The process's own end, told to the device's event tail.
+    //
+    // The App's transcript reads the tail, and the tail used to stop at the
+    // last thing the run said. When the process died — a crash, a kill, a
+    // closed terminal — the App's last word was still `agent.task.started`,
+    // so it kept a turn latched as open and showed the **stop** button for a
+    // session that had nothing left to stop. The session row knew the process
+    // was gone; the transcript did not, and the transcript is what draws the
+    // button.
+    //
+    // It has to go out before the bridge closes: `close()` flushes what is
+    // pending and unregisters the session, and a closed bridge delivers
+    // nothing.
+    await localAgentBridge?.sendEvent({
+      type: "session.exited",
+      provider: agent,
+      runtime: metadata?.runtime ?? null,
+      sessionId,
+      code: code ?? null,
+      signal: signal ?? null,
+    });
     await localAgentBridge?.close(signal ? "stopped" : "completed");
     localAgentBridge = null;
     const exitedAt = new Date().toISOString();
@@ -834,6 +855,17 @@ export async function runLocalAgentSession(agent, rawArgs) {
     onError: (error) => {
       send("session.error", { message: error.message });
       report("session.error", { message: error.message });
+      // The same fact, into the tail the App reads. The relay frame and the
+      // server's report both go to the cloud; the App's transcript reads the
+      // device's own tail, and without this the runtime's death was a thing
+      // the cloud knew and the transcript did not.
+      void localAgentBridge?.sendEvent({
+        type: "session.error",
+        provider: agent,
+        runtime: metadata?.runtime ?? null,
+        sessionId,
+        message: error.message,
+      });
       console.error(error.message);
     },
   });

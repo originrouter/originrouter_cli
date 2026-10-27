@@ -310,4 +310,33 @@ assert.equal(registry.list()[0].status, "stopped");
   assert.equal(turns.list()[0].turn_state, "idle");
 }
 
+{
+  // The process's own end ends the turn, and it says so in the tail.
+  //
+  // The App's transcript reads the tail, and the tail used to stop at the
+  // last thing the run said. When the process died the App's last word was
+  // still `agent.task.started`, so it kept a turn latched as open and showed
+  // the **stop** button for a session with nothing left to stop.
+  let clock = 6_000_000;
+  const exits = new ExternalAgentRegistry({ now: () => clock });
+  exits.register({ sessionId: "exit-1", agent: "claude" });
+  exits.appendEvent("exit-1", { type: "agent.task.started" });
+  assert.equal(exits.list()[0].turn_state, "running");
+
+  exits.appendEvent("exit-1", { type: "session.exited", code: 0 });
+  assert.equal(exits.list()[0].turn_state, "idle");
+
+  // The same for a runtime that reported an error.
+  exits.appendEvent("exit-1", { type: "agent.task.started" });
+  assert.equal(exits.list()[0].turn_state, "running");
+  exits.appendEvent("exit-1", { type: "session.error", message: "boom" });
+  assert.equal(exits.list()[0].turn_state, "idle");
+
+  // And the fact itself is in the tail, where the App reads it.
+  const tail = exits.eventsAfter(0);
+  const types = tail.events.map((event) => event.type);
+  assert.ok(types.includes("session.exited"));
+  assert.ok(types.includes("session.error"));
+}
+
 console.log("external agent registry tests ok");
