@@ -11,6 +11,20 @@ export function getClaudeProjectPath(cwd) {
   return join(claudeConfigDir, "projects", projectId);
 }
 
+/// The marker Claude Code writes into its transcript when the reader stops a
+/// turn from the terminal (Ctrl+C).
+///
+/// The text is the CLI's own, and it is the only trace of the interrupt: no
+/// terminal event reaches the device when the reader presses the key in the
+/// terminal. So the marker has to be read for what it is — the end of a turn.
+export function isInterruptMarker(text) {
+  const value = String(text || "").trim();
+  return (
+    value === "[Request interrupted by user]" ||
+    value === "[Request interrupted by user and no further input requested]"
+  );
+}
+
 export function mapClaudeJsonLine(line) {
   let raw;
   try {
@@ -58,6 +72,27 @@ export function mapClaudeJsonLine(line) {
         eventId: message.messageId,
         createdAt: message.createdAt,
       });
+      // An interrupted turn is a **turn that ended**, and the file records
+      // that as a user message carrying the marker. Read as a message it is
+      // only a line of text; read as what it is, it is the end of the turn —
+      // and the turn's end is what the whole run state hangs on: the daemon
+      // latches `turn_state` from turn events alone, so a run interrupted
+      // from the terminal stayed latched to `running` and the App kept
+      // offering a **stop** button for a run that had already been stopped.
+      //
+      // The terminal event is what clears the latch. The marker itself is
+      // still published as a message, so the conversation keeps the record of
+      // what happened (the App drops that line from the flow — it is a
+      // control signal, not something anyone said).
+      if (isInterruptMarker(message.text)) {
+        events.push({
+          type: "agent.task.aborted",
+          eventId: `claude_${String(raw.uuid || message.messageId).slice(0, 80)}_aborted`,
+          createdAt: message.createdAt,
+          summary: "Turn interrupted",
+          reason: message.text,
+        });
+      }
     }
     if (Array.isArray(content)) {
       for (const block of content) {
