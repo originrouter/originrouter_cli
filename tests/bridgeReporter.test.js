@@ -166,6 +166,52 @@ test("Agent Activity metadata retries without source times for an old server", a
   assert.equal("last_activity_at" in bodies[1], false);
 });
 
+test("the report carries the link to the session the run belongs to", () => {
+  // The device is the only side that knows both ids: the run was started
+  // under a session id, and the conversation is the book that run lives in.
+  const payload = buildAgentConversationMetadata({
+    conversationId: "agc_7d2Lp0",
+    sessionId: "ags_9F3kQ2",
+    agentType: "claude",
+    title: "Fix the callback",
+  });
+
+  assert.equal(payload.session_id, "ags_9F3kQ2");
+});
+
+test("a server that does not know the link still gets the report", async () => {
+  // The cloud may be older than the device. Its schema forbids fields it
+  // does not know, so the report is sent again without the link — and the
+  // sync is not told the timestamp protocol is unavailable, because the
+  // timestamps were never dropped.
+  const bodies = [];
+  const result = await reportAgentConversationMetadata(
+    {
+      conversationId: "agc_7d2Lp0",
+      sessionId: "ags_9F3kQ2",
+      agentType: "claude",
+      createdAt: "2026-07-01T02:00:00Z",
+    },
+    {
+      stateDir: "/tmp/originrouter-missing-auth",
+      ensureFreshAccessTokenFn: async () => makeOAuthCredential({ deviceId: "device-1" }),
+      fetchFn: async (_url, options) => {
+        bodies.push(JSON.parse(options.body));
+        return bodies.length === 1
+          ? { ok: false, status: 422 }
+          : { ok: true, status: 200 };
+      },
+    },
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.legacyFallback, false);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].session_id, "ags_9F3kQ2");
+  assert.equal("session_id" in bodies[1], false);
+  assert.equal(bodies[1].created_at, "2026-07-01T02:00:00.000Z");
+});
+
 test("reportRuntimeEvent fails closed without coding auth", async () => {
   const result = await reportRuntimeEvent(
     buildRuntimeEventEnvelope({

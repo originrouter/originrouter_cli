@@ -729,6 +729,12 @@ export class AgentCatalog {
              w.canonical_path AS workspace_path, w.repo_root,
              r.device_id, r.device_name, r.runtime, r.provider, r.model,
              r.permission_profile, r.status, r.started_at, r.exited_at,
+             -- The session this conversation's current run belongs to. The
+             -- run knows the session id it was started under, and the
+             -- conversation knows the run. Without this the link between a
+             -- conversation and its session exists only for the runs this
+             -- device started itself.
+             r.originrouter_session_id AS session_id,
              (SELECT COUNT(*) FROM agent_artifacts a
               WHERE a.conversation_id = c.conversation_id) AS artifact_count
       FROM agent_conversations c
@@ -837,6 +843,12 @@ export class AgentCatalog {
              w.canonical_path AS workspace_path, w.repo_root,
              r.device_id, r.device_name, r.runtime, r.provider, r.model,
              r.permission_profile, r.status, r.started_at, r.exited_at,
+             -- The session this conversation's current run belongs to. The
+             -- run knows the session id it was started under, and the
+             -- conversation knows the run. Without this the link between a
+             -- conversation and its session exists only for the runs this
+             -- device started itself.
+             r.originrouter_session_id AS session_id,
              (SELECT COUNT(*) FROM agent_artifacts a
               WHERE a.conversation_id = c.conversation_id) AS artifact_count
       ${joins}
@@ -888,9 +900,25 @@ export class AgentCatalog {
 
   getConversation(conversationId) {
     const id = safeText(conversationId, 96);
-    const conversation = this.listConversations({ limit: MAX_LIMIT, includeArchived: true })
-      .find((item) => item.conversation_id === id);
+    const conversations = this.listConversations({ limit: MAX_LIMIT, includeArchived: true });
+    let conversation = conversations.find((item) => item.conversation_id === id);
+    if (!conversation) {
+      // The App reopens a run by the session id it was given, and for a run
+      // the App started itself that is not the conversation's id. The run
+      // knows both, so the run is where the second id is found.
+      const run = this.db.prepare(`
+        SELECT conversation_id FROM agent_runs
+        WHERE originrouter_session_id = ?
+        ORDER BY started_at DESC, rowid DESC LIMIT 1
+      `).get(id);
+      if (run?.conversation_id) {
+        conversation = conversations.find(
+          (item) => item.conversation_id === run.conversation_id,
+        );
+      }
+    }
     if (!conversation) return null;
+    const catalogConversationId = conversation.conversation_id;
     return {
       ...conversation,
       runs: this.db.prepare(`
@@ -899,13 +927,13 @@ export class AgentCatalog {
                started_at, exited_at, exit_code, exit_signal
         FROM agent_runs WHERE conversation_id = ?
         ORDER BY started_at DESC, rowid DESC
-      `).all(id),
+      `).all(catalogConversationId),
       artifacts: this.db.prepare(`
         SELECT artifact_id, kind, locator, display_value,
                first_seen_at, last_seen_at
         FROM agent_artifacts WHERE conversation_id = ?
         ORDER BY last_seen_at DESC
-      `).all(id),
+      `).all(catalogConversationId),
     };
   }
 

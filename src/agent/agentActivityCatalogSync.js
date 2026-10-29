@@ -1,8 +1,9 @@
 import { reportAgentConversationMetadata } from "./bridgeReporter.js";
 
 // Bump the cursor namespace when the projected metadata contract changes so
-// existing conversations are replayed once and receive workspace_display_path.
-const SYNC_META_KEY = "agent_activity_cloud_sync_v4";
+// existing conversations are replayed once and receive workspace_display_path
+// and the link to the session their current run belongs to.
+const SYNC_META_KEY = "agent_activity_cloud_sync_v5";
 const PAGE_SIZE = 200;
 
 function safeText(value, maxLength = 4096) {
@@ -43,13 +44,21 @@ function hasRecallContent(conversation) {
     || safeText(conversation?.last_message_preview)
     // Workspace display paths are also user-visible catalog metadata. They
     // must backfill even for sessions that have no safe prompt/summary text.
-    || safeText(conversation?.workspace_display_path),
+    || safeText(conversation?.workspace_display_path)
+    // The link to the session this conversation's current run belongs to.
+    // Without it the cloud cannot tell which run a conversation belongs to,
+    // and the App cannot find a conversation by the session id it was given.
+    || safeText(conversation?.session_id, 64),
   );
 }
 
 export function agentActivityMetadataFromCatalog(conversation = {}) {
   return {
     conversationId: safeText(conversation.conversation_id, 96),
+    // The session this conversation's current run belongs to. The device is
+    // the only side that knows both ids: the run was started under a
+    // session id, and the conversation is the book that run lives in.
+    sessionId: safeText(conversation.session_id, 64),
     agentType: safeText(conversation.agent_type, 32) || "unknown",
     nativeSessionId: safeText(conversation.native_session_id, 191),
     title: safeText(conversation.title, 191) || "Agent session",

@@ -164,6 +164,10 @@ function publicConversation(row) {
   const permissionState = row.permission_state_json ? JSON.parse(row.permission_state_json) : null;
   return {
     conversation_id: row.conversation_id,
+    // The session this conversation's current run belongs to. A conversation
+    // can be resumed many times, so the run is the one that says which
+    // session is current now.
+    session_id: row.session_id || "",
     agent_type: row.agent_type,
     native_session_id: row.native_session_id || "",
     title: row.title,

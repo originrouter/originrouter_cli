@@ -409,6 +409,11 @@ export function buildAgentConversationMetadata(payload = {}) {
   const archivedAt = safeIsoTimestamp(payload.archivedAt || payload.archived_at);
   return {
     conversation_id: safeText(payload.conversationId || payload.conversation_id, 96),
+    // The session this conversation's current run belongs to. The device is
+    // the only side that knows both ids — the run was started under a
+    // session id, and the conversation is the book that run lives in — so
+    // the link travels with the report.
+    session_id: safeText(payload.sessionId || payload.session_id, 64),
     agent_type: safeText(payload.agentType || payload.agent_type, 32) || "unknown",
     native_session_id: safeText(payload.nativeSessionId || payload.native_session_id, 191),
     title: redactAgentActivityText(payload.title, 191) || "Agent session",
@@ -494,16 +499,34 @@ export async function reportAgentConversationMetadata(payload, {
       await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
     }
     let legacyFallback = false;
-    if (
-      resp.status === 422
-      && (body.created_at || body.last_activity_at || body.archived_at)
-    ) {
-      const legacyBody = { ...body };
-      delete legacyBody.created_at;
-      delete legacyBody.last_activity_at;
-      delete legacyBody.archived_at;
-      resp = await send(legacyBody);
-      legacyFallback = resp.ok;
+    if (resp.status === 422) {
+      // A 422 means the server refused the shape of the report, and its
+      // schema forbids fields it does not know. Two things can be unknown
+      // to it: the link to the session, and the source timestamps.
+      //
+      // The link goes first. It is the newer field, and a report without it
+      // is still a report — the device's own fact, which the cloud asks
+      // again on the next one. The timestamps say when the conversation was
+      // last alive, and dropping those is what stops the sync.
+      let candidate = body;
+      if (candidate.session_id) {
+        candidate = { ...candidate };
+        delete candidate.session_id;
+        resp = await send(candidate);
+      }
+      if (
+        resp.status === 422
+        && (candidate.created_at
+          || candidate.last_activity_at
+          || candidate.archived_at)
+      ) {
+        const legacyBody = { ...candidate };
+        delete legacyBody.created_at;
+        delete legacyBody.last_activity_at;
+        delete legacyBody.archived_at;
+        resp = await send(legacyBody);
+        legacyFallback = resp.ok;
+      }
     }
     return { ok: resp.ok, status: resp.status, legacyFallback };
   } catch {

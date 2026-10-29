@@ -348,6 +348,45 @@ for (const id of ["collab-conversation-1", "explicit-worker-conversation"]) {
   ), false, "paged history must apply the same isolation");
 }
 
+// A run the App started itself: the session id and the conversation id are
+// two different strings, and the run is the only thing that knows both.
+catalog.upsertSession({
+  sessionId: "ags_app_started",
+  conversationId: "agc_app_started",
+  runId: "app-started-run",
+  agent: "claude",
+  title: "App started",
+  deviceId: "server-2",
+  cwd: stateDir,
+  status: "completed",
+  exitedAt: "2026-07-24T00:05:00Z",
+});
+const linked = catalog.listConversations({ includeArchived: true })
+  .find((item) => item.conversation_id === "agc_app_started");
+assert.equal(
+  linked.session_id,
+  "ags_app_started",
+  "a conversation says which session its current run belongs to",
+);
+assert.equal(
+  catalog.listConversationPage({
+    collection: "history",
+    search: "App started",
+    page: 1,
+    pageSize: 20,
+    autoArchiveDays: 0,
+  }).conversations[0].session_id,
+  "ags_app_started",
+  "the paged history carries the link too",
+);
+// The App reopens a run by the session id it was given, and for a run it
+// started itself that is not the conversation's id.
+assert.equal(
+  catalog.getConversation("ags_app_started").conversation_id,
+  "agc_app_started",
+  "a conversation can be found by the session id it belongs to",
+);
+
 catalog.close();
 
 const reopened = new AgentCatalog({ stateDir, now });

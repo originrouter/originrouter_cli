@@ -123,3 +123,43 @@ test("Agent Activity catalog projection excludes local-only locators", () => {
   assert.equal("workspacePath" in projected, false);
   assert.equal("transcriptLocator" in projected, false);
 });
+
+test("the projection carries the link to the session the run belongs to", () => {
+  // The device is the only side that knows both ids, so the link travels
+  // with the report. Without it the cloud can only guess which run a
+  // conversation belongs to.
+  const projected = agentActivityMetadataFromCatalog(
+    conversation("linked", "2026-07-01T00:00:00.000Z", {
+      session_id: "ags_9F3kQ2",
+    }),
+  );
+  assert.equal(projected.sessionId, "ags_9F3kQ2");
+});
+
+test("a conversation with a link and no text is still reported", async () => {
+  // The link is user-visible catalog metadata, like the display path: a
+  // conversation with nothing to say about itself still has to say which
+  // session it belongs to.
+  const catalog = fakeCatalog([
+    conversation("linked-only", "2026-07-01T00:00:00.000Z", {
+      summary: "",
+      first_prompt_preview: "",
+      last_message_preview: "",
+      workspace_display_path: "",
+      session_id: "ags_9F3kQ2",
+    }),
+  ]);
+  const reported = [];
+  const result = await syncAgentActivityCatalog({
+    catalog,
+    stateDir: "/tmp/originrouter-test",
+    reportFn: async (payload) => {
+      reported.push(payload);
+      return { ok: true, status: 200 };
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.synced, 1);
+  assert.equal(result.skipped, 0);
+  assert.equal(reported[0].sessionId, "ags_9F3kQ2");
+});
