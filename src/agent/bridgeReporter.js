@@ -88,7 +88,7 @@ export function buildRuntimeEventEnvelope({
     // writes it when non-empty, so the empty reports that precede it cannot
     // erase a value recorded by an earlier run of the same session.
     ...(native ? { native_session_id: native } : {}),
-    title: safeText(title, 191),
+    title: safeText(typeof title === "function" ? title() : title, 191),
     device_name: safeText(deviceName, 191),
     ...(safeText(workspaceDisplayPath, 4096)
       ? { workspace_display_path: safeText(workspaceDisplayPath, 4096) }
@@ -412,6 +412,10 @@ export function buildAgentConversationMetadata(payload = {}) {
     agent_type: safeText(payload.agentType || payload.agent_type, 32) || "unknown",
     native_session_id: safeText(payload.nativeSessionId || payload.native_session_id, 191),
     title: redactAgentActivityText(payload.title, 191) || "Agent session",
+    // Whether a person chose this title. Without it the cloud cannot tell a
+    // rename from an automatic title, and a later automatic title would
+    // silently undo the rename.
+    title_is_custom: payload.titleIsCustom === true || payload.title_is_custom === true,
     summary: redactAgentActivityText(payload.summary, 4096),
     first_prompt_preview: redactAgentActivityText(
       payload.firstPromptPreview || payload.first_prompt_preview,

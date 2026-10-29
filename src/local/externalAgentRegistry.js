@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { defaultConversationTitle } from "../agent/agentTitleSource.js";
 import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
 
 import { readClaudeConversationHistory } from "../runtime/claudeConversationHistory.js";
@@ -236,8 +237,11 @@ export class ExternalAgentRegistry {
         || isCollaborationSessionPayload({ ...payload, sessionId })
         ? "collaboration" : "interactive",
       agent: safeText(payload?.agent, 32) || "unknown",
+      // A session registers before it has a title of its own, so the
+      // placeholder stands until the agent produces one.
       title:
-        safeText(payload?.title, 191) || `${payload?.agent || "Agent"} session`,
+        safeText(payload?.title, 191)
+        || defaultConversationTitle(payload?.agent || "Agent"),
       deviceId: safeText(payload?.deviceId, 191),
       deviceName: safeText(payload?.deviceName, 191),
       cwd: safeText(payload?.cwd, 1024),
@@ -379,6 +383,12 @@ export class ExternalAgentRegistry {
       session.transcriptPath = safeText(payload.transcriptPath, 4096);
     }
     if (payload.status) session.status = safeText(payload.status, 32);
+    // The title the agent produced, once it has one. The session's own copy
+    // is what the rail falls back to when the conversation row has nothing
+    // better to say.
+    if (payload.title !== undefined) {
+      session.title = safeText(payload.title, 191) || session.title;
+    }
     if (payload.turnState || payload.turn_state) {
       session.turnState = safeText(payload.turnState || payload.turn_state, 32);
     }

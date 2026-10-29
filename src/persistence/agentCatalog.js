@@ -11,6 +11,10 @@ import Database from "better-sqlite3";
 
 import { ensureStateDir } from "./state.js";
 import { activeAccountStateDir } from "./accounts.js";
+import {
+  defaultConversationTitle,
+  looksLikePlaceholderTitle,
+} from "../agent/agentTitleSource.js";
 import { isCollaborationSessionPayload } from "../runtime/agentSessionKind.js";
 import {
   preflightUnattendedWorkspaceAuthorization,
@@ -332,11 +336,21 @@ export class AgentCatalog {
       ? stableId("agent_run", requestedRunId, sessionId)
       : requestedRunId;
     const agent = safeText(payload.agent || payload.agentType, 32) || "unknown";
-    const defaultTitle = `${agent} session`;
+    const defaultTitle = defaultConversationTitle(agent);
     const requestedTitle = safeText(payload.title, 256);
     const title = requestedTitle || defaultTitle;
+    // Whether this title is one of our own placeholders. A placeholder is a
+    // title we wrote, not one anybody chose — and it must be marked as such,
+    // or it latches as a custom title and can never be replaced by the title
+    // the agent actually produced.
+    //
+    // "Claude Code" used to land here as a *custom* title: the agent's own
+    // name in the title slot, which no rule recognised as a placeholder. Once
+    // latched, the conversation could never show anything else.
     const titleIsCustom = payload.titleIsCustom === true
-      || (requestedTitle && requestedTitle.toLowerCase() !== defaultTitle.toLowerCase());
+      || (payload.titleIsCustom !== false
+        && requestedTitle !== ""
+        && !looksLikePlaceholderTitle(requestedTitle, agent));
     const deviceId = safeText(payload.deviceId, 191);
     const cwd = canonicalPath(payload.cwd);
     const workspaceId = cwd
@@ -385,6 +399,26 @@ export class AgentCatalog {
           title = CASE
             WHEN excluded.title_is_custom = 1 THEN excluded.title
             WHEN agent_conversations.title_is_custom = 1 THEN agent_conversations.title
+            -- A placeholder never displaces a real title. This is the rule
+            -- that lets a conversation recover: the placeholder written at
+            -- launch gives way to the title the agent produced.
+            --
+            -- Both sides are judged by the title itself rather than by a
+            -- stored flag, so a row written before this rule existed is
+            -- judged correctly the first time it is written again.
+            WHEN LOWER(TRIM(excluded.title)) IN (
+                'agent session',
+                CONCAT(LOWER(excluded.agent_type), ' session'),
+                CONCAT(LOWER(excluded.agent_type), ' code'),
+                LOWER(excluded.agent_type)
+              )
+              AND LOWER(TRIM(agent_conversations.title)) NOT IN (
+                'agent session',
+                CONCAT(LOWER(agent_conversations.agent_type), ' session'),
+                CONCAT(LOWER(agent_conversations.agent_type), ' code'),
+                LOWER(agent_conversations.agent_type)
+              )
+              THEN agent_conversations.title
             WHEN excluded.title <> '' THEN excluded.title
             ELSE agent_conversations.title
           END,
@@ -457,7 +491,7 @@ export class AgentCatalog {
 
   updateSession(sessionId, payload = {}) {
     const current = this.db.prepare(`
-      SELECT r.*, c.agent_type, c.title, c.workspace_id,
+      SELECT r.*, c.agent_type, c.title, c.title_is_custom, c.workspace_id,
              w.canonical_path AS cwd
       FROM agent_runs r
       JOIN agent_conversations c ON c.conversation_id = r.conversation_id
@@ -469,7 +503,18 @@ export class AgentCatalog {
       conversationId: payload.conversationId || current?.conversation_id,
       runId: current?.run_id,
       agent: current?.agent_type,
-      title: current?.title,
+      // The title a runtime reports is the one it just learned — the agent's
+      // own title, once it has one. Without this the update would keep
+      // re-asserting the stored title and the conversation would never move
+      // off the placeholder it was launched with.
+      title: payload.title !== undefined
+        ? safeText(payload.title, 256)
+        : current?.title,
+      // A title is custom only when somebody chose it. The stored flag
+      // carries that across updates; the caller can override it.
+      titleIsCustom: payload.titleIsCustom !== undefined
+        ? payload.titleIsCustom === true
+        : Boolean(current?.title_is_custom),
       cwd: payload.cwd || current?.cwd,
       deviceId: payload.deviceId || current?.device_id,
       deviceName: payload.deviceName || current?.device_name,

@@ -11,6 +11,12 @@ import {
   updateAgentActivitySnapshot,
 } from "../agent/bridgeReporter.js";
 import { createAdapter } from "../adapters/createAdapter.js";
+import {
+  defaultConversationTitle,
+  looksLikePlaceholderTitle,
+  readAgentSessionTitle,
+  safeTitleText,
+} from "../agent/agentTitleSource.js";
 import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
 import {
   buildAgentProviderEnv,
@@ -260,6 +266,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
   let finalizing = false;
   let shutdownRequested = false;
   let scanTimer = null;
+  let titleTimer = null;
   let signalFallbackTimer = null;
   let stopApprovalPolling = () => {};
   let stopSessionHeartbeat = () => {};
@@ -334,6 +341,37 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // getter closes over it; a `let` below the reporter would be a TDZ error on
   // the first report.
   let nativeSessionId = "";
+  // The title the agent gives the conversation, once it has one, and the
+  // title this session was launched with. Neither is final until the agent
+  // speaks: Claude Code writes an `ai-title` record into the transcript and
+  // Codex writes a thread name into its session index, both a turn or two
+  // in. Until then the placeholder stands — which is the truth, and better
+  // than a title nobody chose.
+  //
+  // A title the launcher asked for is only kept when it is not one of our
+  // own placeholders: "Claude Code" in the title slot is the agent's name,
+  // not a name for this conversation.
+  const requestedTitle = looksLikePlaceholderTitle(options.title, agent)
+    ? ""
+    : safeTitleText(options.title);
+  let agentTitle = "";
+  const sessionTitle = () => agentTitle || requestedTitle || defaultConversationTitle(agent);
+  let lastTitleProbeAt = 0;
+  const refreshAgentTitle = ({ force = false } = {}) => {
+    const now = Date.now();
+    if (!force && now - lastTitleProbeAt < 750) return agentTitle;
+    lastTitleProbeAt = now;
+    const found = readAgentSessionTitle({
+      agentType: agent,
+      transcriptPath: typeof adapter.getTranscriptPath === "function"
+        ? adapter.getTranscriptPath()
+        : "",
+      nativeSessionId,
+    });
+    if (!found || found === agentTitle) return agentTitle;
+    agentTitle = found;
+    return agentTitle;
+  };
   const runtimeReporter = createRuntimeEventReporter({
     sessionId,
     agentType: agent,
@@ -341,7 +379,10 @@ export async function runLocalAgentSession(agent, rawArgs) {
     // frame, or an `agent.session.start` from the provider), and every report
     // after that should carry it.
     nativeSessionId: () => nativeSessionId,
-    title: `${agent} session`,
+    // Read lazily for the same reason: the agent names the conversation
+    // partway through the run, and every report after that must carry the
+    // name it has now — not the one it had when the reporter was built.
+    title: () => sessionTitle(),
     deviceName: device.displayName || device.host,
     workspaceDisplayPath: workspaceDisplayPath(cwd),
     stateDir: ensureStateDir(),
@@ -654,6 +695,10 @@ export async function runLocalAgentSession(agent, rawArgs) {
       clearInterval(scanTimer);
       scanTimer = null;
     }
+    if (titleTimer) {
+      clearInterval(titleTimer);
+      titleTimer = null;
+    }
     if (typeof adapter.cleanup === "function") {
       adapter.cleanup();
     }
@@ -804,11 +849,18 @@ export async function runLocalAgentSession(agent, rawArgs) {
         });
   const modeList = initialModeStatus.availableModes;
   syncCatalog = (status) => {
+    // The agent may have named the conversation since the last sync. Reading
+    // it here means every sync carries the newest name, however often it
+    // happens.
+    refreshAgentTitle();
     const snapshot = {
       conversationId,
       agentType: agent,
       nativeSessionId,
-      title: `${agent} session`,
+      title: sessionTitle(),
+      // The agent's title is not a title somebody chose. It may be replaced
+      // by a better one, and it must never displace a rename.
+      titleIsCustom: false,
       status,
       workspaceId: options.workspaceId,
       workspaceName: basename(cwd),
@@ -829,6 +881,15 @@ export async function runLocalAgentSession(agent, rawArgs) {
     );
     catalogSyncTail = pending.catch(() => ({ ok: false }));
     return pending;
+  };
+  // The agent's name, once it has one, has to reach the local catalog as
+  // well: the desktop's rail reads it from there, not from the cloud.
+  const publishAgentTitle = async () => {
+    const before = agentTitle;
+    refreshAgentTitle();
+    if (!agentTitle || agentTitle === before) return;
+    await localAgentBridge?.update({ title: sessionTitle() });
+    await syncCatalog("running");
   };
   const started = await executor.start({
     command: launch.command,
@@ -888,6 +949,11 @@ export async function runLocalAgentSession(agent, rawArgs) {
     pid: started.pid,
     startedBy: "local-wrapper",
   });
+  // A resumed session already carries a name — the agent wrote it into its
+  // transcript the last time it ran — so the row that announces the session
+  // names it the way the reader knows it, instead of starting from the
+  // placeholder.
+  refreshAgentTitle({ force: true });
   await report("session.started", {
     runtime,
     executor: started.executor,
@@ -941,7 +1007,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     conversationId,
     runId: options.runId || sessionId,
     agent,
-    title: `${agent} session`,
+    title: sessionTitle(),
     deviceId: effectiveDeviceId,
     deviceName: device.displayName || device.host,
     cwd,
@@ -1044,6 +1110,12 @@ export async function runLocalAgentSession(agent, rawArgs) {
       void drainStructuredEvents();
     }, 1000);
   }
+
+  // The agent names the conversation on disk, and nothing announces it: the
+  // title is polled on its own beat, and picked up the moment it lands.
+  titleTimer = setInterval(() => {
+    void publishAgentTitle();
+  }, 1000);
 
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true);

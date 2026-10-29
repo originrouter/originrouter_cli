@@ -53,6 +53,9 @@ export function agentActivityMetadataFromCatalog(conversation = {}) {
     agentType: safeText(conversation.agent_type, 32) || "unknown",
     nativeSessionId: safeText(conversation.native_session_id, 191),
     title: safeText(conversation.title, 191) || "Agent session",
+    // Whether a person chose this title. A title the agent produced is not
+    // one, and must never displace a rename on the server either.
+    titleIsCustom: conversation.title_is_custom === true,
     summary: safeText(conversation.summary, 4096),
     firstPromptPreview: safeText(conversation.first_prompt_preview, 1024),
     lastMessagePreview: safeText(conversation.last_message_preview, 1024),

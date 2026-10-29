@@ -228,6 +228,13 @@ export function extractOriginRouterOptions(args) {
       index += 1;
       continue;
     }
+    // The title is ours, not the agent's: the agent names the conversation
+    // itself, and this is only the name the launcher already knows.
+    if (arg === "--originrouter-title") {
+      options.title = args[index + 1];
+      index += 1;
+      continue;
+    }
     if (arg === "--provider") {
       options.provider = args[index + 1];
       index += 1;

@@ -7,6 +7,10 @@ import {
   isCodexAppServerAvailable,
 } from "../adapters/codex/appServerClient.js";
 import { mapCodexAppServerEvent } from "../adapters/codex/eventMapper.js";
+import {
+  looksLikePlaceholderTitle,
+  safeTitleText,
+} from "../agent/agentTitleSource.js";
 import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
 import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
 import {
@@ -214,9 +218,18 @@ export async function runCodexAppServerSession(rawArgs) {
     providerResult.routes?.main?.model ||
     providerResult.provider?.model ||
     model;
-  const sessionTitle = String(options.title || "Codex session")
-    .trim()
-    .slice(0, 191);
+  // The title this session starts with: whatever the launcher asked for, or
+  // our own placeholder. It is not the end of the story — Codex names the
+  // thread itself, and that name is the one a reader wants to see.
+  //
+  // A title the launcher asked for is only kept when it is not one of our
+  // own placeholders: "Codex" in the title slot is the agent's name, not a
+  // name for this conversation.
+  const requestedTitle = looksLikePlaceholderTitle(options.title, "codex")
+    ? ""
+    : safeTitleText(options.title);
+  let agentTitle = "";
+  const sessionTitle = () => agentTitle || requestedTitle || "Codex session";
   const client = new CodexAppServerClient({
     // The RPC-level backstop for an unanswered approval, derived from the same
     // config value that stamps the interaction's own deadline plus the grace
@@ -232,7 +245,10 @@ export async function runCodexAppServerSession(rawArgs) {
     agentType: "codex",
     // The app-server's thread id, once `thread/start` returns it (line ~985).
     nativeSessionId: () => threadId || "",
-    title: sessionTitle,
+    // Read lazily: Codex names the thread partway through the run, and every
+    // report after that must carry the name it has now — not the one it had
+    // when the reporter was built.
+    title: () => sessionTitle(),
     deviceName: device.displayName || device.host,
     workspaceDisplayPath: workspaceDisplayPath(cwd),
     stateDir,
@@ -315,7 +331,10 @@ export async function runCodexAppServerSession(rawArgs) {
         conversationId: options.conversationId || sessionId,
         agentType: "codex",
         nativeSessionId: threadId,
-        title: sessionTitle,
+        title: sessionTitle(),
+        // The agent's title is not a title somebody chose. It may be replaced
+        // by a better one, and it must never displace a rename.
+        titleIsCustom: false,
         status,
         workspaceId: options.workspaceId,
         workspaceName: basename(cwd),
@@ -330,6 +349,22 @@ export async function runCodexAppServerSession(rawArgs) {
       },
       { stateDir },
     ).catch(() => ({ ok: false }));
+
+  // Codex names the thread itself, and says so: the app-server sends
+  // `thread/name/updated` when the name lands. Until then the placeholder
+  // stands — which is the truth, and better than a title nobody chose.
+  const setAgentTitle = (value) => {
+    const name = safeTitleText(value);
+    if (!name || name === agentTitle) return false;
+    agentTitle = name;
+    return true;
+  };
+  // The agent's name, once it has one, has to reach the local catalog as
+  // well: the desktop's rail reads it from there, not from the cloud.
+  const publishAgentTitle = async () => {
+    await localAgentBridge?.update({ title: sessionTitle() });
+    await syncCatalog("running");
+  };
 
   const send = (type, extra = {}) => {
     if (collaborationWorker || relayViaDaemon || !relayClient)
@@ -738,6 +773,16 @@ export async function runCodexAppServerSession(rawArgs) {
     // The app-server transport is initialized before the managed thread and
     // OriginRouter session exist. Emit one ready event only after thread/start.
     if (rawEvent.type === "codex.initialized") return;
+    // Codex names the thread itself, a turn or two in, and announces it.
+    // This is the conversation's real title, and it is the one the App shows.
+    if (rawEvent.type === "codex.notification" && rawEvent.method === "thread/name/updated") {
+      const notifiedThreadId = String(rawEvent.params?.threadId || "");
+      if (!threadId || !notifiedThreadId || notifiedThreadId === threadId) {
+        if (setAgentTitle(rawEvent.params?.threadName))
+          void publishAgentTitle();
+      }
+      return;
+    }
     if (rawEvent.type === "task_started")
       currentTurnId = rawEvent.turn_id || currentTurnId;
     if (rawEvent.type === "task_complete" || rawEvent.type === "turn_aborted")
@@ -996,6 +1041,11 @@ export async function runCodexAppServerSession(rawArgs) {
     threadId = thread?.thread?.id;
     if (!threadId)
       throw new Error("Codex app-server did not return a thread id.");
+    // A resumed thread already carries its name, and a fresh one may too.
+    // The App-server answers `thread/start` and `thread/resume` with the
+    // thread's own metadata, name included — so the title a conversation
+    // had before it was closed is available the moment it is reopened.
+    setAgentTitle(thread?.thread?.name);
     // Codex may select its configured default model when thread/start omits
     // one. Collaboration-mode settings require that resolved model to be an
     // explicit string, so retain the value returned by the App Server before
@@ -1062,7 +1112,7 @@ export async function runCodexAppServerSession(rawArgs) {
       conversationId: options.conversationId || sessionId,
       runId: options.runId || sessionId,
       agent: "codex",
-      title: sessionTitle,
+      title: sessionTitle(),
       deviceId: effectiveDeviceId,
       deviceName: device.displayName || device.host,
       cwd,

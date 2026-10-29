@@ -45,6 +45,11 @@ import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 import { LocalAgentBridgeClient } from "../local/localAgentBridgeClient.js";
 import { agentGatewayMcpConfig } from "../mcp/agentGatewayConfig.js";
 import {
+  defaultConversationTitle,
+  looksLikePlaceholderTitle,
+  readClaudeTranscriptTitle,
+} from "../agent/agentTitleSource.js";
+import {
   buildInteractionRequest,
   INTERACTION_KINDS,
   INTERACTION_SOURCES,
@@ -368,9 +373,20 @@ export async function runClaudeSdkSession(rawArgs) {
   const modelSelection = resolveClaudeSdkModelSelection(options, providerResult);
   let model = modelSelection.model;
   const messageQueue = new AsyncMessageQueue();
-  const sessionTitle = String(options.title || "Claude session")
-    .trim()
-    .slice(0, 191);
+  // The title this session starts with: whatever the launcher asked for, or
+  // our own placeholder. It is not the end of the story — Claude Code names
+  // the session itself once it has heard the first turn, and that name is the
+  // one a reader wants to see.
+  //
+  // A name the launcher offers counts only if somebody chose it. Ours — the
+  // App used to send "Claude Code" — is a placeholder, and a placeholder must
+  // never outrank the name the agent gives the session.
+  const requestedTitle = looksLikePlaceholderTitle(options.title, "claude")
+    ? ""
+    : String(options.title || "").trim().slice(0, 191);
+  let agentTitle = "";
+  const sessionTitle = () =>
+    agentTitle || requestedTitle || defaultConversationTitle("claude");
   const initialMessage = safeLaunchMessage(options.initialMessage);
   if (initialMessage) messageQueue.push(toUserMessage(initialMessage));
   const recentEvents = [];
@@ -382,7 +398,10 @@ export async function runClaudeSdkSession(rawArgs) {
     // Assigned on the first `agent.session.start` (line ~1143) — before that
     // the SDK has not named the conversation yet.
     nativeSessionId: () => claudeSessionId,
-    title: sessionTitle,
+    // Read lazily: the agent names the session partway through the run, and
+    // every report after that must carry the name it has now — not the one
+    // it had when the reporter was built.
+    title: () => sessionTitle(),
     deviceName: device.displayName || device.host,
     workspaceDisplayPath: workspaceDisplayPath(cwd),
     stateDir,
@@ -410,6 +429,26 @@ export async function runClaudeSdkSession(rawArgs) {
   let claudeSessionId =
     typeof options.resume === "string" ? options.resume : null;
   let transcriptPath = claudeTranscriptPathForSession(cwd, claudeSessionId);
+  // Claude Code names the session itself, and it does so *after* the first
+  // turn: the name lands in the transcript as an `ai-title` record. Until
+  // then there is no title, and the placeholder stands — which is the truth,
+  // and better than a title nobody chose.
+  //
+  // The name is read from the transcript rather than invented here, so the
+  // App shows the same words the terminal does.
+  let lastTitleProbeAt = 0;
+  const refreshAgentTitle = ({ force = false } = {}) => {
+    if (!transcriptPath) return agentTitle;
+    const now = Date.now();
+    // A turn fires several events; the transcript is read once per turn, not
+    // once per event.
+    if (!force && now - lastTitleProbeAt < 750) return agentTitle;
+    lastTitleProbeAt = now;
+    const found = readClaudeTranscriptTitle(transcriptPath);
+    if (!found || found === agentTitle) return agentTitle;
+    agentTitle = found;
+    return agentTitle;
+  };
   let stopped = false;
   let currentMode = options.permissionMode || "default";
   const invalidScopes = invalidAutonomyScopes(options.autonomyAllowedScopes);
@@ -460,14 +499,22 @@ export async function runClaudeSdkSession(rawArgs) {
   };
   let stopHeartbeat = () => {};
   const signalHandlers = new Map();
-  const syncCatalog = (status) => collaborationWorker
+  const syncCatalog = (status) => {
+    // The agent may have named the conversation since the last sync. Reading
+    // it here means every sync carries the newest name, however often it
+    // happens.
+    refreshAgentTitle();
+    return collaborationWorker
     ? Promise.resolve({ ok: true, skipped: true })
     : reportAgentConversationMetadata(
       {
         conversationId: options.conversationId || sessionId,
         agentType: "claude",
         nativeSessionId: claudeSessionId,
-        title: sessionTitle,
+        title: sessionTitle(),
+        // The agent's title is not a title somebody chose. It may be replaced
+        // by a better one, and it must never displace a rename.
+        titleIsCustom: false,
         status,
         workspaceId: options.workspaceId,
         workspaceName: basename(cwd),
@@ -482,6 +529,17 @@ export async function runClaudeSdkSession(rawArgs) {
       },
       { stateDir },
     ).catch(() => ({ ok: false }));
+  };
+
+  // The agent's name, once it has one, has to reach the local catalog as
+  // well: the desktop's rail reads it from there, not from the cloud.
+  const publishAgentTitle = async () => {
+    const before = agentTitle;
+    refreshAgentTitle();
+    if (!agentTitle || agentTitle === before) return;
+    await localAgentBridge?.update({ title: sessionTitle() });
+    await syncCatalog("running");
+  };
 
   const send = (type, extra = {}) => {
     if (collaborationWorker || relayViaDaemon || !relayClient)
@@ -1012,6 +1070,12 @@ export async function runClaudeSdkSession(rawArgs) {
       structuredSources: ["claude-agent-sdk"],
     },
   });
+  // A resumed session already has a name — Claude Code wrote it into the
+  // transcript the last time it ran — so the row that announces the session
+  // carries the name the reader knows it by, not the placeholder we would
+  // otherwise start from. The first turn's name would arrive a moment later;
+  // this one is already there.
+  refreshAgentTitle({ force: true });
   await report("session.started", { runtime: "claude-sdk", executor: "sdk" });
   if (initialMessage) {
     // The launch prompt bypasses the remote-message handler below, so mark it
@@ -1159,6 +1223,10 @@ export async function runClaudeSdkSession(rawArgs) {
           source: providerResult.source,
         }));
       }
+      // Claude Code names the conversation a turn or two in. When the name
+      // arrives, it has to reach both the App and the local catalog — until
+      // then the placeholder stands.
+      await publishAgentTitle();
     }
     if (!stopped) await stopSession(null);
   } catch (error) {
