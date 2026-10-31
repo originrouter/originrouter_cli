@@ -60,6 +60,8 @@ export class SessionManager {
     agentCatalog = null,
     managedAgentSupervisor = null,
     agentBudgetStore = null,
+    runtimeTaskStore = null,
+    runtimeSupervisor = null,
     onLocalControlChanged = null,
     stateDir = ensureStateDir(),
     compatibilityAutomaticUpdates = true,
@@ -79,6 +81,8 @@ export class SessionManager {
     this.agentCatalog = agentCatalog;
     this.managedAgentSupervisor = managedAgentSupervisor;
     this.agentBudgetStore = agentBudgetStore;
+    this.runtimeTaskStore = runtimeTaskStore;
+    this.runtimeSupervisor = runtimeSupervisor;
     this.onLocalControlChanged = onLocalControlChanged;
     this.stateDir = stateDir;
     this.compatibilityAutomaticUpdates = compatibilityAutomaticUpdates;
@@ -901,6 +905,32 @@ export class SessionManager {
   }
 
   handleEvent(payload) {
+    if (payload.type === "runtime_tasks.request") {
+      // The cards hold the messages a user wants sent to their Agents, so
+      // they travel only inside the E2EE envelope (see
+      // PROTECTED_DEVICE_MESSAGE_TYPES), like the approval policy calls.
+      const requestId = String(payload.requestId || "").slice(0, 96);
+      if (!requestId) return false;
+      Promise.resolve().then(() => {
+        if (!this.runtimeTaskStore) {
+          throw Object.assign(new Error("runtime tasks are unavailable"), { code: "RUNTIME_TASKS_UNAVAILABLE" });
+        }
+        return this.runtimeTaskStore.handle(String(payload.action || ""), payload.body || {}, {
+          onChanged: () => this.runtimeSupervisor?.cardsChanged(),
+        });
+      }).then((result) => this.relayClient.send("runtime_tasks.result", {
+        requestId,
+        ...result,
+      })).catch((error) => this.relayClient.send("runtime_tasks.result", {
+        requestId,
+        error: error.message || "runtime task request failed",
+        reason: String(error.code || "runtime_task_request_failed").toLowerCase(),
+        ...(Number.isInteger(error.revision) ? { revision: error.revision } : {}),
+      })).catch((error) => {
+        console.error(`[runtime-tasks] ${error.message}`);
+      });
+      return true;
+    }
     if (payload.type?.startsWith("approval.policy.")) {
       const requestId = String(payload.requestId || "").slice(0, 96);
       if (!requestId) return false;

@@ -1100,6 +1100,13 @@ export async function runLocalAgentSession(agent, rawArgs) {
     sessionId,
     onConnectionChange: (connected) => {
       relayViaDaemon = connected;
+      // The daemon relays for this session now; the wrapper's own socket
+      // would only keep the device "online" while ignoring every frame.
+      // The event loop opens a fresh one if the daemon goes away.
+      if (connected && relayClient) {
+        relayClient.disconnect();
+        relayClient = null;
+      }
     },
     onCommand: async (payload) => {
       let applied;
@@ -1126,6 +1133,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
             type: "user.text",
             provider: agent,
             text: message,
+            ...(payload.origin === "supervisor" ? { origin: "supervisor" } : {}),
             eventId:
               payload.messageId || payload.commandId
                 ? `local-message-${payload.messageId || payload.commandId}`
@@ -1371,6 +1379,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
           type: "user.text",
           provider: agent,
           text: message,
+          ...(payload.origin === "supervisor" ? { origin: "supervisor" } : {}),
           eventId: payload.messageId
             ? `local-message-${payload.messageId}`
             : undefined,

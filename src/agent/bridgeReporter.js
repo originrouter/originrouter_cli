@@ -462,6 +462,46 @@ export async function reportRuntimeEvent(payload, {
   }
 }
 
+// A runtime task asked for the user. Its own endpoint, not `runtime-event`:
+// that one rewrites the session row's status and step, and asking for the
+// user is not a turn event. Only identifiers and a closed reason leave the
+// device; the card's name and the session's content stay inside E2EE.
+export async function reportSupervisorEscalation({ sessionId, eventId, reason }, {
+  stateDir = getStateDir(),
+  fetchFn = globalThis.fetch,
+  readCodingAuthFn = readCodingAuth,
+  ensureFreshAccessTokenFn = ensureFreshAccessToken,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+  const resolved = await resolveRelayAuth({ stateDir, readCodingAuthFn, ensureFreshAccessTokenFn });
+  if (resolved.error) return { ok: false, error: resolved.error };
+  const { credential: auth, token } = resolved;
+  if (typeof fetchFn !== "function") return { ok: false, error: "fetch_unavailable" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetchFn(`${apiBase()}/cli/v1/agent/supervisor/escalations`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        "X-OriginRouter-Device-Id": auth.deviceId,
+      },
+      body: JSON.stringify({
+        session_id: safeText(sessionId, 64),
+        event_id: safeText(eventId, 96),
+        reason: ["card_action", "limit_reached", "needs_user"].includes(reason) ? reason : "card_action",
+      }),
+      signal: controller.signal,
+    });
+    return { ok: resp.ok, status: resp.status };
+  } catch {
+    return { ok: false, error: "request_failed" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function buildAgentConversationMetadata(payload = {}) {
   const createdAt = safeIsoTimestamp(payload.createdAt || payload.created_at);
   const lastActivityAt = safeIsoTimestamp(

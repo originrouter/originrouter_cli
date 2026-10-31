@@ -1,5 +1,5 @@
 import process from "node:process";
-import { reportLocalControlRuntime } from "../agent/bridgeReporter.js";
+import { reportLocalControlRuntime, reportSupervisorEscalation } from "../agent/bridgeReporter.js";
 import { syncAgentActivityCatalog } from "../agent/agentActivityCatalogSync.js";
 import { syncAgentHistoryBodies } from "../agent/agentHistorySync.js";
 import { AgentBudgetStore } from "../agent/agentBudgetStore.js";
@@ -47,6 +47,9 @@ import { AiOperationReviewer } from "../runtime/aiOperationReviewer.js";
 import { AgentCatalog } from "../persistence/agentCatalog.js";
 import { readSessions } from "../persistence/sessionLog.js";
 import { ExternalAgentRegistry } from "../local/externalAgentRegistry.js";
+import { RuntimeTaskStore } from "../runtime/runtimeTaskStore.js";
+import { RuntimeSupervisor } from "../runtime/runtimeSupervisor.js";
+import { SupervisorJudgeClient } from "../runtime/supervisorJudgeClient.js";
 import { ManagedAgentSupervisor } from "./managedAgentSupervisor.js";
 import { CollaborationStore } from "../collaboration/collaborationStore.js";
 import { PlanImplementVerifyCoordinator } from "../collaboration/planImplementVerifyCoordinator.js";
@@ -311,6 +314,19 @@ export async function startDaemon(args) {
   const externalAgentRegistry = new ExternalAgentRegistry({
     catalog: agentCatalog,
   });
+  // AI judgement and the escalation push are account services; a daemon run
+  // without the account relay keeps the built-in rules only.
+  const runtimeTasksOnAccount = relayMode !== "local";
+  const runtimeTaskStore = new RuntimeTaskStore({ stateDir, aiJudgeAvailable: runtimeTasksOnAccount });
+  const supervisorJudge = runtimeTasksOnAccount ? new SupervisorJudgeClient({ stateDir }) : null;
+  const runtimeSupervisor = new RuntimeSupervisor({
+    registry: externalAgentRegistry,
+    store: runtimeTaskStore,
+    judge: supervisorJudge ? (request) => supervisorJudge.judge(request) : null,
+    onEscalated: runtimeTasksOnAccount
+      ? (escalation) => reportSupervisorEscalation(escalation, { stateDir })
+      : null,
+  }).start();
   const externalAgentRelayRouter = new ExternalAgentRelayRouter({
     registry: externalAgentRegistry,
     relayClient: deviceE2eeRelay,
@@ -374,6 +390,8 @@ export async function startDaemon(args) {
     agentCatalog,
     managedAgentSupervisor,
     agentBudgetStore,
+    runtimeTaskStore,
+    runtimeSupervisor,
     stateDir,
     telemetry,
     compatibilityAutomaticUpdates:
@@ -482,6 +500,8 @@ export async function startDaemon(args) {
     sessionManager,
     auditStore,
     agentBudgetStore,
+    runtimeTaskStore,
+    runtimeSupervisor,
     collaborationStore,
     collaborationCoordinator,
     collaborationRuntime,
@@ -644,6 +664,7 @@ export async function startDaemon(args) {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[daemon] received ${signal}, shutting down…`);
+    runtimeSupervisor.stop();
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (agentActivitySyncTimer) clearInterval(agentActivitySyncTimer);
     if (deviceE2eeRefreshTimer) clearInterval(deviceE2eeRefreshTimer);

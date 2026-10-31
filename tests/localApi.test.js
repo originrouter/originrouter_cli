@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startLocalApi, projectSession } from "../src/local/localApi.js";
+import { RuntimeTaskStore } from "../src/runtime/runtimeTaskStore.js";
 import { addProvider, setCurrentProvider } from "../src/config/providers.js";
 import { setRoute } from "../src/config/routes.js";
 import { readConfig, writeConfig } from "../src/persistence/state.js";
@@ -234,6 +235,9 @@ try {
   }
   liveCtx.proxyRequestStore = proxyRequestStore;
   liveCtx.externalAgentRegistry = new ExternalAgentRegistry({ catalog: agentCatalog });
+  liveCtx.runtimeTaskStore = new RuntimeTaskStore({ stateDir: home });
+  let runtimeTaskCardsChanged = 0;
+  liveCtx.runtimeSupervisor = { cardsChanged: () => { runtimeTaskCardsChanged += 1; } };
   serverHandle = await startLocalApi(liveCtx, { port: 0 });
   // The server's liveCtx reads `ctx.localApiPort` lazily; we patch the bound
   // port onto the SAME ctx object we passed in.
@@ -271,6 +275,34 @@ try {
       headers: noAuth ? {} : { ...AUTH },
     });
     return { status: r.status, body: await r.json() };
+  }
+
+  // ---------- Runtime tasks ----------
+  {
+    assert.equal((await getJson("/runtime-tasks", { noAuth: true })).status, 401);
+    const initial = await getJson("/runtime-tasks");
+    assert.equal(initial.status, 200);
+    assert.equal(initial.body.revision, 0);
+    assert.deepEqual(initial.body.cards, []);
+    const card = {
+      id: "rt_local", name: "异常自动继续", checkpoints: ["abnormal_stop"],
+      judge: { kind: "builtin", rule: "retryable_error" },
+      action: { kind: "send", message: "继续" },
+    };
+    const saved = await putJson("/runtime-tasks", { baseRevision: 0, cards: [card] });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.body.revision, 1);
+    assert.equal(runtimeTaskCardsChanged, 1);
+    const stale = await putJson("/runtime-tasks", { baseRevision: 0, cards: [] });
+    assert.equal(stale.status, 409);
+    assert.equal(stale.body.reason, "runtime_tasks_conflict");
+    const invalid = await putJson("/runtime-tasks", { cards: [{ ...card, checkpoints: ["idle"] }] });
+    assert.equal(invalid.status, 400);
+    assert.equal(runtimeTaskCardsChanged, 1, "refused writes do not re-arm the supervisor");
+    const log = await getJson("/runtime-tasks/log?limit=5");
+    assert.equal(log.status, 200);
+    assert.deepEqual(log.body.entries, []);
+    assert.equal((await putJson("/runtime-tasks/log", {})).status, 405);
   }
 
   // ============================================================

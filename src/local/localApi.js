@@ -332,6 +332,8 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
     sessionManager: ctx.sessionManager,
     auditStore,
     agentBudgetStore,
+    runtimeTaskStore: ctx.runtimeTaskStore || null,
+    runtimeSupervisor: ctx.runtimeSupervisor || null,
     proxyRequestStore,
     collaborationStore,
     collaborationCoordinator,
@@ -739,6 +741,32 @@ async function dispatch(ctx, req, res) {
     // deny-by-default; routes are user state, not a static catalog).
     if (req.method === "GET" && pathname === "/routes") {
       return handleRoutesList(ctx, res);
+    }
+    const runtimeTaskMatch = pathname.match(/^\/runtime-tasks(?:\/(log))?$/);
+    if (runtimeTaskMatch) {
+      if (!ctx.runtimeTaskStore) return sendError(res, 503, "runtime tasks are unavailable");
+      const isLog = runtimeTaskMatch[1] === "log";
+      if (!(isLog ? ["GET"] : ["GET", "PUT"]).includes(req.method)) {
+        return sendError(res, 405, `method ${req.method} not allowed on ${pathname}`);
+      }
+      let body = {};
+      if (req.method === "PUT") {
+        body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+        if (body.__error) return sendError(res, 400, body.__error);
+      } else if (isLog) {
+        body = { limit: url.searchParams.get("limit") };
+      }
+      try {
+        const action = isLog ? "log" : req.method === "PUT" ? "set" : "get";
+        return sendOk(res, ctx.runtimeTaskStore.handle(action, body, {
+          onChanged: () => ctx.runtimeSupervisor?.cardsChanged(),
+        }));
+      } catch (error) {
+        const status = error.code === "RUNTIME_TASKS_CONFLICT" ? 409 : 400;
+        return sendError(res, status, error.message || "invalid runtime task", {
+          reason: String(error.code || "invalid_runtime_task").toLowerCase(),
+        });
+      }
     }
     if (pathname === "/agent-budgets") {
       if (req.method === "GET") {
@@ -1661,8 +1689,12 @@ async function dispatch(ctx, req, res) {
           });
         }
       } catch (error) {
-        const status = error?.code === "SESSION_NOT_FOUND" ? 404 : 409;
-        return sendError(res, status, error.message || "local agent request failed");
+        const notFound = error?.code === "SESSION_NOT_FOUND";
+        // The App tells "not registered yet" from every other 404 by this
+        // reason, and waits for the wrapper instead of failing the read.
+        return sendError(res, notFound ? 404 : 409, error.message || "local agent request failed", {
+          reason: notFound ? "session_not_registered" : undefined,
+        });
       }
     }
 

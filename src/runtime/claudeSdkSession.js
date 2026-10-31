@@ -1082,6 +1082,7 @@ export async function runClaudeSdkSession(rawArgs) {
         type: "user.text",
         provider: "claude",
         text,
+        ...(payload.origin === "supervisor" ? { origin: "supervisor" } : {}),
         eventId:
           payload.messageId || payload.commandId
             ? `local-message-${payload.messageId || payload.commandId}`
@@ -1395,6 +1396,13 @@ export async function runClaudeSdkSession(rawArgs) {
       sessionId,
       onConnectionChange: (connected) => {
         relayViaDaemon = connected;
+        // The daemon relays for this session now; the wrapper's own socket
+        // would only keep the device "online" while ignoring every frame.
+        // The event loop opens a fresh one if the daemon goes away.
+        if (connected && relayClient) {
+          relayClient.disconnect();
+          relayClient = null;
+        }
       },
       onCommand: async (payload) => {
         try {

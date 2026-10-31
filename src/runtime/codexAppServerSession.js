@@ -1080,7 +1080,7 @@ export async function runCodexAppServerSession(rawArgs) {
     }
   });
 
-  const sendMessage = async (message, messageId = null) => {
+  const sendMessage = async (message, messageId = null, origin = null) => {
     const text = String(message || "").trim();
     if (!text || !threadId) return false;
     if (!currentTurnId) {
@@ -1094,6 +1094,7 @@ export async function runCodexAppServerSession(rawArgs) {
       type: "user.text",
       provider: "codex",
       text,
+      ...(origin === "supervisor" ? { origin: "supervisor" } : {}),
       eventId: messageId ? `local-message-${messageId}` : undefined,
     });
     if (currentTurnId) {
@@ -1211,6 +1212,7 @@ export async function runCodexAppServerSession(rawArgs) {
       return sendMessage(
         payload.message || payload.data,
         payload.messageId || payload.commandId || null,
+        payload.origin,
       );
     }
     if (payload.type === "agent.interaction.resolve") {
@@ -1397,6 +1399,13 @@ export async function runCodexAppServerSession(rawArgs) {
       sessionId,
       onConnectionChange: (connected) => {
         relayViaDaemon = connected;
+        // The daemon relays for this session now; the wrapper's own socket
+        // would only keep the device "online" while ignoring every frame.
+        // The event loop opens a fresh one if the daemon goes away.
+        if (connected && relayClient) {
+          relayClient.disconnect();
+          relayClient = null;
+        }
       },
       onCommand: async (payload) => {
         try {

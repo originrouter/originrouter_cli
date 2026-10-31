@@ -1280,3 +1280,31 @@ test("the reporter reads nativeSessionId per report, so a late id still travels"
   await reporter.report("agent.tool_call.start");
   assert.equal(sent[1].native_session_id, "6f1c0e2a9d3b4a778e5f0b2c7d41a8e3");
 });
+
+test("an escalation reaches its own endpoint with identifiers only", async () => {
+  const { reportSupervisorEscalation } = await import("../src/agent/bridgeReporter.js");
+  const calls = [];
+  const result = await reportSupervisorEscalation(
+    { sessionId: "claude-1", eventId: "agent.supervisor.escalated_x", reason: "needs_user", cardName: "secret plan" },
+    {
+      ensureFreshAccessTokenFn: async () => makeOAuthCredential({ deviceId: "device-1" }),
+      fetchFn: async (url, init) => {
+        calls.push({ url, init });
+        return { ok: true, status: 200 };
+      },
+    },
+  );
+  assert.equal(result.ok, true);
+  assert.match(calls[0].url, /\/cli\/v1\/agent\/supervisor\/escalations$/);
+  assert.equal(calls[0].init.headers["X-OriginRouter-Device-Id"], "device-1");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    session_id: "claude-1",
+    event_id: "agent.supervisor.escalated_x",
+    reason: "needs_user",
+  });
+  const unauthenticated = await reportSupervisorEscalation(
+    { sessionId: "s", eventId: "e", reason: "limit_reached" },
+    { stateDir: "/tmp/originrouter-missing-auth", fetchFn: async () => { throw new Error("should not fetch"); } },
+  );
+  assert.equal(unauthenticated.ok, false);
+});

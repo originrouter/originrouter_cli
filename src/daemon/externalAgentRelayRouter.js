@@ -1,3 +1,6 @@
+/** The code the App recognises for "this device does not have the session yet". */
+export const SESSION_NOT_REGISTERED = "session_not_registered";
+
 const DIRECT_APP_EVENT_TYPES = new Set([
   "agent.interaction.requested",
   "agent.interaction.result",
@@ -72,6 +75,24 @@ export class ExternalAgentRelayRouter {
     }
 
     const sessionId = String(payload.sessionId || "").slice(0, 64);
+    if (sessionId && payload.type === "agent.history.request"
+        && !this.registry.has(sessionId)) {
+      // Nothing else in the dispatch chain reads a transcript, so a request
+      // for a session this daemon has not registered used to fall through
+      // unanswered and the App waited out its whole history deadline. The
+      // usual cause is a wrapper that announced the session to the account a
+      // moment before it registered here — so the answer is "not yet", and
+      // the App asks again rather than showing a failure.
+      await this.relayClient.send("agent.history.delivery", {
+        sessionId,
+        requestId: payload.requestId,
+        accepted: false,
+        retryable: true,
+        code: SESSION_NOT_REGISTERED,
+        reason: "The session is not registered on this device yet.",
+      });
+      return true;
+    }
     if (!sessionId || !this.registry.has(sessionId)) return false;
     // Ordinary Agent controls are intentionally unavailable for collaboration
     // workers. The collaboration runtime owns their command path and projects

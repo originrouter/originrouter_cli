@@ -201,6 +201,10 @@ export function mapClaudeSdkMessage(message) {
         : undefined,
       isError: Boolean(message.is_error),
       stopReason: safeText(message.stop_reason, 128),
+      // Why the loop ended. `aborted_*` is how an interrupt looks once it has
+      // become a result, and the runtime supervisor must not mistake it for
+      // an error to recover from.
+      ...(message.terminal_reason ? { terminalReason: safeText(message.terminal_reason, 64) } : {}),
       durationMs: Number(message.duration_ms || 0),
       numTurns: Number(message.num_turns || 0),
       eventId: messageEventId(message, "result"),

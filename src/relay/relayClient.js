@@ -67,6 +67,27 @@ export class RelayClient {
     }
   }
 
+  /**
+   * Close the events socket for good and let `connectEvents` return.
+   *
+   * A wrapper opens its own relay socket while its daemon is unreachable and
+   * hands relaying to the daemon once it connects. That socket used to stay
+   * open: `connectEvents` only returns when its socket goes away, and nothing
+   * closed it. It then kept the device "online" at the relay while every
+   * frame it received was ignored — and when the daemon later dropped, the
+   * cloud still had a live socket for the device, so a command sent to it
+   * vanished instead of being refused as offline.
+   */
+  disconnect() {
+    this._aborted = true;
+    const ws = this._ws;
+    this._ws = null;
+    if (!ws) return;
+    try {
+      ws.close();
+    } catch {}
+  }
+
   async send(type, payload = {}) {
     const envelope = { type, deviceId: this.deviceId, ...payload };
     if (this._ws && this._ws.readyState === WebSocket.OPEN) {

@@ -46,6 +46,9 @@ export const PROTECTED_DEVICE_MESSAGE_TYPES = new Set([
   "agent.interaction.result",
   "agent.history.request",
   "agent.history.page",
+  // The daemon's answer for a session it has not registered: it names the
+  // session and is a reply on the same pairwise route as the page.
+  "agent.history.delivery",
   "agent.audit.request",
   "agent.audit.page",
   "agent.inquiry.request",
@@ -71,6 +74,8 @@ export const PROTECTED_DEVICE_MESSAGE_TYPES = new Set([
   "approval.policy.revisions.result",
   "approval.policy.rollback",
   "approval.policy.rollback.result",
+  "runtime_tasks.request",
+  "runtime_tasks.result",
   "agent.launch.request",
   "session.stop",
   "session.start",

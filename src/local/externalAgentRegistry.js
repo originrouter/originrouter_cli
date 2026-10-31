@@ -20,7 +20,7 @@ function safeText(value, maxLength) {
   return String(value || "").slice(0, maxLength);
 }
 
-function canonicalTurnEventType(value) {
+export function canonicalTurnEventType(value) {
   const type = safeText(value, 96).trim();
   return ({
     "agent.task.completed": "agent.task.complete",
@@ -673,7 +673,28 @@ export class ExternalAgentRegistry {
     if (session.commands.length > MAX_COMMANDS) {
       session.commands.splice(0, session.commands.length - MAX_COMMANDS);
     }
+    // Watchers that act on a session need to know when someone told it to
+    // stop: the runtime supervisor must never "recover" from an interrupt.
+    this.notify("command", sessionId, item);
     return item;
+  }
+
+  // The few facts a watcher needs about one session, without projecting the
+  // whole row. Null when the session is not registered here.
+  sessionFacts(sessionId) {
+    const session = this.sessions.get(String(sessionId || ""));
+    if (!session) return null;
+    const status = this.publicStatus(session);
+    return {
+      sessionId: session.sessionId,
+      sessionKind: session.sessionKind,
+      agent: session.agent,
+      cwd: session.cwd,
+      status,
+      turnState: resolveTurnState(session, status),
+      attached: session.attached !== false,
+      pendingInteractions: session.pendingInteractions.size,
+    };
   }
 
   commandsAfter(sessionId, after = 0) {

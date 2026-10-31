@@ -185,3 +185,64 @@ test("isForeignRelayFrame treats an absent target as ours and a peer as foreign"
   assert.equal(isForeignRelayFrame({ type: "x", targetDeviceId: "device-b" }, DEVICE_ID, warn), true);
   assert.equal(lines.length, 1, "only a genuine mismatch is worth logging");
 });
+
+test("a history request for an unregistered session is answered through the chain", async () => {
+  // Only the external router reads transcripts. A request it did not claim
+  // used to reach sessionManager, which has no history responder, and the
+  // App heard nothing. Driven through the real chain so an earlier handler
+  // claiming the type would show up here.
+  const { ExternalAgentRelayRouter } = await import("../src/daemon/externalAgentRelayRouter.js");
+  const routerSent = [];
+  const router = new ExternalAgentRelayRouter({
+    registry: { has: () => false, list: () => [] },
+    relayClient: {
+      send: async (type, payload) => {
+        routerSent.push({ type, payload });
+        return { accepted: true };
+      },
+    },
+  });
+  const { dispatch } = fixture({ control: router });
+  await dispatch({ type: "agent.history.request", sessionId: "claude-new", requestId: "h1" });
+  await settle();
+  assert.equal(routerSent.length, 1);
+  assert.equal(routerSent[0].type, "agent.history.delivery");
+  assert.equal(routerSent[0].payload.code, "session_not_registered");
+  assert.equal(routerSent[0].payload.requestId, "h1");
+});
+
+test("a runtime-task request is answered through the chain", async () => {
+  // The App reads and writes the cards over E2EE with this one type. Driven
+  // through the real chain so that an earlier handler claiming it shows up.
+  const { RuntimeTaskStore } = await import("../src/runtime/runtimeTaskStore.js");
+  const { dispatch, sent, sessionManager, runtime } = fixture();
+  sessionManager.runtimeTaskStore = new RuntimeTaskStore({
+    stateDir: mkdtempSync(join(tmpdir(), "originrouter-relay-rt-")),
+  });
+  let changed = 0;
+  sessionManager.runtimeSupervisor = { cardsChanged: () => { changed += 1; } };
+  await dispatch({ type: "runtime_tasks.request", requestId: "rt-get", action: "get" });
+  await dispatch({
+    type: "runtime_tasks.request",
+    requestId: "rt-set",
+    action: "set",
+    body: { baseRevision: 0, cards: [{
+      id: "rt_a", name: "a", checkpoints: ["abnormal_stop"],
+      judge: { kind: "builtin", rule: "retryable_error" },
+      action: { kind: "send", message: "继续" },
+    }] },
+  });
+  await dispatch({ type: "runtime_tasks.request", requestId: "rt-stale", action: "set", body: { baseRevision: 0, cards: [] } });
+  await settle();
+  const answers = Object.fromEntries(sent
+    .filter((item) => item.type === "runtime_tasks.result")
+    .map((item) => [item.payload.requestId, item.payload]));
+  assert.equal(answers["rt-get"].revision, 0);
+  assert.equal(answers["rt-get"].capabilities.aiJudge, false);
+  assert.equal(answers["rt-set"].revision, 1);
+  assert.equal(answers["rt-set"].cards[0].id, "rt_a");
+  assert.equal(answers["rt-stale"].reason, "runtime_tasks_conflict");
+  assert.equal(answers["rt-stale"].revision, 1);
+  assert.equal(changed, 1, "only the write that landed re-arms the supervisor");
+  runtime.close();
+});

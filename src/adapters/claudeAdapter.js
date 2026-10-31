@@ -262,6 +262,7 @@ export function mapClaudeHookEvent(payload = {}) {
       provider: "claude",
       status: "error",
       reason: safeText(payload.error || payload.reason, 4096),
+      ...(payload.error_details ? { errorDetails: safeText(payload.error_details, 2048) } : {}),
     };
   }
   if (eventName === "UserPromptSubmit") {

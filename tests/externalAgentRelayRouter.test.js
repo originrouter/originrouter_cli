@@ -564,3 +564,41 @@ test("one failed snapshot does not suppress the rest", async () => {
     "the healthy sessions must still be answered",
   );
 });
+
+test("a history request for a session the daemon has not registered is answered", async () => {
+  // The wrapper announces a session to the account a moment before it
+  // registers with its daemon. The App that asks in that moment used to get
+  // nothing at all and waited out its whole history deadline.
+  const { router, sent } = fixture();
+  assert.equal(
+    await router.handle({
+      type: "agent.history.request",
+      sessionId: "session-not-yet",
+      requestId: "history-early",
+    }),
+    true,
+  );
+  assert.deepEqual(sent, [
+    {
+      type: "agent.history.delivery",
+      payload: {
+        sessionId: "session-not-yet",
+        requestId: "history-early",
+        accepted: false,
+        retryable: true,
+        code: "session_not_registered",
+        reason: "The session is not registered on this device yet.",
+      },
+    },
+  ]);
+});
+
+test("an unregistered session's other frames still fall through to the session manager", async () => {
+  const { router, sent, commands } = fixture();
+  assert.equal(
+    await router.handle({ type: "agent.message", sessionId: "session-not-yet", message: "hi" }),
+    false,
+  );
+  assert.deepEqual(sent, []);
+  assert.deepEqual(commands, []);
+});
