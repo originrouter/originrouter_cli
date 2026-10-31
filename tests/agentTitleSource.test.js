@@ -14,6 +14,7 @@ import {
   safeTitleText,
 } from "../src/agent/agentTitleSource.js";
 import { AgentCatalog } from "../src/persistence/agentCatalog.js";
+import { ExternalAgentRegistry } from "../src/local/externalAgentRegistry.js";
 
 // The placeholder is ours, not the conversation's. "Claude Code" is the
 // agent's own name in the title slot, and it used to be treated as a title
@@ -204,13 +205,20 @@ try {
   catalog.renameConversation("conversation-app", "The name I chose");
   catalog.updateSession("session-app", {
     title: "A different automatic title",
-    titleIsCustom: false,
   });
   assert.equal(
     catalog.getConversation("conversation-app").title,
     "The name I chose",
     "a rename is never overwritten by an automatic title",
   );
+  const registry = new ExternalAgentRegistry({ catalog });
+  registry.register({ sessionId: "session-app", conversationId: "conversation-app",
+    runId: "run-app", agent: "claude", title: "Old automatic title" });
+  registry.update("session-app", { title: "New automatic title" });
+  registry.register({ sessionId: "session-app", conversationId: "conversation-app",
+    runId: "run-app", agent: "claude", title: "Stale launch title", titleIsCustom: true });
+  assert.equal(catalog.getConversation("conversation-app").title, "The name I chose",
+    "legacy registration and title updates cannot undo a rename");
 
   // A conversation with no title of its own keeps the placeholder.
   catalog.upsertSession({

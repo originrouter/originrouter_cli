@@ -19,6 +19,7 @@ import {
 } from "../adapters/codex/jsonlScanner.js";
 import {
   createRuntimeEventReporter,
+  captureRelayAccountContext,
   reportAgentConversationMetadata,
   shouldSyncAgentActivitySnapshot,
   startAgentSessionHeartbeat,
@@ -45,6 +46,17 @@ import {
   readLocalApiConfig,
 } from "../persistence/state.js";
 import { RemoteCodingProxyManager } from "../proxy/remoteCodingProxyManager.js";
+import {
+  applyLaunchSessionModel,
+  clearSessionModel,
+  getSessionModel,
+  directProvidersForTransport,
+  modelControlForTransport,
+  resolveLaunchModelTarget,
+  resolvePricingTarget,
+  setSessionModel,
+  validateSessionModelTarget,
+} from "../proxy/sessionModels.js";
 import {
   NOOP_REMOTE_CODING_SNAPSHOT,
   readLocalProxySnapshot,
@@ -95,6 +107,7 @@ import {
 } from "./approvalPolicyStore.js";
 import {
   CODEX_MODES,
+  assertNoCodexBypassFlag,
   codexApprovalExpiresAt,
   codexCommandApprovalDecision,
   codexCommandApprovalPresentation,
@@ -108,7 +121,17 @@ import {
   gatewayResponseIdsFromTurnResult,
   requestInteractionId,
   textInput,
+  withCodexThreadPermission,
+  withCodexTurnPermission,
 } from "./codexAppServerPrimitives.js";
+import {
+  CODEX_EFFORT_LEVELS,
+  effortLevelsForModel,
+  normalizeAgentEffort,
+} from "./agentEffort.js";
+import {
+  loadEffortCatalogue,
+} from "./modelEffortCatalog.js";
 
 export {
   buildCodexCollaborationMode,
@@ -121,7 +144,12 @@ export {
 } from "./codexAppServerPrimitives.js";
 
 export async function runCodexAppServerSession(rawArgs) {
+  // Refuse before anything is spawned. A session that starts with one of these
+  // flags has already lost its approval path, and there is no way to restore it
+  // afterwards: the thread would be running with a reviewer we cannot reach.
+  assertNoCodexBypassFlag(rawArgs);
   const stateDir = ensureStateDir();
+  const relayAccount = captureRelayAccountContext(stateDir);
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
   const options = extractOptions(rawArgs);
   const collaborationWorker = isCollaborationSessionPayload({
@@ -192,9 +220,16 @@ export async function runCodexAppServerSession(rawArgs) {
   }
   let providerResult = await buildAgentProviderEnv("codex", config, {
     provider: options.provider,
+    // Same contract as the Claude runtime: the credential names the session so
+    // the compatibility gateway can apply this session's model override.
+    sessionId,
     proxyStatus: staticProxyStatusFn(readLocalProxySnapshot()),
     remoteCodingStatus,
   });
+  // Which levels a model supports. The catalogue is where that is said, and
+  // it is asked for before the proxy starts, because the proxy is what tells
+  // Codex which levels its models have.
+  const effortCatalogue = await loadEffortCatalogue({ stateDir });
   let originrouterCodingProxy = null;
   let localAgentBridge = null;
   let relayViaDaemon = false;
@@ -203,18 +238,45 @@ export async function runCodexAppServerSession(rawArgs) {
     await protectOriginrouterCodingEnv("codex", providerResult, {
       stateDir,
       runId: options.runId,
+      // The proxy belongs to this session, and the session's own model
+      // override is what the proxy resolves the alias against.
+      sessionId,
+      // The levels the models have, so the model list Codex reads is the
+      // model list the device publishes.
+      effortCatalogue,
       onGatewayResponseIds: (ids) => { void emitGatewayResponseIds?.(ids); },
     }));
   const telemetry = createTelemetryPipeline({
     stateDir,
     uploadOwner: options.telemetryOwner === "1",
   });
+  // A launch-time --model becomes a session override rather than Codex's own
+  // model string: Codex must keep asking for the route alias, or the gateway
+  // has nothing to translate. Every transport with a gateway in front of the
+  // agent gets this; the ones without one keep the old meaning.
+  let effectiveOptions = options;
+  let launchModel = null;
+  if (modelControlForTransport(providerResult.source) === "supported" && options.model) {
+    launchModel = applyLaunchSessionModel(config, stateDir, sessionId, {
+      agent: "codex",
+      model: options.model,
+      provider: options.provider,
+      allowedProviders: directProvidersForTransport(providerResult),
+    });
+    if (!launchModel.applied) {
+      process.stderr.write(
+        `[originrouter] --model ${options.model} ignored (${launchModel.reason}); `
+        + "this session uses the device route.\n",
+      );
+    }
+    effectiveOptions = { ...options, model: undefined };
+  }
   let model =
-    options.model ||
+    effectiveOptions.model ||
     providerResult.env.OPENAI_MODEL ||
     providerResult.provider?.model;
   const pricingModel =
-    options.model ||
+    effectiveOptions.model ||
     providerResult.routes?.main?.model ||
     providerResult.provider?.model ||
     model;
@@ -251,7 +313,7 @@ export async function runCodexAppServerSession(rawArgs) {
     title: () => sessionTitle(),
     deviceName: device.displayName || device.host,
     workspaceDisplayPath: workspaceDisplayPath(cwd),
-    stateDir,
+    ...relayAccount,
     telemetryQueue: telemetry.queue,
     telemetryUploader: telemetry.uploader,
     telemetryContext: () => ({
@@ -276,6 +338,35 @@ export async function runCodexAppServerSession(rawArgs) {
   let transcriptPath = null;
   let currentTurnId = null;
   let currentMode = "default";
+  // The session's model override, if the user pinned one. Null means the
+  // device route is in force.
+  let sessionModel = getSessionModel(stateDir, sessionId);
+  // The reasoning effort this session runs on, as the App last named it.
+  // Null means nobody has chosen one yet: the thread is on the model's own
+  // default, and the device says so as soon as it can tell.
+  let sessionEffort = null;
+  // A level the reader picked before the thread was up. Applied when it is.
+  let pendingEffortPayload = null;
+  // The model whose levels this session is judged by.
+  //
+  // Codex runs under a route alias, and the alias is not a model: the model
+  // behind it changes while the session runs. The levels belong to the model
+  // that answers, so they are read from that one — the reader's own pick
+  // first, then the device's route, then the provider's model.
+  const sessionEffortModelId = () =>
+    sessionModel?.model ||
+    providerResult.routes?.main?.model ||
+    providerResult.provider?.model ||
+    "";
+  // The levels that model takes.
+  //
+  // A model we know nothing about gets the runtime's whole vocabulary: we
+  // have no better answer, and offering every level the app-server can take
+  // is what we did before the models said otherwise.
+  const sessionEffortLevels = () => {
+    const levels = effortLevelsForModel(sessionEffortModelId(), effortCatalogue);
+    return levels.length ? levels : [...CODEX_EFFORT_LEVELS];
+  };
   const invalidScopes = invalidAutonomyScopes(options.autonomyAllowedScopes);
   if (invalidScopes.length) {
     throw new Error(`Unknown unattended scope(s): ${invalidScopes.join(", ")}`);
@@ -347,7 +438,7 @@ export async function runCodexAppServerSession(rawArgs) {
       permissionRevision: permissionState.revision,
         ...activitySnapshot,
       },
-      { stateDir },
+      relayAccount,
     ).catch(() => ({ ok: false }));
 
   // Codex names the thread itself, and says so: the app-server sends
@@ -461,6 +552,108 @@ export async function runCodexAppServerSession(rawArgs) {
       ]);
     },
   });
+  // The reasoning effort of this session.
+  //
+  // The device owns this fact: the app-server takes the level on the thread
+  // (`thread/settings/update`) and on every turn (`turn/start`), and it
+  // spells them the way the protocol does — `none`, `minimal`, `low`,
+  // `medium`, `high`, `xhigh`, `max`, `ultra`.
+  //
+  // The levels it publishes are the *model's* levels, not the protocol's
+  // whole vocabulary. The app-server will take any level it is given and
+  // send it to the model, and a model that cannot take one answers with an
+  // error instead of a run. So the device publishes the levels the model
+  // behind the alias actually has, and refuses the rest.
+  const reportSessionEffort = (requestId = null, { accepted = null, reason = null } = {}) =>
+    sendAgentEvent({
+      type: "agent.effort.status",
+      provider: "codex",
+      runtime: "codex-app-server",
+      sessionId,
+      effort: sessionEffort,
+      effortControl: "supported",
+      availableEfforts: sessionEffortLevels(),
+      requestId,
+      accepted,
+      reason,
+    });
+  const applyEffort = async (payload) => {
+    const requested = normalizeAgentEffort(payload?.effort);
+    if (!requested) {
+      await reportSessionEffort(payload?.requestId || null, {
+        accepted: false,
+        reason: "effort_level_unknown",
+      });
+      return false;
+    }
+    if (!sessionEffortLevels().includes(requested)) {
+      await reportSessionEffort(payload?.requestId || null, {
+        accepted: false,
+        reason: "effort_level_unsupported",
+      });
+      return false;
+    }
+    if (!threadId) {
+      // The thread is not up yet. The choice is kept and applied when it
+      // is, so a reader who picks a level before the session is ready does
+      // not have to pick it again.
+      pendingEffortPayload = payload;
+      return true;
+    }
+    try {
+      // The level rides inside the collaboration mode. The app-server gives
+      // the mode precedence over the request's own `effort`, and it replaces
+      // the mode's settings wholesale — so a mode that left the level out
+      // would clear the one the reader chose.
+      await client.updateThreadSettings(withCodexTurnPermission({
+        threadId,
+        collaborationMode: buildCodexCollaborationMode(currentMode, model, requested),
+      }));
+      sessionEffort = requested;
+      await reportSessionEffort(payload?.requestId || null, { accepted: true });
+      return true;
+    } catch (error) {
+      await reportSessionEffort(payload?.requestId || null, {
+        accepted: false,
+        reason: "effort_change_failed",
+      });
+      return false;
+    }
+  };
+  // The levels move under the session when the model does.
+  //
+  // A model change replaces the model the levels were read from, and the level
+  // the reader chose can belong to a model that is no longer running. The
+  // device says so: the levels are published again, and a level the new model
+  // does not have is dropped rather than left standing on a row the App would
+  // keep offering.
+  //
+  // The status carries no request id: it is a consequence of the model
+  // change, not the answer to a command.
+  const reconcileEffortWithModel = async () => {
+    const levels = sessionEffortLevels();
+    if (!sessionEffort || levels.includes(sessionEffort)) {
+      await reportSessionEffort();
+      return;
+    }
+    sessionEffort = null;
+    if (threadId) {
+      try {
+        // The mode is replaced wholesale, so a mode with no level in it is
+        // how the thread is put back on the model's own default.
+        await client.updateThreadSettings(withCodexTurnPermission({
+          threadId,
+          collaborationMode: buildCodexCollaborationMode(currentMode, model, null),
+        }));
+      } catch {
+        // The thread refused the reset. The status still tells the truth: the
+        // session is on no level of its own, and the next turn carries
+        // whatever the model does on its own.
+      }
+    }
+    await reportSessionEffort();
+  };
+
   const reportMode = (requestId = null) =>
     sendAgentEvent({
       type: "agent.mode.status",
@@ -471,6 +664,92 @@ export async function runCodexAppServerSession(rawArgs) {
       availableModes: CODEX_MODES,
       requestId,
     });
+  // Per-session model selection. Codex keeps asking the proxy for the route
+  // alias; the compatibility gateway substitutes the concrete model this
+  // session pinned, so a change lands on the next turn with no restart.
+  const reportSessionModel = (requestId = null, { accepted = null, reason = null } = {}) =>
+    sendAgentEvent({
+      type: "agent.model.status",
+      provider: "codex",
+      runtime: "codex-app-server",
+      sessionId,
+      model: sessionModel?.model || null,
+      modelProvider: sessionModel?.provider || null,
+      source: sessionModel ? "session" : "device",
+      // Three transports have a place to rewrite the request's model — route
+      // mode's compatibility gateway, the cloud's per-session auth proxy, the
+      // remote device's relay proxy. The others show what the session runs on
+      // but must not offer a change they cannot apply.
+      modelControl: modelControlForTransport(providerResult.source),
+      requestId,
+      accepted,
+      reason,
+    });
+  const applySessionModel = async (payload) => {
+    const requested = String(payload?.model || "").trim();
+    const requestedProvider = String(payload?.provider || "").trim();
+    try {
+      if (!requested) {
+        // Clearing is allowed on every transport: it is the safe direction, and
+        // it is how an override written while the session was on route mode is
+        // removed after the device moved on.
+        clearSessionModel(stateDir, sessionId);
+        sessionModel = null;
+        await reportSessionModel(payload?.requestId || null, { accepted: true });
+        // The session is back on the device route, so its levels are the
+        // route's model's levels now.
+        await reconcileEffortWithModel();
+        return true;
+      }
+      // Refused here, not merely hidden in the App: on a transport with no
+      // model-rewrite point there is nowhere for an override to take effect,
+      // and accepting it would leave a session that claims a model it does not
+      // run on.
+      if (modelControlForTransport(providerResult.source) !== "supported") {
+        await reportSessionModel(payload?.requestId || null, {
+          accepted: false,
+          reason: "model_control_unsupported",
+        });
+        return false;
+      }
+      const target = requestedProvider
+        ? validateSessionModelTarget(config, {
+          provider: requestedProvider,
+          model: requested,
+          allowedProviders: directProvidersForTransport(providerResult),
+        })
+        : resolveLaunchModelTarget(config, {
+          agent: "codex",
+          model: requested,
+          allowedProviders: directProvidersForTransport(providerResult),
+        });
+      if (!target.ok) {
+        await reportSessionModel(payload?.requestId || null, {
+          accepted: false,
+          reason: target.reason,
+        });
+        return false;
+      }
+      setSessionModel(stateDir, sessionId, {
+        agent: "codex",
+        provider: target.provider,
+        model: target.model,
+      });
+      sessionModel = { provider: target.provider, model: target.model };
+      await reportSessionModel(payload?.requestId || null, { accepted: true });
+      // The model changed, so the levels the session can offer changed with
+      // it. The App draws the device's list, and a list that still names the
+      // old model's levels is a list of rows that fail.
+      await reconcileEffortWithModel();
+      return true;
+    } catch (error) {
+      await reportSessionModel(payload?.requestId || null, {
+        accepted: false,
+        reason: error.message,
+      });
+      return false;
+    }
+  };
   const permissionState = createAgentPermissionStateTracker({
     stateDir, sessionId, cwd, deviceId: effectiveDeviceId,
     workspaceId: options.workspaceId, agent: "codex", title: sessionTitle,
@@ -789,8 +1068,13 @@ export async function runCodexAppServerSession(rawArgs) {
       currentTurnId = null;
     for (const event of mapCodexAppServerEvent(rawEvent)) {
       void agentEventQueue.enqueue(applyConfiguredPricing(event, {
-        provider: providerResult.provider,
-        model: pricingModel,
+        // A session override moves the session onto another provider, so the
+        // price table has to follow it — otherwise the session is billed at
+        // the device route's rate.
+        ...resolvePricingTarget(config, sessionModel, {
+          provider: providerResult.provider,
+          model: pricingModel,
+        }),
         source: providerResult.source,
       }));
     }
@@ -820,11 +1104,21 @@ export async function runCodexAppServerSession(rawArgs) {
       });
       return true;
     }
-    const result = await client.startTurn({
+    // Re-pin on every turn. `turn/start` documents all three permission fields
+    // as applying "for this turn and subsequent turns", so the thread carries
+    // forward whatever the last request set — and Codex itself upgrades an
+    // omitted `approvalsReviewer` to its Guardian subagent when the model
+    // requires auto-review. Sending them here is what keeps the approval path
+    // pointed at the App for the whole session, not just its first request.
+    const result = await client.startTurn(withCodexTurnPermission({
       threadId,
       input: textInput(text),
-      collaborationMode: buildCodexCollaborationMode(currentMode, model),
-    });
+      // The level the reader chose rides inside the collaboration mode, which
+      // is the only place the app-server reads it from when a mode is set.
+      // A turn that starts right after a change must be on the new level
+      // rather than on the thread's older one.
+      collaborationMode: buildCodexCollaborationMode(currentMode, model, sessionEffort),
+    }));
     currentTurnId = result?.turn?.id || currentTurnId;
     const gatewayResponseIds = gatewayResponseIdsFromTurnResult(result);
     if (gatewayResponseIds.length) {
@@ -936,13 +1230,27 @@ export async function runCodexAppServerSession(rawArgs) {
       const mode = String(payload.mode || "");
       if (!CODEX_MODES.some((item) => item.id === mode) || !threadId)
         return false;
-      await client.updateThreadSettings({
+      // The permission pin rides along: `thread/settings/update` replaces the
+      // values it carries, so a settings update that named only the
+      // collaboration mode would leave the thread's approvals wherever the last
+      // turn put them.
+      //
+      // The reasoning level rides along too, for the same reason: a mode
+      // replaces the previous mode's settings, so a mode that left the level
+      // out would clear the one the reader chose.
+      await client.updateThreadSettings(withCodexTurnPermission({
         threadId,
-        collaborationMode: buildCodexCollaborationMode(mode, model),
-      });
+        collaborationMode: buildCodexCollaborationMode(mode, model, sessionEffort),
+      }));
       currentMode = mode;
       await reportMode(payload.requestId || null);
       return true;
+    }
+    if (payload.type === "agent.model.set") {
+      return applySessionModel(payload);
+    }
+    if (payload.type === "agent.effort.set") {
+      return applyEffort(payload);
     }
     if (payload.type === "agent.autonomy.set") {
       try {
@@ -952,6 +1260,24 @@ export async function runCodexAppServerSession(rawArgs) {
         approvalPolicy = next.approvalPolicy;
         aiReviewPolicy = next.aiReviewPolicy;
         autonomyAllowedScopes = next.allowedScopes;
+        // The profile is enforced by our broker, so the local switch above is
+        // the one that decides anything. The pin is pushed as well: it is what
+        // the profile is supposed to mean at the thread level (see
+        // withCodexTurnPermission), and it repairs a thread written by an
+        // older client. A failed push does not undo the profile — the state is
+        // already local and authoritative — so it is reported, not returned.
+        if (threadId) {
+          await client.updateThreadSettings(withCodexTurnPermission({
+            threadId,
+          })).catch((error) => {
+            void sendAgentEvent({
+              type: "agent.adapter.status",
+              provider: "codex",
+              state: "permission_pin_failed",
+              message: error.message,
+            });
+          });
+        }
         await reportAutonomy(payload.requestId || null, { accepted: true });
         return true;
       } catch (error) {
@@ -1029,12 +1355,10 @@ export async function runCodexAppServerSession(rawArgs) {
           }
         : null,
     });
-    const threadOptions = {
-      cwd,
-      model,
-      approvalPolicy: "on-request",
-      sandbox: "workspace-write",
-    };
+    // The thread-level pin. `thread/resume` takes the same fields, and a
+    // resumed thread inherits whatever settings it was last written with, so
+    // both paths send the full set rather than only the freshly started one.
+    const threadOptions = withCodexThreadPermission({ cwd, model });
     const thread = options.resume
       ? await client.resumeThread(options.resume, threadOptions)
       : await client.startThread({ ...threadOptions, ephemeral: false });
@@ -1113,6 +1437,7 @@ export async function runCodexAppServerSession(rawArgs) {
       runId: options.runId || sessionId,
       agent: "codex",
       title: sessionTitle(),
+      titleIsCustom: Boolean(requestedTitle && !agentTitle),
       deviceId: effectiveDeviceId,
       deviceName: device.displayName || device.host,
       cwd,
@@ -1138,7 +1463,7 @@ export async function runCodexAppServerSession(rawArgs) {
     });
     stopHeartbeat = collaborationWorker
       ? () => {}
-      : startAgentSessionHeartbeat({ sessionId, stateDir });
+      : startAgentSessionHeartbeat({ sessionId, ...relayAccount });
     await syncCatalog("running");
     appendSessionStart({
       sessionId,
@@ -1158,6 +1483,20 @@ export async function runCodexAppServerSession(rawArgs) {
     await reportMode();
     await reportAutonomy();
     await reportDetail();
+    // The session states its model as soon as it is ready. A session nobody
+    // has touched yet still answers on the device route, and the App needs
+    // to hear that — including whether this transport can change it — before
+    // it can offer a choice.
+    await reportSessionModel();
+    // And the effort it runs on. A session nobody has put on a level yet is
+    // on the model's own default, and saying so is what lets the App offer
+    // the choice at all.
+    await reportSessionEffort();
+    if (pendingEffortPayload) {
+      const payload = pendingEffortPayload;
+      pendingEffortPayload = null;
+      await applyEffort(payload);
+    }
     process.stderr.write("[originrouter] Managed Codex session ready.\n");
     void eventLoop();
     if (options.initialMessage) await sendMessage(options.initialMessage);

@@ -555,9 +555,13 @@ const CODEX_CALL_ID = "codex-approval-1781663500000-zyxwvu";
   assert.deepEqual(writes, ["\x1b[Z", "\x1b[Z"]);
   assert.equal(adapter.currentMode, "plan");
   assert.equal(adapter.modeControl, "supported");
+  // "auto" is not offered: every session carries `disableAutoMode: "disable"`
+  // in its --settings file, which removes auto from Claude Code's own
+  // Shift+Tab cycle. Advertising it would offer a mode the terminal can never
+  // reach.
   assert.deepEqual(
     adapter.availableModes().map((item) => item.id),
-    ["default", "acceptEdits", "plan", "auto"],
+    ["default", "acceptEdits", "plan"],
   );
   const result = adapter
     .scanStructuredEvents()
@@ -614,6 +618,34 @@ const CODEX_CALL_ID = "codex-approval-1781663500000-zyxwvu";
   assert.deepEqual(writes, ["\x1b[Z"]);
   assert.equal(adapter.currentMode, "default");
   adapter.cleanup();
+}
+
+// A session launched with `--permission-mode auto` does not start in auto.
+//
+// Every session this adapter starts carries `disableAutoMode: "disable"` in its
+// --settings file, so Claude Code refuses to enter auto mode under it: the
+// startup mode is rewritten to "default" (telemetry trigger `auto_gate_denied`).
+// The adapter therefore reports the mode the session is *in*, not the one the
+// command line asked for — otherwise the App would show a mode the terminal
+// has already left.
+{
+  for (const args of [
+    ["--permission-mode", "auto"],
+    ["--permission-mode=auto"],
+  ]) {
+    const adapter = new ClaudeAdapter({
+      args,
+      cwd: "/tmp/proj",
+      hookServerFactory: makeFakeHookServer().factory,
+    });
+    assert.equal(adapter.currentMode, "default", `${args.join(" ")} should floor to default`);
+    // The modes the App may pick are the reachable ones.
+    assert.deepEqual(
+      adapter.availableModes().map((item) => item.id),
+      ["default", "acceptEdits", "plan"],
+    );
+    adapter.cleanup();
+  }
 }
 
 // Mode changes are rejected while Claude is processing a turn. No terminal

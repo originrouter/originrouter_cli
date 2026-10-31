@@ -15,6 +15,7 @@ import {
   agentInteractionTimeoutMsFromConfig,
 } from "../config/agentInteractionTimeout.js";
 import { readClaudeConversationHistory } from "../runtime/claudeConversationHistory.js";
+import { CLAUDE_PTY_EFFORT_LEVELS } from "../runtime/agentEffort.js";
 import { readConfig } from "../persistence/state.js";
 
 const CLAUDE_NATIVE_MODES = Object.freeze([
@@ -30,16 +31,45 @@ const CLAUDE_NATIVE_MODES = Object.freeze([
 // sessions can still cycle the modes through Shift+Tab. OriginRouter drives
 // that native control one step at a time and requires a Hook ACK before it
 // sends another key, so a UI/version mismatch cannot turn into blind input.
+//
+// "auto" is deliberately absent. Every session this adapter starts carries
+// `disableAutoMode: "disable"` in its --settings file (see
+// claude/hookSettings.js), which takes auto out of Claude Code's own Shift+Tab
+// cycle. Advertising it here would offer the App a mode the terminal can never
+// reach, and every attempt would end in `mode_not_reachable`. The native list
+// above keeps the id so an incoming `agent.mode.set` for it still normalizes
+// and reports a clean rejection instead of an unknown value.
 const CLAUDE_REMOTE_MODE_IDS = new Set([
   "default",
   "acceptEdits",
   "plan",
-  "auto",
 ]);
 const CLAUDE_SHIFT_TAB = "\x1b[Z";
 const DEFAULT_MODE_CHANGE_TIMEOUT_MS = 3_000;
 const DEFAULT_MODE_CHANGE_MAX_STEPS = 8;
 const DEFAULT_MODE_OUTPUT_SETTLE_MS = 160;
+
+// Claude Code's TUI owns the reasoning effort of a running session. The
+// `/effort` command opens a slider over the levels the model offers; the
+// arrow keys move it, `s` applies the level to this session only, and
+// `Enter` applies it as the default for new sessions as well.
+//
+// OriginRouter drives the session-only path. The other one writes
+// `effortLevel` into the reader's own `~/.claude/settings.json`, and the
+// level of one session is not the reader's business.
+//
+// The levels are the ones the slider offers, in the order it offers them.
+// A level the slider does not have is a level the runtime cannot take, so
+// the list is the slider's list and nothing else.
+const CLAUDE_EFFORT_LEVELS = Object.freeze([
+  ...CLAUDE_PTY_EFFORT_LEVELS,
+]);
+const CLAUDE_EFFORT_LEFT = "\x1b[D";
+const CLAUDE_EFFORT_RIGHT = "\x1b[C";
+const DEFAULT_EFFORT_CHANGE_TIMEOUT_MS = 5_000;
+// The slider needs a moment to move its marker between two presses; the
+// keys themselves are written in one go.
+const EFFORT_KEY_SETTLE_MS = 140;
 // Read per request rather than captured once at import, so
 // `originrouter config set agent.interactionTimeoutMs` takes effect on the
 // next permission without restarting the daemon. See
@@ -53,14 +83,26 @@ function normalizeClaudeMode(value) {
   return CLAUDE_NATIVE_MODES.some((item) => item.id === mode) ? mode : "";
 }
 
+// The mode the session starts in, as far as Claude Code will actually honour
+// it. `--permission-mode auto` cannot stick: our --settings file pins
+// `disableAutoMode`, and Claude Code answers that combination by rewriting the
+// startup mode to "default" (telemetry trigger `auto_gate_denied`). Reporting
+// "auto" here would show a mode the terminal is not in until the SessionStart
+// hook corrects it, so the floor is applied at the point the argument is read.
+function floorUnavailablePermissionMode(mode) {
+  return mode === "auto" ? "default" : mode;
+}
+
 function initialPermissionMode(args) {
   for (let index = 0; index < args.length; index += 1) {
     const value = String(args[index] || "");
     if (value === "--permission-mode" && index + 1 < args.length) {
-      return normalizeClaudeMode(args[index + 1]);
+      return floorUnavailablePermissionMode(normalizeClaudeMode(args[index + 1]));
     }
     if (value.startsWith("--permission-mode=")) {
-      return normalizeClaudeMode(value.slice("--permission-mode=".length));
+      return floorUnavailablePermissionMode(
+        normalizeClaudeMode(value.slice("--permission-mode=".length)),
+      );
     }
     if (value === "--dangerously-skip-permissions") {
       return "bypassPermissions";
@@ -100,6 +142,96 @@ function modeFromTerminalText(value) {
 function safeText(value, maxLength = 512) {
   return String(value || "").slice(0, maxLength);
 }
+
+// The terminal writes its words with cursor jumps between them, so the text
+// that reaches us has no spaces in it: "seteffortleveltomax". Every match
+// below is made against the squashed text.
+function squashTerminalText(value) {
+  return cleanTerminalText(value).replace(/\s+/g, "");
+}
+
+// The badge the TUI keeps in its header: "● high · /effort".
+//
+// The badge is also the capability. A Claude Code without the effort
+// feature does not draw it, so a session whose badge never appeared has no
+// effort control to offer — and a CLI that has the badge has the slider
+// too, because they are the same feature.
+//
+// The terminal writes the badge two ways: "● high · /effort" when the
+// session starts and "◉xhigh·/effort" when the level changes, so the level
+// is read from the word in front of the separator. Only a word that is one
+// of the levels counts: the terminal also writes "Max effort · /effort to
+// change", which is a sentence about the cap and not a level.
+function effortBadgeFromTerminalText(value) {
+  const text = squashTerminalText(value);
+  let badge = "";
+  for (const match of text.matchAll(/([a-z]+)[·:•]\/effort/g)) {
+    if (!CLAUDE_EFFORT_LEVELS.includes(match[1])) continue;
+    badge = match[1];
+  }
+  return badge;
+}
+
+// The line the TUI prints after it applied a level:
+// "Set effort level to max (this session only)".
+function effortAppliedFromTerminalText(value) {
+  const text = squashTerminalText(value);
+  let applied = "";
+  for (const match of text.matchAll(
+    /seteffortlevelto(low|medium|high|xhigh|max)/g,
+  )) {
+    applied = match[1];
+  }
+  return applied;
+}
+
+// What the terminal says after a level was applied.
+//
+// Two ways, and either is the terminal's own word that the change landed:
+// the header repaints its badge with the new level ("◉xhigh·/effort"), and
+// on some paths a line says so ("Set effort level to xhigh (this session
+// only)"). The badge comes first because it is the one that is always
+// drawn.
+function effortLandedFromTerminalText(value) {
+  return effortAppliedFromTerminalText(value) || effortBadgeFromTerminalText(value) || null;
+}
+
+// The slider's own footer: "←/→ to adjust · Enter to confirm · s for this
+// session only". It is what says the slider opened.
+function effortSliderFromTerminalText(value) {
+  const text = squashTerminalText(value);
+  return /toadjust|forthissessiononly/.test(text) ? true : null;
+}
+
+// The levels the slider offers, read from the line it draws them on:
+// "low     medium     high     xhigh      max".
+//
+// The list is the model's own: a model that cannot take a level does not
+// have it in its slider, and a level the runtime cannot take is a row that
+// fails when it is tapped. The words are read as one run because the
+// terminal draws them with the spaces between them collapsed.
+//
+// The longest run is the slider's line of levels. A run of one word is a
+// word somewhere else on the screen — the badge, a sentence about the cap —
+// and is not a list.
+function effortLevelsFromTerminalText(value) {
+  const text = squashTerminalText(value);
+  let levels = [];
+  for (const match of text.matchAll(/(?:low|medium|high|xhigh|max)+/g)) {
+    const split = [];
+    let rest = match[0];
+    while (rest.length) {
+      const level = CLAUDE_EFFORT_LEVELS.find((item) => rest.startsWith(item));
+      if (!level) break;
+      split.push(level);
+      rest = rest.slice(level.length);
+    }
+    if (split.length >= levels.length) levels = split;
+  }
+  return levels;
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function schemaContainsSecret(value) {
   if (!value || typeof value !== "object") return false;
@@ -307,6 +439,19 @@ export class ClaudeAdapter extends TerminalAdapter {
     this.modeChangeWaiter = null;
     this.modeOutputBuffer = "";
     this.modeOutputTimer = null;
+    // The reasoning effort of the session. `currentEffort` is the level the
+    // terminal says the session is on, and `effortControl` says whether the
+    // session has a control at all — which the terminal's own effort badge
+    // decides, not this file.
+    this.currentEffort = null;
+    // Unsupported until the terminal's own effort badge proves the CLI has
+    // the feature; a headless run never draws one.
+    this.effortControl = "unsupported";
+    // The levels this session can be put on. The terminal's whole
+    // vocabulary until its own slider says which of them this model takes.
+    this.effortLevels = [...CLAUDE_EFFORT_LEVELS];
+    this.effortOutputBuffer = "";
+    this.effortWaiter = null;
     this.taskActive = false;
     this.sessionReady = false;
   }
@@ -374,6 +519,11 @@ export class ClaudeAdapter extends TerminalAdapter {
   }
 
   handleOutput(data) {
+    // The effort badge and the line that confirms an applied level are read
+    // from every repaint, not only while a change is pending: the badge is
+    // how the session learns the level it is on, and it is redrawn whenever
+    // the terminal repaints.
+    this.observeEffortInOutput(data);
     if (!this.modeChangeWaiter) return [];
     this.modeOutputBuffer = `${this.modeOutputBuffer}${data}`.slice(-12_000);
     const observed = modeFromTerminalText(this.modeOutputBuffer);
@@ -458,6 +608,151 @@ export class ClaudeAdapter extends TerminalAdapter {
       visited.add(nextMode);
     }
     return fail("mode_not_reachable");
+  }
+
+  // The levels this session's terminal can put on a running turn.
+  //
+  // The list is the slider's list. A level the runtime cannot take is a row
+  // that fails when it is tapped, so the App is handed exactly the levels
+  // the runtime has.
+  availableEfforts() {
+    if (this.effortControl !== "supported") return [];
+    return [...this.effortLevels];
+  }
+
+  effortStatusEvent({ accepted, reason, requestId } = {}) {
+    return {
+      type: "agent.effort.status",
+      provider: "claude",
+      runtime: "claude-pty",
+      sessionId: this.sessionId,
+      effort: this.currentEffort,
+      effortControl: this.effortControl,
+      availableEfforts: this.availableEfforts(),
+      ...(accepted == null ? {} : { accepted: Boolean(accepted) }),
+      ...(reason ? { reason: safeText(reason, 128) } : {}),
+      ...(requestId ? { requestId: safeText(requestId, 96) } : {}),
+    };
+  }
+
+  // Reads the session's level out of the terminal.
+  //
+  // Two things are read from the repaints: the badge in the status line,
+  // which says which level the session is on, and the line the TUI prints
+  // after it applied one, which says which level it applied.
+  observeEffortInOutput(data) {
+    this.effortOutputBuffer = `${this.effortOutputBuffer}${data}`.slice(-12_000);
+    const squashed = squashTerminalText(this.effortOutputBuffer);
+    const waiter = this.effortWaiter;
+    if (waiter) {
+      const hit = waiter.matches(squashed);
+      if (hit) {
+        clearTimeout(waiter.timer);
+        this.effortWaiter = null;
+        waiter.resolve(hit);
+      }
+    }
+    const badge = effortBadgeFromTerminalText(squashed);
+    if (badge) {
+      const firstBadge = this.effortControl !== "supported";
+      this.effortControl = "supported";
+      if (badge !== this.currentEffort) {
+        this.currentEffort = badge;
+        this.pendingEvents.push(this.effortStatusEvent());
+      } else if (firstBadge) {
+        // The badge appeared for the first time: the session can be told
+        // what it can do, even though the level itself did not change.
+        this.pendingEvents.push(this.effortStatusEvent());
+      }
+    }
+    const applied = effortAppliedFromTerminalText(squashed);
+    if (applied && applied !== this.currentEffort) {
+      this.currentEffort = applied;
+      this.pendingEvents.push(this.effortStatusEvent());
+    }
+  }
+
+  waitForEffortText(matches, timeoutMs = DEFAULT_EFFORT_CHANGE_TIMEOUT_MS) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.effortWaiter?.resolve === resolve) this.effortWaiter = null;
+        resolve(null);
+      }, timeoutMs);
+      this.effortWaiter = { matches, resolve, timer };
+    });
+  }
+
+  // Puts a level on a running session.
+  //
+  // The terminal's own slider is the only place a running session's level
+  // can be changed, so the command is typed the way the reader would type
+  // it and the terminal's own answer is what says it worked.
+  async setEffort(payload, executor) {
+    const requested = String(payload?.effort || "").trim().toLowerCase();
+    const requestId = payload?.requestId || payload?.commandId || "";
+    const fail = (reason) => {
+      this.pendingEvents.push(
+        this.effortStatusEvent({ accepted: false, reason, requestId }),
+      );
+      return false;
+    };
+    if (this.effortControl !== "supported") return fail("effort_control_unsupported");
+    if (!this.sessionReady) return fail("effort_change_not_ready");
+    if (!this.effortLevels.includes(requested)) {
+      return fail("effort_level_unsupported");
+    }
+    if (!executor || typeof executor.write !== "function") {
+      return fail("effort_control_unavailable");
+    }
+    if (this.taskActive || this.pendingInteractionInputs.size > 0) {
+      return fail("effort_change_busy");
+    }
+    if (this.effortWaiter) return fail("effort_change_in_progress");
+    if (requested === this.currentEffort) {
+      this.pendingEvents.push(
+        this.effortStatusEvent({ accepted: true, requestId }),
+      );
+      return true;
+    }
+
+    // Open the slider.
+    const slider = this.waitForEffortText(effortSliderFromTerminalText);
+    executor.write("/effort\r");
+    if (!(await slider)) return fail("effort_change_not_confirmed");
+
+    // The slider's own levels are the ones this model takes: a model that
+    // cannot take a level does not have it in its slider. They are read
+    // from the line the slider drew, and the published list is narrowed to
+    // them, so the App stops offering a row that cannot be applied.
+    const sliderLevels = effortLevelsFromTerminalText(this.effortOutputBuffer);
+    if (sliderLevels.length > 1) {
+      this.effortLevels = sliderLevels;
+      this.pendingEvents.push(this.effortStatusEvent());
+    }
+    const wanted = this.effortLevels.indexOf(requested);
+    if (wanted < 0) return fail("effort_level_unsupported");
+
+    // The slider opens on the level the session is already on. Walking it
+    // to the far left first makes the walk to the wanted level a fixed
+    // number of steps, whatever the session started on.
+    executor.write(CLAUDE_EFFORT_LEFT.repeat(this.effortLevels.length));
+    await delay(EFFORT_KEY_SETTLE_MS);
+    executor.write(CLAUDE_EFFORT_RIGHT.repeat(wanted));
+    await delay(EFFORT_KEY_SETTLE_MS);
+
+    // `s` applies the level to this session only. `Enter` would apply it
+    // as the default for new sessions as well, which writes the reader's
+    // own settings file — not this session's business.
+    this.effortOutputBuffer = "";
+    const applied = this.waitForEffortText(effortLandedFromTerminalText);
+    executor.write("s");
+    const level = await applied;
+    if (!level || level !== requested) return fail("effort_change_not_confirmed");
+    this.currentEffort = level;
+    this.pendingEvents.push(
+      this.effortStatusEvent({ accepted: true, requestId }),
+    );
+    return true;
   }
 
   questionPayload(input) {

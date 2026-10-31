@@ -3,6 +3,55 @@
 All notable changes to OriginRouter CLI will be documented here. The project
 uses Semantic Versioning and follows the Keep a Changelog structure.
 
+## Unreleased
+
+### Added
+
+- **A session can name its own model.** The device route stays the default:
+  a session that names no model runs on whatever the device is routed to, and
+  changing the device's route never invalidates a session's own choice. The
+  override is written per session, survives the daemon, and is applied by the
+  compatibility gateway on the next request — the agent keeps asking for the
+  route alias it was given and never learns which upstream model is really
+  answering, so the Claude and Codex SDKs are untouched by this.
+- A launch-time `--model` now *is* a session override rather than the agent's
+  own model string. In route mode the agent must keep asking for the route
+  alias, or the proxy has nothing to translate — handing a concrete id
+  straight through named a model the proxy could not resolve. A target that
+  does not validate is reported and the device route stays in force.
+- The session publishes its model as soon as it is ready
+  (`agent.model.status`). The registry folds the status into the session
+  record, and the session list and control snapshot carry it out.
+- The status reaches the cloud too, so an App on another machine sees the
+  session's model without asking the device: the runtime event carries the
+  session's four model facts (`model`, `modelProvider`, `source`,
+  `modelControl`), and the control plane records them on the session row.
+- `modelControl` tells the App whether the session's model may be changed. It
+  is `supported` only on route mode, which is the one transport with a place to
+  rewrite the request's model — the compatibility gateway. A session connected
+  through the account bridge is still route mode, so it can change its own
+  conversation's model; a session on `remote-coding`,
+  `originrouter-coding` or `inherited` reports `unsupported` and the App shows
+  its model read-only.
+- **A refused change is said out loud.** The device's answer to a model change
+  travels with the status event — whether the change was accepted and, when it
+  was not, the device's own reason — so the App can tell the reader that the
+  change did not happen instead of leaving the tap looking like it did nothing.
+
+### Changed
+
+- The session's model is not invalidated by a device route change. A route is
+  the default; a session's own choice is a fact about that session.
+- **The list of models a session may be pinned to is no longer carried on the
+  session.** It is the device's fact, and it already has exactly one transport:
+  the local-control provider snapshot (`localControlProviderSnapshot` →
+  `providers_json`). The runtime event carries the session's model and nothing
+  else, the registry does not store a catalogue, and the App asks the device
+  for the list when it opens its picker. A per-session copy would go stale the
+  moment the device's providers changed, and the CLI's own
+  `availableSessionModels` — a third derivation of the same rule — is gone
+  with it.
+
 ## 0.5.1 - 2026-10-15
 
 ### Added

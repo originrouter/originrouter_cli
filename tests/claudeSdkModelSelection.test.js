@@ -104,9 +104,22 @@ settingsOverride.cleanup();
 assert.throws(() => statSync(settingsOverride.path), /ENOENT/);
 settingsOverride.cleanup();
 
-assert.equal(createClaudeRuntimeSettingsOverride({
+// An inherited route has no transport to pin, but it still gets a settings file:
+// the permission safety keys are not transport and must be written for every
+// session. A null here used to mean "no --settings file", which left auto mode
+// reachable through the user's own settings.json.
+const inheritedOverride = createClaudeRuntimeSettingsOverride({
   source: "inherited",
   env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:5580" },
-}), null);
+}, { temporaryRoot });
+assert.ok(inheritedOverride);
+const inheritedSettings = JSON.parse(readFileSync(inheritedOverride.path, "utf8"));
+assert.equal(inheritedSettings.disableAutoMode, "disable");
+assert.deepEqual(inheritedSettings.permissions, { defaultMode: "default" });
+// No transport override means no `env` block at all: the route stays whatever
+// the environment says, and only the permission keys are added.
+assert.equal("env" in inheritedSettings, false);
+inheritedOverride.cleanup();
+assert.throws(() => statSync(inheritedOverride.path), /ENOENT/);
 
 console.log("claude SDK model selection tests passed");

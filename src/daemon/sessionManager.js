@@ -680,11 +680,20 @@ export class SessionManager {
           : null;
         providerResult = await this.buildAgentProviderEnvFn(agent, readConfig(), {
           provider: payload.provider,
+          // The session id rides along as the route credential, so the gateway
+          // in front of the agent can apply this session's model override. The
+          // PTY runtime asks for the same alias every transport does; without
+          // the credential the gateway cannot tell which session a request
+          // belongs to, and the override never reaches it.
+          sessionId,
           proxyStatus: staticProxyStatusFn(proxySnapshot),
         });
         const protectedResult = await protectOriginrouterCodingEnv(agent, providerResult, {
           stateDir: ensureStateDir(),
           runId: payload.runId,
+          // Same reason: the proxy resolves the alias against this session's
+          // own override.
+          sessionId,
         });
         providerResult = protectedResult.providerResult;
         session.originrouterCodingProxy = protectedResult.proxy;

@@ -15,6 +15,25 @@ function textEntries(content) {
   return entries;
 }
 
+// The CLI's own bookkeeping of a slash command.
+//
+// A command typed in the terminal — `/effort`, `/clear` — is recorded in
+// the transcript as a run of messages: the caveat that says the command was
+// not sent to the model, the command itself, and its output. None of it is
+// something anyone said, and the App draws the conversation, so the records
+// are dropped instead of showing up as three odd lines around every
+// command the runtime was asked to run.
+const LOCAL_COMMAND_MARKERS = [
+  "<local-command-caveat>",
+  "<local-command-stdout>",
+  "<command-name>",
+];
+
+export function isLocalCommandRecord(text) {
+  const value = String(text || "").trim();
+  return LOCAL_COMMAND_MARKERS.some((marker) => value.startsWith(marker));
+}
+
 function stableMessageId(raw, lineIndex, role, blockIndex, text) {
   const sourceId = raw.uuid || raw.message?.id || raw.id;
   if (sourceId) {
@@ -42,7 +61,8 @@ export function claudeConversationMessagesFromRaw(raw, { lineIndex = 0 } = {}) {
       text: text.trim(),
       createdAt: typeof raw.timestamp === "string" ? raw.timestamp : null,
     }))
-    .filter((message) => message.text);
+    .filter((message) => message.text)
+    .filter((message) => !isLocalCommandRecord(message.text));
 }
 
 function safeToolResult(content) {
@@ -72,6 +92,7 @@ export function claudeConversationTimelineItemsFromRaw(raw, { lineIndex = 0 } = 
   for (let blockIndex = 0; blockIndex < content.length; blockIndex += 1) {
     const block = content[blockIndex];
     if (block?.type === "text" && typeof block.text === "string" && block.text.trim()) {
+      if (isLocalCommandRecord(block.text)) continue;
       items.push({
         messageId: stableMessageId(raw, lineIndex, role, blockIndex, block.text),
         role,

@@ -404,6 +404,30 @@ export function effectiveRoutes(routeSet) {
   return effectiveAgentRoutes("claude", r);
 }
 
+/**
+ * The concrete model each slot falls back to.
+ *
+ * This is the chain the env used to be filled with: the slot's own route
+ * model, then the provider's own model, then the primary slot's model. It is
+ * kept here — not next to the env builder — because the local gateways need
+ * it too: when a session's model is an alias, this is the model the session
+ * started on, and it is what the gateway falls back to when nothing else
+ * resolves the alias.
+ *
+ * @param {"claude"|"codex"} agent
+ * @param {{routes?: object, provider?: object|null}} providerResult
+ * @returns {Record<string, string|null>}
+ */
+export function fallbackModelsFor(agent, providerResult) {
+  const routes = providerResult?.routes || {};
+  const provider = providerResult?.provider || null;
+  const modelFor = (slot) =>
+    routes[slot]?.model || provider?.model || routes.main?.model || null;
+  const out = {};
+  for (const slot of ROUTE_DEFS[agent]?.slots || []) out[slot] = modelFor(slot);
+  return out;
+}
+
 // Per-agent effective routes. Slots listed in ROUTE_DEFS[agent]
 // .inheritsFromPrimary are materialized from the primary slot when unset
 // (Claude: opus/sonnet/haiku/fable; Codex: none). The renderer iterates

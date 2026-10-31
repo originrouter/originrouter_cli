@@ -1,7 +1,16 @@
+function sliceWellFormed(value, maxLen) {
+  let text = value.slice(0, maxLen);
+  const last = text.charCodeAt(text.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) text = text.slice(0, -1);
+  return text.toWellFormed();
+}
+
 function safeText(value, maxLen = 512) {
   const text = String(value || "").replace(/[\r\n]+/g, " ").trim();
   if (!text) return "";
-  return text.slice(0, maxLen);
+  // Truncation can split an emoji's UTF-16 surrogate pair. Omit the partial
+  // character and repair any other invalid code unit before serialization.
+  return sliceWellFormed(text, maxLen);
 }
 
 function safeLocalControlProviders(value) {
@@ -88,10 +97,14 @@ function safeAgentBudgets(value) {
     daily: {
       sampled_tokens: Math.max(0, Number(entry?.daily?.sampled_tokens) || 0),
       amount_micros: Math.max(0, Number(entry?.daily?.amount_micros) || 0),
+      unpriced_events: Math.max(0, Number(entry?.daily?.unpriced_events) || 0),
+      other_currency_events: Math.max(0, Number(entry?.daily?.other_currency_events) || 0),
     },
     weekly: {
       sampled_tokens: Math.max(0, Number(entry?.weekly?.sampled_tokens) || 0),
       amount_micros: Math.max(0, Number(entry?.weekly?.amount_micros) || 0),
+      unpriced_events: Math.max(0, Number(entry?.weekly?.unpriced_events) || 0),
+      other_currency_events: Math.max(0, Number(entry?.weekly?.other_currency_events) || 0),
     },
     warning: entry?.warning === true,
     exhausted: entry?.exhausted === true,
@@ -151,11 +164,13 @@ function compactText(value, maxLen = 512) {
 }
 
 export function redactAgentActivityText(value, maxLen = 4096) {
-  return compactText(value, maxLen)
+  const redacted = compactText(value, maxLen)
     .replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g, "[REDACTED_KEY]")
     .replace(/\b(?:sk[-_]|or_at_|or_rt_|ghp_|github_pat_|xox[baprs]-)[A-Za-z0-9._~-]{8,}\b/g, "[REDACTED_TOKEN]")
     .replace(/(authorization\s*:\s*bearer\s+)[^\s,;]+/gi, "$1[REDACTED]")
     .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]");
+  // A replacement marker can be longer than the secret it replaces.
+  return sliceWellFormed(redacted, maxLen);
 }
 
 export function normalizeAgentActivityEventType(event = {}) {
@@ -269,6 +284,8 @@ function displaySummaryForAgentEvent(event) {
   if (type === "user.text") return "User message received";
   if (type === "token_count") return "Token usage updated";
   if (type === "agent.mode.status") return "Agent mode updated";
+  if (type === "agent.model.status") return "Agent model updated";
+  if (type === "agent.effort.status") return "Agent reasoning effort updated";
   if (type === "agent.autonomy.status") return "Unattended execution updated";
   if (type === "agent.interaction.auto_resolved") return "Blocking action continued automatically";
   if (type === "agent.task.started") return "Task started";
@@ -449,6 +466,8 @@ function projectRuntimeEvent({ eventType, event, summary, riskLevel }) {
     "user.text",
     "token_count",
     "agent.mode.status",
+    "agent.model.status",
+    "agent.effort.status",
     "agent.autonomy.status",
     "agent.interaction.auto_resolved",
     "agent.ready",
@@ -494,6 +513,43 @@ function projectRuntimeEvent({ eventType, event, summary, riskLevel }) {
             })
         .filter((item) => item.id)
       : [],
+    // The model this session runs on. The models the device serves are NOT
+    // here: they belong to the device, go out in the device's provider
+    // snapshot, and the App reads them from there when it opens its picker.
+    // A copy per event would be a stale duplicate of a device fact.
+    model: nestedType === "agent.model.status" ? safeText(event?.model, 191) : "",
+    modelProvider: nestedType === "agent.model.status"
+      ? safeText(event?.modelProvider, 191)
+      : "",
+    modelSource: nestedType === "agent.model.status" ? safeText(event?.source, 16) : "",
+    modelControl: nestedType === "agent.model.status"
+      ? safeText(event?.modelControl, 16)
+      : "",
+    // Whether the device accepted the change this event is about, and why it
+    // refused. This is the only way the App learns that the change it asked
+    // for did not happen: the session row says what the session runs on, and
+    // the command's own answer says only that the command arrived.
+    modelAccepted: nestedType === "agent.model.status"
+      ? (event?.accepted === true ? true : event?.accepted === false ? false : null)
+      : null,
+    modelReason: nestedType === "agent.model.status" ? safeText(event?.reason, 191) : "",
+    // The session's own reasoning effort, and the levels the device said it
+    // can run. The runtime owns this vocabulary; the App renders what it is
+    // given rather than a list of its own.
+    effort: nestedType === "agent.effort.status" ? safeText(event?.effort, 16) : "",
+    effortControl: nestedType === "agent.effort.status"
+      ? safeText(event?.effortControl, 16)
+      : "",
+    availableEfforts: nestedType === "agent.effort.status"
+      ? (Array.isArray(event?.availableEfforts) ? event.availableEfforts : [])
+        .slice(0, 8)
+        .map((item) => safeText(item, 16))
+        .filter(Boolean)
+      : [],
+    effortAccepted: nestedType === "agent.effort.status"
+      ? (event?.accepted === true ? true : event?.accepted === false ? false : null)
+      : null,
+    effortReason: nestedType === "agent.effort.status" ? safeText(event?.reason, 191) : "",
   };
 }
 

@@ -300,6 +300,37 @@ export class ExternalAgentRegistry {
       availableModes: Array.isArray(payload?.availableModes)
         ? payload.availableModes.slice(0, 16)
         : existing?.availableModes || [],
+      // The session's own model. Null means the session follows the device
+      // route, which is the default and the fallback.
+      //
+      // Not the register payload's `model`: that one names the model the
+      // *device* is routed to, which is the device's fact and belongs to the
+      // catalog. The session's own model is the runtime's word — it states
+      // the model when the session starts and again on every change — and
+      // that event is the only thing that writes this field. Reading the
+      // payload's model here put a model the session had not chosen on a
+      // session that had chosen none, and the two readings disagreed about
+      // what the field meant.
+      model: existing?.model ?? null,
+      modelProvider: existing?.modelProvider ?? null,
+      modelSource: existing?.modelSource || "device",
+      modelControl: existing?.modelControl || "unsupported",
+      // The session's own reasoning effort. Null means the runtime has not
+      // said yet — the runtime owns the vocabulary, so the App renders the
+      // level list it publishes rather than a list of its own.
+      //
+      // The control and the list of levels are the runtime's capability, and
+      // they are told at registration: a daemon that restarts rebuilds the
+      // session record from this payload, and a session that came back
+      // without its levels came back without a control.
+      effort: existing?.effort ?? null,
+      effortControl:
+        safeText(payload?.effortControl, 16) ||
+        existing?.effortControl ||
+        "unsupported",
+      availableEfforts: Array.isArray(payload?.availableEfforts)
+        ? payload.availableEfforts.slice(0, 8)
+        : existing?.availableEfforts || [],
       autonomyRevision: existing?.autonomyRevision || 0,
       autonomyProfile:
         existing?.autonomyStatus?.autonomyProfile || safeText(payload?.autonomyProfile, 32) ||
@@ -353,7 +384,15 @@ export class ExternalAgentRegistry {
     };
     this.sessions.set(sessionId, session);
     try {
-      this.catalog?.upsertSession({ ...payload, sessionKind: session.sessionKind });
+      const existingConversation = this.catalog?.listConversations?.({
+        conversationId: session.conversationId, includeArchived: true, limit: 1,
+      })?.[0];
+      this.catalog?.upsertSession({
+        ...payload, sessionKind: session.sessionKind,
+        // A registration can carry an old launch title across reconnects.
+        // It may name a new conversation, but it cannot undo a later rename.
+        titleIsCustom: payload.titleIsCustom === true && !existingConversation?.title_is_custom,
+      });
     } catch {}
     this.notify("registered", sessionId, {
       ...payload,
@@ -497,6 +536,37 @@ export class ExternalAgentRegistry {
       session.availableModes = Array.isArray(event?.availableModes)
         ? event.availableModes.slice(0, 16)
         : session.availableModes;
+    }
+    if (event?.type === "agent.model.status") {
+      // The model is a fact about the session, and it can be cleared: an
+      // empty model means the session is back on the device route, so the
+      // value is assigned rather than kept when it is blank.
+      session.model = safeText(event?.model, 191) || null;
+      session.modelProvider = safeText(event?.modelProvider, 191) || null;
+      session.modelSource =
+        safeText(event?.source, 16) || session.modelSource || "device";
+      session.modelControl =
+        safeText(event?.modelControl, 16) || session.modelControl;
+    }
+    if (event?.type === "agent.effort.status") {
+      // The runtime publishes the levels it can actually run. An empty
+      // effort means the runtime fell back to its own default, so the value
+      // is assigned rather than kept when it is blank.
+      session.effort = safeText(event?.effort, 16) || null;
+      session.effortControl =
+        safeText(event?.effortControl, 16) || session.effortControl;
+      session.availableEfforts = Array.isArray(event?.availableEfforts)
+        ? event.availableEfforts
+            .map((item) => safeText(item, 16))
+            .filter(Boolean)
+            .slice(0, 8)
+        : session.availableEfforts;
+      if (event.requestId) {
+        session.controlResults.set(event.requestId, event);
+        while (session.controlResults.size > 32) {
+          session.controlResults.delete(session.controlResults.keys().next().value);
+        }
+      }
     }
     if (event?.type === "agent.autonomy.status" &&
         (Number(event.autonomyRevision || 0) >= Number(session.autonomyRevision || 0))) {
@@ -662,6 +732,16 @@ export class ExternalAgentRegistry {
       event_cursor: this.eventCursor,
       stream_id: this.eventStreamId,
       mode: session.mode,
+      // The session's own model. `null` means the device route answers.
+      model: session.model,
+      modelProvider: session.modelProvider,
+      modelSource: session.modelSource,
+      modelControl: session.modelControl,
+      // The session's own reasoning effort, and the levels the runtime
+      // published for it.
+      effort: session.effort,
+      effortControl: session.effortControl,
+      availableEfforts: session.availableEfforts,
       autonomyProfile: session.autonomyProfile,
       autonomy:
         session.autonomyStatus,
@@ -744,6 +824,15 @@ export class ExternalAgentRegistry {
       mode: session.mode,
       mode_control: session.modeControl,
       available_modes: session.availableModes,
+      // The session's own model. `null` means the device route answers, and
+      // the App offers that as the first row rather than hiding it.
+      model: session.model,
+      model_provider: session.modelProvider,
+      model_source: session.modelSource,
+      model_control: session.modelControl,
+      effort: session.effort,
+      effort_control: session.effortControl,
+      available_efforts: session.availableEfforts,
       autonomy_profile: session.autonomyProfile,
       autonomy_revision: session.autonomyRevision,
       autonomy_control: session.autonomyControl,

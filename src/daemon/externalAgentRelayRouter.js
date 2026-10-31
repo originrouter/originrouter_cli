@@ -11,6 +11,8 @@ const SESSION_COMMAND_TYPES = new Set([
   "terminal.interrupt",
   "agent.interaction.resolve",
   "agent.mode.set",
+  "agent.model.set",
+  "agent.effort.set",
   "agent.autonomy.set",
   "session.stop",
 ]);

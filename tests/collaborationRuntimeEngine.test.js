@@ -125,6 +125,18 @@ assert.ok(registry.commands.some((item) => (
   && item.command.action === "allow"
   && item.command.response.policy_evaluated === true
 )));
+store.updateSupervisorApproval(created.run_id, { profile: "manual" });
+registry.emit(leadSession, {
+  type: "agent.interaction.requested", eventId: "lead-manual-confirmation",
+  interactionId: "confirm-manual", kind: "confirm", title: "Continue?", prompt: "Review first.",
+});
+await runtime.queue;
+attention = store.getSnapshot(created.run_id).attention;
+const manualConfirm = attention.find((item) => item.kind === "confirm");
+assert.ok(manualConfirm);
+await runtime.resolveAttention(created.run_id, manualConfirm.attention_id, { action: "allow", expected_revision: manualConfirm.revision });
+assert.ok(registry.commands.some((item) => item.command.interactionId === "confirm-manual" && item.command.action === "allow"));
+store.updateSupervisorApproval(created.run_id, { profile: "guarded" });
 registry.emit(leadSession, {
   type: "agent.interaction.requested",
   eventId: "lead-questions-request",
@@ -363,6 +375,42 @@ assert.ok(registry.commands.some((item) => (
   item.sessionId === failedLeadSession && item.command.type === "session.stop"
 )));
 
+const pausedCreated = coordinator.create({
+  objective: "Ignore interrupted turn results after a manual pause.",
+  agents: {
+    lead: { runtime: "codex", device_id: "device-local", workspace_id: "workspace-1", responsibilities: ["research"] },
+    worker: { runtime: "claude", device_id: "device-local", workspace_id: "workspace-1", responsibilities: ["implement"] },
+  },
+});
+await runtime.start(pausedCreated.run_id);
+await new Promise((resolve) => setImmediate(resolve));
+const pausedSession = store.getRun(pausedCreated.run_id).agents.lead.originrouter_session_id;
+store.updateSupervisorApproval(pausedCreated.run_id, { profile: "manual" });
+await runtime.handleRegistryNotification({ type: "event", sessionId: pausedSession, payload: {
+  type: "agent.interaction.requested", eventId: "before-pause-request", interactionId: "before-pause", kind: "permission",
+} });
+const interruptedAttention = store.getSnapshot(pausedCreated.run_id).attention.find((item) => item.payload?.interaction_id === "before-pause");
+assert.ok(interruptedAttention);
+await runtime.pause(pausedCreated.run_id);
+assert.equal(store.listAttention(pausedCreated.run_id).some((item) => item.attention_id === interruptedAttention.attention_id), false);
+assert.equal(store.listAttention(pausedCreated.run_id, { status: "" }).find((item) => item.attention_id === interruptedAttention.attention_id).resolution, "interrupted");
+await runtime.handleRegistryNotification({ type: "registered", sessionId: pausedSession, payload: { nativeSessionId: "late-native-id" } });
+await runtime.handleRegistryNotification({ type: "unregistered", sessionId: pausedSession, payload: { status: "stopped" } });
+assert.equal(store.getRun(pausedCreated.run_id).agents.lead.status, "paused", "late registration events must not erase the pause");
+assert.equal(store.getRun(pausedCreated.run_id).agents.lead.native_session_id, "late-native-id");
+for (const event of [
+  { type: "agent.task.failed", eventId: "paused-failure" },
+  { type: "agent.task.complete", status: "aborted", eventId: "paused-completion" },
+  { type: "agent.usage", sampledTokens: 17, eventId: "paused-usage" },
+]) {
+  await runtime.handleRegistryNotification({ type: "event", sessionId: pausedSession, payload: event });
+}
+assert.equal(store.getRun(pausedCreated.run_id).state, "paused");
+assert.equal(store.getRun(pausedCreated.run_id).usage.sampled_tokens, 17, "late usage must still be accounted for");
+await runtime.resume(pausedCreated.run_id);
+assert.equal(store.getRun(pausedCreated.run_id).state, "researching");
+assert.equal(store.getRun(pausedCreated.run_id).agents.lead.status, "running");
+
 const budgetRelayMessages = [];
 const budgetRuntime = new CollaborationRuntime({
   store,
@@ -396,9 +444,23 @@ const budgetCreated = coordinator.create({
     },
   },
 });
+const siblingBudgetRun = coordinator.create({
+  objective: "An account limit affects every Run on a coordinator.",
+  agents: {
+    lead: { runtime: "codex", device_id: "device-local", workspace_id: "workspace-1", responsibilities: ["research"] },
+    worker: { runtime: "claude", device_id: "device-local", workspace_id: "workspace-1", responsibilities: ["implement"] },
+  },
+});
+coordinator.start(siblingBudgetRun.run_id);
 await budgetRuntime.start(budgetCreated.run_id);
 await new Promise((resolve) => setImmediate(resolve));
 const budgetLeadSession = store.getRun(budgetCreated.run_id).agents.lead.originrouter_session_id;
+const statusRequestsBeforeOrdinaryUsage = budgetRelayMessages.filter((item) => item.type === "collaboration.budget.status.request").length;
+await budgetRuntime.handleRelayEvent({
+  type: "collaboration.budget.status", targetDeviceId: "device-local", status_protocol: 1, blocked: false,
+});
+assert.equal(budgetRelayMessages.filter((item) => item.type === "collaboration.budget.status.request").length,
+  statusRequestsBeforeOrdinaryUsage, "ordinary unblocked usage must not trigger a status request each time");
 await budgetRuntime.handleRelayEvent({
   type: "collaboration.budget.status",
   targetDeviceId: "device-local",
@@ -408,6 +470,15 @@ await budgetRuntime.handleRelayEvent({
 let budgetRun = store.getRun(budgetCreated.run_id);
 assert.equal(budgetRun.state, "budget_exhausted");
 assert.equal(budgetRun.account_budget_blocked, true);
+for (const event of [
+  { type: "agent.task.aborted", eventId: "late-budget-abort" },
+  { type: "agent.task.complete", status: "aborted", eventId: "late-budget-completion" },
+]) {
+  await budgetRuntime.handleRegistryNotification({ type: "event", sessionId: budgetLeadSession, payload: event });
+  assert.equal(store.getRun(budgetCreated.run_id).state, "budget_exhausted", "an interrupted turn cannot fail a budget-blocked Run");
+}
+assert.equal(store.getRun(siblingBudgetRun.run_id).account_budget_blocked, true,
+  "a status carrying a reporting Run ID still applies to sibling Runs");
 assert.ok(registry.commands.some((item) => (
   item.sessionId === budgetLeadSession && item.command.type === "terminal.interrupt"
 )));
@@ -432,13 +503,13 @@ await new Promise((resolve) => setImmediate(resolve));
 budgetRun = store.getRun(budgetCreated.run_id);
 assert.equal(budgetRun.state, "researching");
 assert.equal(budgetRun.account_budget_blocked, false);
+assert.equal(store.getRun(siblingBudgetRun.run_id).account_budget_blocked, false);
 assert.ok(budgetRun.messages.some((message) => message.payload?.budget_status === "account_available"));
 
 await budgetRuntime.refreshAccountBudgetStatus();
-assert.deepEqual(budgetRelayMessages.at(-1), {
-  type: "collaboration.budget.status.request",
-  payload: { sourceDeviceId: "device-local" },
-});
+assert.equal(budgetRelayMessages.at(-1).type, "collaboration.budget.status.request");
+assert.equal(budgetRelayMessages.at(-1).payload.sourceDeviceId, "device-local");
+assert.ok(budgetRelayMessages.at(-1).payload.requestId);
 
 await budgetRuntime.handleRelayEvent({
   type: "collaboration.budget.status",
@@ -467,7 +538,181 @@ await new Promise((resolve) => setImmediate(resolve));
 assert.equal(store.getRun(createdWhileBlocked.run_id).state, "researching");
 assert.equal(launches.length, launchCountBeforeBlockedStart + 1);
 
+const multiBudgetRun = coordinator.create({
+  objective: "Interrupt every participant when the task budget is exhausted.",
+  agents: {
+    lead: { runtime: "codex", device_id: "device-local", workspace_id: "workspace-1", responsibilities: ["research"] },
+    worker: { runtime: "claude", device_id: "device-remote", workspace_id: "workspace-2", responsibilities: ["implement"] },
+  },
+  budget: { token_limit: 100 },
+});
+coordinator.start(multiBudgetRun.run_id);
+const multiTaskId = store.getRun(multiBudgetRun.run_id).task_ids[0];
+registry.add("budget-local-session");
+for (const role of ["lead", "worker"]) {
+  store.issueAgentLease(multiBudgetRun.run_id, role, { dispatchKey: `budget-${role}` });
+  store.updateAgent(multiBudgetRun.run_id, role, {
+    currentTaskId: multiTaskId, status: "running",
+    ...(role === "lead" ? { originrouterSessionId: "budget-local-session" } : {}),
+  });
+}
+const exhausted = store.recordUsage(multiBudgetRun.run_id, {
+  eventId: "multi-budget-usage-1", sampledTokens: 100,
+});
+await budgetRuntime.handleBudgetResult(multiBudgetRun.run_id, "lead", "budget-local-session", exhausted);
+assert.ok(registry.commands.some((item) => item.sessionId === "budget-local-session" && item.command.type === "terminal.interrupt"));
+const budgetCancel = budgetRelayMessages.find((item) => item.type === "collaboration.remote.cancel" && item.payload.runId === multiBudgetRun.run_id);
+assert.equal(budgetCancel?.payload.taskId, multiTaskId);
+assert.equal(budgetCancel?.payload.reason, "budget_exhausted");
+assert.equal(budgetCancel?.payload.targetDeviceId, "device-remote");
+
+// A remote block arriving before its dispatch must fence that dispatch, but
+// must not prevent a later attempt after the budget is raised.
+await budgetRuntime.handleRelayEvent({ ...budgetCancel.payload, type: "collaboration.remote.cancel", targetDeviceId: "device-local" });
+assert.equal(store.isRemoteAssignmentCancelled(budgetCancel.payload), true);
+assert.equal(store.isRemoteAssignmentCancelled({ ...budgetCancel.payload, fencingToken: budgetCancel.payload.fencingToken + 1, attempt: budgetCancel.payload.attempt + 1 }), false);
+
+const loweredBudgetRun = coordinator.create({
+  objective: "Interrupt running work when a budget is lowered.",
+  agents: {
+    lead: { runtime: "codex", device_id: "device-local", workspace_id: "workspace-1", responsibilities: ["research"] },
+    worker: { runtime: "claude", device_id: "device-local", workspace_id: "workspace-1", responsibilities: ["implement"] },
+  },
+  budget: { token_limit: 1000 },
+});
+coordinator.start(loweredBudgetRun.run_id);
+store.recordUsage(loweredBudgetRun.run_id, { eventId: "lowered-budget-usage-1", sampledTokens: 500 });
+registry.add("lowered-budget-session");
+store.updateAgent(loweredBudgetRun.run_id, "lead", { currentTaskId: store.getRun(loweredBudgetRun.run_id).task_ids[0], originrouterSessionId: "lowered-budget-session", status: "running" });
+assert.equal((await budgetRuntime.updateBudget(loweredBudgetRun.run_id, { token_limit: 400 })).state, "budget_exhausted");
+assert.ok(registry.commands.some((item) => item.sessionId === "lowered-budget-session" && item.command.type === "terminal.interrupt"));
+
+const startingRun = coordinator.create({
+  objective: "Do not send a task after its budget is blocked during startup.",
+  agents: {
+    lead: { runtime: "codex", device_id: "device-local", workspace_id: "workspace-1", responsibilities: ["research"] },
+    worker: { runtime: "claude", device_id: "device-local", workspace_id: "workspace-1", responsibilities: ["implement"] },
+  },
+});
+coordinator.start(startingRun.run_id);
+let releaseLaunch;
+const launchGate = new Promise((resolve) => { releaseLaunch = resolve; });
+let startingSessionId;
+const slowRuntime = new CollaborationRuntime({
+  store, coordinator, registry, deviceId: "device-local",
+  supervisor: { async start(payload) {
+    startingSessionId = payload.sessionId;
+    await launchGate;
+    registry.add(payload.sessionId);
+    return { sessionId: payload.sessionId, conversationId: payload.conversationId };
+  } },
+  registrationTimeoutMs: 100, pollIntervalMs: 1,
+});
+const startingDispatch = slowRuntime.dispatchForState(startingRun.run_id);
+assert.ok(startingSessionId);
+store.setAccountBudgetBlocked(startingRun.run_id, true);
+releaseLaunch();
+await startingDispatch;
+assert.ok(registry.commands.some((item) => item.sessionId === startingSessionId && item.command.type === "session.stop"));
+assert.equal(registry.commands.some((item) => item.sessionId === startingSessionId && item.command.type === "agent.message"), false);
+slowRuntime.close();
+
+let releaseBudgetInterrupt;
+let markBudgetInterruptStarted;
+const budgetInterruptGate = new Promise((resolve) => { releaseBudgetInterrupt = resolve; });
+const budgetInterruptStarted = new Promise((resolve) => { markBudgetInterruptStarted = resolve; });
+const originalBudgetInterrupt = budgetRuntime.interruptBudgetAgents;
+budgetRuntime.interruptBudgetAgents = async () => {
+  markBudgetInterruptStarted();
+  await budgetInterruptGate;
+};
+const blockInFlight = budgetRuntime.handleRelayEvent({
+  type: "collaboration.budget.status", targetDeviceId: "device-local", blocked: true,
+});
+await budgetInterruptStarted;
+let clearFinished = false;
+const clearInFlight = budgetRuntime.handleRelayEvent({
+  type: "collaboration.budget.status", targetDeviceId: "device-local", blocked: false,
+}).then(() => { clearFinished = true; });
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(clearFinished, false, "account status transitions must not interleave during remote interruption");
+releaseBudgetInterrupt();
+await Promise.all([blockInFlight, clearInFlight]);
+assert.equal(store.getRun(siblingBudgetRun.run_id).account_budget_blocked, false);
+budgetRuntime.interruptBudgetAgents = originalBudgetInterrupt;
+
+// A delayed account-available push, or a snapshot requested before a newer
+// block, must not resume work until a fresh status confirms it is available.
+await budgetRuntime.handleRelayEvent({
+  type: "collaboration.budget.status", targetDeviceId: "device-local", status_protocol: 1, blocked: true,
+});
+assert.equal(store.getRun(siblingBudgetRun.run_id).account_budget_blocked, true);
+await budgetRuntime.handleRelayEvent({
+  type: "collaboration.budget.status", targetDeviceId: "device-local", status_protocol: 1, blocked: false,
+});
+assert.equal(store.getRun(siblingBudgetRun.run_id).account_budget_blocked, true);
+const oldBudgetRequest = budgetRelayMessages.at(-1).payload.requestId;
+await budgetRuntime.handleRelayEvent({
+  type: "collaboration.budget.status", targetDeviceId: "device-local", status_protocol: 1, blocked: true,
+});
+await budgetRuntime.handleRelayEvent({
+  type: "collaboration.budget.status", targetDeviceId: "device-local", status_protocol: 1,
+  request_id: oldBudgetRequest, blocked: false,
+});
+assert.equal(store.getRun(siblingBudgetRun.run_id).account_budget_blocked, true);
+const freshBudgetRequest = budgetRelayMessages.at(-1).payload.requestId;
+assert.notEqual(freshBudgetRequest, oldBudgetRequest);
+await budgetRuntime.handleRelayEvent({
+  type: "collaboration.budget.status", targetDeviceId: "device-local", status_protocol: 1,
+  request_id: freshBudgetRequest, blocked: false,
+});
+assert.equal(store.getRun(siblingBudgetRun.run_id).account_budget_blocked, false);
+
+// Acknowledged HTTP reports and status snapshots must work even if the
+// WebSocket status notification never reaches the coordinator.
+let acknowledgedBlocked = true;
+budgetRuntime.relayClient.sendAcknowledged = async (_type, _payload) => ({
+  data: { accepted: true, budget: { blocked: acknowledgedBlocked } },
+});
+const httpUsageId = "usage-http-budget-test";
+const httpReportId = "account-usage-http-test";
+const httpReport = budgetRuntime.accountUsageReport(siblingBudgetRun.run_id, httpUsageId, { sampledTokens: 5 });
+store.recordUsage(siblingBudgetRun.run_id, {
+  eventId: httpUsageId, sampledTokens: 5, accountReport: httpReport, accountReportOutboxId: httpReportId,
+});
+await budgetRuntime.deliverAccountUsage(httpReportId);
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(store.getRun(siblingBudgetRun.run_id).account_budget_blocked, true, "the report acknowledgement applies its blocked budget");
+assert.equal(store.getOutbox(httpReportId).state, "delivered");
+acknowledgedBlocked = false;
+await budgetRuntime.refreshAccountBudgetStatus();
+assert.equal(store.getRun(siblingBudgetRun.run_id).account_budget_blocked, false, "an acknowledged status snapshot clears the block without a WebSocket");
+
 budgetRuntime.close();
+const cancelledRun = coordinator.create({
+  objective: "Do not resolve requests after cancellation.",
+  agents: {
+    lead: { runtime: "codex", device_id: "device-local", workspace_id: "workspace-1", responsibilities: ["research"] },
+    worker: { runtime: "claude", device_id: "device-local", workspace_id: "workspace-1", responsibilities: ["implement"] },
+  },
+});
+const pendingAfterCancel = store.createAttention(cancelledRun.run_id, {
+  kind: "approval", title: "Pending", actions: ["allow", "deny"], participantId: "lead",
+  idempotencyKey: "cancelled-permission-test",
+  payload: { session_id: leadSession, interaction_id: "cancelled-permission", kind: "permission" },
+});
+coordinator.cancel(cancelledRun.run_id);
+// Reproduce an older persisted terminal Run with a stale pending attention.
+store.db.prepare("UPDATE collaboration_attention_items SET status = 'pending' WHERE attention_id = ?").run(pendingAfterCancel.attention_id);
+await assert.rejects(runtime.resolveAttention(cancelledRun.run_id, pendingAfterCancel.attention_id, { action: "allow" }), { code: "COLLABORATION_RUN_TERMINAL" });
+assert.equal(registry.commands.some((item) => item.command.interactionId === "cancelled-permission"), false);
+const retryResults = await Promise.all([
+  runtime.retry(cancelledRun.run_id, "", "retry-concurrent-request"),
+  runtime.retry(cancelledRun.run_id, "", "retry-concurrent-request"),
+]);
+assert.equal(retryResults[0].run_id, retryResults[1].run_id);
+assert.equal(store.retryForRequest(cancelledRun.run_id, "retry-concurrent-request").run_id, retryResults[0].run_id);
+assert.notEqual(retryResults[0].state, "created");
 runtime.close();
 store.close();
 console.log("collaboration runtime engine tests passed");

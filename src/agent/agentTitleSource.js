@@ -14,7 +14,7 @@
 // Everything else — the catalog's own precedence, the server's guard — exists
 // to keep that order true when two writers meet.
 
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -67,27 +67,36 @@ export function looksLikePlaceholderTitle(title, agentType) {
 export function readClaudeTranscriptTitle(transcriptPath) {
   const path = safeTitleText(transcriptPath, 4096);
   if (!path) return "";
-  let size = 0;
+  let fd;
   try {
-    size = statSync(path).size;
-  } catch {
-    return "";
-  }
-  if (!size) return "";
-  try {
-    const buffer = readFileSync(path);
-    const start = size > TAIL_BYTES ? size - TAIL_BYTES : 0;
-    const tail = buffer.subarray(start).toString("utf8");
-    const found = parseClaudeTitleRecords(tail);
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    if (!size) return "";
+    const readWindow = (start, length) => {
+      const buffer = Buffer.allocUnsafe(length);
+      let offset = 0;
+      while (offset < length) {
+        const count = readSync(fd, buffer, offset, length - offset, start + offset);
+        if (count === 0) break; // The file may have been truncated meanwhile.
+        offset += count;
+      }
+      return buffer.subarray(0, offset).toString("utf8");
+    };
+    const start = Math.max(0, size - TAIL_BYTES);
+    const found = parseClaudeTitleRecords(readWindow(start, size - start));
     if (found) return found;
     // The tail held no title. For a file small enough to read whole, the
     // title may simply be older than the tail window.
-    if (size <= FULL_READ_LIMIT) {
-      return parseClaudeTitleRecords(buffer.toString("utf8"));
+    if (start > 0 && size <= FULL_READ_LIMIT) {
+      return parseClaudeTitleRecords(readWindow(0, size));
     }
     return "";
   } catch {
     return "";
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* The file is already closed. */ }
+    }
   }
 }
 

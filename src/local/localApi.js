@@ -953,6 +953,7 @@ async function dispatch(ctx, req, res) {
           return sendOk(res, await ctx.collaborationRuntime.handleControlOperation(operation, {
             configuration_id: configurationId,
             answers: body.answers || {},
+            expected_proposal_token: body.expected_proposal_token,
           }));
         } catch (error) {
           return sendError(res, 409, error.message || "configuration action failed", { reason: error.code || "configuration_action_failed" });
@@ -1063,7 +1064,7 @@ async function dispatch(ctx, req, res) {
       }
     }
     const collaborationMatch = pathname.match(
-      /^\/collaboration\/local\/runs\/([^/]+)(?:\/(start|confirm|replan|begin-planning|begin-implementation|pause|resume|retry|cancel|messages|budget|approval))?$/,
+      /^\/collaboration\/local\/runs\/([^/]+)(?:\/(start|confirm|replan|begin-planning|begin-implementation|pause|resume|retry|retry-lookup|cancel|messages|budget|approval))?$/,
     );
     if (collaborationMatch) {
       const runId = decodeURIComponent(collaborationMatch[1]);
@@ -1081,6 +1082,9 @@ async function dispatch(ctx, req, res) {
             limit: url.searchParams.get("limit"),
           }),
         });
+      }
+      if (req.method === "GET" && action === "retry-lookup") {
+        return sendOk(res, { run: ctx.collaborationStore.retryForRequest(runId, url.searchParams.get("request_id")) });
       }
       if (req.method === "DELETE" && !action) {
         try {
@@ -1106,12 +1110,12 @@ async function dispatch(ctx, req, res) {
               : ctx.collaborationCoordinator.start(runId) }
           : action === "confirm"
             ? { run: ctx.collaborationRuntime
-                ? await ctx.collaborationRuntime.confirm(runId)
-                : ctx.collaborationCoordinator.confirm(runId) }
+                ? await ctx.collaborationRuntime.confirm(runId, { expectedPlanRevision: body.expected_plan_revision })
+                : ctx.collaborationCoordinator.confirm(runId, { expectedPlanRevision: body.expected_plan_revision }) }
           : action === "replan"
             ? { run: ctx.collaborationRuntime
-                ? await ctx.collaborationRuntime.revisePlan(runId, body.feedback)
-                : ctx.collaborationStore.requestAdaptivePlanRevision(runId, body.feedback) }
+                ? await ctx.collaborationRuntime.revisePlan(runId, body.feedback, { expectedPlanRevision: body.expected_plan_revision })
+                : ctx.collaborationStore.requestAdaptivePlanRevision(runId, body.feedback, { expectedPlanRevision: body.expected_plan_revision }) }
           : action === "begin-planning"
             ? { run: ctx.collaborationCoordinator.beginPlanning(runId) }
             : action === "begin-implementation"
@@ -1130,10 +1134,12 @@ async function dispatch(ctx, req, res) {
                         : ctx.collaborationStore.resumeRun(runId) }
                     : action === "retry"
                       ? { run: ctx.collaborationRuntime
-                          ? await ctx.collaborationRuntime.retry(runId, body.task_id || body.taskId)
+                          ? await ctx.collaborationRuntime.retry(runId, body.task_id || body.taskId, body.request_id || body.requestId)
                           : (body.task_id || body.taskId
                               ? ctx.collaborationStore.retryAdaptiveTask(runId, body.task_id || body.taskId)
-                              : ctx.collaborationStore.retryRun(runId)) }
+                              : body.request_id || body.requestId
+                                ? ctx.collaborationStore.retryRunOnce(runId, body.request_id || body.requestId).run
+                                : ctx.collaborationStore.retryRun(runId)) }
                 : action === "budget"
                   ? { run: ctx.collaborationRuntime
                       ? await ctx.collaborationRuntime.updateBudget(runId, body)
@@ -1321,6 +1327,11 @@ async function dispatch(ctx, req, res) {
       }
       const conversation = ctx.agentCatalog.getConversation(conversationId);
       if (!conversation) return sendError(res, 404, "agent conversation not found");
+      // The lookup accepts a session ID as well as a conversation ID. Check
+      // the resolved identity too, so the alias cannot bypass the worker guard.
+      if (ctx.agentCatalog.isCollaborationConversation?.(conversation.conversation_id)) {
+        return sendError(res, 404, "agent conversation not found");
+      }
       return sendOk(res, { conversation });
     }
     if (pathname === "/agent/local/settings/detail") {
@@ -1420,7 +1431,7 @@ async function dispatch(ctx, req, res) {
     }
 
     const localAgentMatch = pathname.match(
-      /^\/agent\/local\/sessions\/([^/]+)\/(update|unregister|events|commands|snapshot|history|audit|message|interrupt|stop|interaction|mode|autonomy)$/,
+      /^\/agent\/local\/sessions\/([^/]+)\/(update|unregister|events|commands|snapshot|history|audit|message|interrupt|stop|interaction|mode|model|effort|autonomy)$/,
     );
     if (localAgentMatch) {
       const sessionId = decodeURIComponent(localAgentMatch[1]);
@@ -1542,6 +1553,48 @@ async function dispatch(ctx, req, res) {
             type: "agent.mode.set",
             sessionId,
             mode,
+            requestId: body.requestId,
+          });
+          return sendOk(res, {
+            session_id: sessionId,
+            accepted: true,
+            request_id: command.commandId,
+          });
+        }
+        if (action === "model") {
+          // An empty model clears the override and returns the session to the
+          // device route. The runtime validates the target against the
+          // provider catalog and answers with an agent.model.status event.
+          const model = String(body.model || "").trim();
+          const provider = String(body.provider || "").trim();
+          if (model.length > 191 || provider.length > 191) {
+            return sendError(res, 400, "invalid agent model");
+          }
+          const command = ctx.externalAgentRegistry.enqueueCommand(sessionId, {
+            type: "agent.model.set",
+            sessionId,
+            model,
+            provider,
+            requestId: body.requestId,
+          });
+          return sendOk(res, {
+            session_id: sessionId,
+            accepted: true,
+            request_id: command.commandId,
+          });
+        }
+        if (action === "effort") {
+          // The runtime owns the vocabulary: it answers with an
+          // agent.effort.status event carrying the levels it can actually
+          // run. The daemon only checks the shape of what the App sent.
+          const effort = String(body.effort || "").trim().toLowerCase();
+          if (!effort || effort.length > 32) {
+            return sendError(res, 400, "invalid agent effort");
+          }
+          const command = ctx.externalAgentRegistry.enqueueCommand(sessionId, {
+            type: "agent.effort.set",
+            sessionId,
+            effort,
             requestId: body.requestId,
           });
           return sendOk(res, {

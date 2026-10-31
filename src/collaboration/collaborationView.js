@@ -121,6 +121,7 @@ export function derivedAttentionItems(run) {
       summary: "Review the proposed plan before execution starts.",
       risk: "normal",
       actions: ["confirm", "revise", "cancel"],
+      payload: { plan_revision: Number(run.plan_revision || 0), plan_revision_guard: 1 },
       created_at: run.updated_at,
       expires_at: null,
       resolved_at: null,
@@ -128,7 +129,12 @@ export function derivedAttentionItems(run) {
       derived: true,
     });
   }
-  if (run?.state === "budget_exhausted" || run?.account_budget_blocked) {
+  const taskBudgetExhausted = Boolean(
+    (run?.budget?.token_limit && Number(run.usage?.sampled_tokens || 0) >= Number(run.budget.token_limit))
+    || (run?.budget?.amount_limit_micros && Number(run.usage?.amount_micros || 0) >= Number(run.budget.amount_limit_micros))
+  );
+  if (run?.state === "budget_exhausted" || run?.account_budget_blocked
+      || (run?.state === "paused" && taskBudgetExhausted)) {
     items.push({
       attention_id: `derived:${runId}:budget`,
       kind: "budget",
@@ -145,6 +151,17 @@ export function derivedAttentionItems(run) {
       resolved_at: null,
       resolved_by: null,
       derived: true,
+    });
+  }
+  if (run?.state === "paused" && ["budget_exhausted", "resume_state_unknown"].includes(run.resume_state)) {
+    items.push({
+      attention_id: `derived:${runId}:resume_state_unknown`,
+      kind: "resume_state_unknown", status: "pending", run_id: runId,
+      task_id: null, participant_id: null,
+      title: "The original execution state is unavailable",
+      summary: "Cancel this Run and start another collaboration after reviewing its history.",
+      risk: "normal", actions: [], created_at: run.updated_at,
+      expires_at: null, resolved_at: null, resolved_by: null, derived: true,
     });
   }
   return items;

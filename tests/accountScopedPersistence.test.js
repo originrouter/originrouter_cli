@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, existsSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -16,6 +16,8 @@ import {
   writeCodingAuth,
 } from "../src/persistence/codingAuth.js";
 import { readConfig, writeConfig } from "../src/persistence/state.js";
+import { captureRelayAccountContext } from "../src/agent/bridgeReporter.js";
+import { CollaborationStore } from "../src/collaboration/collaborationStore.js";
 
 function credential(accountScope, sessionId) {
   const token = (value) => ({
@@ -95,6 +97,27 @@ test("proxy state honors the caller state directory instead of global HOME", asy
   assert.equal(readProxyState("proxy", stateA), null);
 });
 
+test("cached account budget status stays in the selected account", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "originrouter-account-budget-scope-"));
+  try {
+    activateAccount(stateDir, "sha256:budget-account-a");
+    let store = new CollaborationStore({ stateDir });
+    store.setAccountBudgetBlockedState(true);
+    store.close();
+    activateAccount(stateDir, "sha256:budget-account-b");
+    store = new CollaborationStore({ stateDir });
+    assert.equal(store.getAccountBudgetBlockedState(), null);
+    store.setAccountBudgetBlockedState(false);
+    store.close();
+    activateAccount(stateDir, "sha256:budget-account-a");
+    store = new CollaborationStore({ stateDir });
+    assert.equal(store.getAccountBudgetBlockedState(), true);
+    store.close();
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("a verified legacy session migrates its own config exactly once", () => {
   const stateDir = mkdtempSync(join(tmpdir(), "originrouter-account-migrate-"));
   const previousHome = process.env.ORIGINROUTER_HOME;
@@ -117,4 +140,19 @@ test("a verified legacy session migrates its own config exactly once", () => {
 
   if (previousHome == null) delete process.env.ORIGINROUTER_HOME;
   else process.env.ORIGINROUTER_HOME = previousHome;
+});
+
+test("runtime relay binding follows verified legacy account migration", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "originrouter-runtime-account-migrate-"));
+  try {
+    const account = "sha256:legacy-runtime-account";
+    writeFileSync(join(stateDir, "coding-key.json"), JSON.stringify(credential(account, "or_ses_legacy")));
+    const binding = captureRelayAccountContext(stateDir);
+    assert.equal(binding.stateDir, activeAccountStateDir(stateDir));
+    assert.equal(binding.expectedAccountStateDir, binding.stateDir);
+    assert.equal(binding.accountSelectionRoot, stateDir);
+    assert.equal(readCodingAuth(binding.stateDir).accountScope, account);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
 });

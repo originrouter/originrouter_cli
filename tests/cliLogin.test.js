@@ -128,9 +128,11 @@ test("the first operational CLI command writes bundled Cloud defaults once", asy
     assert.equal(first.code, 0, first.stderr);
     const seeded = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
     assert.equal(seeded.routes.claude.main.model, "claude-sonnet-5");
-    // The auxiliary families start out inheriting the primary model, so no
-    // auxiliary slot is written at all.
-    assert.equal(seeded.routes.claude.haiku, undefined);
+    // The Haiku family is the device's cheap model, so it is written as its
+    // own slot. The remaining auxiliary families start out inheriting the
+    // primary model, so no other auxiliary slot is written at all.
+    assert.equal(seeded.routes.claude.haiku.model, "claude-haiku-4-5");
+    assert.equal(seeded.routes.claude.opus, undefined);
     assert.equal(seeded.routes.codex.main.model, "gpt-5.6-sol");
 
     seeded.routes.codex.main.model = "user-selected-model";

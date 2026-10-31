@@ -51,12 +51,17 @@ export function getSnapshot(store, runId) {
         can_resolve_approval: attention.some((item) =>
           item.status === "pending" && Array.isArray(item.actions) && item.actions.length > 0,
         ),
-        can_pause: ["queued", "running", "blocked"].includes(projected.state),
-        can_resume: projected.state === "paused",
+        can_pause: ["planning", "queued", "running", "blocked"].includes(projected.state),
+        can_resume: run.state === "paused" && !run.account_budget_blocked
+          && !["budget_exhausted", "resume_state_unknown"].includes(run.resume_state)
+          && (!run.budget.token_limit || Number(run.usage.sampled_tokens || 0) < Number(run.budget.token_limit))
+          && (!run.budget.amount_limit_micros || Number(run.usage.amount_micros || 0) < Number(run.budget.amount_limit_micros)),
         can_cancel: !terminal,
         can_retry_task: !terminal && retryableTask,
         can_retry_run: ["failed", "cancelled", "expired"].includes(projected.state),
+        retry_request_idempotency: 1,
         can_change_budget: !terminal,
+        budget_revision_control: 1,
         can_archive: terminal && !run.archived_at,
         can_delete: terminal,
         can_view_diagnostics: true,

@@ -330,6 +330,7 @@ try {
     assert.deepEqual(cfg.routes, {
       claude: {
         main: { provider: "originrouter-cloud", model: "claude-sonnet-5" },
+        haiku: { provider: "originrouter-cloud", model: "claude-haiku-4-5" },
       },
     });
   }
@@ -344,6 +345,7 @@ try {
     assert.deepEqual(cfg.routes, {
       claude: {
         main: { provider: "originrouter-cloud", model: "claude-sonnet-5" },
+        haiku: { provider: "originrouter-cloud", model: "claude-haiku-4-5" },
       },
     });
     assert.equal(cfg.providers.openai_codex, undefined);
@@ -392,10 +394,15 @@ try {
       const r = await runCli(["env", "print", "--agent", "claude"], { env });
       assert.match(r.stdout, /Source: originrouter-coding/);
       assert.match(r.stdout, /ANTHROPIC_BASE_URL=http:\/\/127\.0\.0\.1:<session-port>\/coding/);
-      assert.match(r.stdout, /ANTHROPIC_MODEL=claude-sonnet-4-6/);
-      // Each auxiliary family is injected separately and inherits main here.
-      assert.match(r.stdout, /ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-sonnet-4-6/);
-      assert.match(r.stdout, /ANTHROPIC_DEFAULT_OPUS_MODEL=claude-sonnet-4-6/);
+      // The env carries the route *alias*, not the concrete model: the alias
+      // is what the gateway substitutes per request, and a name that never
+      // changes is what lets a running session switch models. The concrete
+      // model the alias currently resolves to is shown in the route table
+      // above it.
+      assert.match(r.stdout, /ANTHROPIC_MODEL=originrouter-claude-model/);
+      // Each auxiliary family is injected separately, under its own alias.
+      assert.match(r.stdout, /ANTHROPIC_DEFAULT_HAIKU_MODEL=originrouter-claude-haiku/);
+      assert.match(r.stdout, /ANTHROPIC_DEFAULT_OPUS_MODEL=originrouter-claude-opus/);
       assert.ok(!r.stdout.includes("ANTHROPIC_SMALL_FAST_MODEL="),
         "the fast-model variable is no longer part of the inject set");
       assert.ok(!r.stdout.includes("CLAUDE_CODE_SUBAGENT_MODEL="),
@@ -418,7 +425,7 @@ try {
       const r = await runCli(["env", "print", "--agent", "codex"], { env });
       assert.match(r.stdout, /Source: originrouter-coding/);
       assert.match(r.stdout, /OPENAI_BASE_URL=http:\/\/127\.0\.0\.1:<session-port>\/coding\/v1/);
-      assert.match(r.stdout, /OPENAI_MODEL=gpt-5-codex/);
+      assert.match(r.stdout, /OPENAI_MODEL=originrouter-codex-model/);
       assert.match(r.stdout, /OPENAI_API_KEY=or_l\.\.\.y>/);
       assert.ok(!r.stdout.includes("or_at_coding_test"),
         "raw Coding access token must never appear in env print output");

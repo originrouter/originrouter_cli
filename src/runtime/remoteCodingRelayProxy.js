@@ -20,6 +20,11 @@ import {
   verifyAndPinRemotePublicKey,
 } from "../crypto/remoteCodingE2ee.js";
 import { newRequestId, RemoteCodingRelayClient } from "../relay/remoteCodingRelayClient.js";
+import { rewriteModelInBody } from "./agentModelRewrite.js";
+import {
+  sessionIdFromCredential,
+  sessionIdFromHeaders,
+} from "../proxy/sessionModels.js";
 
 function translateErrorToHttp(evt) {
   const code = evt?.code || "upstream_error";
@@ -45,12 +50,19 @@ export class RemoteCodingRelayProxy {
     targetDeviceId = null,
     authToken = null,
     fetchFn = globalThis.fetch,
+    modelResolverForSession = null,
   }) {
     this.relayUrl = relayUrl;
     this.stateDir = stateDir;
     this.deviceId = deviceId;
     this.targetDeviceId = targetDeviceId;
     this.fetchFn = fetchFn;
+    // One proxy serves every session on this device, so the resolver is
+    // asked per request: the session is named by the credential the agent
+    // was started with.
+    this.modelResolverForSession = typeof modelResolverForSession === "function"
+      ? modelResolverForSession
+      : null;
     this._client = new RemoteCodingRelayClient({ relayUrl, deviceId, authToken, fetchFn });
     this._server = null;
     this._port = null;
@@ -137,7 +149,23 @@ export class RemoteCodingRelayProxy {
     req.on("end", async () => {
       try {
         const rawBody = Buffer.concat(chunks);
-        const base64Body = rawBody.length === 0 ? "" : rawBody.toString("base64");
+
+        // The agent holds a route alias, not a model id. This proxy is the
+        // last hop on this side, so it is where the alias becomes the model
+        // the remote device should answer with. The session is named by the
+        // credential the agent was started with, so the session's own model
+        // override applies.
+        let body = rawBody;
+        const sessionId = sessionIdFromHeaders(req.headers);
+        if (this.modelResolverForSession && sessionId) {
+          // The runtime is not asked for: the agent does not announce it over
+          // the wire (that header is ours, and only the relay client sets it),
+          // and it is not needed — the alias names the runtime by itself, and
+          // the two alias tables are disjoint.
+          const resolve = this.modelResolverForSession(sessionId);
+          body = rewriteModelInBody(rawBody, resolve);
+        }
+        const base64Body = body.length === 0 ? "" : body.toString("base64");
 
         // Forwarded headers: drop hop-by-hop / credential headers that
         // are caller-side concerns only. The worker still gets its own
@@ -152,6 +180,11 @@ export class RemoteCodingRelayProxy {
             || lk === "x-originrouter-target-device"
             || lk === "x-originrouter-runtime"
           ) continue;
+          // The session credential is this side's addressing, not the
+          // remote device's business: the worker strips it anyway, and it
+          // names a session that is not the remote device's to know.
+          if (lk === "x-api-key" && sessionIdFromCredential(v)) continue;
+          if (lk === "authorization" && sessionIdFromCredential(String(v || "").replace(/^Bearer\s+/i, ""))) continue;
           forwardedHeaders[k] = v;
         }
 

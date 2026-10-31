@@ -118,6 +118,15 @@ try {
   const snapshotPayload = await snapshotResponse.json();
   assert.equal(snapshotPayload.snapshot.schema_version, 2);
   assert.equal(snapshotPayload.snapshot.run.state, "created");
+  assert.equal(snapshotPayload.snapshot.capabilities.budget_revision_control, 1);
+  const editBudget = async (body) => fetch(`${base}/collaboration/local/runs/${encodeURIComponent(created.run_id)}/budget`, {
+    method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const budgetEdit = await editBudget({ expected_budget_revision: snapshotPayload.snapshot.run.budget_revision, token_limit: 1234 });
+  assert.equal(budgetEdit.status, 200);
+  const staleBudgetEdit = await editBudget({ expected_budget_revision: snapshotPayload.snapshot.run.budget_revision, token_limit: 5678 });
+  assert.equal(staleBudgetEdit.status, 409);
+  assert.equal((await staleBudgetEdit.json()).reason, "COLLABORATION_BUDGET_REVISION_CONFLICT");
 
   store.recordExecutionEvent(created.run_id, {
     type: "task.progress",

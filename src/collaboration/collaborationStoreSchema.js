@@ -1,5 +1,9 @@
 export function installCollaborationSchema(store) {
     store.db.exec(`
+      CREATE TABLE IF NOT EXISTS collaboration_runtime_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      ) STRICT;
       CREATE TABLE IF NOT EXISTS collaboration_runs (
         run_id TEXT PRIMARY KEY,
         workspace_session_id TEXT NOT NULL DEFAULT '',
@@ -313,6 +317,21 @@ export function installCollaborationSchema(store) {
         updated_at TEXT NOT NULL,
         expires_at TEXT NOT NULL DEFAULT ''
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS collaboration_configuration_permissions (
+        configuration_id TEXT PRIMARY KEY REFERENCES collaboration_configuration_sessions(configuration_id) ON DELETE CASCADE,
+        snapshot_json TEXT NOT NULL,
+        digest TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS collaboration_run_permissions (
+        run_id TEXT PRIMARY KEY REFERENCES collaboration_runs(run_id) ON DELETE CASCADE,
+        snapshot_json TEXT NOT NULL,
+        digest TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS collaboration_retry_requests (
+        request_id TEXT PRIMARY KEY,
+        source_run_id TEXT NOT NULL REFERENCES collaboration_runs(run_id) ON DELETE CASCADE,
+        run_id TEXT NOT NULL
+      ) STRICT;
       CREATE INDEX IF NOT EXISTS idx_collaboration_runs_updated ON collaboration_runs(updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_collaboration_runs_updated_stable
         ON collaboration_runs(updated_at DESC, run_id DESC);
@@ -339,6 +358,9 @@ export function installCollaborationSchema(store) {
     store.ensureColumn("collaboration_runs", "session_continuation", "INTEGER NOT NULL DEFAULT 0");
     store.ensureColumn("collaboration_runs", "supervisor_permission_profile", "TEXT NOT NULL DEFAULT 'guarded'");
     store.ensureColumn("collaboration_runs", "supervisor_policy_id", "TEXT NOT NULL DEFAULT ''");
+    store.ensureColumn("collaboration_runs", "supervisor_snapshot_digest", "TEXT NOT NULL DEFAULT ''");
+    store.ensureColumn("collaboration_runs", "approval_revision", "INTEGER NOT NULL DEFAULT 0");
+    store.ensureColumn("collaboration_runs", "budget_revision", "INTEGER NOT NULL DEFAULT 0");
     store.ensureColumn("collaboration_runs", "revision", "INTEGER NOT NULL DEFAULT 1");
     store.ensureColumn("collaboration_runs", "phase", "TEXT NOT NULL DEFAULT ''");
     store.ensureColumn("collaboration_runs", "pause_reason", "TEXT NOT NULL DEFAULT ''");
@@ -380,6 +402,7 @@ export function installCollaborationSchema(store) {
     store.ensureColumn("collaboration_usage_receipts", "amount_micros", "INTEGER NOT NULL DEFAULT 0");
     store.ensureColumn("collaboration_usage_receipts", "currency", "TEXT NOT NULL DEFAULT ''");
     store.ensureColumn("collaboration_usage_receipts", "cost_source", "TEXT NOT NULL DEFAULT ''");
+    store.ensureColumn("collaboration_outbox", "dispatch_metadata_json", "TEXT NOT NULL DEFAULT '{}'");
     store.ensureColumn("collaboration_agents", "attempt", "INTEGER NOT NULL DEFAULT 0");
     store.ensureColumn("collaboration_agents", "fencing_token", "INTEGER NOT NULL DEFAULT 0");
     store.ensureColumn("collaboration_agents", "lease_id", "TEXT NOT NULL DEFAULT ''");

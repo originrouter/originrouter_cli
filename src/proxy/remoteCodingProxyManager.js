@@ -17,6 +17,7 @@ import { readCodingAuth } from "../persistence/codingAuth.js";
 import { RemoteCodingRelayProxy } from "../runtime/remoteCodingRelayProxy.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import { OAUTH_RESOURCES } from "../runtime/authContract.js";
+import { createAgentModelResolver } from "../runtime/agentModelRewrite.js";
 
 const REFRESH_LEAD_MS = 60_000; // refresh 60s before expiresAt
 
@@ -117,6 +118,21 @@ export class RemoteCodingProxyManager {
       targetDeviceId: this.targetDeviceId,
       authToken,
       fetchFn: this.fetchFn,
+      // The proxy serves every session on this device, so the resolver is
+      // asked per request: which session is named by the credential the
+      // agent was started with.
+      //
+      // Both runtimes' alias tables are consulted. The agent does not tell us
+      // which runtime it is over the wire — that header is ours, and only the
+      // relay client sets it — but the alias it asks for belongs to exactly
+      // one of them, so the alias itself is enough.
+      modelResolverForSession: (sessionId) =>
+        createAgentModelResolver({
+          agent: "claude",
+          agents: ["claude", "codex"],
+          stateDir: this.stateDir,
+          sessionId,
+        }),
     });
     try {
       const result = await proxy.start();

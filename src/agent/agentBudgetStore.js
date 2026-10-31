@@ -11,11 +11,12 @@ const ENFORCEMENT = new Set(["block", "warn"]);
 
 function integerOrNull(value) {
   if (value == null || value === "") return null;
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error("budget limits must be positive numbers");
+  const parsed = typeof value === "number" || (typeof value === "string" && value.trim())
+    ? Number(value) : NaN;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error("budget limits must be positive safe integers");
   }
-  return Math.floor(parsed);
+  return parsed;
 }
 
 function normalizePolicy(value = {}) {
@@ -147,30 +148,34 @@ export class AgentBudgetStore {
     ).get(scope, agent));
   }
 
-  usage({ agent = null, period = "daily" } = {}) {
+  usage({ agent = null, period = "daily", currency = "USD" } = {}) {
     const start = periodStart(this.now(), period);
+    const columns = `COALESCE(SUM(sampled_tokens), 0) AS sampled_tokens,
+      COALESCE(SUM(CASE WHEN currency = ? THEN amount_micros ELSE 0 END), 0) AS amount_micros,
+      COALESCE(SUM(CASE WHEN currency = '' THEN 1 ELSE 0 END), 0) AS unpriced_events,
+      COALESCE(SUM(CASE WHEN currency <> '' AND currency <> ? THEN 1 ELSE 0 END), 0) AS other_currency_events`;
     const row = agent
       ? this.db.prepare(`
-          SELECT COALESCE(SUM(sampled_tokens), 0) AS sampled_tokens,
-                 COALESCE(SUM(amount_micros), 0) AS amount_micros
+          SELECT ${columns}
           FROM agent_budget_receipts WHERE agent = ? AND created_at >= ?
-        `).get(agent, start)
+        `).get(currency, currency, agent, start)
       : this.db.prepare(`
-          SELECT COALESCE(SUM(sampled_tokens), 0) AS sampled_tokens,
-                 COALESCE(SUM(amount_micros), 0) AS amount_micros
+          SELECT ${columns}
           FROM agent_budget_receipts WHERE created_at >= ?
-        `).get(start);
+        `).get(currency, currency, start);
     return {
       sampled_tokens: Number(row?.sampled_tokens || 0),
       amount_micros: Number(row?.amount_micros || 0),
+      unpriced_events: Number(row?.unpriced_events || 0),
+      other_currency_events: Number(row?.other_currency_events || 0),
       starts_at: start,
     };
   }
 
   status(scope, agent = "") {
     const policy = this.policy(scope, agent);
-    const daily = this.usage({ agent: scope === "agent" ? agent : null, period: "daily" });
-    const weekly = this.usage({ agent: scope === "agent" ? agent : null, period: "weekly" });
+    const daily = this.usage({ agent: scope === "agent" ? agent : null, period: "daily", currency: policy.currency });
+    const weekly = this.usage({ agent: scope === "agent" ? agent : null, period: "weekly", currency: policy.currency });
     const ratios = [
       policy.daily_token_limit ? daily.sampled_tokens / policy.daily_token_limit : 0,
       policy.weekly_token_limit ? weekly.sampled_tokens / policy.weekly_token_limit : 0,
@@ -211,10 +216,17 @@ export class AgentBudgetStore {
       0,
       Math.floor(Number(input.sampled_tokens ?? input.sampledTokens) || 0),
     );
-    const currency = String(input.currency || "").trim().toUpperCase();
-    const amountMicros = /^[A-Z]{3}$/.test(currency)
-      ? Math.max(0, Math.floor(Number(input.amount_micros ?? input.amountMicros) || 0))
-      : 0;
+    const rawCurrency = String(input.currency || "").trim().toUpperCase();
+    const rawAmount = input.amount_micros ?? input.amountMicros;
+    const number = typeof rawAmount === "number" || (typeof rawAmount === "string" && rawAmount.trim())
+      ? Number(rawAmount) : NaN;
+    const source = String(input.cost_source ?? input.costSource ?? "").trim();
+    // Old local producers did not send a source. New producers identify
+    // unsupported prices explicitly; do not present them as known costs.
+    const priced = /^[A-Z]{3}$/.test(rawCurrency) && Number.isSafeInteger(number)
+      && number >= 0 && (!source || source === "configured");
+    const currency = priced ? rawCurrency : "";
+    const amountMicros = priced ? number : 0;
     const createdAt = new Date(input.created_at ?? input.createdAt ?? this.now()).toISOString();
     const result = this.db.prepare(`
       INSERT OR IGNORE INTO agent_budget_receipts(

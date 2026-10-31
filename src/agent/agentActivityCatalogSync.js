@@ -1,10 +1,14 @@
-import { reportAgentConversationMetadata } from "./bridgeReporter.js";
+import { reportAgentConversationMetadata, reconcileAgentCatalogPreview } from "./bridgeReporter.js";
+import { accountSelectionRoot } from "../persistence/accounts.js";
 
 // Bump the cursor namespace when the projected metadata contract changes so
 // existing conversations are replayed once and receive workspace_display_path
 // and the link to the session their current run belongs to.
 const SYNC_META_KEY = "agent_activity_cloud_sync_v5";
+const REPAIR_META_KEY = "agent_activity_missing_backfill_v1";
+const PREVIEW_SCHEDULER_KEY = "agent_activity_preview_scheduler_v1";
 const PAGE_SIZE = 200;
+const REPAIR_BATCH_SIZE = 50;
 
 function safeText(value, maxLength = 4096) {
   return String(value ?? "").trim().slice(0, maxLength);
@@ -35,6 +39,120 @@ function writeCursor(catalog, cursor) {
     SYNC_META_KEY,
     JSON.stringify({ cursor, synced_at: new Date().toISOString() }),
   );
+}
+
+function readRepairState(catalog) {
+  try {
+    const state = JSON.parse(catalog?.getMeta?.(REPAIR_META_KEY) || "{}");
+    return { done: state.done === true, cursor: safeText(state.cursor, 256) };
+  } catch {
+    return { done: false, cursor: "" };
+  }
+}
+
+function writeRepairState(catalog, state) {
+  catalog?.setMeta?.(REPAIR_META_KEY, JSON.stringify(state));
+}
+
+async function backfillMissingRows({ catalog, stateDir, reportFn }) {
+  const state = readRepairState(catalog);
+  if (state.done) return;
+  // Activity timestamps can change while the repair is in progress. Use
+  // the stable conversation ID so moving a row cannot move it behind the
+  // checkpoint between batches.
+  const repairId = (conversation) => safeText(conversation.conversation_id, 96);
+  const remaining = readAllConversations(catalog)
+    .filter((conversation) => repairId(conversation) > state.cursor)
+    .sort((left, right) => {
+      const a = repairId(left);
+      const b = repairId(right);
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+  const batch = remaining.slice(0, REPAIR_BATCH_SIZE);
+  for (const conversation of batch) {
+    if (hasRecallContent(conversation)) {
+      // This is a distinct server route, never an ordinary upsert. If the
+      // server does not support it or the request fails, leave the cursor
+      // where it is and retry later; normal sync remains independent.
+      let result;
+      try {
+        result = await reportFn(agentActivityMetadataFromCatalog(conversation), {
+          stateDir, expectedAccountStateDir: catalog.stateDir,
+          accountSelectionRoot: catalog.stateDir ? accountSelectionRoot(catalog.stateDir) : undefined, insertOnly: true,
+        });
+      } catch {
+        return;
+      }
+      if (!result?.ok) return;
+    }
+    state.cursor = repairId(conversation);
+    writeRepairState(catalog, state);
+  }
+  if (remaining.length <= batch.length) {
+    state.done = true;
+    writeRepairState(catalog, state);
+  }
+}
+
+// Inserts made after the one-time repair can have an activity timestamp before
+// its checkpoint. Persist their identities at insertion time and only try the
+// insert-only endpoint, so an old local title cannot replace a cloud rename.
+async function syncPendingInserts({ catalog, stateDir, reportFn }) {
+  if (!catalog.listPendingCatalogInserts || !catalog.acknowledgeCatalogInsert) return;
+  for (const entry of catalog.listPendingCatalogInserts(REPAIR_BATCH_SIZE)) {
+    const row = catalog.listConversations({
+      conversationId: entry.conversation_id, includeArchived: true,
+      includeCollaboration: false, limit: 1,
+    })[0];
+    if (row && hasRecallContent(row)) {
+      let result;
+      try {
+        result = await reportFn(agentActivityMetadataFromCatalog(row), {
+          stateDir, expectedAccountStateDir: catalog.stateDir,
+          accountSelectionRoot: catalog.stateDir ? accountSelectionRoot(catalog.stateDir) : undefined, insertOnly: true,
+        });
+      } catch {
+        return;
+      }
+      if (!result?.ok) return;
+    }
+    catalog.acknowledgeCatalogInsert(entry.sequence);
+  }
+}
+
+async function syncPendingPreviews({ catalog, stateDir, reconcileFn }) {
+  if (!catalog.listPendingCatalogPreviews || !catalog.acknowledgeCatalogPreview) return;
+  let after = Math.max(0, Number(catalog.getMeta?.(PREVIEW_SCHEDULER_KEY)) || 0);
+  const attempted = new Set();
+  for (let count = 0; count < REPAIR_BATCH_SIZE; count++) {
+    let [change] = catalog.listPendingCatalogPreviews(1, after);
+    if (!change && after) [change] = catalog.listPendingCatalogPreviews(1, 0);
+    if (!change || attempted.has(change.sequence)) break;
+    attempted.add(change.sequence);
+    after = change.sequence;
+    catalog.setMeta?.(PREVIEW_SCHEDULER_KEY, String(after));
+    const row = catalog.listConversations({ conversationId: change.conversation_id,
+      includeArchived: true, includeCollaboration: false, limit: 1 })[0];
+    if (row) {
+      let result;
+      try {
+        result = await reconcileFn(change, { stateDir, expectedAccountStateDir: catalog.stateDir,
+          accountSelectionRoot: catalog.stateDir ? accountSelectionRoot(catalog.stateDir) : undefined });
+      } catch {
+        return;
+      }
+      // A conflict is a successful, deliberate preservation of the server's
+      // newer value. Only an actual transport/protocol failure stays queued.
+      if (!result?.ok) {
+        // A missing row or an unsupported endpoint must not starve unrelated
+        // conversations. Leave it queued and try another conversation; all
+        // later changes to this one stay behind its earliest pending change.
+        if ([404, 409, 422].includes(result?.status)) continue;
+        return;
+      }
+    }
+    catalog.acknowledgeCatalogPreview(change.sequence);
+  }
 }
 
 function hasRecallContent(conversation) {
@@ -91,6 +209,11 @@ export function agentActivityMetadataFromCatalog(conversation = {}) {
 }
 
 function readAllConversations(catalog) {
+  const read = () => readConversationPages(catalog);
+  return catalog.readCatalogSnapshot ? catalog.readCatalogSnapshot(read) : read();
+}
+
+function readConversationPages(catalog) {
   const conversations = [];
   for (let offset = 0; ; offset += PAGE_SIZE) {
     const page = catalog.listConversations({
@@ -102,20 +225,31 @@ function readAllConversations(catalog) {
     conversations.push(...page);
     if (page.length < PAGE_SIZE) break;
   }
-  return conversations.sort((left, right) =>
-    conversationCursor(left).localeCompare(conversationCursor(right))
-  );
+  return conversations.sort((left, right) => {
+    const leftCursor = conversationCursor(left);
+    const rightCursor = conversationCursor(right);
+    return leftCursor < rightCursor ? -1 : leftCursor > rightCursor ? 1 : 0;
+  });
 }
 
 export async function syncAgentActivityCatalog({
   catalog,
   stateDir,
   reportFn = reportAgentConversationMetadata,
+  reconcileFn = reconcileAgentCatalogPreview,
 } = {}) {
   if (!catalog?.listConversations) {
     return { ok: false, error: "catalog_unavailable", scanned: 0, synced: 0 };
   }
+  // Bind credentials to the catalog selected at construction, not a new
+  // active account that may appear before the daemon's restart timer fires.
+  stateDir = catalog.stateDir || stateDir;
   const previousCursor = readCursor(catalog);
+  if (!previousCursor && !catalog?.getMeta?.(REPAIR_META_KEY)) {
+    // Even if the first normal sync is interrupted, the corrected cursor
+    // resumes that full scan; it does not need a second backfill pass.
+    writeRepairState(catalog, { done: true, cursor: "" });
+  }
   const pending = readAllConversations(catalog).filter(
     (conversation) => conversationCursor(conversation) > previousCursor,
   );
@@ -130,7 +264,8 @@ export async function syncAgentActivityCatalog({
     }
     const result = await reportFn(
       agentActivityMetadataFromCatalog(conversation),
-      { stateDir },
+      { stateDir, expectedAccountStateDir: catalog.stateDir,
+        accountSelectionRoot: catalog.stateDir ? accountSelectionRoot(catalog.stateDir) : undefined },
     );
     if (!result?.ok) {
       return {
@@ -153,6 +288,11 @@ export async function syncAgentActivityCatalog({
     synced += 1;
     writeCursor(catalog, cursor);
   }
+  if (previousCursor) {
+    await backfillMissingRows({ catalog, stateDir, reportFn });
+  }
+  await syncPendingInserts({ catalog, stateDir, reportFn });
+  await syncPendingPreviews({ catalog, stateDir, reconcileFn });
   return {
     ok: true,
     scanned: pending.length,

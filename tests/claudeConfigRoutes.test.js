@@ -295,12 +295,15 @@ try {
     assert.equal(out.source, "originrouter-coding");
     assert.equal(out.env.ANTHROPIC_BASE_URL, "https://api.easytransnote.com/coding");
     assert.equal(out.env.ANTHROPIC_API_KEY, "or_at_coding_test");
-    assert.equal(out.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
-    // Every auxiliary inherits the primary model, each injected separately.
-    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "claude-sonnet-4-6");
-    assert.equal(out.env.ANTHROPIC_DEFAULT_SONNET_MODEL, "claude-sonnet-4-6");
-    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "claude-sonnet-4-6");
-    assert.equal(out.env.ANTHROPIC_DEFAULT_FABLE_MODEL, "claude-sonnet-4-6");
+    // The agent is started holding the route alias, not the concrete model:
+    // the per-session auth proxy in front of the cloud substitutes the
+    // concrete model per request, so a running session's model can change.
+    assert.equal(out.env.ANTHROPIC_MODEL, "originrouter-claude-model");
+    // Every auxiliary family is injected separately, under its own alias.
+    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "originrouter-claude-opus");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_SONNET_MODEL, "originrouter-claude-sonnet");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "originrouter-claude-haiku");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_FABLE_MODEL, "originrouter-claude-fable");
     assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, undefined);
     assert.equal(out.env.CLAUDE_CODE_SUBAGENT_MODEL, undefined);
   }
@@ -325,7 +328,8 @@ try {
     assert.equal(out.source, "originrouter-coding");
     assert.equal(out.env.OPENAI_BASE_URL, "https://api.easytransnote.com/coding/v1");
     assert.equal(out.env.OPENAI_API_KEY, "or_at_coding_test");
-    assert.equal(out.env.OPENAI_MODEL, "gpt-5-codex");
+    // The alias, like Claude's: the coding proxy substitutes the model.
+    assert.equal(out.env.OPENAI_MODEL, "originrouter-codex-model");
   }
 } finally {
   rmSync(home, { recursive: true, force: true });

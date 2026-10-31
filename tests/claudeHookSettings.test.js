@@ -92,6 +92,51 @@ assert.equal(hostileParsed.env.ANTHROPIC_MODEL, "m");
 
 // ---------- permissions ----------
 
+// The permission safety keys are in every settings file this module writes —
+// including the hooks-only one, which is what a session on a native
+// configuration actually starts with.
+//
+// `disableAutoMode` is Claude Code's kill switch for auto mode: it takes "auto"
+// out of the Shift+Tab cycle, refuses to adopt it at startup, and suppresses
+// the server-side classifier that would otherwise approve a call before our
+// PermissionRequest hook is ever consulted. `permissions.defaultMode` pins the
+// session's starting mode to "default", which is the real "ask every time"
+// mode. ("dontAsk" is not a lower level of asking — it denies without asking.)
+//
+// Both are read by Claude Code from the settings file, and this file is the
+// `--settings` flag layer, which outranks the user's own settings.json.
+assert.equal(hooksOnly.disableAutoMode, "disable");
+assert.equal(hooksOnly.permissions.defaultMode, "default");
+// The override case carries them too.
+assert.equal(parsed.disableAutoMode, "disable");
+assert.equal(parsed.permissions.defaultMode, "default");
+
+// An override cannot re-enable auto mode, and cannot move the default mode:
+// the safety keys are applied after the override, not before it.
+const autoOverride = generateClaudeHookSettings({
+  port: 43213,
+  settingsOverride: {
+    disableAutoMode: "enable",
+    permissions: { defaultMode: "auto" },
+  },
+});
+const autoParsed = JSON.parse(readFileSync(autoOverride, "utf8"));
+assert.equal(autoParsed.disableAutoMode, "disable");
+assert.equal(autoParsed.permissions.defaultMode, "default");
+
+// …and the merge is a merge, not a replace: a caller's own permission rules
+// are the user's, and dropping them would change what the session may do.
+const rulesOverride = generateClaudeHookSettings({
+  port: 43214,
+  settingsOverride: {
+    permissions: { allow: ["Bash(npm test)"], deny: ["Bash(rm:*)"] },
+  },
+});
+const rulesParsed = JSON.parse(readFileSync(rulesOverride, "utf8"));
+assert.deepEqual(rulesParsed.permissions.allow, ["Bash(npm test)"]);
+assert.deepEqual(rulesParsed.permissions.deny, ["Bash(rm:*)"]);
+assert.equal(rulesParsed.permissions.defaultMode, "default");
+
 // The file now carries ANTHROPIC_AUTH_TOKEN. fs mode bits are effectively a
 // no-op on Windows (a 0600 file reports 666 there), where the directory ACL is
 // what protects it instead.
@@ -103,6 +148,8 @@ if (platform() !== "win32") {
 cleanupClaudeHookSettings(hooksOnlyPath);
 cleanupClaudeHookSettings(withOverride);
 cleanupClaudeHookSettings(hostile);
+cleanupClaudeHookSettings(autoOverride);
+cleanupClaudeHookSettings(rulesOverride);
 // Idempotent: a second cleanup on a removed path is a no-op, not a throw.
 cleanupClaudeHookSettings(withOverride);
 cleanupClaudeHookSettings(null);

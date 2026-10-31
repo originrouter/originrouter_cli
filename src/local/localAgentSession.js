@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import {
   startAgentSessionHeartbeat,
+  captureRelayAccountContext,
   createRuntimeEventReporter,
   reportAgentConversationMetadata,
   shouldSyncAgentActivitySnapshot,
@@ -43,6 +44,15 @@ import {
   readLocalApiConfig,
 } from "../persistence/state.js";
 import { RemoteCodingProxyManager } from "../proxy/remoteCodingProxyManager.js";
+import {
+  clearSessionModel,
+  getSessionModel,
+  directProvidersForTransport,
+  modelControlForTransport,
+  resolveLaunchModelTarget,
+  setSessionModel,
+  validateSessionModelTarget,
+} from "../proxy/sessionModels.js";
 import {
   readLocalProxySnapshot,
   NOOP_REMOTE_CODING_SNAPSHOT,
@@ -108,6 +118,7 @@ function writeLocal(data) {
 
 export async function runLocalAgentSession(agent, rawArgs) {
   const stateDir = ensureStateDir();
+  const relayAccount = captureRelayAccountContext(stateDir);
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
 
   const { options, passthrough } = extractOriginRouterOptions(rawArgs);
@@ -215,6 +226,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
     ? { env: {}, provider: null, source: "native-config" }
     : await buildAgentProviderEnv(agent, localConfig, {
         provider: options.provider,
+        // Names the session on every proxied request, so a per-session model
+        // override applies to the terminal runtime too.
+        sessionId,
         proxyStatus,
         remoteCodingStatus,
       });
@@ -224,6 +238,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
       await protectOriginrouterCodingEnv(agent, providerResult, {
         stateDir,
         runId: options.runId,
+        // The proxy belongs to this session, and the session's own model
+        // override is what the proxy resolves the alias against.
+        sessionId,
       }));
   }
   const providerEnv = providerResult.env;
@@ -302,6 +319,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
           (autonomyAllowedScopes.length ? "custom" : "manual"),
       )
     : "manual";
+  // The session's model override, if the user pinned one. Null means the
+  // device route is in force.
+  let sessionModel = getSessionModel(stateDir, sessionId);
   let approvalPolicy = inheritedPermission
     ? inheritedPermission.approvalPolicy
     : autonomySupported && autonomyProfile === "custom" && options.approvalPolicyReference
@@ -385,7 +405,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     title: () => sessionTitle(),
     deviceName: device.displayName || device.host,
     workspaceDisplayPath: workspaceDisplayPath(cwd),
-    stateDir: ensureStateDir(),
+    ...relayAccount,
     telemetryQueue: telemetry.queue,
     telemetryUploader: telemetry.uploader,
     telemetryContext: () => ({
@@ -537,6 +557,123 @@ export async function runLocalAgentSession(agent, rawArgs) {
       await sendTransientEvent(autonomyStatus(payload?.requestId || null, {
         accepted: false,
         reason: error.code || error.message,
+      }));
+      return false;
+    }
+  };
+  // Per-session model selection. The terminal agent keeps asking the proxy
+  // for the route alias; the compatibility gateway substitutes the concrete
+  // model this session pinned.
+  const sessionModelStatus = (requestId = null, { accepted = null, reason = null } = {}) => ({
+    type: "agent.model.status",
+    provider: agent,
+    runtime: "claude-pty",
+    sessionId,
+    model: sessionModel?.model || null,
+    modelProvider: sessionModel?.provider || null,
+    source: sessionModel ? "session" : "device",
+    // Three transports have a place to rewrite the request's model — route
+    // mode's compatibility gateway, the cloud's per-session auth proxy, the
+    // remote device's relay proxy. The others show what the session runs on
+    // but must not offer a change they cannot apply.
+    modelControl: modelControlForTransport(providerSource),
+    requestId,
+    accepted,
+    reason,
+  });
+  // The reasoning effort of a terminal session.
+  //
+  // The runtime owns the vocabulary: the levels it can put on a running
+  // turn are the ones it publishes, and a level it cannot take is a row
+  // that fails when it is tapped. Claude Code's TUI has a slider over the
+  // levels it offers and applies one for the session only, so a PTY
+  // session has a control after all; a runtime without one says so and the
+  // App offers nothing.
+  const sessionEffortStatus = (requestId = null, { accepted = null, reason = null } = {}) => {
+    if (typeof adapter.effortStatusEvent === "function") {
+      return adapter.effortStatusEvent({ accepted, reason, requestId });
+    }
+    return {
+      type: "agent.effort.status",
+      provider: agent,
+      runtime: "claude-pty",
+      sessionId,
+      effort: null,
+      effortControl: "unsupported",
+      availableEfforts: [],
+      requestId,
+      accepted,
+      reason,
+    };
+  };
+  const applyEffort = async (payload) => {
+    if (typeof adapter.setEffort === "function") {
+      // The runtime answers with its own status event, and that event is
+      // what says the level actually changed.
+      return await adapter.setEffort(payload, executor);
+    }
+    await sendTransientEvent(sessionEffortStatus(payload?.requestId || null, {
+      accepted: false,
+      reason: "effort_control_unsupported",
+    }));
+    return false;
+  };
+  const applySessionModel = async (payload) => {
+    const requested = String(payload?.model || "").trim();
+    const requestedProvider = String(payload?.provider || "").trim();
+    try {
+      if (!requested) {
+        // Clearing is allowed on every transport: it is the safe direction, and
+        // it is how an override written while the session was on route mode is
+        // removed after the device moved on.
+        clearSessionModel(stateDir, sessionId);
+        sessionModel = null;
+        await sendTransientEvent(sessionModelStatus(payload?.requestId || null, { accepted: true }));
+        return true;
+      }
+      // Refused here, not merely hidden in the App: on a transport with no
+      // model-rewrite point there is nowhere for an override to take effect,
+      // and accepting it would leave a session that claims a model it does not
+      // run on.
+      if (modelControlForTransport(providerSource) !== "supported") {
+        await sendTransientEvent(
+          sessionModelStatus(payload?.requestId || null, {
+            accepted: false,
+            reason: "model_control_unsupported",
+          }),
+        );
+        return false;
+      }
+      const target = requestedProvider
+        ? validateSessionModelTarget(localConfig, {
+          provider: requestedProvider,
+          model: requested,
+          allowedProviders: directProvidersForTransport(providerResult),
+        })
+        : resolveLaunchModelTarget(localConfig, {
+          agent,
+          model: requested,
+          allowedProviders: directProvidersForTransport(providerResult),
+        });
+      if (!target.ok) {
+        await sendTransientEvent(sessionModelStatus(payload?.requestId || null, {
+          accepted: false,
+          reason: target.reason,
+        }));
+        return false;
+      }
+      setSessionModel(stateDir, sessionId, {
+        agent,
+        provider: target.provider,
+        model: target.model,
+      });
+      sessionModel = { provider: target.provider, model: target.model };
+      await sendTransientEvent(sessionModelStatus(payload?.requestId || null, { accepted: true }));
+      return true;
+    } catch (error) {
+      await sendTransientEvent(sessionModelStatus(payload?.requestId || null, {
+        accepted: false,
+        reason: error.message,
       }));
       return false;
     }
@@ -809,7 +946,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
 
   stopApprovalPolling = startApprovalDecisionPolling({
     sessionId,
-    stateDir: ensureStateDir(),
+    ...relayAccount,
     onDecision: async (payload) => {
       const applied = handleRemoteEvent(payload, {
         sessionId,
@@ -876,8 +1013,8 @@ export async function runLocalAgentSession(agent, rawArgs) {
       ...activitySnapshot,
     };
     const pending = catalogSyncTail.then(
-      () => reportAgentConversationMetadata(snapshot, { stateDir }),
-      () => reportAgentConversationMetadata(snapshot, { stateDir }),
+      () => reportAgentConversationMetadata(snapshot, relayAccount),
+      () => reportAgentConversationMetadata(snapshot, relayAccount),
     );
     catalogSyncTail = pending.catch(() => ({ ok: false }));
     return pending;
@@ -978,6 +1115,8 @@ export async function runLocalAgentSession(agent, rawArgs) {
           adapter,
           executor,
           applyAutonomy,
+          applySessionModel,
+          applyEffort,
         });
       }
       if (payload?.type === "agent.message") {
@@ -1008,6 +1147,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     runId: options.runId || sessionId,
     agent,
     title: sessionTitle(),
+    titleIsCustom: Boolean(requestedTitle && !agentTitle),
     deviceId: effectiveDeviceId,
     deviceName: device.displayName || device.host,
     cwd,
@@ -1023,6 +1163,21 @@ export async function runLocalAgentSession(agent, rawArgs) {
     mode: initialModeStatus.mode,
     modeControl: initialModeStatus.modeControl,
     availableModes: modeList,
+    // The reasoning effort the runtime can put on this session, and the
+    // levels it can take. The runtime says both; a runtime without the
+    // feature says nothing and the App offers no control.
+    effort:
+      typeof adapter.effortStatusEvent === "function"
+        ? adapter.effortStatusEvent().effort ?? null
+        : null,
+    effortControl:
+      typeof adapter.effortStatusEvent === "function"
+        ? adapter.effortStatusEvent().effortControl
+        : "unsupported",
+    availableEfforts:
+      typeof adapter.effortStatusEvent === "function"
+        ? adapter.effortStatusEvent().availableEfforts
+        : [],
     autonomyProfile,
     autonomyControl: autonomySupported ? "supported" : "unsupported",
     allowedAutonomyScopes: autonomyAllowedScopes,
@@ -1044,7 +1199,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
   void syncCatalog("running");
   stopSessionHeartbeat = startAgentSessionHeartbeat({
     sessionId,
-    stateDir: ensureStateDir(),
+    ...relayAccount,
   });
 
   const requestSignalShutdown = (signal) => {
@@ -1082,6 +1237,11 @@ export async function runLocalAgentSession(agent, rawArgs) {
   void localAgentBridge?.sendEvent(initialModeStatus);
   void sendTransientEvent(autonomyStatus());
   void sendTransientEvent(detailStatus());
+  // The session states its model as soon as it starts. A session nobody has
+  // touched yet still answers on the device route, and the App needs to hear
+  // that — including whether this transport can change it — before it can
+  // offer a choice.
+  void sendTransientEvent(sessionModelStatus());
 
   try {
     appendSessionStart({
@@ -1201,6 +1361,8 @@ export async function runLocalAgentSession(agent, rawArgs) {
       adapter,
       executor,
       applyAutonomy,
+      applySessionModel,
+      applyEffort,
     });
     if (payload?.type === "agent.message") {
       const message = String(payload.message || "").replace(/[\r\n]+$/g, "");

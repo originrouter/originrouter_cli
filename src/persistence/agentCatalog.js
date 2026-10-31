@@ -61,6 +61,19 @@ export class AgentCatalog {
         value TEXT NOT NULL
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS agent_catalog_insert_queue (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS agent_catalog_preview_queue (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL,
+        field TEXT NOT NULL,
+        previous_value TEXT NOT NULL,
+        next_value TEXT NOT NULL
+      ) STRICT;
+
       CREATE TABLE IF NOT EXISTS agent_workspaces (
         workspace_id TEXT PRIMARY KEY,
         device_id TEXT NOT NULL DEFAULT '',
@@ -149,6 +162,32 @@ export class AgentCatalog {
         ON agent_runs(device_id, started_at DESC);
       CREATE INDEX IF NOT EXISTS idx_agent_artifacts_conversation
         ON agent_artifacts(conversation_id, last_seen_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_agent_catalog_preview_conversation
+        ON agent_catalog_preview_queue(conversation_id, sequence);
+
+      CREATE TRIGGER IF NOT EXISTS agent_catalog_queue_new_conversation
+      AFTER INSERT ON agent_conversations BEGIN
+        INSERT INTO agent_catalog_insert_queue(conversation_id) VALUES (NEW.conversation_id);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS agent_catalog_queue_summary
+      AFTER UPDATE OF summary ON agent_conversations
+      WHEN OLD.summary IS NOT NEW.summary BEGIN
+        INSERT INTO agent_catalog_preview_queue(conversation_id, field, previous_value, next_value)
+        VALUES (NEW.conversation_id, 'summary', OLD.summary, NEW.summary);
+      END;
+      CREATE TRIGGER IF NOT EXISTS agent_catalog_queue_first_prompt
+      AFTER UPDATE OF first_prompt_preview ON agent_conversations
+      WHEN OLD.first_prompt_preview IS NOT NEW.first_prompt_preview BEGIN
+        INSERT INTO agent_catalog_preview_queue(conversation_id, field, previous_value, next_value)
+        VALUES (NEW.conversation_id, 'first_prompt_preview', OLD.first_prompt_preview, NEW.first_prompt_preview);
+      END;
+      CREATE TRIGGER IF NOT EXISTS agent_catalog_queue_last_message
+      AFTER UPDATE OF last_message_preview ON agent_conversations
+      WHEN OLD.last_message_preview IS NOT NEW.last_message_preview BEGIN
+        INSERT INTO agent_catalog_preview_queue(conversation_id, field, previous_value, next_value)
+        VALUES (NEW.conversation_id, 'last_message_preview', OLD.last_message_preview, NEW.last_message_preview);
+      END;
     `);
     const conversationColumns = new Set(
       this.db.prepare("PRAGMA table_info(agent_conversations)").all()
@@ -205,6 +244,37 @@ export class AgentCatalog {
       INSERT INTO catalog_meta(key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `).run(safeText(key, 191), String(value ?? ""));
+  }
+
+  listPendingCatalogInserts(limit = 50) {
+    return this.db.prepare(`
+      SELECT sequence, conversation_id FROM agent_catalog_insert_queue
+      ORDER BY sequence LIMIT ?
+    `).all(Math.max(1, Math.min(200, Number(limit) || 50)));
+  }
+
+  acknowledgeCatalogInsert(sequence) {
+    this.db.prepare("DELETE FROM agent_catalog_insert_queue WHERE sequence = ?").run(sequence);
+  }
+
+  listPendingCatalogPreviews(limit = 50, after = 0) {
+    return this.db.prepare(`
+      SELECT q.sequence, q.conversation_id, q.field, q.previous_value, q.next_value
+      FROM agent_catalog_preview_queue q
+      WHERE q.sequence > ? AND NOT EXISTS (
+        SELECT 1 FROM agent_catalog_preview_queue earlier
+        WHERE earlier.conversation_id = q.conversation_id AND earlier.sequence < q.sequence
+      )
+      ORDER BY q.sequence LIMIT ?
+    `).all(Math.max(0, Number(after) || 0), Math.max(1, Math.min(200, Number(limit) || 50)));
+  }
+
+  acknowledgeCatalogPreview(sequence) {
+    this.db.prepare("DELETE FROM agent_catalog_preview_queue WHERE sequence = ?").run(sequence);
+  }
+
+  readCatalogSnapshot(read) {
+    return this.db.transaction(read).deferred();
   }
 
   getLaunchReceipt(launchId) {
@@ -428,7 +498,7 @@ export class AgentCatalog {
           last_message_preview = CASE WHEN excluded.last_message_preview <> '' THEN excluded.last_message_preview ELSE agent_conversations.last_message_preview END,
           workspace_id = COALESCE(excluded.workspace_id, agent_conversations.workspace_id),
           transcript_locator = CASE WHEN excluded.transcript_locator <> '' THEN excluded.transcript_locator ELSE agent_conversations.transcript_locator END,
-          last_activity_at = excluded.last_activity_at,
+          last_activity_at = MAX(agent_conversations.last_activity_at, excluded.last_activity_at),
           archived_at = COALESCE(excluded.archived_at, agent_conversations.archived_at)
       `).run(
         conversationId,
@@ -514,7 +584,7 @@ export class AgentCatalog {
       // carries that across updates; the caller can override it.
       titleIsCustom: payload.titleIsCustom !== undefined
         ? payload.titleIsCustom === true
-        : Boolean(current?.title_is_custom),
+        : payload.title !== undefined ? false : Boolean(current?.title_is_custom),
       cwd: payload.cwd || current?.cwd,
       deviceId: payload.deviceId || current?.device_id,
       deviceName: payload.deviceName || current?.device_name,
@@ -642,7 +712,7 @@ export class AgentCatalog {
       updates.push("transcript_locator = ?");
       values.push(canonicalPath(event.transcriptPath));
     }
-    updates.push("last_activity_at = ?");
+    updates.push("last_activity_at = MAX(last_activity_at, ?)");
     values.push(createdAt, conversationId);
     this.db.prepare(
       `UPDATE agent_conversations SET ${updates.join(", ")} WHERE conversation_id = ?`,
@@ -680,10 +750,14 @@ export class AgentCatalog {
     return true;
   }
 
-  listConversations({ search = "", agent = "", deviceId = "", workspaceId = "", status = "", limit = DEFAULT_LIMIT, offset = 0, includeArchived = false, includeCollaboration = true } = {}) {
+  listConversations({ search = "", conversationId = "", agent = "", deviceId = "", workspaceId = "", status = "", limit = DEFAULT_LIMIT, offset = 0, includeArchived = false, includeCollaboration = true } = {}) {
     const clauses = [];
     const params = {};
     if (!includeArchived) clauses.push("c.archived_at IS NULL");
+    if (safeText(conversationId, 96)) {
+      clauses.push("c.conversation_id = @conversationId");
+      params.conversationId = safeText(conversationId, 96);
+    }
     if (!includeCollaboration) {
       clauses.push("COALESCE(r.started_by, '') NOT IN ('collaboration-runtime', 'collaboration-remote')");
       clauses.push("substr(COALESCE(r.run_id, ''), 1, 4) <> 'acr_'");
@@ -752,7 +826,7 @@ export class AgentCatalog {
           r2.started_at DESC, r2.rowid DESC LIMIT 1
       )
       ${where}
-      ORDER BY c.last_activity_at DESC
+      ORDER BY c.last_activity_at DESC, c.conversation_id DESC
       LIMIT @limit OFFSET @offset
     `).all(params);
     return rows.map(publicConversation);
@@ -832,7 +906,11 @@ export class AgentCatalog {
       LEFT JOIN agent_runs r ON r.run_id = (
         SELECT r2.run_id FROM agent_runs r2
         WHERE r2.conversation_id = c.conversation_id
-        ORDER BY r2.started_at DESC, r2.rowid DESC LIMIT 1
+        ORDER BY
+          CASE WHEN r2.status IN ('running', 'starting', 'waiting_approval',
+                                  'waiting_input', 'waiting_device')
+               THEN 0 ELSE 1 END,
+          r2.started_at DESC, r2.rowid DESC LIMIT 1
       )
     `;
     const total = Number(
@@ -853,7 +931,7 @@ export class AgentCatalog {
               WHERE a.conversation_id = c.conversation_id) AS artifact_count
       ${joins}
       ${where}
-      ORDER BY c.last_activity_at DESC
+      ORDER BY c.last_activity_at DESC, c.conversation_id DESC
       LIMIT @pageSize OFFSET @offset
     `).all(params);
     const totalPages = total > 0 ? Math.ceil(total / normalizedPageSize) : 0;
@@ -892,7 +970,7 @@ export class AgentCatalog {
     if (!nextTitle) throw new Error("title is required");
     const result = this.db.prepare(`
       UPDATE agent_conversations
-      SET title = ?, title_is_custom = 1, last_activity_at = ?
+      SET title = ?, title_is_custom = 1, last_activity_at = MAX(last_activity_at, ?)
       WHERE conversation_id = ?
     `).run(nextTitle, iso(this.now()), id);
     return result.changes > 0 ? this.getConversation(id) : null;
@@ -900,8 +978,10 @@ export class AgentCatalog {
 
   getConversation(conversationId) {
     const id = safeText(conversationId, 96);
-    const conversations = this.listConversations({ limit: MAX_LIMIT, includeArchived: true });
-    let conversation = conversations.find((item) => item.conversation_id === id);
+    if (!id) return null;
+    let conversation = this.listConversations({
+      conversationId: id, limit: 1, includeArchived: true,
+    })[0];
     if (!conversation) {
       // The App reopens a run by the session id it was given, and for a run
       // the App started itself that is not the conversation's id. The run
@@ -912,9 +992,9 @@ export class AgentCatalog {
         ORDER BY started_at DESC, rowid DESC LIMIT 1
       `).get(id);
       if (run?.conversation_id) {
-        conversation = conversations.find(
-          (item) => item.conversation_id === run.conversation_id,
-        );
+        conversation = this.listConversations({
+          conversationId: run.conversation_id, limit: 1, includeArchived: true,
+        })[0];
       }
     }
     if (!conversation) return null;
@@ -946,13 +1026,21 @@ export class AgentCatalog {
   isCollaborationConversation(conversationId) {
     const id = safeText(conversationId, 96);
     if (!id) return false;
-    const run = this.db.prepare(`
+    let run = this.db.prepare(`
       SELECT run_id, originrouter_session_id, started_by
       FROM agent_runs
       WHERE conversation_id = ?
       ORDER BY started_at DESC, rowid DESC
       LIMIT 1
     `).get(id);
+    // Catalog lookup also accepts a session ID. Resolve that exact run so a
+    // worker cannot escape the boundary through its alternate identifier.
+    if (!run) {
+      run = this.db.prepare(`
+        SELECT run_id, originrouter_session_id, started_by
+        FROM agent_runs WHERE originrouter_session_id = ? LIMIT 1
+      `).get(id);
+    }
     return isCollaborationSessionPayload(run || {});
   }
 

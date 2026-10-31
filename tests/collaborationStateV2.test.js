@@ -257,10 +257,12 @@ const recoveryRun = coordinator.create({
 });
 coordinator.start(recoveryRun.run_id);
 let recoverySnapshot = store.getSnapshot(recoveryRun.run_id);
+assert.equal(recoverySnapshot.capabilities.can_pause, true, "an active planning phase can be paused");
 store.pauseRun(recoveryRun.run_id);
 recoverySnapshot = store.getSnapshot(recoveryRun.run_id);
 assert.equal(recoverySnapshot.run.state, "paused");
 assert.equal(recoverySnapshot.run.pause_reason, "user_requested");
+assert.equal(recoverySnapshot.capabilities.can_resume, true);
 store.resumeRun(recoveryRun.run_id);
 recoverySnapshot = store.getSnapshot(recoveryRun.run_id);
 assert.equal(recoverySnapshot.run.state, "planning");
@@ -371,7 +373,10 @@ store.setAdaptivePlan(revisionRun.run_id, {
 });
 revisionSnapshot = store.getSnapshot(revisionRun.run_id);
 assert.equal(revisionSnapshot.run.plan_revision, 2);
-store.confirmAdaptivePlan(revisionRun.run_id);
+assert.equal(revisionSnapshot.attention.find((item) => item.kind === "plan_confirmation").payload.plan_revision, 2);
+assert.throws(() => store.confirmAdaptivePlan(revisionRun.run_id, { expectedPlanRevision: 1 }), { code: "COLLABORATION_PLAN_REVISION_CONFLICT" });
+assert.throws(() => store.requestAdaptivePlanRevision(revisionRun.run_id, "Old feedback", { expectedPlanRevision: 1 }), { code: "COLLABORATION_PLAN_REVISION_CONFLICT" });
+store.confirmAdaptivePlan(revisionRun.run_id, { expectedPlanRevision: 2 });
 const revisionRows = store.db.prepare(`
   SELECT revision, status, feedback, confirmed_at, superseded_at
   FROM collaboration_plan_revisions
@@ -424,11 +429,20 @@ assert.equal(retriedRun.retry_of_run_id, recoveryRun.run_id);
 assert.equal(retriedRun.state, "created");
 assert.ok(store.listExecutionEvents(retriedRun.run_id, { limit: 20 })
   .some((event) => event.type === "run.retry_created"));
+const firstIdempotentRetry = store.retryRunOnce(recoveryRun.run_id, "retry-request-unique-1");
+const duplicateIdempotentRetry = store.retryRunOnce(recoveryRun.run_id, "retry-request-unique-1");
+assert.equal(firstIdempotentRetry.created, true);
+assert.equal(duplicateIdempotentRetry.created, false);
+assert.equal(duplicateIdempotentRetry.run.run_id, firstIdempotentRetry.run.run_id);
+assert.throws(() => store.retryRunOnce(created.run_id, "retry-request-unique-1"), { code: "COLLABORATION_RETRY_REQUEST_CONFLICT" });
 
 const lastSequence = snapshot.last_sequence;
 store.close();
 
 const reopened = new CollaborationStore({ stateDir });
+assert.equal(reopened.retryRunOnce(recoveryRun.run_id, "retry-request-unique-1").run.run_id, firstIdempotentRetry.run.run_id);
+assert.equal(reopened.retryForRequest(recoveryRun.run_id, "retry-request-unique-1").run_id, firstIdempotentRetry.run.run_id);
+assert.equal(reopened.retryForRequest(recoveryRun.run_id, "retry-unknown-request"), null);
 const reopenedSnapshot = reopened.getSnapshot(created.run_id);
 assert.equal(reopenedSnapshot.last_sequence, lastSequence);
 assert.equal(reopenedSnapshot.final_report.outcome, "completed");

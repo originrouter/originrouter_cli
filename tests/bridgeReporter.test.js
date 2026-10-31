@@ -7,6 +7,9 @@ import {
   createRuntimeEventReporter,
   pollResolvedApprovals,
   reportAgentConversationMetadata,
+  reportAgentHistoryChunk,
+  reportAgentHistoryManifest,
+  reconcileAgentCatalogPreview,
   reportAgentSessionHeartbeat,
   reportLocalControlRuntime,
   reportRuntimeEvent,
@@ -14,7 +17,112 @@ import {
   shouldSyncAgentActivitySnapshot,
   updateAgentActivitySnapshot,
 } from "../src/agent/bridgeReporter.js";
+import { agentActivityMetadataFromCatalog } from "../src/agent/agentActivityCatalogSync.js";
 import { makeOAuthCredential } from "./support/oauthCredential.js";
+import { accountStateDir, activateAccount } from "../src/persistence/accounts.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+test("catalog and history uploads reject credentials from another account", async () => {
+  const accountA = "sha256:account-a";
+  const accountB = "sha256:account-b";
+  const expectedAccountStateDir = accountStateDir("/tmp/originrouter-account-test", accountA);
+  let requests = 0;
+  const options = { stateDir: "/tmp/originrouter-account-test", expectedAccountStateDir,
+    ensureFreshAccessTokenFn: async () => makeOAuthCredential({ accountScope: accountB, deviceId: "device-1" }),
+    fetchFn: async () => { requests++; return { ok: true, status: 200, json: async () => ({}) }; } };
+  const metadata = await reportAgentConversationMetadata({ conversationId: "c1" }, options);
+  const preview = await reconcileAgentCatalogPreview({ conversation_id: "c1", field: "summary",
+    previous_value: "old", next_value: "new" }, options);
+  const history = await reportAgentHistoryChunk({ device_id: "device-1" }, options);
+  const manifest = await reportAgentHistoryManifest("start", { conversation_id: "c1", content_version: 1 }, options);
+  const event = await reportRuntimeEvent({ session_id: "s1", event_type: "agent.ready" }, options);
+  const heartbeat = await reportAgentSessionHeartbeat("s1", options);
+  const approvals = await pollResolvedApprovals({ sessionId: "s1", ...options });
+  for (const result of [metadata, preview, history, manifest, event, heartbeat, approvals]) {
+    assert.equal(result.ok, false);
+    assert.equal(result.error, "account_context_changed");
+  }
+  assert.equal(requests, 0);
+  const noAccount = await reportAgentConversationMetadata({ conversationId: "c1" }, {
+    ...options, expectedAccountStateDir: "/tmp/originrouter-account-test",
+  });
+  assert.equal(noAccount.error, "account_context_changed");
+  const sameAccount = await reportAgentConversationMetadata({ conversationId: "c1" }, {
+    ...options, ensureFreshAccessTokenFn: async () => makeOAuthCredential({ accountScope: accountA, deviceId: "device-1" }),
+  });
+  assert.equal(sameAccount.ok, true);
+  assert.equal(requests, 1);
+});
+
+test("manifest reporter requires a valid confirmation and fails closed on old servers", async () => {
+  const credential = makeOAuthCredential({ deviceId: "device-1" });
+  const options = { ensureFreshAccessTokenFn: async () => credential,
+    fetchFn: async () => ({ ok: false, status: 404, json: async () => ({}) }) };
+  assert.equal((await reportAgentHistoryManifest("start", {}, options)).error, "http_404");
+  options.fetchFn = async () => ({ ok: false, status: 409, json: async () => ({ detail: { code: "history_version_stale" } }) });
+  assert.equal((await reportAgentHistoryManifest("start", {}, options)).error, "history_version_stale");
+  options.fetchFn = async () => ({ ok: true, status: 200, json: async () => ({ code: 0, data: { state: "queued" } }) });
+  assert.equal((await reportAgentHistoryManifest("complete", {}, options)).error, "invalid_manifest_response");
+  options.fetchFn = async () => ({ ok: true, status: 200, json: async () => ({ code: 0, data: { state: "already_stored" } }) });
+  assert.equal((await reportAgentHistoryManifest("start", {}, options)).error, "invalid_manifest_response");
+  options.fetchFn = async () => ({ ok: true, status: 200, json: async () => ({ code: 0, data: { state: "stored" } }) });
+  assert.equal((await reportAgentHistoryManifest("complete", {}, options)).ok, true);
+  options.fetchFn = async () => ({ ok: true, status: 200, json: async () => ({ code: 0, data: { pending_chunk_ids: ["other"], published: false } }) });
+  assert.equal((await reportAgentHistoryManifest("status", { chunk_ids: ["one"] }, options)).error, "invalid_manifest_response");
+  options.fetchFn = async () => ({ ok: true, status: 200, json: async () => ({ code: 0, data: { pending_chunk_ids: ["one"], published: false } }) });
+  assert.deepEqual((await reportAgentHistoryManifest("status", { chunk_ids: ["one"] }, options)).pendingChunkIds, ["one"]);
+});
+
+test("approval decisions arriving after an account change are discarded", async () => {
+  const root = mkdtempSync(join(tmpdir(), "originrouter-approval-account-"));
+  const accountA = "sha256:account-a";
+  const scopedA = activateAccount(root, accountA);
+  let release;
+  const waiting = new Promise((resolve) => { release = resolve; });
+  let requestStarted;
+  const started = new Promise((resolve) => { requestStarted = resolve; });
+  try {
+    const pending = pollResolvedApprovals({ sessionId: "s1", stateDir: scopedA,
+      expectedAccountStateDir: scopedA, accountSelectionRoot: root,
+      ensureFreshAccessTokenFn: async () => makeOAuthCredential({ accountScope: accountA }),
+      fetchFn: async () => { requestStarted(); await waiting; return { ok: true, status: 200,
+        json: async () => ({ data: { approvals: [{ approval_id: "a1", decision: "allow" }] } }) }; },
+    });
+    await started;
+    activateAccount(root, "sha256:account-b");
+    release();
+    const result = await pending;
+    assert.equal(result.error, "account_context_changed");
+    assert.deepEqual(result.approvals, []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("account selection change during token refresh prevents catalog upload", async () => {
+  const root = mkdtempSync(join(tmpdir(), "originrouter-upload-account-"));
+  const accountA = "sha256:account-a";
+  const accountB = "sha256:account-b";
+  const scopedA = activateAccount(root, accountA);
+  let release;
+  const token = new Promise((resolve) => { release = resolve; });
+  let requests = 0;
+  try {
+    const pending = reportAgentConversationMetadata({ conversationId: "c1" }, {
+      stateDir: scopedA, expectedAccountStateDir: scopedA, accountSelectionRoot: root,
+      ensureFreshAccessTokenFn: () => token,
+      fetchFn: async () => { requests++; return { ok: true, status: 200 }; },
+    });
+    activateAccount(root, accountB);
+    release(makeOAuthCredential({ accountScope: accountA }));
+    assert.equal((await pending).error, "account_context_changed");
+    assert.equal(requests, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("buildRuntimeEventEnvelope normalizes and truncates strings", () => {
   const payload = buildRuntimeEventEnvelope({
@@ -84,6 +192,24 @@ test("buildAgentConversationMetadata excludes transcript prompt command and path
   assert.equal(payload.last_message_preview.includes("or_at_anothersecret123"), false);
   assert.equal(payload.created_at, "2026-07-01T02:00:00.000Z");
   assert.equal(payload.last_activity_at, "2026-07-01T02:10:00.000Z");
+});
+
+test("redaction cannot make catalog fields exceed their schema limits", () => {
+  const input = `${"a".repeat(1011)} sk-abcdefgh`;
+  const payload = buildAgentConversationMetadata({ conversationId: "c1", lastMessagePreview: input });
+  assert.ok(payload.last_message_preview.length <= 1024);
+  assert.equal(payload.last_message_preview.includes("sk-abcdefgh"), false);
+  const title = buildAgentConversationMetadata({ conversationId: "c1", title: `${"a".repeat(178)} sk-abcdefgh` });
+  assert.ok(title.title.length <= 191);
+  assert.equal(title.title.includes("sk-abcdefgh"), false);
+});
+
+test("catalog projection does not emit invalid Unicode at a truncation boundary", () => {
+  const value = `${"a".repeat(1023)}😀`;
+  const payload = buildAgentConversationMetadata({ conversationId: "c1", lastMessagePreview: value });
+  assert.equal(payload.last_message_preview.length, 1023);
+  assert.equal(payload.last_message_preview.isWellFormed(), true);
+  assert.equal(payload.last_message_preview.includes("�"), false);
 });
 
 test("Agent Activity snapshot preserves idea, result, and task summary", () => {
@@ -165,6 +291,126 @@ test("Agent Activity metadata retries without source times for an old server", a
   assert.equal("created_at" in bodies[1], false);
   assert.equal("last_activity_at" in bodies[1], false);
 });
+
+test("catalog report exposes the saved cloud row and rejects an unrelated row", async () => {
+  const saved = { conversation_id: "session", title: "Cloud rename", title_is_custom: true };
+  const options = {
+    stateDir: "/tmp/originrouter-missing-auth",
+    ensureFreshAccessTokenFn: async () => makeOAuthCredential({ deviceId: "device-1" }),
+    fetchFn: async () => ({ ok: true, status: 200, json: async () => ({ data: { conversation: saved } }) }),
+  };
+  const result = await reportAgentConversationMetadata({ conversationId: "session", title: "Old local title" }, options);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.conversation, saved);
+  const unrelated = await reportAgentConversationMetadata({ conversationId: "other" }, options);
+  assert.equal(unrelated.ok, true);
+  assert.equal(unrelated.conversation, undefined);
+});
+
+test("preview reconciliation redacts both sides and requires a valid server acknowledgment", async () => {
+  const requests = [];
+  const change = { conversation_id: "c1", field: "last_message_preview",
+    previous_value: "api_key=sk-oldsecret12345", next_value: "api_key=sk-newsecret12345 done" };
+  const options = { stateDir: "/tmp/originrouter-missing-auth",
+    ensureFreshAccessTokenFn: async () => makeOAuthCredential({ deviceId: "device-1" }),
+    fetchFn: async (url, request) => {
+      const body = JSON.parse(request.body);
+      requests.push({ url, body });
+      return { ok: true, status: 200, json: async () => ({ code: 0,
+        data: { previews: { last_message_preview: body.last_message_preview.value } } }) };
+    },
+  };
+  assert.equal((await reconcileAgentCatalogPreview(change, options)).applied, true);
+  assert.match(requests[0].url, /\/reconcile-previews$/);
+  assert.equal(JSON.stringify(requests[0].body).includes("oldsecret"), false);
+  assert.equal(JSON.stringify(requests[0].body).includes("newsecret"), false);
+  const invalid = await reconcileAgentCatalogPreview(change, { ...options,
+    fetchFn: async () => ({ ok: true, status: 200, json: async () => ({ code: 0 }) }) });
+  assert.equal(invalid.ok, false);
+  const badField = await reconcileAgentCatalogPreview({ ...change, field: "__proto__" }, options);
+  assert.equal(badField.ok, false);
+});
+
+test("preview comparison uses exactly the catalog projection at length and newline boundaries", async () => {
+  const raw = `${"a".repeat(1019)}\r\nsecret tail`;
+  const projected = buildAgentConversationMetadata(agentActivityMetadataFromCatalog({
+    conversation_id: "c1", last_message_preview: raw,
+  })).last_message_preview;
+  let body;
+  const result = await reconcileAgentCatalogPreview({ conversation_id: "c1",
+    field: "last_message_preview", previous_value: raw, next_value: "new" }, {
+    stateDir: "/tmp/originrouter-missing-auth",
+    ensureFreshAccessTokenFn: async () => makeOAuthCredential({ deviceId: "device-1" }),
+    fetchFn: async (_url, request) => {
+      body = JSON.parse(request.body);
+      return { ok: true, status: 200, json: async () => ({ code: 0,
+        data: { previews: { last_message_preview: "new" } } }) };
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(body.last_message_preview.expected, projected);
+});
+
+test("preview reconciliation preserves valid Unicode after truncation", async () => {
+  const raw = `${"a".repeat(1023)}😀`;
+  let body;
+  const result = await reconcileAgentCatalogPreview({ conversation_id: "c1",
+    field: "last_message_preview", previous_value: raw, next_value: raw }, {
+    stateDir: "/tmp/originrouter-missing-auth",
+    ensureFreshAccessTokenFn: async () => makeOAuthCredential({ deviceId: "device-1" }),
+    fetchFn: async (_url, request) => {
+      body = JSON.parse(request.body);
+      return { ok: true, status: 200, json: async () => ({ code: 0,
+        data: { previews: { last_message_preview: body.last_message_preview.value } } }) };
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(body.last_message_preview.expected.isWellFormed(), true);
+  assert.equal(body.last_message_preview.value.isWellFormed(), true);
+});
+
+test("reconciled previews stay within schema limits after secret replacement", async () => {
+  const raw = `${"a".repeat(1011)} sk-abcdefgh`;
+  let body;
+  const result = await reconcileAgentCatalogPreview({ conversation_id: "c1",
+    field: "last_message_preview", previous_value: raw, next_value: raw }, {
+    stateDir: "/tmp/originrouter-missing-auth",
+    ensureFreshAccessTokenFn: async () => makeOAuthCredential({ deviceId: "device-1" }),
+    fetchFn: async (_url, request) => {
+      body = JSON.parse(request.body);
+      return { ok: true, status: 200, json: async () => ({ code: 0,
+        data: { previews: { last_message_preview: body.last_message_preview.value } } }) };
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.ok(body.last_message_preview.expected.length <= 1024);
+  assert.ok(body.last_message_preview.value.length <= 1024);
+  assert.equal(JSON.stringify(body).includes("sk-abcdefgh"), false);
+});
+
+for (const status of [404, 422]) {
+  test(`insert-only backfill never falls back to ordinary writes on ${status}`, async () => {
+    const requests = [];
+    const result = await reportAgentConversationMetadata(
+      { conversationId: "old", sessionId: "session", agentType: "claude",
+        createdAt: "2026-07-01T02:00:00Z" },
+      {
+        insertOnly: true,
+        stateDir: "/tmp/originrouter-missing-auth",
+        ensureFreshAccessTokenFn: async () => makeOAuthCredential({ deviceId: "device-1" }),
+        fetchFn: async (url, options) => {
+          requests.push({ url, body: JSON.parse(options.body) });
+          return { ok: false, status };
+        },
+      },
+    );
+    assert.equal(result.ok, false);
+    assert.equal(requests.length, 1);
+    assert.match(requests[0].url, /\/catalog\/conversations\/backfill$/);
+    assert.equal(requests[0].body.session_id, "session");
+    assert.ok(requests[0].body.created_at);
+  });
+}
 
 test("the report carries the link to the session the run belongs to", () => {
   // The device is the only side that knows both ids: the run was started
@@ -357,6 +603,20 @@ test("reportLocalControlRuntime posts display-safe daemon status", async () => {
       },
     ],
   });
+});
+
+test("device budget reporting preserves excluded usage counts", async () => {
+  let reported;
+  await reportLocalControlRuntime({ agentBudgets: {
+    device: { policy: { currency: "EUR" }, daily: { amount_micros: 500, unpriced_events: 2, other_currency_events: 3 } },
+  } }, {
+    stateDir: "/tmp/originrouter-missing-auth",
+    ensureFreshAccessTokenFn: async () => makeOAuthCredential({ deviceId: "device-1" }),
+    fetchFn: async (_url, options) => { reported = JSON.parse(options.body); return { ok: true, status: 200 }; },
+  });
+  assert.equal(reported.agent_budgets.device.policy.currency, "EUR");
+  assert.equal(reported.agent_budgets.device.daily.unpriced_events, 2);
+  assert.equal(reported.agent_budgets.device.daily.other_currency_events, 3);
 });
 
 test("pollResolvedApprovals maps decided approvals into runtime decisions", async () => {
@@ -622,6 +882,117 @@ test("buildRuntimeEventEnvelope projects managed interactions and mode state", (
   assert.equal(mode.mode, "plan");
   assert.equal(mode.mode_control, "supported");
   assert.equal(mode.available_modes.length, 2);
+});
+
+test("the session's own model reaches the cloud, and nothing about the device's catalogue", () => {
+  // The session states its own model. The models the device serves stay on the
+  // device: they go out in the local-control provider snapshot, and the App
+  // reads them there. A copy per event would be a stale duplicate.
+  const model = buildRuntimeEventEnvelope({
+    sessionId: "session-managed",
+    agentType: "claude",
+    title: "Managed Claude",
+    eventType: "agent.event",
+    event: {
+      type: "agent.model.status",
+      model: "deepseek-chat",
+      modelProvider: "deepseek",
+      source: "session",
+      modelControl: "supported",
+      availableModels: [
+        { id: "deepseek-chat", provider: "deepseek", providerName: "DeepSeek" },
+        { id: "gpt-5-codex", provider: "openai-codex", providerName: "OpenAI" },
+      ],
+    },
+  });
+  assert.equal(model.model, "deepseek-chat");
+  assert.equal(model.model_provider, "deepseek");
+  assert.equal(model.model_source, "session");
+  assert.equal(model.model_control, "supported");
+  assert.equal("available_models" in model, false);
+});
+
+test("a session on the device route states no model of its own", () => {
+  // An empty model is a state — the session follows the device route — and
+  // the cloud must be able to tell it from a device that said nothing.
+  const model = buildRuntimeEventEnvelope({
+    sessionId: "session-managed",
+    agentType: "claude",
+    title: "Managed Claude",
+    eventType: "agent.event",
+    event: {
+      type: "agent.model.status",
+      model: null,
+      modelProvider: null,
+      source: "device",
+      modelControl: "supported",
+      availableModels: [{ id: "deepseek-chat", provider: "deepseek" }],
+    },
+  });
+  assert.equal(model.model, "");
+  assert.equal(model.model_provider, "");
+  assert.equal(model.model_source, "device");
+  assert.equal("available_models" in model, false);
+});
+
+test("a refusal reaches the cloud with the device's reason", () => {
+  // The refusal is the only way the App learns that the change it asked for
+  // did not happen: the session row says what the session runs on, and the
+  // command's own answer says only that the command arrived.
+  const refusal = buildRuntimeEventEnvelope({
+    sessionId: "session-managed",
+    agentType: "claude",
+    title: "Managed Claude",
+    eventType: "agent.event",
+    event: {
+      type: "agent.model.status",
+      model: null,
+      modelProvider: null,
+      source: "device",
+      modelControl: "unsupported",
+      accepted: false,
+      reason: "model_control_unsupported",
+    },
+  });
+  assert.equal(refusal.model_accepted, false);
+  assert.equal(refusal.model_reason, "model_control_unsupported");
+});
+
+test("a status that was not asked about says nothing about being accepted", () => {
+  // Null is "the device was not asked" — the status only states what the
+  // session runs on. False would be a refusal, and the App must not mistake
+  // one for the other.
+  const status = buildRuntimeEventEnvelope({
+    sessionId: "session-managed",
+    agentType: "claude",
+    title: "Managed Claude",
+    eventType: "agent.event",
+    event: {
+      type: "agent.model.status",
+      model: "deepseek-chat",
+      modelProvider: "deepseek",
+      source: "session",
+      modelControl: "supported",
+    },
+  });
+  assert.equal(status.model_accepted, null);
+  assert.equal(status.model_reason, "");
+});
+
+test("another event carries no model's acceptance", () => {
+  const other = buildRuntimeEventEnvelope({
+    sessionId: "session-managed",
+    agentType: "claude",
+    title: "Managed Claude",
+    eventType: "agent.event",
+    event: {
+      type: "agent.ready",
+      accepted: false,
+      reason: "not-a-model-event",
+    },
+  });
+  assert.equal(other.model_accepted, null);
+  assert.equal(other.model_reason, "");
 });
 
 test("interaction delivery failures do not close the long-lived session", () => {

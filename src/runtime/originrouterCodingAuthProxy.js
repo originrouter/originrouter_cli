@@ -3,6 +3,9 @@ import http from "node:http";
 
 import { ensureFreshAccessToken } from "./oauthTokenRefresher.js";
 import { OAUTH_RESOURCES, accessTokenFor } from "./authContract.js";
+import { rewriteModelInBody, createAgentModelResolver, fallbackModelsFor } from "./agentModelRewrite.js";
+import { buildEffortCatalogue } from "./modelEffortCatalog.js";
+import { CODEX_MAIN_ALIAS } from "../config/routes.js";
 import {
   DEFAULT_ORIGINROUTER_BASE_URL,
 } from "../config/providerRoutes.js";
@@ -113,16 +116,42 @@ function isModelsPath(rawUrl) {
   }
 }
 
-function codexModelInfo(model) {
+// The levels Codex is told a model has.
+//
+// Codex keeps no list of its own: the levels a model has are the ones the
+// provider's model list says, and this proxy is the provider. An empty list
+// is what Codex falls back to when the provider says nothing — and a model
+// with no levels has no effort to offer, and no way to resolve `ultra`.
+//
+// So the levels the device publishes for a model are published here too, and
+// the two agree because they come from the same catalogue.
+const CODEX_EFFORT_DESCRIPTIONS = Object.freeze({
+  none: "No reasoning at all",
+  minimal: "The lightest reasoning",
+  low: "Faster responses with lighter reasoning",
+  medium: "Balances speed and reasoning depth for everyday tasks",
+  high: "Greater reasoning depth for complex problems",
+  xhigh: "Extra high reasoning depth for complex problems",
+  max: "Maximum reasoning depth for the hardest problems",
+  ultra: "Maximum reasoning with automatic task delegation",
+});
+
+function codexModelInfo(model, levels = [], defaults = {}) {
   const slug = typeof model?.id === "string" ? model.id.trim() : "";
   if (!slug) return null;
+  const supported = Array.isArray(levels) ? levels : [];
   return {
     slug,
     display_name: typeof model.name === "string" && model.name.trim()
       ? model.name.trim()
       : slug,
     base_instructions: "",
-    supported_reasoning_levels: [],
+    supported_reasoning_levels: supported.map((effort) => ({
+      effort,
+      description: CODEX_EFFORT_DESCRIPTIONS[effort] || "",
+    })),
+    ...(defaults.default ? { default_reasoning_level: defaults.default } : {}),
+    ...(defaults.multiAgent ? { multi_agent_reasoning_effort: defaults.multiAgent } : {}),
     shell_type: "shell_command",
     visibility: "list",
     supported_in_api: true,
@@ -133,7 +162,7 @@ function codexModelInfo(model) {
   };
 }
 
-async function normalizeCodexModelsResponse(req, response) {
+async function normalizeCodexModelsResponse(req, response, catalogue = null) {
   if (!isModelsPath(req.url) || !response.ok) return response;
   const body = await response.text();
   let payload;
@@ -141,7 +170,32 @@ async function normalizeCodexModelsResponse(req, response) {
   if (Array.isArray(payload?.models) || !Array.isArray(payload?.data)) {
     return new Response(body, response);
   }
-  const models = payload.data.map(codexModelInfo).filter(Boolean);
+  const models = payload.data
+    .map((model) => {
+      const known = catalogue?.levelsFor(model?.id) || null;
+      return codexModelInfo(model, known?.levels || [], {
+        default: known?.default || null,
+        multiAgent: known?.multiAgent || null,
+      });
+    })
+    .filter(Boolean);
+  // The alias is the model the session actually asks for, so it has to be in
+  // the list: Codex resolves a model by the name it holds, and an alias that
+  // is not in the list is a model it knows nothing about — no levels, no
+  // clamping, and `ultra` with nothing to resolve to.
+  if (catalogue?.aliasModels) {
+    for (const alias of catalogue.aliasModels) {
+      const slug = typeof alias?.slug === "string" ? alias.slug.trim() : "";
+      if (!slug) continue;
+      const concrete = alias.resolveModel?.() || null;
+      const known = catalogue.levelsFor(concrete);
+      models.push(codexModelInfo(
+        { id: slug, name: concrete || slug },
+        known?.levels || [],
+        { default: known?.default || null, multiAgent: known?.multiAgent || null },
+      ));
+    }
+  }
   const headers = new Headers(response.headers);
   headers.delete("content-length");
   headers.delete("content-encoding");
@@ -161,6 +215,8 @@ export class OriginRouterCodingAuthProxy {
     ensureFreshAccessTokenFn = ensureFreshAccessToken,
     maxRequestBytes = MAX_REQUEST_BYTES,
     onGatewayResponseIds = null,
+    modelResolver = null,
+    effortCatalogue = null,
   }) {
     this.stateDir = stateDir;
     this.upstreamBaseUrl = trimBaseUrl(upstreamBaseUrl);
@@ -169,6 +225,12 @@ export class OriginRouterCodingAuthProxy {
     this.ensureFreshAccessTokenFn = ensureFreshAccessTokenFn;
     this.maxRequestBytes = maxRequestBytes;
     this.onGatewayResponseIds = typeof onGatewayResponseIds === "function" ? onGatewayResponseIds : null;
+    // The agent asks for a route alias; this turns it into the concrete model
+    // the cloud should answer with. Null means "do not rewrite anything".
+    this.modelResolver = typeof modelResolver === "function" ? modelResolver : null;
+    // What the models on offer can do. The model list Codex reads is written
+    // here, so this is where the levels a model has are told.
+    this.effortCatalogue = effortCatalogue;
     this.localToken = `or_local_${randomBytes(32).toString("base64url")}`;
     this._server = null;
     this._port = null;
@@ -283,7 +345,13 @@ export class OriginRouterCodingAuthProxy {
     });
 
     try {
-      const body = await readBody(req, this.maxRequestBytes);
+      const rawBody = await readBody(req, this.maxRequestBytes);
+      // The agent holds a route alias, not a model id. The cloud is asked for
+      // the concrete model this session runs on, which may have changed since
+      // the session started.
+      const body = this.modelResolver
+        ? rewriteModelInBody(rawBody, this.modelResolver)
+        : rawBody;
       let token = await this._codingToken();
       let upstream = await this._fetchUpstream(req, body, token, controller.signal);
       if (upstream.status === 401) {
@@ -295,7 +363,7 @@ export class OriginRouterCodingAuthProxy {
         token = refreshed;
         upstream = await this._fetchUpstream(req, body, token, controller.signal);
       }
-      upstream = await normalizeCodexModelsResponse(req, upstream);
+      upstream = await normalizeCodexModelsResponse(req, upstream, this.effortCatalogue);
       this._observeGatewayResponseIds(upstream.headers);
       res.writeHead(upstream.status, responseHeaders(upstream.headers));
       if (!upstream.body) {
@@ -327,17 +395,43 @@ export class OriginRouterCodingAuthProxy {
 export async function protectOriginrouterCodingEnv(agent, providerResult, {
   stateDir,
   runId = "",
+  sessionId = "",
   onGatewayResponseIds = null,
+  effortCatalogue = null,
   proxyFactory = (options) => new OriginRouterCodingAuthProxy(options),
 } = {}) {
   if (providerResult?.source !== "originrouter-coding") {
     return { providerResult, proxy: null };
   }
+  // This proxy belongs to one session, so it knows whose override applies.
+  // The alias it receives is translated into the model this session runs on
+  // — the override the reader picked, the device route, or the model the
+  // session started on.
+  const modelResolver = createAgentModelResolver({
+    agent,
+    stateDir,
+    sessionId,
+    fallbackModels: fallbackModelsFor(agent, providerResult),
+  });
   const proxy = proxyFactory({
     stateDir,
     upstreamBaseUrl: DEFAULT_ORIGINROUTER_BASE_URL,
     runId,
     onGatewayResponseIds,
+    modelResolver,
+    // What the models on offer can do, so the model list Codex reads is the
+    // model list the device publishes. The alias is in that list too: the
+    // session asks for the alias, and an alias Codex has never heard of is a
+    // model with no levels.
+    effortCatalogue: buildEffortCatalogue({
+      models: effortCatalogue,
+      aliasModels: agent === "codex"
+        ? [{
+          slug: CODEX_MAIN_ALIAS,
+          resolveModel: () => modelResolver(CODEX_MAIN_ALIAS),
+        }]
+        : [],
+    }),
   });
   const status = await proxy.start();
   const localBase = `http://${status.host}:${status.port}`;

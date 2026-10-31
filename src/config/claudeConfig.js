@@ -31,6 +31,7 @@ import {
 } from "../runtime/authContract.js";
 import { getStateDir } from "../persistence/state.js";
 import { NOOP_ANTHROPIC_API_KEY } from "../proxy/litellm.js";
+import { credentialForSession } from "../proxy/sessionModels.js";
 
 // Stage 8.0: placeholder API key we inject into OPENAI_API_KEY when routing
 // Codex through the local LiteLLM proxy. LiteLLM does not validate this —
@@ -38,6 +39,15 @@ import { NOOP_ANTHROPIC_API_KEY } from "../proxy/litellm.js";
 // refuses to start if OPENAI_API_KEY is empty. Matches the Claude
 // NOOP_ANTHROPIC_API_KEY pattern.
 export const NOOP_OPENAI_API_KEY = "sk-noop-litellm-passthrough";
+
+// The credential the agent carries in route mode. When the caller knows the
+// session id, the value doubles as a lookup key: the compatibility gateway
+// reads it off the request and resolves the session's model override. Without
+// a session id (env printing, a shell without a session) the no-op key keeps
+// today's behaviour exactly.
+function routeCredential(options, fallback) {
+  return credentialForSession(options?.sessionId) || fallback;
+}
 
 const CLAUDE_ENV_MAP = {
   baseUrl: "ANTHROPIC_BASE_URL",
@@ -470,22 +480,11 @@ export function hasAnyClaudeRoute(routes) {
   return Boolean(routes) && Object.values(routes).some((entry) => entry);
 }
 
-// Resolve the five slot models for the direct (remote / originrouter)
-// transports, where the env value is a concrete model id. `eff` is already
-// inherit-resolved, so a slot is present whenever main is. The provider's own
-// default model is the last resort, matching the OR-chain the two-tier code
-// used before per-family slots existed.
-function modelsFromRoutes(eff, provider) {
-  const modelFor = (slot) => eff[slot]?.model || provider?.model || eff.main?.model || null;
-  return {
-    main: modelFor("main"),
-    opus: modelFor("opus"),
-    sonnet: modelFor("sonnet"),
-    haiku: modelFor("haiku"),
-    fable: modelFor("fable"),
-  };
-}
-
+// The env carries the *alias* on every transport that has a local gateway in
+// front of the agent (the route proxy, the per-session coding proxy, the
+// relay proxy). The gateway substitutes the concrete model per request, so
+// the session can change its model while it runs.
+//
 // Proxy mode injects aliases rather than model ids.
 function claudeAliasModels() {
   return {
@@ -534,8 +533,14 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
       const provider = remoteRoutes.mainProvider;
       const env = {
         ANTHROPIC_BASE_URL: `http://${remoteCodingProbe.host || "127.0.0.1"}:${remoteCodingProbe.port}`,
-        ANTHROPIC_API_KEY: NOOP_ANTHROPIC_API_KEY,
-        ...buildClaudeModelEnv(modelsFromRoutes(eff, provider)),
+        // The session credential, not the no-op key: the relay proxy reads
+        // it to learn which session a request belongs to, so the session's
+        // own model override can apply. The remote worker strips the header.
+        ANTHROPIC_API_KEY: routeCredential(options, NOOP_ANTHROPIC_API_KEY),
+        // The alias, not a concrete model id. The relay proxy in front of the
+        // remote device translates it per request, so this session can change
+        // its model while it runs.
+        ...buildClaudeModelEnv(claudeAliasModels()),
       };
       return {
         env,
@@ -552,7 +557,10 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
       const env = {
         ANTHROPIC_BASE_URL: originrouterBaseForRuntime(provider, "claude"),
         ANTHROPIC_API_KEY: apiKey,
-        ...buildClaudeModelEnv(modelsFromRoutes(eff, provider)),
+        // The alias, not a concrete model id: the per-session auth proxy in
+        // front of the cloud translates it per request, so this session can
+        // change its model while it runs.
+        ...buildClaudeModelEnv(claudeAliasModels()),
       };
       return {
         env,
@@ -579,7 +587,7 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
       // provide.
       const env = {
         ANTHROPIC_BASE_URL: `http://${probe.host || "127.0.0.1"}:${probe.port}`,
-        ANTHROPIC_API_KEY: NOOP_ANTHROPIC_API_KEY,
+        ANTHROPIC_API_KEY: routeCredential(options, NOOP_ANTHROPIC_API_KEY),
         ...buildClaudeModelEnv(claudeAliasModels()),
       };
       return {
@@ -654,8 +662,11 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
       }
       const env = {
         OPENAI_BASE_URL: `http://${remoteCodingProbe.host || "127.0.0.1"}:${remoteCodingProbe.port}/v1`,
-        OPENAI_API_KEY: NOOP_OPENAI_API_KEY,
-        OPENAI_MODEL: codexRoutes.main.model || mainProvider.model,
+        // The session credential, not the no-op key: the relay proxy reads it
+        // to learn which session a request belongs to.
+        OPENAI_API_KEY: routeCredential(options, NOOP_OPENAI_API_KEY),
+        // The alias, not a concrete model id — see the Claude branch above.
+        OPENAI_MODEL: CODEX_MAIN_ALIAS,
       };
       return {
         env,
@@ -670,7 +681,10 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
       const env = {
         OPENAI_BASE_URL: originrouterBaseForRuntime(mainProvider, "codex-app-server"),
         OPENAI_API_KEY: apiKey,
-        OPENAI_MODEL: codexRoutes.main.model || mainProvider.model,
+        // The alias, not a concrete model id: the per-session auth proxy
+        // translates it per request, so this session can change its model
+        // while it runs.
+        OPENAI_MODEL: CODEX_MAIN_ALIAS,
       };
       return {
         env,
@@ -697,7 +711,7 @@ export async function buildAgentProviderEnv(agent, config, options = {}) {
           : CODEX_MAIN_ALIAS;
       const env = {
         OPENAI_BASE_URL: `http://${probe.host || "127.0.0.1"}:${probe.port}/v1`,
-        OPENAI_API_KEY: NOOP_OPENAI_API_KEY,
+        OPENAI_API_KEY: routeCredential(options, NOOP_OPENAI_API_KEY),
         OPENAI_MODEL: codexProxyAlias,
       };
       return {

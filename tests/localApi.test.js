@@ -1547,6 +1547,13 @@ try {
       requestId: "mode-local-1",
     });
     assert.equal(mode.body.accepted, true);
+    // The reasoning level travels the same road as the model: the daemon
+    // only checks the shape, and the runtime answers with its own status.
+    const effort = await postJson("/agent/local/sessions/external-claude-1/effort", {
+      effort: "high",
+      requestId: "effort-local-1",
+    });
+    assert.equal(effort.body.accepted, true);
     const autonomy = await postJson("/agent/local/sessions/external-claude-1/autonomy", {
       profile: "custom",
       allowedScopes: ["workspace_edits", "workspace_commands"],
@@ -1557,8 +1564,13 @@ try {
     assert.deepEqual(controlCommands.body.commands.map((item) => item.type), [
       "agent.interaction.resolve",
       "agent.mode.set",
+      "agent.effort.set",
       "agent.autonomy.set",
     ]);
+    assert.equal(
+      controlCommands.body.commands.find((item) => item.type === "agent.effort.set").effort,
+      "high",
+    );
     assert.deepEqual(controlCommands.body.commands.at(-1).allowedScopes, [
       "workspace_edits",
       "workspace_commands",
@@ -1566,7 +1578,7 @@ try {
 
     const stopped = await postJson("/agent/local/sessions/external-claude-1/stop", {});
     assert.equal(stopped.body.accepted, true);
-    const stopCommand = await getJson("/agent/local/sessions/external-claude-1/commands?after=4");
+    const stopCommand = await getJson("/agent/local/sessions/external-claude-1/commands?after=5");
     assert.equal(stopCommand.body.commands[0].type, "session.stop");
 
     await postJson("/agent/local/sessions/external-claude-1/events", {
@@ -1642,6 +1654,19 @@ try {
   // Collaboration workers remain available to their runtime, but never to
   // ordinary Agent event feeds or controls, including a stale/deep-linked id.
   {
+    agentCatalog.upsertSession({
+      sessionId: "worker-session-alias", conversationId: "worker-private-conversation",
+      runId: "worker-private-run", agent: "claude", sessionKind: "collaboration",
+      status: "completed",
+    });
+    for (const id of ["worker-session-alias", "worker-private-conversation"]) {
+      const response = await getJson(`/agent/catalog/conversations/${id}`);
+      assert.equal(response.status, 404, `worker must remain hidden through ${id}`);
+      const rename = await putJson(`/agent/catalog/conversations/${id}/rename`, { title: "no" });
+      assert.equal(rename.status, 409);
+      const archive = await postJson(`/agent/catalog/conversations/${id}/archive`, {});
+      assert.equal(archive.status, 409);
+    }
     const sessionId = "explicit-local-isolation";
     const sessionPath = `/agent/local/sessions/${sessionId}`;
     const registered = await postJson("/agent/local/sessions/register", {
@@ -1706,6 +1731,27 @@ try {
       assert.ok(!history.body.conversations.some((item) => item.conversation_id === sessionId),
         "completed workers must not leak into ordinary history");
     }
+  }
+
+  // Lookup is not limited to the first page of the catalog, including when
+  // the App addresses the run by its session ID.
+  agentCatalog.upsertSession({
+    sessionId: "lookup-old-session", conversationId: "lookup-old-conversation",
+    runId: "lookup-old-run", agent: "claude", title: "Old work", status: "completed",
+    startedAt: "2020-01-01T00:00:00Z", nativeSessionId: "native-old",
+  });
+  for (let i = 0; i < 205; i++) {
+    agentCatalog.upsertSession({
+      sessionId: `lookup-new-session-${i}`, conversationId: `lookup-new-${i}`,
+      runId: `lookup-new-run-${i}`, agent: "claude", status: "completed",
+      startedAt: "2026-01-01T00:00:00Z",
+    });
+  }
+  for (const id of ["lookup-old-session", "lookup-old-conversation"]) {
+    const response = await getJson(`/agent/catalog/conversations/${id}`);
+    assert.equal(response.status, 200);
+    assert.equal(response.body.conversation.conversation_id, "lookup-old-conversation");
+    assert.equal(response.body.conversation.native_session_id, "native-old");
   }
 
   console.log("local api smoke ok");

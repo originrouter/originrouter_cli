@@ -1,9 +1,19 @@
 import { parseJson } from "./collaborationStorePrimitives.js";
 import { eventPresentation } from "./collaborationView.js";
+import { createHash } from "node:crypto";
+
+export function configurationProposalToken(session) {
+  if (!session || session.state !== "proposal_ready") return null;
+  return createHash("sha256").update(JSON.stringify({
+    request: session.request,
+    server_proposal: session.server_proposal,
+    proposal: session.proposal,
+  })).digest("hex");
+}
 
 export function publicConfigurationSession(row) {
   if (!row) return null;
-  return {
+  const result = {
     configuration_id: row.configuration_id,
     state: row.state,
     objective: row.objective,
@@ -29,6 +39,8 @@ export function publicConfigurationSession(row) {
     updated_at: row.updated_at,
     expires_at: row.expires_at || null,
   };
+  result.proposal_token = configurationProposalToken(result);
+  return result;
 }
 
 export function publicMessage(row) {

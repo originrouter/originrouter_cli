@@ -240,6 +240,12 @@ export function createCompatibilityGateway({
   routeMap = { aliases: {} },
   engine = new CompatibilityEngine(),
   engineProvider = null,
+  // Optional per-session model override. Returns
+  // `{ provider, model, alias }` when the request's credential names a session
+  // the user pinned to a concrete model, and null otherwise. The rewrite
+  // happens before the compatibility context is built so patches see the
+  // provider family the request will actually reach.
+  sessionModelProvider = null,
   maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
   logger = console,
 } = {}) {
@@ -267,6 +273,22 @@ export function createCompatibilityGateway({
       return;
     }
     const protocol = protocolForRequest(req.url);
+    // Per-session model override. This is the only place the alias the agent
+    // holds is translated into a different upstream model, which is why a
+    // session can change models without the agent touching its own model
+    // string, and without restarting LiteLLM.
+    if (typeof sessionModelProvider === "function") {
+      try {
+        const override = sessionModelProvider(req.headers, document);
+        if (override && typeof document?.model === "string") {
+          document.model = override.alias;
+        }
+      } catch (error) {
+        // A broken override file must not break inference. The device route
+        // is the documented fallback.
+        logger.warn?.(`[compatibility] session model override skipped: ${error.message}`);
+      }
+    }
     const context = compatibilityContextForRequest(routeMap, {
       method: req.method,
       path: req.url,

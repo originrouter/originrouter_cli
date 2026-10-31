@@ -213,6 +213,78 @@ const assignment = worker.store.getRemoteAssignment(`assign-${run.run_id}-worker
 assert.ok(assignment);
 assert.equal(assignment.fencing_token, current.agents.worker.fencing_token);
 const workerSession = assignment.originrouter_session_id;
+// Blocking and restoring the budget must fence the old remote attempt and
+// actually deliver a fresh task to the resumed worker.
+await source.runtime.handleRelayEvent({ type: "collaboration.budget.status", targetDeviceId: "device-a", run_id: run.run_id, blocked: true });
+assert.equal(source.store.getRun(run.run_id).state, "budget_exhausted");
+assert.equal(worker.store.getRemoteAssignment(assignment.assignment_id).status, "budget_exhausted");
+await worker.runtime.handleRemoteAgentNotification(assignment, { type: "registered", sessionId: workerSession, payload: { nativeSessionId: "remote-late-native" } });
+await worker.runtime.handleRemoteAgentNotification(assignment, { type: "unregistered", sessionId: workerSession, payload: { status: "stopped" } });
+assert.equal(worker.store.getRemoteAssignment(assignment.assignment_id).status, "budget_exhausted", "late registration must not reopen an interrupted remote assignment");
+assert.equal(worker.store.getRemoteAssignment(assignment.assignment_id).native_session_id, "remote-late-native");
+const delayedResolution = {
+  type: "collaboration.remote.interaction.resolve", sourceDeviceId: "device-a", targetDeviceId: "device-b",
+  runId: run.run_id, taskId: assignment.task_id, role: assignment.role,
+  sessionId: workerSession, interactionId: "interrupted-approval",
+  attempt: assignment.attempt, fencingToken: assignment.fencing_token,
+  command: { action: "allow" },
+};
+const resolutionsBeforeInterruption = worker.registry.commands.filter((item) => item.command.type === "agent.interaction.resolve").length;
+await worker.runtime.handleRelayEvent(delayedResolution);
+assert.equal(worker.registry.commands.filter((item) => item.command.type === "agent.interaction.resolve").length, resolutionsBeforeInterruption);
+for (const event of [
+  { type: "agent.task.aborted", eventId: "remote-late-abort" },
+  { type: "agent.task.complete", status: "aborted", eventId: "remote-late-completion" },
+]) {
+  await worker.runtime.handleRemoteAgentNotification(worker.store.getRemoteAssignment(assignment.assignment_id), {
+    type: "event", sessionId: workerSession, payload: event,
+  });
+  assert.equal(worker.store.getRemoteAssignment(assignment.assignment_id).status, "budget_exhausted");
+  assert.equal(source.store.getRun(run.run_id).state, "budget_exhausted");
+}
+await source.runtime.handleRelayEvent({
+  type: "collaboration.remote.error", sourceDeviceId: "device-b", targetDeviceId: "device-a",
+  assignmentId: assignment.assignment_id, runId: run.run_id, taskId: assignment.task_id,
+  role: assignment.role, attempt: assignment.attempt, fencingToken: assignment.fencing_token,
+  code: "LATE_ABORT", message: "Interrupted after the budget was exhausted",
+});
+assert.equal(source.store.getRun(run.run_id).state, "budget_exhausted");
+const commandsBeforeResume = worker.registry.commands.filter((item) => item.command.type === "agent.message").length;
+await source.runtime.handleRelayEvent({ type: "collaboration.budget.status", targetDeviceId: "device-a", run_id: run.run_id, blocked: false });
+await new Promise((resolve) => setImmediate(resolve));
+const resumedAssignment = worker.store.getRemoteAssignment(assignment.assignment_id);
+assert.ok(resumedAssignment.fencing_token > assignment.fencing_token);
+assert.equal(resumedAssignment.status, "running");
+const lateUsage = {
+  type: "collaboration.remote.usage", sourceDeviceId: "device-b", targetDeviceId: "device-a",
+  assignmentId: assignment.assignment_id, runId: run.run_id, taskId: assignment.task_id,
+  role: assignment.role, attempt: assignment.attempt, fencingToken: assignment.fencing_token,
+  usageId: "old-turn-usage-001", sampledTokens: 23, amountMicros: 100, currency: "USD", costSource: "configured",
+};
+const usageBeforeLateReceipt = source.store.getRun(run.run_id).usage.sampled_tokens;
+assert.equal(source.store.hasDispatchedRemoteAttempt(lateUsage), true);
+const storedDispatch = source.store.db.prepare("SELECT dispatch_metadata_json, payload_json FROM collaboration_outbox WHERE message_type = 'collaboration.remote.dispatch' AND run_id = ? ORDER BY created_at LIMIT 1").get(run.run_id);
+assert.equal(storedDispatch.payload_json, "{}");
+assert.equal(storedDispatch.dispatch_metadata_json.includes("prompt"), false);
+source.store.db.prepare("UPDATE collaboration_outbox SET dispatch_metadata_json = '{}' WHERE run_id = ? AND message_type = 'collaboration.remote.dispatch'").run(run.run_id);
+assert.equal(source.store.hasDispatchedRemoteAttempt(lateUsage), true, "older dispatched events also prove the attempt");
+await source.runtime.handleRelayEvent(lateUsage);
+await source.runtime.handleRelayEvent(lateUsage);
+assert.equal(source.store.getRun(run.run_id).usage.sampled_tokens, usageBeforeLateReceipt + 23, "late usage is counted once after recovery");
+await source.runtime.handleRelayEvent({ ...lateUsage, sourceDeviceId: "wrong-device", usageId: "forged-device-usage" });
+await source.runtime.handleRelayEvent({ ...lateUsage, attempt: 99, fencingToken: 99, usageId: "forged-attempt-usage" });
+assert.equal(source.store.getRun(run.run_id).usage.sampled_tokens, usageBeforeLateReceipt + 23, "unrecognized attempts and devices cannot add usage");
+await worker.runtime.handleRelayEvent(delayedResolution);
+assert.equal(worker.registry.commands.filter((item) => item.command.type === "agent.interaction.resolve").length, resolutionsBeforeInterruption, "the old turn cannot authorize the resumed Agent");
+assert.equal(worker.registry.commands.filter((item) => item.command.type === "agent.message").length, commandsBeforeResume + 1);
+const interruptsBeforeStalePause = worker.registry.commands.filter((item) => item.command.type === "terminal.interrupt").length;
+await worker.runtime.handleRelayEvent({
+  type: "collaboration.remote.pause", sourceDeviceId: "device-a", targetDeviceId: "device-b",
+  assignmentId: assignment.assignment_id, runId: run.run_id, taskId: assignment.task_id,
+  role: assignment.role, attempt: assignment.attempt, fencingToken: assignment.fencing_token,
+});
+assert.equal(worker.registry.commands.filter((item) => item.command.type === "terminal.interrupt").length, interruptsBeforeStalePause);
+assert.equal(worker.store.getRemoteAssignment(assignment.assignment_id).status, "running");
 worker.registry.emit(workerSession, {
   type: "agent.interaction.requested",
   eventId: "b-approval",

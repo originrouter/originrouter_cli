@@ -124,6 +124,10 @@ export class LocalAgentBridgeClient {
         payload.conversationId !== this.sessionMetadata.conversationId) {
       this.pendingInteractions.clear();
     }
+    // Re-registration must carry the provenance of the latest runtime title.
+    if (payload.title !== undefined && payload.titleIsCustom === undefined) {
+      payload = { ...payload, titleIsCustom: false };
+    }
     this.sessionMetadata = { ...this.sessionMetadata, ...payload };
     if (this.closed || !(await this.connect())) return false;
     try {
@@ -142,9 +146,15 @@ export class LocalAgentBridgeClient {
 
   async sendEvent(event) {
     if (this.closed) return false;
-    if (["agent.autonomy.status", "agent.mode.status", "agent.detail.status"].includes(event?.type)) {
+    if (["agent.autonomy.status", "agent.mode.status", "agent.detail.status", "agent.model.status", "agent.effort.status"].includes(event?.type)) {
       // The runtime outlives the daemon. Reconnect must rehydrate current
       // configuration even when its original telemetry was delivered.
+      //
+      // The model is part of that configuration, and it is the only one a
+      // reader can change: a daemon restart rebuilds the session record from
+      // the register metadata, which does not carry the session's own model.
+      // Without the replay a session the reader had pinned silently fell back
+      // to the device route on the daemon's next start.
       this.latestStatusEvents.set(event.type, event);
       if (event.type === "agent.autonomy.status") {
         this.sessionMetadata = { ...this.sessionMetadata,
@@ -155,6 +165,20 @@ export class LocalAgentBridgeClient {
           allowedAutonomyScopes: event.allowedAutonomyScopes,
           availableAutonomyScopes: event.availableAutonomyScopes,
           approvalPolicy: event.approvalPolicy, aiReviewPolicy: event.aiReviewPolicy,
+        };
+      }
+      if (event.type === "agent.effort.status") {
+        // The effort is configuration too: a daemon restart rebuilds the
+        // session record from the register metadata, so the level and the
+        // levels the runtime can take have to travel with it. Without them
+        // a session the reader had put on a level came back without a
+        // control at all.
+        this.sessionMetadata = { ...this.sessionMetadata,
+          effort: event.effort ?? null,
+          effortControl: event.effortControl || "unsupported",
+          availableEfforts: Array.isArray(event.availableEfforts)
+            ? event.availableEfforts.slice(0, 8)
+            : [],
         };
       }
     }

@@ -6,6 +6,7 @@ import net from "node:net";
 
 import { CompatibilityEngine } from "./engine.js";
 import { createCompatibilityGateway } from "./gateway.js";
+import { createSessionModelResolver } from "../proxy/sessionModels.js";
 import {
   compatibilityPatchPreferencesPath,
   loadActiveCompatibilityPack,
@@ -101,10 +102,19 @@ async function main() {
     };
     watchFile(activePackPath, { interval: 5000, persistent: false }, reloadEngine);
     watchFile(preferencesPath, { interval: 500, persistent: false }, reloadEngine);
+    // Per-session model overrides live in their own file and are read on
+    // demand (mtime-guarded), so a change takes effect on the next request of
+    // that session: no restart, no route hash change.
+    const resolveSessionModel = createSessionModelResolver({
+      stateDir: options["state-dir"],
+      knownAliases: () => routeMap.aliases || {},
+      logger: console,
+    });
     gateway = createCompatibilityGateway({
       upstreamBaseUrl: `http://${host}:${internalPort}`,
       routeMap,
       engineProvider: () => engine,
+      sessionModelProvider: resolveSessionModel,
     });
     await new Promise((resolve, reject) => {
       gateway.once("error", reject);

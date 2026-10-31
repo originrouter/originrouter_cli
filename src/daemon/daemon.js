@@ -255,6 +255,7 @@ export async function startDaemon(args) {
   let agentActivitySyncInFlight = null;
   let agentHistorySyncInFlight = null;
   let lastAgentActivitySyncError = null;
+  let lastAgentHistorySyncError = null;
   const syncAgentActivityHistory = () => {
     if (agentActivitySyncInFlight) return agentActivitySyncInFlight;
     agentActivitySyncInFlight = syncAgentActivityCatalog({
@@ -294,6 +295,12 @@ export async function startDaemon(args) {
       .then((result) => {
         if (result.ok && result.synced > 0) {
           console.log(`[agent-history] synced ${result.synced} display-safe transcripts`);
+        }
+        if (result.ok) {
+          lastAgentHistorySyncError = null;
+        } else if (result.error !== lastAgentHistorySyncError) {
+          lastAgentHistorySyncError = result.error;
+          console.error(`[agent-history] sync deferred: ${result.error || "unknown"}`);
         }
         return result;
       })
@@ -405,6 +412,7 @@ export async function startDaemon(args) {
         sampledTokens: event.sampledTokens,
         amountMicros: event.amountMicros,
         currency: event.currency,
+        costSource: event.costSource,
         createdAt: event.createdAt,
       });
       if (result.duplicate || result.ignored) return;
@@ -856,6 +864,9 @@ export async function startDaemon(args) {
   heartbeatTimer = setInterval(() => {
     if (!relayConnected) return;
     reportLocalControlHeartbeat().catch(() => {});
+    // Account limits reset at UTC boundaries even when no new usage arrives.
+    // Reconcile missed status pushes as well as the first read on reconnect.
+    collaborationRuntime.refreshAccountBudgetStatus().catch(() => {});
   }, 60_000);
   heartbeatTimer.unref?.();
   agentActivitySyncTimer = setInterval(() => {

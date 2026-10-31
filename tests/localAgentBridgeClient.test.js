@@ -4,6 +4,29 @@ import test from "node:test";
 import { LocalAgentBridgeClient } from "../src/local/localAgentBridgeClient.js";
 import { ExternalAgentRegistry } from "../src/local/externalAgentRegistry.js";
 
+test("automatic title provenance survives bridge reconnection", async () => {
+  const registrations = [];
+  const originalFetch = globalThis.fetch;
+  const client = new LocalAgentBridgeClient({ stateDir: "/tmp/originrouter-title-reconnect-test",
+    sessionId: "title-test", onCommand: async () => {},
+    endpointProvider: () => ({ baseUrl: "http://127.0.0.1:7437", token: "test" }) });
+  globalThis.fetch = async (url, options) => {
+    if (url.endsWith("/register")) registrations.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+  try {
+    client.sessionMetadata = { sessionId: "title-test", title: "Chosen", titleIsCustom: true };
+    await client.update({ title: "Agent title" });
+    client.setEndpoint(null);
+    await client.connect();
+    assert.equal(registrations.at(-1).title, "Agent title");
+    assert.equal(registrations.at(-1).titleIsCustom, false);
+  } finally {
+    await client.close();
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("reconnect rehydrates the installed autonomy snapshot even after the event tail is gone", async () => {
   const originalFetch = globalThis.fetch;
   const delivered = [];
@@ -23,6 +46,33 @@ test("reconnect rehydrates the installed autonomy snapshot even after the event 
     while (client.flushingEvents) await new Promise((resolve) => setTimeout(resolve, 1));
     assert.equal(delivered.length, 2);
     assert.deepEqual(delivered[1].aiReviewPolicy, delivered[0].aiReviewPolicy);
+  } finally { client.close(); globalThis.fetch = originalFetch; }
+});
+
+test("reconnect rehydrates the session's own model after a daemon restart", async () => {
+  // The registry rebuilds the record from the register metadata, which names
+  // the model the *device* is routed to — not the model the session pinned.
+  // A session the reader had pinned would come back on the device route, and
+  // the header would say so, until the runtime stated its model again.
+  const originalFetch = globalThis.fetch;
+  const delivered = [];
+  const client = new LocalAgentBridgeClient({ stateDir: "/tmp/originrouter-model-reconnect-test",
+    sessionId: "pinned", onCommand: async () => {},
+    endpointProvider: () => ({ baseUrl: "http://127.0.0.1:7437", token: "test" }),
+  });
+  globalThis.fetch = async (url, options) => {
+    if (url.endsWith("/events")) delivered.push(JSON.parse(options.body).event);
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+  try {
+    await client.sendEvent({ type: "agent.model.status", eventId: "pinned-model",
+      model: "deepseek-reasoner", modelProvider: "deepseek", source: "session",
+      modelControl: "supported" });
+    client.setEndpoint(null);
+    await client.connect();
+    while (client.flushingEvents) await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.equal(delivered.length, 2);
+    assert.deepEqual(delivered[1], delivered[0]);
   } finally { client.close(); globalThis.fetch = originalFetch; }
 });
 

@@ -99,6 +99,18 @@ export function handleRemoteEvent(payload, ctx) {
   ) {
     return ctx.adapter.setMode(payload, ctx.executor);
   }
+  if (
+    payload.type === "agent.model.set" &&
+    typeof ctx.applySessionModel === "function"
+  ) {
+    return ctx.applySessionModel(payload);
+  }
+  if (
+    payload.type === "agent.effort.set" &&
+    typeof ctx.applyEffort === "function"
+  ) {
+    return ctx.applyEffort(payload);
+  }
   if (payload.type === "session.stop") {
     ctx.executor.stop();
     return true;

@@ -1,6 +1,7 @@
 import { resolveWithAutonomy } from "../runtime/agentAutonomyPolicy.js";
 import { aiReviewPolicyFromEnvironment } from "../runtime/aiReviewPolicy.js";
 import { readApprovalPolicy } from "../runtime/approvalPolicyStore.js";
+import { resolveCollaborationPermissionSnapshot } from "./collaborationPermissionSnapshot.js";
 
 const ASK = Symbol("originrouter-supervisor-ask");
 
@@ -26,37 +27,46 @@ export class CollaborationApprovalSupervisor {
     this.aiReviewer = aiReviewer;
   }
 
-  async evaluateLayer({ request, profile, policyId, workspaceRoot, runtime }) {
+  async evaluateLayer({ request, profile, policyId, workspaceRoot, runtime, policySnapshot = null }) {
+    const selected = policySnapshot ? resolveCollaborationPermissionSnapshot(policySnapshot) : null;
+    if (selected && selected.profile !== profile) {
+      throw Object.assign(new Error("The saved Session permission does not match its profile."), { code: "COLLABORATION_PERMISSION_SNAPSHOT_INVALID" });
+    }
     return resolveWithAutonomy({
       request,
       profile,
       workspaceRoot,
       runtime,
       stateDir: this.stateDir,
-      approvalPolicy: profile === "custom" && policyId
+      approvalPolicy: selected?.approvalPolicy || (profile === "custom" && policyId
         ? readApprovalPolicy(policyId, { stateDir: this.stateDir })
-        : null,
+        : null),
       aiReviewer: this.aiReviewer,
-      aiReviewPolicy: profile === "ai_review" ? aiReviewPolicyFromEnvironment() : null,
+      aiReviewPolicy: selected?.aiReviewPolicy || (profile === "ai_review" ? aiReviewPolicyFromEnvironment() : null),
       requestInteraction: async () => ASK,
     });
   }
 
-  async evaluate({ request, agent, run, workspaceRoot }) {
+  async evaluate({ request, agent, run, workspaceRoot, sessionPermissionSnapshot = null }) {
     const agentProfile = text(agent?.permission_profile, 64) || "manual";
     const sessionProfile = text(run?.supervisor_permission_profile, 64) || "guarded";
     const common = { request, workspaceRoot, runtime: agent?.runtime };
     const samePolicy = agentProfile === sessionProfile
-      && text(agent?.approval_policy_id, 64) === text(run?.supervisor_policy_id, 64);
+      && text(agent?.approval_policy_id, 64) === text(run?.supervisor_policy_id, 64)
+      && !sessionPermissionSnapshot;
     const agentResult = await this.evaluateLayer({
       ...common,
       profile: agentProfile,
       policyId: agent?.approval_policy_id,
     });
-    const sessionResult = samePolicy ? agentResult : await this.evaluateLayer({
+    const applicability = sessionPermissionSnapshot?.aiReviewPolicy?.applicability || {};
+    const applicable = (!applicability.device_id || applicability.device_id === agent?.device_id)
+      && (!applicability.workspace_reference || [agent?.workspace_id, workspaceRoot].includes(applicability.workspace_reference));
+    const sessionResult = !applicable ? ASK : samePolicy ? agentResult : await this.evaluateLayer({
       ...common,
       profile: sessionProfile,
       policyId: run?.supervisor_policy_id,
+      policySnapshot: sessionPermissionSnapshot,
     });
     const layers = [
       evidence("agent", agentProfile, agentResult),

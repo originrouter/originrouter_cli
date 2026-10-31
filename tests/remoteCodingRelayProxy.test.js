@@ -52,7 +52,9 @@ function scriptedResponses(body, script) {
   assert.equal(r.source, "remote-coding");
   assert.equal(r.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:40123");
   assert.equal(r.env.ANTHROPIC_API_KEY, "sk-noop-litellm-passthrough");
-  assert.equal(r.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
+  // The alias, like every transport that has a gateway in front of it: the
+  // relay proxy substitutes the concrete model per request.
+  assert.equal(r.env.ANTHROPIC_MODEL, "originrouter-claude-model");
 }
 
 {
@@ -69,7 +71,7 @@ function scriptedResponses(body, script) {
   assert.equal(r.source, "remote-coding");
   assert.equal(r.env.OPENAI_BASE_URL, "http://127.0.0.1:40123/v1");
   assert.equal(r.env.OPENAI_API_KEY, "sk-noop-litellm-passthrough");
-  assert.equal(r.env.OPENAI_MODEL, "gpt-5-codex");
+  assert.equal(r.env.OPENAI_MODEL, "originrouter-codex-model");
 }
 
 {

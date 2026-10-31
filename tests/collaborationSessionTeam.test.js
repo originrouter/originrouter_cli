@@ -195,6 +195,11 @@ await assert.rejects(
 );
 assert.equal(store.getWorkspaceSession(second.run_id).team_revision, 1);
 assert.equal(store.listAttention(second.run_id)[0].status, "pending");
+const priorBudget = store.getRun(second.run_id);
+const editedBudget = store.updateBudget(second.run_id, {
+  expected_budget_revision: priorBudget.budget_revision, token_limit: 12345,
+});
+const budgetRevisionBeforeTeamChange = editedBudget.budget_revision;
 await runtime.resolveAttention(second.run_id, attention.attention_id, {
   action: "confirm_team_change",
   expectedRevision: attention.revision,
@@ -204,6 +209,8 @@ run = store.getRun(second.run_id);
 session = store.getWorkspaceSession(second.run_id);
 assert.equal(session.team_revision, 2);
 assert.equal(run.team_revision, 2);
+assert.equal(run.budget_revision, budgetRevisionBeforeTeamChange);
+assert.equal(run.budget.token_limit, 12345, "a Team change must not restore an old Run budget");
 assert.equal(run.state, "executing");
 assert.ok(run.agents.linux_verifier);
 assert.ok(run.tasks.some((task) => task.task_key === "team_change_resume_2"));

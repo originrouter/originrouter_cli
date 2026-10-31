@@ -43,7 +43,7 @@ export class PlanImplementVerifyCoordinator {
     }
     return this.move(runId, "researching", { taskState: "active", taskPhase: "research" });
   }
-  confirm(runId) { return this.store.confirmAdaptivePlan(runId); }
+  confirm(runId, options) { return this.store.confirmAdaptivePlan(runId, options); }
   beginPlanning(runId) { return this.move(runId, "planning", { taskState: "active", taskPhase: "planning" }); }
   beginImplementation(runId) { return this.move(runId, "implementing", { taskState: "active", taskPhase: "implementation" }); }
 

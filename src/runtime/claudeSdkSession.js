@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
   createRuntimeEventReporter,
+  captureRelayAccountContext,
   reportAgentConversationMetadata,
   shouldSyncAgentActivitySnapshot,
   startAgentSessionHeartbeat,
@@ -63,10 +64,27 @@ import {
 } from "./agentAutonomyPolicy.js";
 import { AsyncMessageQueue } from "./asyncMessageQueue.js";
 import {
+  claudeEffortSettings,
+  CLAUDE_EFFORT_LEVELS,
+  normalizeAgentEffort,
+} from "./agentEffort.js";
+import {
+  applyLaunchSessionModel,
+  clearSessionModel,
+  getSessionModel,
+  directProvidersForTransport,
+  modelControlForTransport,
+  resolveLaunchModelTarget,
+  resolvePricingTarget,
+  setSessionModel,
+  validateSessionModelTarget,
+} from "../proxy/sessionModels.js";
+import {
   claudeTranscriptPathForSession,
   readClaudeConversationHistory,
 } from "./claudeConversationHistory.js";
 import { mapClaudeSdkMessage } from "./claudeSdkEvents.js";
+import { withClaudePermissionSafety } from "../adapters/claude/hookSettings.js";
 import { PendingInteractionRegistry } from "./pendingInteractionRegistry.js";
 import { isCollaborationSessionPayload } from "./agentSessionKind.js";
 import { protectOriginrouterCodingEnv } from "./originrouterCodingAuthProxy.js";
@@ -88,6 +106,9 @@ import {
   readWorkspaceApprovalPolicySafe,
 } from "./approvalPolicyStore.js";
 
+// Claude Code's own permission modes, kept whole so a status event coming back
+// from the runtime can still be translated into a word. This is a vocabulary,
+// not an offer: what the App is allowed to select is CLAUDE_REMOTE_MODE_IDS.
 const CLAUDE_MODES = Object.freeze([
   { id: "default", label: "Default" },
   { id: "acceptEdits", label: "Accept edits" },
@@ -96,6 +117,40 @@ const CLAUDE_MODES = Object.freeze([
   { id: "dontAsk", label: "Don't ask" },
   { id: "bypassPermissions", label: "Bypass permissions" },
 ]);
+
+// What `agent.mode.set` will accept, and what `availableModes` publishes.
+//
+// Two modes are missing on purpose, for two different reasons that both end in
+// "the request never reaches the broker":
+//
+//   auto     — every session pins `disableAutoMode: "disable"` in its settings
+//              (see adapters/claude/hookSettings.js), which is what removes the
+//              classifier and its gateway billing notice. Claude Code refuses to
+//              enter auto under that pin, so the mode is unreachable and
+//              advertising it offers the App a button that cannot work.
+//   dontAsk  — not a lower level of asking but the absence of it: it denies
+//              anything not already pre-approved, so the model retries into a
+//              wall and the App is shown nothing to approve.
+//
+// `bypassPermissions` stays. It is a deliberate, user-typed choice ("Implement
+// without further prompts" on a plan card), not a mode a session can drift into,
+// and removing it would take away the only way to accept a plan that asks for
+// exactly that.
+// Exported so the vocabulary is a tested thing rather than a comment: the
+// modes this runtime accepts (`agent.mode.set`) and publishes
+// (`availableModes`) are the same list, and "auto"/"dontAsk" are not in it.
+export const CLAUDE_REMOTE_MODE_IDS = Object.freeze(["default", "acceptEdits", "plan", "bypassPermissions"]);
+export const CLAUDE_AVAILABLE_MODES = Object.freeze(
+  CLAUDE_MODES.filter((item) => CLAUDE_REMOTE_MODE_IDS.includes(item.id)),
+);
+
+// The mode a session actually starts in. `--permission-mode auto` cannot stick
+// because of the same settings pin, so the startup value is floored to
+// "default" rather than reported as a mode the runtime will immediately leave.
+function floorUnavailablePermissionMode(mode) {
+  const value = String(mode || "");
+  return value === "auto" || value === "dontAsk" ? "default" : value;
+}
 
 const PLAN_APPROVAL_OPTIONS = Object.freeze([
   { id: "default", label: "Implement with normal approvals" },
@@ -134,13 +189,19 @@ export function resolveClaudeSdkModelSelection(options = {}, providerResult = {}
 // path pin exactly the same set. It previously named only five env keys, which
 // left CLAUDE_CODE_SUBAGENT_MODEL and the whole ANTHROPIC_DEFAULT_*_MODEL
 // family — the keys a stale settings.json is most likely to hold — unpinned.
+//
+// The permission safety keys are applied even when there is no transport to
+// pin. This used to return null for the `inherited` and `native-config`
+// sources, and that was a hole rather than an optimization: those are exactly
+// the sessions that have no --settings file of their own, so nothing was
+// carrying `disableAutoMode` and a user's `permissions.defaultMode: "auto"`
+// could put the session in auto mode — with the classifier and its 24-hour
+// billing notice — where our broker's requests would never be generated.
 export function createClaudeRuntimeSettingsOverride(
   providerResult = {},
   { temporaryRoot = tmpdir() } = {},
 ) {
-  const settings = buildClaudeSettingsOverride(providerResult);
-  if (!settings) return null;
-
+  const settings = withClaudePermissionSafety(buildClaudeSettingsOverride(providerResult));
   const directory = mkdtempSync(join(temporaryRoot, "originrouter-claude-settings-"));
   const path = join(directory, "settings.json");
   try {
@@ -310,6 +371,7 @@ async function loadClaudeAgentSdk() {
 
 export async function runClaudeSdkSession(rawArgs) {
   const stateDir = ensureStateDir();
+  const relayAccount = captureRelayAccountContext(stateDir);
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
   const options = extractOriginRouterOptions(rawArgs);
   const collaborationWorker = isCollaborationSessionPayload({
@@ -355,22 +417,56 @@ export async function runClaudeSdkSession(rawArgs) {
   });
   let providerResult = await buildAgentProviderEnv("claude", config, {
     provider: options.provider,
+    // The session id rides along as the route credential so the compatibility
+    // gateway can resolve this session's model override without the agent
+    // ever learning which upstream model it is talking to.
+    sessionId,
     proxyStatus: staticProxyStatusFn(readLocalProxySnapshot()),
   });
   let originrouterCodingProxy = null;
   let localAgentBridge = null;
   let runtimeSettingsOverride = null;
   let relayViaDaemon = false;
+  // A launch-time --model becomes a session override rather than the agent's
+  // own model string: the agent must keep asking for the route alias, or the
+  // gateway has nothing to translate. A target that does not validate is
+  // reported and the device route stays in force.
+  //
+  // Every transport with a gateway in front of the agent gets this — route
+  // mode's compatibility gateway, the cloud's per-session auth proxy, the
+  // remote device's relay proxy. The transports without one (inherited) talk
+  // to their endpoint directly, so --model keeps its old meaning there.
+  let effectiveOptions = options;
+  if (modelControlForTransport(providerResult.source) === "supported" && options.model) {
+    const launchModel = applyLaunchSessionModel(config, stateDir, sessionId, {
+      agent: "claude",
+      model: options.model,
+      provider: options.provider,
+      allowedProviders: directProvidersForTransport(providerResult),
+    });
+    if (launchModel.applied) {
+      effectiveOptions = { ...options, model: undefined };
+    } else {
+      process.stderr.write(
+        `[originrouter] --model ${options.model} ignored (${launchModel.reason}); `
+        + "this session uses the device route.\n",
+      );
+      effectiveOptions = { ...options, model: undefined };
+    }
+  }
   ({ providerResult, proxy: originrouterCodingProxy } =
     await protectOriginrouterCodingEnv("claude", providerResult, {
       stateDir,
       runId: options.runId,
+      // The proxy belongs to this session, and the session's own model
+      // override is what the proxy resolves the alias against.
+      sessionId,
     }));
   const telemetry = createTelemetryPipeline({
     stateDir,
     uploadOwner: options.telemetryOwner === "1",
   });
-  const modelSelection = resolveClaudeSdkModelSelection(options, providerResult);
+  const modelSelection = resolveClaudeSdkModelSelection(effectiveOptions, providerResult);
   let model = modelSelection.model;
   const messageQueue = new AsyncMessageQueue();
   // The title this session starts with: whatever the launcher asked for, or
@@ -404,7 +500,7 @@ export async function runClaudeSdkSession(rawArgs) {
     title: () => sessionTitle(),
     deviceName: device.displayName || device.host,
     workspaceDisplayPath: workspaceDisplayPath(cwd),
-    stateDir,
+    ...relayAccount,
     telemetryQueue: telemetry.queue,
     telemetryUploader: telemetry.uploader,
     telemetryContext: () => ({
@@ -450,7 +546,17 @@ export async function runClaudeSdkSession(rawArgs) {
     return agentTitle;
   };
   let stopped = false;
-  let currentMode = options.permissionMode || "default";
+  // The startup mode is floored, not trusted: `--permission-mode auto` cannot
+  // stick under the session's `disableAutoMode` pin, so reporting "auto" would
+  // show the App a mode the runtime is about to leave on its own.
+  let currentMode = floorUnavailablePermissionMode(options.permissionMode || "default") || "default";
+  // The session's model override, if the user pinned one. Null means the
+  // device route is in force.
+  let sessionModel = getSessionModel(stateDir, sessionId);
+  // The reasoning effort this session runs on, as the App last named it.
+  // Null means nobody has chosen one yet: the run is on whatever the model
+  // does by itself, and the device says so as soon as it can tell.
+  let sessionEffort = null;
   const invalidScopes = invalidAutonomyScopes(options.autonomyAllowedScopes);
   if (invalidScopes.length) {
     throw new Error(`Unknown unattended scope(s): ${invalidScopes.join(", ")}`);
@@ -492,6 +598,8 @@ export async function runClaudeSdkSession(rawArgs) {
   }
 
   let pendingModePayload = null;
+  // A level the reader picked before the runtime was up. Applied when it is.
+  let pendingEffortPayload = null;
   const activitySnapshot = {
     summary: "",
     firstPromptPreview: "",
@@ -527,7 +635,7 @@ export async function runClaudeSdkSession(rawArgs) {
       permissionRevision: permissionState.revision,
         ...activitySnapshot,
       },
-      { stateDir },
+      relayAccount,
     ).catch(() => ({ ok: false }));
   };
 
@@ -608,7 +716,7 @@ export async function runClaudeSdkSession(rawArgs) {
       runtime: "claude-sdk",
       mode: currentMode,
       modeControl: "supported",
-      availableModes: CLAUDE_MODES,
+      availableModes: CLAUDE_AVAILABLE_MODES,
       requestId,
     });
   const permissionState = createAgentPermissionStateTracker({
@@ -663,7 +771,11 @@ export async function runClaudeSdkSession(rawArgs) {
   };
   const applyMode = async (payload) => {
     const mode = String(payload?.mode || "");
-    if (!CLAUDE_MODES.some((item) => item.id === mode)) return false;
+    // Only the offered modes. `auto` and `dontAsk` are refused here rather than
+    // forwarded: `auto` is blocked by the session's own settings pin and would
+    // come back as a mode the runtime silently left, and `dontAsk` would answer
+    // every future request by denying it without asking us.
+    if (!CLAUDE_REMOTE_MODE_IDS.includes(mode)) return false;
     if (!queryRef) {
       pendingModePayload = payload;
       return true;
@@ -679,6 +791,152 @@ export async function runClaudeSdkSession(rawArgs) {
         provider: "claude",
         state: "mode_change_failed",
         message: error.message,
+      });
+      return false;
+    }
+  };
+
+  // The reasoning effort of this session.
+  //
+  // The device owns this fact: it is the runtime that has to apply the
+  // level, and only the runtime knows which levels a *running* session can
+  // take. Claude's settings layer holds `low|medium|high|xhigh` and turns
+  // thinking off with a flag of its own, so `max` is not among them — it
+  // exists only as the launch flag, and a session that is already running
+  // has no way to take it.
+  const reportSessionEffort = (requestId = null, { accepted = null, reason = null } = {}) =>
+    sendAgentEvent({
+      type: "agent.effort.status",
+      provider: "claude",
+      runtime: "claude-sdk",
+      sessionId,
+      effort: sessionEffort,
+      effortControl: "supported",
+      availableEfforts: CLAUDE_EFFORT_LEVELS,
+      requestId,
+      accepted,
+      reason,
+    });
+  const applyEffort = async (payload) => {
+    const requested = normalizeAgentEffort(payload?.effort);
+    if (!requested) {
+      await reportSessionEffort(payload?.requestId || null, {
+        accepted: false,
+        reason: "effort_level_unknown",
+      });
+      return false;
+    }
+    if (!CLAUDE_EFFORT_LEVELS.includes(requested)) {
+      // Refused here rather than hidden in the App: `max` is a launch flag,
+      // and accepting it would leave a session claiming an effort it does
+      // not run on.
+      await reportSessionEffort(payload?.requestId || null, {
+        accepted: false,
+        reason: "effort_level_unsupported",
+      });
+      return false;
+    }
+    if (!queryRef) {
+      // The runtime is not up yet. The choice is kept and applied when it
+      // is, so a reader who picks a level before the session is ready does
+      // not have to pick it again.
+      pendingEffortPayload = payload;
+      return true;
+    }
+    try {
+      await queryRef.applyFlagSettings(claudeEffortSettings(requested));
+      sessionEffort = requested;
+      await reportSessionEffort(payload?.requestId || null, { accepted: true });
+      return true;
+    } catch (error) {
+      await reportSessionEffort(payload?.requestId || null, {
+        accepted: false,
+        reason: "effort_change_failed",
+      });
+      return false;
+    }
+  };
+
+  // Per-session model selection. The agent's own model string never changes:
+  // it keeps asking the proxy for the route alias, and the compatibility
+  // gateway substitutes the concrete model this session pinned. That is why
+  // this takes effect on the next turn instead of restarting anything.
+  const reportSessionModel = (requestId = null, { accepted = null, reason = null } = {}) =>
+    sendAgentEvent({
+      type: "agent.model.status",
+      provider: "claude",
+      runtime: "claude-sdk",
+      sessionId,
+      model: sessionModel?.model || null,
+      modelProvider: sessionModel?.provider || null,
+      // "device" means the session follows the device route.
+      source: sessionModel ? "session" : "device",
+      // Changing a session's model needs a place to rewrite the request's
+      // model on the way out. Three transports have one — route mode's
+      // compatibility gateway, the cloud's per-session auth proxy, the remote
+      // device's relay proxy. On the others (inherited) the session can still
+      // *show* what it runs on, but the App must not offer a picker that would
+      // be accepted and change nothing.
+      modelControl: modelControlForTransport(providerResult.source),
+      requestId,
+      accepted,
+      reason,
+    });
+  const applySessionModel = async (payload) => {
+    const requested = String(payload?.model || "").trim();
+    const requestedProvider = String(payload?.provider || "").trim();
+    try {
+      if (!requested) {
+        // An empty model clears the override and returns the session to the
+        // device route. This is allowed on every transport: clearing is the
+        // safe direction, and it is how an override written while the session
+        // was on route mode is removed after the device moved on.
+        clearSessionModel(stateDir, sessionId);
+        sessionModel = null;
+        await reportSessionModel(payload?.requestId || null, { accepted: true });
+        return true;
+      }
+      // Refused here, not merely hidden in the App: on a transport with no
+      // model-rewrite point there is nowhere for an override to take effect,
+      // and accepting it would leave a session claiming a model it does not
+      // run on.
+      if (modelControlForTransport(providerResult.source) !== "supported") {
+        await reportSessionModel(payload?.requestId || null, {
+          accepted: false,
+          reason: "model_control_unsupported",
+        });
+        return false;
+      }
+      const target = requestedProvider
+        ? validateSessionModelTarget(config, {
+          provider: requestedProvider,
+          model: requested,
+          allowedProviders: directProvidersForTransport(providerResult),
+        })
+        : resolveLaunchModelTarget(config, {
+          agent: "claude",
+          model: requested,
+          allowedProviders: directProvidersForTransport(providerResult),
+        });
+      if (!target.ok) {
+        await reportSessionModel(payload?.requestId || null, {
+          accepted: false,
+          reason: target.reason,
+        });
+        return false;
+      }
+      setSessionModel(stateDir, sessionId, {
+        agent: "claude",
+        provider: target.provider,
+        model: target.model,
+      });
+      sessionModel = { provider: target.provider, model: target.model };
+      await reportSessionModel(payload?.requestId || null, { accepted: true });
+      return true;
+    } catch (error) {
+      await reportSessionModel(payload?.requestId || null, {
+        accepted: false,
+        reason: error.message,
       });
       return false;
     }
@@ -846,6 +1104,12 @@ export async function runClaudeSdkSession(rawArgs) {
     }
     if (payload.type === "agent.mode.set") {
       return applyMode(payload);
+    }
+    if (payload.type === "agent.model.set") {
+      return applySessionModel(payload);
+    }
+    if (payload.type === "agent.effort.set") {
+      return applyEffort(payload);
     }
     if (payload.type === "agent.autonomy.set") {
       return applyAutonomy(payload);
@@ -1089,7 +1353,7 @@ export async function runClaudeSdkSession(rawArgs) {
   }
   stopHeartbeat = collaborationWorker
     ? () => {}
-    : startAgentSessionHeartbeat({ sessionId, stateDir });
+    : startAgentSessionHeartbeat({ sessionId, ...relayAccount });
 
   for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
     const handler = () =>
@@ -1170,7 +1434,8 @@ export async function runClaudeSdkSession(rawArgs) {
       conversationId: options.conversationId || sessionId,
       runId: options.runId || sessionId,
       agent: "claude",
-      title: sessionTitle,
+      title: sessionTitle(),
+      titleIsCustom: Boolean(requestedTitle && !agentTitle),
       deviceId: effectiveDeviceId,
       deviceName: device.displayName || device.host,
       cwd,
@@ -1185,7 +1450,7 @@ export async function runClaudeSdkSession(rawArgs) {
       startedBy: collaborationWorker ? "collaboration-runtime" : "local-sdk",
       mode: currentMode,
       modeControl: "supported",
-      availableModes: CLAUDE_MODES,
+      availableModes: CLAUDE_AVAILABLE_MODES,
       autonomyProfile,
       autonomyControl: "supported",
       allowedAutonomyScopes: autonomyAllowedScopes,
@@ -1198,11 +1463,25 @@ export async function runClaudeSdkSession(rawArgs) {
       pendingModePayload = null;
       await applyMode(payload);
     }
+    if (pendingEffortPayload) {
+      const payload = pendingEffortPayload;
+      pendingEffortPayload = null;
+      await applyEffort(payload);
+    }
     await syncCatalog("running");
     await sendAgentEvent({ type: "agent.ready", provider: "claude" });
     await reportMode();
     await reportAutonomy();
     await reportDetail();
+    // The session states its model as soon as it is ready. A session nobody
+    // has touched yet still answers on the device route, and the App needs
+    // to hear that — including whether this transport can change it — before
+    // it can offer a choice.
+    await reportSessionModel();
+    // And the effort it runs on. A session nobody has put on a level yet is
+    // on the model's own default, and saying so is what lets the App offer
+    // the choice at all.
+    await reportSessionEffort();
     process.stderr.write("[originrouter] Managed Claude session ready.\n");
     for await (const message of queryRef) {
       for (const event of mapClaudeSdkMessage(message)) {
@@ -1218,8 +1497,13 @@ export async function runClaudeSdkSession(rawArgs) {
           await syncCatalog("running");
         }
         await sendAgentEvent(applyConfiguredPricing(event, {
-          provider: providerResult.provider,
-          model: model || providerResult.routes?.main?.model,
+          // A session override moves the session onto another provider, so the
+          // price table has to follow it — otherwise the session is billed at
+          // the device route's rate.
+          ...resolvePricingTarget(config, sessionModel, {
+            provider: providerResult.provider,
+            model: model || providerResult.routes?.main?.model,
+          }),
           source: providerResult.source,
         }));
       }

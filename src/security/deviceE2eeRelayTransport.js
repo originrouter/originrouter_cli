@@ -54,6 +54,8 @@ export const PROTECTED_DEVICE_MESSAGE_TYPES = new Set([
   "agent.message.result",
   "agent.stream.event",
   "agent.mode.set",
+  "agent.model.set",
+  "agent.effort.set",
   "agent.autonomy.set",
   "agent.workspace.browse",
   "agent.workspace.page",
@@ -747,6 +749,13 @@ export class DeviceE2eeRelayTransport {
       throw error;
     }
     return this._sendOnSession(session, type, wirePayload);
+  }
+
+  async sendAcknowledged(type, payload = {}) {
+    if (PROTECTED_DEVICE_MESSAGE_TYPES.has(type)) {
+      throw new Error("protected device messages require the E2EE transport");
+    }
+    return this.relayClient.sendAcknowledged(type, payload);
   }
 
   async _ensureTargetSession({ targetDeviceId, keys = [], localIdentity }) {

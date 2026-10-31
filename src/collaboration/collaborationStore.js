@@ -21,6 +21,7 @@ import {
   telemetryTokenUsage,
 } from "./collaborationStorePrimitives.js";
 import { installCollaborationSchema } from "./collaborationStoreSchema.js";
+import { collaborationPermissionSnapshotDigest, normalizeCollaborationPermissionSnapshot } from "./collaborationPermissionSnapshot.js";
 import {
   publicAttention as projectPublicAttention,
   publicConfigurationSession as projectPublicConfigurationSession,
@@ -186,6 +187,51 @@ export class CollaborationStore {
   publicExecutionEvent(row) { return projectPublicExecutionEvent(row); }
 
   publicAttention(row) { return projectPublicAttention(row); }
+
+  savePermissionSnapshot(owner, ownerId, input) {
+    const tables = {
+      configuration: ["collaboration_configuration_permissions", "configuration_id"],
+      run: ["collaboration_run_permissions", "run_id"],
+    };
+    const target = tables[owner];
+    if (!target) throw new Error("invalid collaboration permission snapshot owner");
+    const snapshot = normalizeCollaborationPermissionSnapshot(input);
+    const digest = collaborationPermissionSnapshotDigest(snapshot);
+    this.db.prepare(`INSERT INTO ${target[0]} (${target[1]}, snapshot_json, digest) VALUES (?, ?, ?)`)
+      .run(safeText(ownerId, 195), JSON.stringify(snapshot), digest);
+    return digest;
+  }
+
+  getPermissionSnapshot(owner, ownerId) {
+    const tables = {
+      configuration: ["collaboration_configuration_permissions", "configuration_id"],
+      run: ["collaboration_run_permissions", "run_id"],
+    };
+    const target = tables[owner];
+    if (!target) throw new Error("invalid collaboration permission snapshot owner");
+    const row = this.db.prepare(`SELECT snapshot_json, digest FROM ${target[0]} WHERE ${target[1]} = ?`)
+      .get(safeText(ownerId, 195));
+    if (!row) return null;
+    const snapshot = normalizeCollaborationPermissionSnapshot(JSON.parse(row.snapshot_json));
+    if (collaborationPermissionSnapshotDigest(snapshot) !== row.digest) {
+      throw Object.assign(new Error("The saved Session permission snapshot is corrupted."), { code: "COLLABORATION_PERMISSION_SNAPSHOT_INVALID" });
+    }
+    return { snapshot, digest: row.digest };
+  }
+
+  createRunWithPermissionSnapshot(input, snapshot) {
+    const normalized = normalizeCollaborationPermissionSnapshot(snapshot);
+    if (normalized.profile !== input.supervisor_permission_profile
+        || (normalized.profile === "custom" && normalized.policyBundle.id !== input.supervisor_policy_id)) {
+      throw Object.assign(new Error("The Session permission snapshot does not match the requested profile."), { code: "COLLABORATION_PERMISSION_SNAPSHOT_INVALID" });
+    }
+    return this.db.transaction(() => {
+      const run = this.createRun(input);
+      const digest = this.savePermissionSnapshot("run", run.run_id, normalized);
+      this.db.prepare("UPDATE collaboration_runs SET supervisor_snapshot_digest = ? WHERE run_id = ?").run(digest, run.run_id);
+      return this.getRun(run.run_id);
+    })();
+  }
 
 
   createConfigurationSession(input = {}) {
@@ -964,15 +1010,19 @@ export class CollaborationStore {
       }
       const planner = normalized.participants.find((item) => item.planner)
         || normalized.participants[0];
+      const sameSupervisor = run.supervisor_permission_profile === normalized.supervisor_permission_profile
+        && (run.supervisor_policy_id || "") === normalized.supervisor_policy_id;
       this.db.prepare(`
         UPDATE collaboration_runs
         SET team_revision = ?, planner_role = ?, supervisor_permission_profile = ?,
-            supervisor_policy_id = ?, budget_json = ?, updated_at = ?, revision = revision + 1
+            supervisor_policy_id = ?, supervisor_snapshot_digest = ?, approval_revision = approval_revision + 1,
+            updated_at = ?, revision = revision + 1
         WHERE run_id = ?
       `).run(
         Math.max(1, Number(revision) || 1), planner.participant_id,
         normalized.supervisor_permission_profile, normalized.supervisor_policy_id,
-        JSON.stringify(normalized.budget), updatedAt, runId,
+        sameSupervisor ? (run.supervisor_snapshot_digest || "") : "",
+        updatedAt, runId,
       );
     })();
     return this.getRun(runId);
@@ -1022,7 +1072,18 @@ export class CollaborationStore {
       WHERE attention.run_id = collaboration_runs.run_id
         AND attention.status = 'pending'
     )`;
-    const needsAttention = `(state IN ${attentionStates} OR ${pendingAttention})`;
+    const pausedTaskBudgetExhausted = `(CASE
+      WHEN json_valid(budget_json) AND json_valid(usage_json) THEN (
+        (CAST(json_extract(budget_json, '$.token_limit') AS REAL) > 0
+          AND CAST(COALESCE(json_extract(usage_json, '$.sampled_tokens'), 0) AS REAL)
+              >= CAST(json_extract(budget_json, '$.token_limit') AS REAL))
+        OR (CAST(json_extract(budget_json, '$.amount_limit_micros') AS REAL) > 0
+          AND CAST(COALESCE(json_extract(usage_json, '$.amount_micros'), 0) AS REAL)
+              >= CAST(json_extract(budget_json, '$.amount_limit_micros') AS REAL))
+      ) ELSE 0 END)`;
+    const needsAttention = `(state IN ${attentionStates} OR ${pendingAttention}
+      OR (state = 'paused' AND (account_budget_blocked = 1
+        OR resume_state IN ('budget_exhausted', 'resume_state_unknown') OR ${pausedTaskBudgetExhausted})))`;
     const conditions = [];
     if (!includeArchived) conditions.push("archived_at IS NULL");
     if (category === "attention") conditions.push(needsAttention);
@@ -1131,6 +1192,35 @@ export class CollaborationStore {
       WHERE state NOT IN ('completed', 'failed', 'cancelled', 'expired')
       ORDER BY updated_at ASC, run_id ASC LIMIT ?
     `).all(Math.max(1, Math.min(500, Number(limit) || 100))).map(publicRun);
+  }
+
+  listAccountBudgetRunIds() {
+    return this.db.prepare(`
+      SELECT run_id FROM collaboration_runs
+      WHERE state NOT IN ('completed', 'failed', 'cancelled', 'expired')
+      ORDER BY run_id ASC
+    `).all().map((row) => row.run_id);
+  }
+
+  hasAccountBudgetBlockedRuns() {
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM collaboration_runs
+      WHERE account_budget_blocked = 1
+        AND state NOT IN ('completed', 'failed', 'cancelled', 'expired') LIMIT 1
+    `).get());
+  }
+
+  getAccountBudgetBlockedState() {
+    const row = this.db.prepare("SELECT value FROM collaboration_runtime_state WHERE key = 'account_budget_blocked'").get();
+    if (!row || !["0", "1"].includes(row.value)) return null;
+    return row.value === "1";
+  }
+
+  setAccountBudgetBlockedState(blocked) {
+    this.db.prepare(`
+      INSERT INTO collaboration_runtime_state(key, value) VALUES ('account_budget_blocked', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(blocked ? "1" : "0");
   }
 
   updateAgent(runId, role, payload = {}) {
@@ -1254,11 +1344,14 @@ export class CollaborationStore {
     return this.getRun(runId);
   }
 
-  confirmAdaptivePlan(runId) {
+  confirmAdaptivePlan(runId, { expectedPlanRevision = null } = {}) {
     const run = this.getRun(runId, { includeMessages: false });
     if (!run || run.template_id !== ADAPTIVE_TEMPLATE_ID) throw new Error("adaptive collaboration run not found");
     if (run.state !== "awaiting_plan_confirmation" || run.plan_status !== "proposed") {
       throw new Error("collaboration plan is not waiting for confirmation");
+    }
+    if (expectedPlanRevision != null && (!Number.isInteger(Number(expectedPlanRevision)) || Number(expectedPlanRevision) !== Number(run.plan_revision))) {
+      throw Object.assign(new Error("The collaboration plan changed. Review it again."), { code: "COLLABORATION_PLAN_REVISION_CONFLICT" });
     }
     const updatedAt = iso(this.now());
     this.db.transaction(() => {
@@ -1290,13 +1383,16 @@ export class CollaborationStore {
     return this.getRun(runId);
   }
 
-  requestAdaptivePlanRevision(runId, feedback) {
+  requestAdaptivePlanRevision(runId, feedback, { expectedPlanRevision = null } = {}) {
     const run = this.getRun(runId, { includeMessages: false });
     if (!run || run.template_id !== ADAPTIVE_TEMPLATE_ID) {
       throw new Error("adaptive collaboration run not found");
     }
     if (run.state !== "awaiting_plan_confirmation" || run.plan_status !== "proposed") {
       throw new Error("collaboration plan is not waiting for revision feedback");
+    }
+    if (expectedPlanRevision != null && (!Number.isInteger(Number(expectedPlanRevision)) || Number(expectedPlanRevision) !== Number(run.plan_revision))) {
+      throw Object.assign(new Error("The collaboration plan changed. Review it again."), { code: "COLLABORATION_PLAN_REVISION_CONFLICT" });
     }
     const normalizedFeedback = safeText(feedback, 16_000);
     if (!normalizedFeedback) throw new Error("plan revision feedback is required");
@@ -1775,7 +1871,7 @@ export class CollaborationStore {
     if (existing) {
       const same = existing.message_type === messageType
         && existing.target_device_id === targetDeviceId
-        && (existing.state === "delivered"
+        && (["delivered", "cancelled"].includes(existing.state)
           || JSON.stringify(existing.payload) === JSON.stringify(payload));
       if (!same) {
         const error = new Error("collaboration outbox id conflicts with another message");
@@ -1787,8 +1883,8 @@ export class CollaborationStore {
     this.db.prepare(`
       INSERT OR IGNORE INTO collaboration_outbox(
         outbox_id, run_id, assignment_id, message_type, target_device_id,
-        payload_json, state, attempts, last_error, created_at, updated_at, delivered_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, '', ?, ?, NULL)
+        payload_json, dispatch_metadata_json, state, attempts, last_error, created_at, updated_at, delivered_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, '', ?, ?, NULL)
     `).run(
       outboxId,
       safeText(input.run_id ?? input.runId, 195),
@@ -1796,6 +1892,10 @@ export class CollaborationStore {
       messageType,
       targetDeviceId,
       JSON.stringify(payload),
+      JSON.stringify(messageType === "collaboration.remote.dispatch" ? {
+        taskId: payload.taskId, role: payload.role,
+        attempt: payload.attempt, fencingToken: payload.fencingToken,
+      } : {}),
       now,
       now,
     );
@@ -1809,13 +1909,53 @@ export class CollaborationStore {
     return row ? { ...row, payload: parseJson(row.payload_json, {}) } : null;
   }
 
-  listPendingOutbox({ limit = 100 } = {}) {
+  pendingOutboxHighWater() {
+    return Number(this.db.prepare("SELECT COALESCE(MAX(rowid), 0) AS high FROM collaboration_outbox WHERE state = 'pending'").get().high);
+  }
+
+  countPendingOutboxThrough(highWater) {
+    return Number(this.db.prepare("SELECT COUNT(*) AS count FROM collaboration_outbox WHERE state = 'pending' AND rowid <= ?").get(highWater).count);
+  }
+
+  listPendingOutbox({ limit = 100, afterRowId = 0, throughRowId = Number.MAX_SAFE_INTEGER } = {}) {
     return this.db.prepare(`
-      SELECT * FROM collaboration_outbox
-      WHERE state = 'pending'
-      ORDER BY created_at ASC LIMIT ?
-    `).all(Math.max(1, Math.min(500, Number(limit) || 100)))
+      SELECT rowid AS queue_sequence, * FROM collaboration_outbox
+      WHERE state = 'pending' AND rowid > ? AND rowid <= ?
+      ORDER BY rowid ASC LIMIT ?
+    `).all(afterRowId, throughRowId, Math.max(1, Math.min(500, Number(limit) || 100)))
       .map((row) => ({ ...row, payload: parseJson(row.payload_json, {}) }));
+  }
+
+  hasDispatchedRemoteAttempt(input = {}) {
+    const attempt = Number(input.attempt);
+    const fencingToken = Number(input.fencingToken);
+    if (!Number.isSafeInteger(attempt) || attempt < 1
+        || !Number.isSafeInteger(fencingToken) || fencingToken < 1) return false;
+    const rows = this.db.prepare(`
+      SELECT payload_json, dispatch_metadata_json FROM collaboration_outbox
+      WHERE run_id = ? AND assignment_id = ? AND target_device_id = ?
+        AND message_type = 'collaboration.remote.dispatch' AND attempts > 0
+    `).all(safeText(input.runId, 195), safeText(input.assignmentId, 195), safeText(input.sourceDeviceId, 191));
+    const matches = rows.some((row) => {
+      const metadata = parseJson(row.dispatch_metadata_json, {});
+      const dispatch = metadata.taskId ? metadata : parseJson(row.payload_json, {});
+      return dispatch.taskId === input.taskId && dispatch.role === input.role
+        && Number(dispatch.attempt) === attempt && Number(dispatch.fencingToken) === fencingToken;
+    });
+    if (matches) return true;
+    // Older versions cleared delivered outbox payloads. Their execution log
+    // still identifies successfully dispatched attempts without storing prompts.
+    const events = this.db.prepare(`
+      SELECT payload_json FROM collaboration_execution_events
+      WHERE run_id = ? AND task_id = ? AND participant_id = ?
+        AND type = 'remote_assignment.dispatched'
+    `).all(safeText(input.runId, 195), safeText(input.taskId, 195), safeText(input.role, 32));
+    return events.some((row) => {
+      const event = parseJson(row.payload_json, {});
+      return event.assignment_id === input.assignmentId
+        && event.assignment_target_device_id === input.sourceDeviceId
+        && Number(event.assignment_attempt) === attempt && Number(event.assignment_fence) === fencingToken;
+    });
   }
 
   markOutboxAttempt(outboxId, error = "") {
@@ -1845,6 +1985,16 @@ export class CollaborationStore {
       SET state = 'failed', payload_json = '{}', last_error = ?, updated_at = ?
       WHERE outbox_id = ? AND state = 'pending'
     `).run(safeText(error, 2048), now, safeText(outboxId, 191));
+    return this.getOutbox(outboxId);
+  }
+
+  cancelOutbox(outboxId, reason) {
+    const now = iso(this.now());
+    this.db.prepare(`
+      UPDATE collaboration_outbox
+      SET state = 'cancelled', payload_json = '{}', last_error = ?, updated_at = ?
+      WHERE outbox_id = ? AND state = 'pending'
+    `).run(safeText(reason, 2048), now, safeText(outboxId, 191));
     return this.getOutbox(outboxId);
   }
 
@@ -2020,18 +2170,23 @@ export class CollaborationStore {
     const sampledTokens = Math.max(0, Math.floor(Number(input.sampled_tokens ?? input.sampledTokens) || 0));
     const rawAmount = input.amount_micros ?? input.amountMicros;
     const costSource = safeText(input.cost_source ?? input.costSource, 32);
-    const priced = rawAmount != null
+    const amount = typeof rawAmount === "number" || (typeof rawAmount === "string" && rawAmount.trim())
+      ? Number(rawAmount) : NaN;
+    const priced = Number.isSafeInteger(amount) && amount >= 0
       && costSource === "configured"
       && /^[A-Z]{3}$/.test(String(input.currency || "").toUpperCase());
     const currency = priced ? String(input.currency).toUpperCase() : "";
-    const currencyMatches = !run.budget.currency || run.budget.currency === currency;
+    // Once amounts have a currency, never add a different currency to the
+    // same aggregate, including when the Run has no amount limit.
+    const aggregateCurrency = run.usage.currency || run.budget.currency || null;
+    const currencyMatches = !aggregateCurrency || aggregateCurrency === currency;
     const amountMicros = priced && currencyMatches
-      ? Math.max(0, Math.floor(Number(rawAmount) || 0))
+      ? amount
       : 0;
     const usage = {
       sampled_tokens: Number(run.usage.sampled_tokens || 0) + sampledTokens,
       amount_micros: Number(run.usage.amount_micros || 0) + amountMicros,
-      currency: run.budget.currency || currency || run.usage.currency || null,
+      currency: aggregateCurrency || currency || null,
       unpriced_events: Number(run.usage.unpriced_events || 0) + (priced && currencyMatches ? 0 : 1),
     };
     const ratios = [
@@ -2056,7 +2211,19 @@ export class CollaborationStore {
       );
       this.db.prepare("UPDATE collaboration_runs SET usage_json = ?, updated_at = ?, revision = revision + 1 WHERE run_id = ?")
         .run(JSON.stringify(usage), updatedAt, runId);
-      if (exhausted && !["completed", "failed", "cancelled", "expired"].includes(run.state)) {
+      if (input.accountReport && typeof input.accountReport === "object") {
+        this.enqueueOutbox({
+          outboxId: input.accountReportOutboxId,
+          runId,
+          messageType: "collaboration.usage.report",
+          targetDeviceId: input.accountReport.sourceDeviceId,
+          payload: input.accountReport,
+        });
+      }
+      // Usage can arrive after a manual pause while an agent is stopping.
+      // Keep that pause and its original resume state; resumeRun checks the
+      // latest usage before allowing the user to continue.
+      if (exhausted && !["paused", "completed", "failed", "cancelled", "expired"].includes(run.state)) {
         const resumeState = run.state === "budget_exhausted"
           ? safeText(run.resume_state, 64)
           : run.state;
@@ -2094,8 +2261,38 @@ export class CollaborationStore {
   updateBudget(runId, input = {}) {
     const run = this.getRun(runId, { includeMessages: false });
     if (!run) throw new Error("collaboration run not found");
+    const guarded = Object.hasOwn(input, "expected_budget_revision");
+    const expectedRevision = input.expected_budget_revision;
+    if (guarded && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)) {
+      throw Object.assign(new Error("Invalid expected budget revision."), { code: "COLLABORATION_BUDGET_INVALID" });
+    }
+    if (guarded && expectedRevision !== run.budget_revision) {
+      throw Object.assign(new Error("The collaboration budget changed. Review it again."), { code: "COLLABORATION_BUDGET_REVISION_CONFLICT" });
+    }
+    if (guarded && ["completed", "failed", "cancelled", "expired"].includes(run.state)) {
+      throw Object.assign(new Error("A finished collaboration budget cannot be changed."), { code: "COLLABORATION_BUDGET_INVALID" });
+    }
+    if (input.currency != null) {
+      const currency = typeof input.currency === "string" ? input.currency.trim().toUpperCase() : "";
+      if (!/^[A-Z]{3}$/.test(currency)) {
+        throw Object.assign(new Error("Budget currency must be a three-letter code."), { code: "COLLABORATION_BUDGET_INVALID" });
+      }
+      if (run.usage.currency && currency !== run.usage.currency) {
+        throw Object.assign(new Error("Budget currency must match this Run's recorded usage."), { code: "COLLABORATION_BUDGET_CURRENCY_CONFLICT" });
+      }
+    }
+    for (const key of ["token_limit", "amount_limit_micros", "max_concurrency"]) {
+      if (input[key] == null) continue;
+      const value = input[key];
+      const number = typeof value === "number" || (typeof value === "string" && value.trim() !== "")
+        ? Number(value) : NaN;
+      if (!Number.isSafeInteger(number) || number < 1 || (key === "max_concurrency" && number > 32)) {
+        throw Object.assign(new Error(`Invalid collaboration budget ${key}.`), { code: "COLLABORATION_BUDGET_INVALID" });
+      }
+    }
     const budget = {
-      token_limit: input.token_limit == null ? run.budget.token_limit : Math.max(1, Math.floor(Number(input.token_limit))),
+      token_limit: guarded && input.token_limit === null ? null
+        : input.token_limit == null ? run.budget.token_limit : Math.max(1, Math.floor(Number(input.token_limit))),
       amount_limit_micros: input.amount_limit_micros === null
         ? null
         : input.amount_limit_micros == null
@@ -2105,7 +2302,7 @@ export class CollaborationStore {
         ? null
         : input.currency == null
           ? run.budget.currency
-          : safeText(input.currency, 3).toUpperCase(),
+          : input.currency.trim().toUpperCase(),
       max_concurrency: input.max_concurrency == null
         ? run.budget.max_concurrency
         : Math.max(1, Math.min(32, Math.floor(Number(input.max_concurrency)))),
@@ -2122,7 +2319,7 @@ export class CollaborationStore {
     let nextResumeState = safeText(run.resume_state, 64);
     let restoredState = null;
     const terminal = ["completed", "failed", "cancelled", "expired"].includes(run.state);
-    if (taskBudgetExhausted && !terminal) {
+    if (taskBudgetExhausted && !terminal && run.state !== "paused") {
       if (run.state !== "budget_exhausted") nextResumeState = run.state;
       nextState = "budget_exhausted";
     } else if (run.state === "budget_exhausted" && !run.account_budget_blocked) {
@@ -2135,14 +2332,17 @@ export class CollaborationStore {
       nextResumeState = "";
     }
     this.db.transaction(() => {
-      this.db.prepare(`
+      const updated = this.db.prepare(`
         UPDATE collaboration_runs
         SET budget_json = ?, state = ?, resume_state = ?, updated_at = ?,
-            revision = revision + 1,
-            pause_reason = CASE WHEN ? = 'budget_exhausted' THEN 'budget_exhausted' ELSE '' END
-        WHERE run_id = ?
-      `).run(JSON.stringify(budget), nextState, nextResumeState, updatedAt, nextState, runId);
-      if (taskBudgetExhausted && !terminal) {
+            revision = revision + 1, budget_revision = budget_revision + 1,
+            pause_reason = CASE WHEN ? = 'budget_exhausted' THEN 'budget_exhausted' WHEN ? = 'paused' THEN pause_reason ELSE '' END
+        WHERE run_id = ? AND revision = ? AND budget_revision = ?
+      `).run(JSON.stringify(budget), nextState, nextResumeState, updatedAt, nextState, nextState, runId, run.revision, run.budget_revision);
+      if (!updated.changes) {
+        throw Object.assign(new Error("The collaboration changed. Review the budget again."), { code: "COLLABORATION_BUDGET_REVISION_CONFLICT" });
+      }
+      if (taskBudgetExhausted && !terminal && run.state !== "paused") {
         this.db.prepare("UPDATE collaboration_tasks SET state = 'paused', updated_at = ? WHERE run_id = ? AND state IN ('active', 'pending')")
           .run(updatedAt, runId);
       }
@@ -2193,8 +2393,8 @@ export class CollaborationStore {
     const updatedAt = iso(this.now());
     this.db.prepare(`
       UPDATE collaboration_runs
-      SET supervisor_permission_profile = ?, supervisor_policy_id = ?,
-          updated_at = ?, revision = revision + 1
+      SET supervisor_permission_profile = ?, supervisor_policy_id = ?, supervisor_snapshot_digest = '',
+          approval_revision = approval_revision + 1, updated_at = ?, revision = revision + 1
       WHERE run_id = ?
     `).run(profile, policyId, updatedAt, safeText(runId, 195));
     const session = run.workspace_session_id ? this.getWorkspaceSession(run.workspace_session_id) : null;
@@ -2239,6 +2439,12 @@ export class CollaborationStore {
     const nextBlocked = Boolean(blocked);
     if (run.account_budget_blocked === nextBlocked) {
       return { run: this.getRun(runId), changed: false, restored: false };
+    }
+    if (run.state === "paused") {
+      const updatedAt = iso(this.now());
+      this.db.prepare("UPDATE collaboration_runs SET account_budget_blocked = ?, updated_at = ?, revision = revision + 1 WHERE run_id = ?")
+        .run(nextBlocked ? 1 : 0, updatedAt, runId);
+      return { run: this.getRun(runId), changed: true, restored: false };
     }
     const updatedAt = iso(this.now());
     let restoredState = null;
@@ -2319,13 +2525,20 @@ export class CollaborationStore {
     }
     if (run.state === "paused") return run;
     const updatedAt = iso(this.now());
+    // A user may pause while a budget already holds the Run. Preserve the
+    // phase that preceded the budget hold, not the intermediate hold itself.
+    const budgetResumeState = safeText(run.resume_state, 64);
+    const resumeState = run.state === "budget_exhausted"
+      ? (budgetResumeState && budgetResumeState !== "budget_exhausted" && budgetResumeState !== "paused"
+          ? budgetResumeState : "resume_state_unknown")
+      : run.state;
     this.db.transaction(() => {
       this.db.prepare(`
         UPDATE collaboration_runs
         SET state = 'paused', resume_state = ?, pause_reason = ?,
             updated_at = ?, revision = revision + 1
         WHERE run_id = ?
-      `).run(run.state, safeText(reason, 64) || "user_requested", updatedAt, run.run_id);
+      `).run(resumeState, safeText(reason, 64) || "user_requested", updatedAt, run.run_id);
       this.db.prepare(`
         UPDATE collaboration_tasks
         SET state = 'paused', waiting_reason = 'run_paused', updated_at = ?
@@ -2351,9 +2564,13 @@ export class CollaborationStore {
     if (!run) throw new Error("collaboration run not found");
     if (run.state !== "paused") throw new Error("collaboration run is not paused");
     if (run.account_budget_blocked) throw new Error("account budget still prevents this collaboration from resuming");
+    if ((run.budget.token_limit && Number(run.usage.sampled_tokens || 0) >= Number(run.budget.token_limit))
+        || (run.budget.amount_limit_micros && Number(run.usage.amount_micros || 0) >= Number(run.budget.amount_limit_micros))) {
+      throw Object.assign(new Error("The collaboration budget must be increased before resuming."), { code: "COLLABORATION_BUDGET_EXHAUSTED" });
+    }
     const nextState = safeText(run.resume_state, 64) || (run.template_id === ADAPTIVE_TEMPLATE_ID ? "executing" : "researching");
-    if (!RUN_STATES.has(nextState) || ["paused", "completed", "failed", "cancelled", "expired"].includes(nextState)) {
-      throw new Error("collaboration run has no resumable state");
+    if (!RUN_STATES.has(nextState) || ["paused", "budget_exhausted", "completed", "failed", "cancelled", "expired"].includes(nextState)) {
+      throw Object.assign(new Error("The original collaboration state is unavailable; inspect the Run before continuing."), { code: "COLLABORATION_RESUME_STATE_UNKNOWN" });
     }
     const projected = runViewState(nextState);
     const updatedAt = iso(this.now());
@@ -2368,7 +2585,7 @@ export class CollaborationStore {
         UPDATE collaboration_tasks
         SET state = ?, waiting_reason = '', finished_at = NULL, updated_at = ?
         WHERE run_id = ? AND state = 'paused'
-      `).run(run.template_id === ADAPTIVE_TEMPLATE_ID ? "pending" : "active", updatedAt, run.run_id);
+      `).run(nextState === "created" || run.template_id === ADAPTIVE_TEMPLATE_ID ? "pending" : "active", updatedAt, run.run_id);
       this.db.prepare(`
         UPDATE collaboration_agents
         SET status = 'idle', current_task_id = '', updated_at = ?
@@ -2436,9 +2653,17 @@ export class CollaborationStore {
     if (!["failed", "cancelled", "expired"].includes(source.state)) {
       throw new Error("only failed, cancelled, or expired runs can be retried as a new run");
     }
+    const pinnedPermission = source.supervisor_snapshot_digest
+      ? this.getPermissionSnapshot("run", source.run_id) : null;
+    if (source.supervisor_snapshot_digest && pinnedPermission?.digest !== source.supervisor_snapshot_digest) {
+      throw Object.assign(new Error("The saved Session permission snapshot is missing or changed."), { code: "COLLABORATION_PERMISSION_SNAPSHOT_INVALID" });
+    }
+    const createRetry = (input) => pinnedPermission
+      ? this.createRunWithPermissionSnapshot(input, pinnedPermission.snapshot)
+      : this.createRun(input);
     let created;
     if (source.template_id === ADAPTIVE_TEMPLATE_ID) {
-      created = this.createRun({
+      created = createRetry({
         objective: source.objective,
         workspace_session_id: source.workspace_session_id,
         continued_from_run_id: source.run_id,
@@ -2486,7 +2711,7 @@ export class CollaborationStore {
           conversation_id: agent.conversation_id,
         } : null;
       };
-      created = this.createRun({
+      created = createRetry({
         objective: source.objective,
         workspace_session_id: source.workspace_session_id,
         continued_from_run_id: source.run_id,
@@ -2517,6 +2742,35 @@ export class CollaborationStore {
       createdAt: updatedAt,
     });
     return this.getRun(created.run_id);
+  }
+
+  retryRunOnce(runId, requestId) {
+    const key = safeText(requestId, 128);
+    if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) {
+      throw Object.assign(new Error("A valid retry request ID is required."), { code: "COLLABORATION_RETRY_REQUEST_INVALID" });
+    }
+    return this.db.transaction(() => {
+      const existing = this.db.prepare("SELECT source_run_id, run_id FROM collaboration_retry_requests WHERE request_id = ?").get(key);
+      if (existing) {
+        if (existing.source_run_id !== runId) {
+          throw Object.assign(new Error("Retry request ID belongs to a different Run."), { code: "COLLABORATION_RETRY_REQUEST_CONFLICT" });
+        }
+        return { run: this.getRun(existing.run_id), created: false };
+      }
+      const run = this.retryRun(runId);
+      this.db.prepare("INSERT INTO collaboration_retry_requests(request_id, source_run_id, run_id) VALUES (?, ?, ?)")
+        .run(key, runId, run.run_id);
+      return { run, created: true };
+    })();
+  }
+
+  retryForRequest(runId, requestId) {
+    const key = safeText(requestId, 128);
+    const row = this.db.prepare("SELECT source_run_id, run_id FROM collaboration_retry_requests WHERE request_id = ?").get(key);
+    if (!row || row.source_run_id !== runId) return null;
+    const run = this.getRun(row.run_id);
+    if (!run) throw Object.assign(new Error("The retry Run no longer exists."), { code: "COLLABORATION_RETRY_GONE" });
+    return run;
   }
 
   appendMessage(runId, input = {}) {

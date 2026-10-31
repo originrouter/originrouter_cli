@@ -80,6 +80,54 @@ function buildForwarderHook(port, holdMs, extra = {}) {
   };
 }
 
+// Claude Code's "auto mode" is a *second*, server-side permission classifier
+// that runs in front of our PermissionRequest hook. When it is on, a call can
+// be approved (or denied) by Anthropic's classifier before the hook is ever
+// consulted, so a request the user should have seen never reaches the App. It
+// also shows an unavoidable billing notice on the gateway path: the notice's
+// eligibility test resolves the *request host* (`127.0.0.1:<port>` here) and
+// treats anything that is not `*.anthropic.com` as an incompatible gateway, so
+// on our relay it is never eligible and re-arms every 24 hours.
+//
+// Both halves are structural rather than configurable, so the only lever is to
+// take auto out of the session entirely:
+//   - `disableAutoMode: "disable"` is Claude Code's documented kill switch. It
+//     removes "auto" from the Shift+Tab cycle, refuses to adopt it at startup,
+//     and suppresses the classifier path (and therefore its notice).
+//   - `permissions.defaultMode: "default"` pins the session's starting mode to
+//     "default", which is the real "ask every time" mode. "dontAsk" is not a
+//     lower level — it denies without asking, which starves the relay.
+// An explicit `--permission-mode` on the command line still outranks settings,
+// so a user who deliberately passes one keeps it.
+const CLAUDE_PERMISSION_SAFETY_SETTINGS = Object.freeze({
+  disableAutoMode: "disable",
+  permissions: Object.freeze({ defaultMode: "default" }),
+});
+
+/**
+ * Merge the safety keys into a settings object, forcing them last so neither a
+ * caller's override nor a stray settings fragment can weaken them. `permissions`
+ * is merged rather than replaced: an override may legitimately carry `allow` /
+ * `deny` / `ask` rules we must not drop.
+ */
+export function withClaudePermissionSafety(settings) {
+  const base = settings && typeof settings === "object" && !Array.isArray(settings)
+    ? settings
+    : {};
+  const basePermissions = base.permissions && typeof base.permissions === "object"
+    && !Array.isArray(base.permissions)
+    ? base.permissions
+    : {};
+  return {
+    ...base,
+    disableAutoMode: CLAUDE_PERMISSION_SAFETY_SETTINGS.disableAutoMode,
+    permissions: {
+      ...basePermissions,
+      defaultMode: CLAUDE_PERMISSION_SAFETY_SETTINGS.permissions.defaultMode,
+    },
+  };
+}
+
 export function generateClaudeHookSettings({
   port,
   registerPermissionRequest = true,
@@ -152,8 +200,12 @@ export function generateClaudeHookSettings({
     ];
   }
 
-  // Spread first so `hooks` cannot be displaced by an override key.
-  const payload = { ...(settingsOverride || {}), hooks };
+  // Spread first so `hooks` cannot be displaced by an override key; the safety
+  // keys are applied last, after the spread, so an override cannot re-enable
+  // auto mode either. (`--settings` is the flagSettings layer, which outranks
+  // user/project/local files, so this is the one place a session-wide pin
+  // actually holds.)
+  const payload = withClaudePermissionSafety({ ...(settingsOverride || {}), hooks });
 
   // The file now carries ANTHROPIC_AUTH_TOKEN, so it is written 0600 like
   // every other credential-bearing file here. fs mode bits are close to a

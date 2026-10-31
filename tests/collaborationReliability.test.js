@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { CollaborationRuntime } from "../src/collaboration/collaborationRuntime.js";
 import { CollaborationStore } from "../src/collaboration/collaborationStore.js";
 import { PlanImplementVerifyCoordinator } from "../src/collaboration/planImplementVerifyCoordinator.js";
+import { RelayClient } from "../src/relay/relayClient.js";
 
 function runtimeFor(store, relayClient) {
   return new CollaborationRuntime({
@@ -26,16 +27,26 @@ let runtime = runtimeFor(store, {
   },
 });
 
+const coordinator = new PlanImplementVerifyCoordinator({ store });
+const durableRun = coordinator.create({
+  objective: "Exercise durable dispatch recovery.",
+  agents: {
+    lead: { runtime: "codex", device_id: "device-a", workspace_id: "w", responsibilities: ["research"] },
+    worker: { runtime: "claude", device_id: "device-b", workspace_id: "w", responsibilities: ["implement"] },
+  },
+});
+coordinator.start(durableRun.run_id);
+const durableAgent = store.issueAgentLease(durableRun.run_id, "worker", { dispatchKey: "durable-test" });
 const durablePayload = {
   protocolVersion: "1",
   sourceDeviceId: "device-a",
   targetDeviceId: "device-b",
   assignmentId: "assignment-reliability",
-  runId: "run-reliability",
-  taskId: "task-reliability",
+  runId: durableRun.run_id,
+  taskId: durableRun.task_ids[0],
   role: "worker",
-  attempt: 1,
-  fencingToken: 1,
+  attempt: durableAgent.attempt,
+  fencingToken: durableAgent.fencing_token,
   deliveryId: "delivery-reliability",
   prompt: "Private task content that must survive a local restart.",
 };
@@ -69,6 +80,34 @@ assert.equal(pending.state, "delivered");
 assert.equal(pending.attempts, 2);
 assert.equal(delivered[0].payload.prompt, durablePayload.prompt);
 assert.deepEqual(pending.payload, {});
+const sentBeforeStaleSnapshot = delivered.length;
+await runtime.deliverOutbox({ ...pending, state: "pending", payload: durablePayload });
+assert.equal(delivered.length, sentBeforeStaleSnapshot, "a stale queue snapshot cannot resend an already delivered message");
+
+// A failed early item must not hide the rest of a backlog larger than one
+// batch. Each pass attempts each original item at most once.
+const backlogDir = mkdtempSync(join(tmpdir(), "originrouter-outbox-backlog-"));
+const backlogStore = new CollaborationStore({ stateDir: backlogDir });
+let backlogOffline = true;
+const backlogSent = [];
+const backlogRuntime = runtimeFor(backlogStore, {
+  async send(_type, payload) {
+    backlogSent.push(payload.id);
+    if (backlogOffline && payload.id < 2) return { accepted: false, reason: "relay_ack_timeout" };
+    return { accepted: true };
+  },
+});
+for (let i = 0; i < 520; i += 1) {
+  backlogStore.enqueueOutbox({ outboxId: `backlog-${i}`, messageType: "test.message", targetDeviceId: "device-b", payload: { id: i } });
+}
+assert.deepEqual(await backlogRuntime.flushOutbox(), { pending: 2, delivered: 518 });
+assert.equal(backlogSent.length, 520);
+assert.ok(backlogSent.includes(519), "later batches must not starve behind retryable failures");
+backlogOffline = false;
+assert.deepEqual(await backlogRuntime.flushOutbox(), { pending: 0, delivered: 2 });
+backlogRuntime.close();
+backlogStore.close();
+
 assert.throws(
   () => store.enqueueOutbox({
     outboxId: "dispatch:delivery-reliability",
@@ -78,6 +117,64 @@ assert.throws(
   }),
   /outbox id conflicts/,
 );
+
+const pauseCoordinator = new PlanImplementVerifyCoordinator({ store });
+const pausedDispatchRun = pauseCoordinator.create({
+  objective: "A paused Run must not replay a queued dispatch.",
+  agents: {
+    lead: { runtime: "codex", device_id: "device-a", workspace_id: "w", responsibilities: ["research"] },
+    worker: { runtime: "claude", device_id: "device-b", workspace_id: "w", responsibilities: ["implement"] },
+  },
+});
+pauseCoordinator.start(pausedDispatchRun.run_id);
+const pausedAgent = store.issueAgentLease(pausedDispatchRun.run_id, "worker", { dispatchKey: "pause-test" });
+store.enqueueOutbox({
+  outboxId: "dispatch:paused-recovery", messageType: "collaboration.remote.dispatch",
+  runId: pausedDispatchRun.run_id, targetDeviceId: "device-b",
+  payload: { ...durablePayload, runId: pausedDispatchRun.run_id, taskId: pausedDispatchRun.task_ids[0],
+    attempt: pausedAgent.attempt, fencingToken: pausedAgent.fencing_token },
+});
+store.pauseRun(pausedDispatchRun.run_id);
+const sentBeforePausedFlush = delivered.length;
+assert.deepEqual(await runtime.flushOutbox(), { pending: 0, delivered: 0, cancelled: 1 });
+assert.equal(delivered.length, sentBeforePausedFlush);
+assert.equal(store.getOutbox("dispatch:paused-recovery").state, "cancelled");
+assert.deepEqual(store.getOutbox("dispatch:paused-recovery").payload, {});
+
+const restartStateDir = mkdtempSync(join(tmpdir(), "originrouter-budget-restart-"));
+let restartStore = new CollaborationStore({ stateDir: restartStateDir });
+let restartRuntime = runtimeFor(restartStore, null);
+await restartRuntime.handleRelayEvent({ type: "collaboration.budget.status", targetDeviceId: "device-a", blocked: true });
+restartRuntime.close();
+restartStore.close();
+restartStore = new CollaborationStore({ stateDir: restartStateDir });
+restartRuntime = runtimeFor(restartStore, null);
+assert.equal(restartRuntime.accountBudgetBlocked, true, "account block survives restart even with no existing Runs");
+const restartCoordinator = new PlanImplementVerifyCoordinator({ store: restartStore });
+const interruptedBeforePersistence = restartCoordinator.create({
+  objective: "Reconcile Runs when the daemon stopped partway through applying a block.",
+  agents: {
+    lead: { runtime: "codex", device_id: "device-a", workspace_id: "w", responsibilities: ["research"] },
+    worker: { runtime: "claude", device_id: "device-a", workspace_id: "w", responsibilities: ["implement"] },
+  },
+});
+restartCoordinator.start(interruptedBeforePersistence.run_id);
+await restartRuntime.recover();
+assert.equal(restartStore.getRun(interruptedBeforePersistence.run_id).account_budget_blocked, true);
+restartCoordinator.cancel(interruptedBeforePersistence.run_id);
+const afterRestart = restartCoordinator.create({
+  objective: "Do not bypass a known account block after restart.",
+  agents: {
+    lead: { runtime: "codex", device_id: "device-a", workspace_id: "w", responsibilities: ["research"] },
+    worker: { runtime: "claude", device_id: "device-a", workspace_id: "w", responsibilities: ["implement"] },
+  },
+});
+assert.equal((await restartRuntime.start(afterRestart.run_id)).account_budget_blocked, true);
+restartCoordinator.cancel(afterRestart.run_id);
+await restartRuntime.handleRelayEvent({ type: "collaboration.budget.status", targetDeviceId: "device-a", blocked: false });
+assert.equal(restartStore.getAccountBudgetBlockedState(), false);
+restartRuntime.close();
+restartStore.close();
 
 let releaseConcurrentSend;
 let concurrentSendCount = 0;
@@ -468,6 +565,9 @@ const remoteFailure = failureStore.upsertRemoteAssignment({
   fencingToken: 1,
   deliveryId: "delivery-command-failure",
 }).assignment;
+failureStore.updateRemoteAssignment(remoteFailure.assignment_id, {
+  originrouterSessionId: "session-command-failure", status: "running",
+});
 await failureRuntime.handleRemoteAgentNotification(remoteFailure, {
   type: "event",
   sessionId: "session-command-failure",
@@ -484,6 +584,82 @@ assert.equal(remoteError.payload.code, "COLLABORATION_AGENT_COMMAND_FAILED");
 assert.match(remoteError.payload.message, /turn\/start/);
 failureRuntime.close();
 failureStore.close();
+
+const usageStateDir = mkdtempSync(join(tmpdir(), "originrouter-collaboration-offline-usage-"));
+let usageStore = new CollaborationStore({ stateDir: usageStateDir });
+let usageRuntime = runtimeFor(usageStore, { async send() { return { accepted: false, reason: "relay_ack_timeout" }; } });
+const offlineAssignment = usageStore.upsertRemoteAssignment({
+  assignmentId: "assignment-offline-usage", runId: "run-offline-usage", taskId: "task-offline-usage",
+  role: "worker", sourceDeviceId: "device-b", targetDeviceId: "device-a", runtime: "codex",
+  workspaceId: "workspace-a", attempt: 1, fencingToken: 1, deliveryId: "delivery-offline-usage",
+}).assignment;
+usageStore.updateRemoteAssignment(offlineAssignment.assignment_id, { originrouterSessionId: "session-offline-usage", status: "running" });
+await assert.rejects(usageRuntime.handleRemoteAgentNotification(offlineAssignment, {
+  type: "event", sessionId: "session-offline-usage",
+  payload: { type: "agent.usage", eventId: "usage-offline", sampledTokens: 42 },
+}), /relay_ack_timeout/);
+assert.deepEqual(usageStore.listPendingOutbox().map((item) => item.message_type).sort(),
+  ["collaboration.remote.event", "collaboration.remote.usage"]);
+await usageRuntime.handleRemoteAgentNotification(offlineAssignment, {
+  type: "event", sessionId: "session-offline-usage", payload: { type: "agent.text", eventId: "offline-text", text: "Completed work" },
+});
+await assert.rejects(usageRuntime.handleRemoteAgentNotification(offlineAssignment, {
+  type: "event", sessionId: "session-offline-usage", payload: { type: "agent.task.completed", eventId: "offline-completion" },
+}), /relay_ack_timeout/);
+assert.ok(usageStore.listPendingOutbox().some((item) => item.message_type === "collaboration.remote.result" && item.payload.output === "Completed work"));
+usageRuntime.close();
+usageStore.close();
+usageStore = new CollaborationStore({ stateDir: usageStateDir });
+const offlineDeliveries = [];
+usageRuntime = runtimeFor(usageStore, { async send(type, payload) { offlineDeliveries.push({ type, payload }); return { accepted: true }; } });
+assert.deepEqual(await usageRuntime.flushOutbox(), { pending: 0, delivered: 5 });
+assert.equal(offlineDeliveries.find((item) => item.type === "collaboration.remote.usage").payload.sampledTokens, 42);
+assert.equal(offlineDeliveries.find((item) => item.type === "collaboration.remote.result").payload.output, "Completed work");
+usageRuntime.close();
+usageStore.close();
+
+const accountDir = mkdtempSync(join(tmpdir(), "originrouter-account-usage-"));
+let accountStore = new CollaborationStore({ stateDir: accountDir });
+const accountCoordinator = new PlanImplementVerifyCoordinator({ store: accountStore });
+const accountRun = accountCoordinator.create({
+  objective: "Persist account usage alongside the local receipt",
+  agents: {
+    lead: { runtime: "codex", device_id: "device-a", workspace_id: "w", responsibilities: ["research"] },
+    worker: { runtime: "claude", device_id: "device-a", workspace_id: "w", responsibilities: ["implement"] },
+  },
+});
+let accountRuntime = runtimeFor(accountStore, { async sendAcknowledged() { throw new Error("offline"); } });
+const accountReport = accountRuntime.accountUsageReport(accountRun.run_id, "usage-account-001", { sampledTokens: 31, amountMicros: "invalid", costSource: "configured", currency: "USD" });
+assert.equal(accountReport.amountMicros, null);
+const accountReceipt = { eventId: "usage-account-001", sampledTokens: 31, accountReport, accountReportOutboxId: "account-usage-test" };
+accountStore.recordUsage(accountRun.run_id, accountReceipt);
+accountStore.recordUsage(accountRun.run_id, accountReceipt);
+await accountRuntime.deliverAccountUsage("account-usage-test");
+assert.equal(accountStore.getRun(accountRun.run_id).usage.sampled_tokens, 31);
+assert.equal(accountStore.getOutbox("account-usage-test").state, "pending");
+accountRuntime.close();
+accountStore.close();
+accountStore = new CollaborationStore({ stateDir: accountDir });
+const acknowledged = [];
+accountRuntime = runtimeFor(accountStore, { async sendAcknowledged(type, payload) { acknowledged.push({ type, payload }); return { data: { accepted: true } }; } });
+assert.deepEqual(await accountRuntime.flushOutbox(), { pending: 0, delivered: 1 });
+assert.equal(acknowledged[0].payload.usageId, "usage-account-001");
+assert.equal(accountStore.getOutbox("account-usage-test").state, "delivered");
+accountRuntime.close();
+accountStore.close();
+
+const originalFetch = globalThis.fetch;
+try {
+  const requests = [];
+  globalThis.fetch = async (url, options) => { requests.push({ url, options }); return { ok: true, json: async () => ({ data: { accepted: true } }) }; };
+  const relay = new RelayClient({ relayUrl: "https://example.invalid", deviceId: "device-a", authToken: "test-token" });
+  relay._ws = { readyState: 1, send() { throw new Error("unacknowledged websocket used"); } };
+  const response = await relay.sendAcknowledged("collaboration.usage.report", { sourceDeviceId: "device-a", usageId: "usage-account-001" });
+  assert.equal(response.data.accepted, true);
+  assert.equal(JSON.parse(requests[0].options.body).payload.type, "collaboration.usage.report");
+} finally {
+  globalThis.fetch = originalFetch;
+}
 
 const projectionRuntime = Object.create(CollaborationRuntime.prototype);
 projectionRuntime.deviceId = "device-a";

@@ -1,7 +1,9 @@
 import { publicAutonomyStatus } from "../runtime/agentPermissionState.js";
 import { randomUUID } from "node:crypto";
+import { basename, resolve } from "node:path";
 
 import { readCodingAuth } from "../persistence/codingAuth.js";
+import { accountNamespace, activeAccountStateDir, accountSelectionRoot, isAccountStateDir } from "../persistence/accounts.js";
 import { getStateDir } from "../persistence/state.js";
 import { DEFAULT_ORIGINROUTER_CONTROL_BASE_URL } from "../config/providerRoutes.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
@@ -42,11 +44,29 @@ function apiBase() {
 }
 
 
+export function captureRelayAccountContext(stateDir) {
+  // A verified pre-account-directory credential selects and migrates its
+  // account on first read. Bind only after that existing migration runs.
+  readCodingAuth(stateDir);
+  const expectedAccountStateDir = activeAccountStateDir(stateDir);
+  return { stateDir: expectedAccountStateDir, expectedAccountStateDir,
+    accountSelectionRoot: accountSelectionRoot(stateDir) };
+}
+
+function relayAccountIsCurrent(expectedAccountStateDir, selectionRoot) {
+  return !selectionRoot || !expectedAccountStateDir
+    || resolve(activeAccountStateDir(selectionRoot)) === resolve(expectedAccountStateDir);
+}
+
 async function resolveRelayAuth({
   stateDir,
   readCodingAuthFn,
   ensureFreshAccessTokenFn,
+  expectedAccountStateDir,
+  accountSelectionRoot,
 }) {
+  const accountIsCurrent = () => relayAccountIsCurrent(expectedAccountStateDir, accountSelectionRoot);
+  if (!accountIsCurrent()) return { error: "account_context_changed" };
   let credential;
   try {
     credential = await ensureFreshAccessTokenFn({
@@ -56,6 +76,14 @@ async function resolveRelayAuth({
     if (!credential && readCodingAuthFn) credential = readCodingAuthFn(stateDir);
   } catch {
     return { error: "no_coding_auth" };
+  }
+  if (!accountIsCurrent()) return { error: "account_context_changed" };
+  if (expectedAccountStateDir) {
+    const expectedNamespace = isAccountStateDir(expectedAccountStateDir)
+      ? basename(expectedAccountStateDir).toLowerCase() : null;
+    if (accountNamespace(credential?.accountScope) !== expectedNamespace) {
+      return { error: "account_context_changed" };
+    }
   }
   const token = accessTokenFor(credential, OAUTH_RESOURCES.RELAY)?.token;
   if (!token) return { error: "no_access_token" };
@@ -105,6 +133,32 @@ export function buildRuntimeEventEnvelope({
     mode: safeText(projected.mode, 32),
     mode_control: safeText(projected.modeControl, 16),
     available_modes: projected.availableModes || [],
+    // The session's own model. Empty is a state — the session follows the
+    // device route.
+    //
+    // The models the device serves do NOT travel here. They are the device's
+    // fact, not this session's: they already go out in the local-control
+    // provider snapshot, and the App reads them from there when it opens the
+    // picker. A copy per event would be a stale duplicate.
+    model: safeText(projected.model, 191),
+    model_provider: safeText(projected.modelProvider, 191),
+    model_source: safeText(projected.modelSource, 16),
+    model_control: safeText(projected.modelControl, 16),
+    // Whether the device accepted the change, and why it refused. Null means
+    // the device was not asked — the status only states what the session runs
+    // on.
+    model_accepted: projected.modelAccepted ?? null,
+    model_reason: safeText(projected.modelReason, 191),
+    // The session's own reasoning effort. Empty is a state — the runtime has
+    // not said, and the session runs on the runtime's own default.
+    //
+    // The levels travel with the fact: the runtime owns the vocabulary, and
+    // the App renders the list it is given instead of one of its own.
+    effort: safeText(projected.effort, 16),
+    effort_control: safeText(projected.effortControl, 16),
+    available_efforts: projected.availableEfforts || [],
+    effort_accepted: projected.effortAccepted ?? null,
+    effort_reason: safeText(projected.effortReason, 191),
     ...(publicAutonomyStatus(event) ? {
       autonomy_status: publicAutonomyStatus(event),
     } : {}),
@@ -121,6 +175,8 @@ export function createRuntimeEventReporter({
   deviceName,
   workspaceDisplayPath = "",
   stateDir = getStateDir(),
+  expectedAccountStateDir,
+  accountSelectionRoot: selectionRoot,
   reportRuntimeEventFn = reportRuntimeEvent,
   enabled = true,
   telemetryQueue = null,
@@ -147,7 +203,8 @@ export function createRuntimeEventReporter({
   const sendWithRetry = async (payload) => {
     let result = { ok: false, error: "request_failed" };
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      result = await reportRuntimeEventFn(payload, { stateDir }).catch(() => ({
+      result = await reportRuntimeEventFn(payload, { stateDir, expectedAccountStateDir,
+        accountSelectionRoot: selectionRoot }).catch(() => ({
         ok: false,
         error: "request_failed",
       }));
@@ -367,12 +424,16 @@ export async function reportRuntimeEvent(payload, {
   readCodingAuthFn = readCodingAuth,
   ensureFreshAccessTokenFn = ensureFreshAccessToken,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  expectedAccountStateDir,
+  accountSelectionRoot: selectionRoot,
 } = {}) {
   if (!payload) return { ok: false, error: "empty_runtime_event" };
   const resolved = await resolveRelayAuth({
     stateDir,
     readCodingAuthFn,
     ensureFreshAccessTokenFn,
+    expectedAccountStateDir,
+    accountSelectionRoot: selectionRoot,
   });
   if (resolved.error) return { ok: false, error: resolved.error };
   const { credential: auth, token } = resolved;
@@ -458,6 +519,9 @@ export async function reportAgentConversationMetadata(payload, {
   readCodingAuthFn = readCodingAuth,
   ensureFreshAccessTokenFn = ensureFreshAccessToken,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  insertOnly = false,
+  expectedAccountStateDir,
+  accountSelectionRoot,
 } = {}) {
   const body = buildAgentConversationMetadata(payload);
   if (!body.conversation_id) return { ok: false, error: "invalid_conversation_id" };
@@ -465,6 +529,8 @@ export async function reportAgentConversationMetadata(payload, {
     stateDir,
     readCodingAuthFn,
     ensureFreshAccessTokenFn,
+    expectedAccountStateDir,
+    accountSelectionRoot,
   });
   if (resolved.error) return { ok: false, error: resolved.error };
   const { credential: auth, token } = resolved;
@@ -473,7 +539,7 @@ export async function reportAgentConversationMetadata(payload, {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const send = (candidate) => fetchFn(
-      `${apiBase()}/cli/v1/agent/catalog/conversations`,
+      `${apiBase()}/cli/v1/agent/catalog/conversations${insertOnly ? "/backfill" : ""}`,
       {
         method: "POST",
         headers: {
@@ -499,7 +565,7 @@ export async function reportAgentConversationMetadata(payload, {
       await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
     }
     let legacyFallback = false;
-    if (resp.status === 422) {
+    if (resp.status === 422 && !insertOnly) {
       // A 422 means the server refused the shape of the report, and its
       // schema forbids fields it does not know. Two things can be unknown
       // to it: the link to the session, and the source timestamps.
@@ -528,7 +594,110 @@ export async function reportAgentConversationMetadata(payload, {
         legacyFallback = resp.ok;
       }
     }
-    return { ok: resp.ok, status: resp.status, legacyFallback };
+    // The server returns the row actually stored after applying its title and
+    // permission rules. Preserve it when available so future reconciliation
+    // can compare against cloud state instead of assuming our input won.
+    let conversation;
+    if (resp.ok && typeof resp.json === "function") {
+      try {
+        const payload = await resp.json();
+        const saved = payload?.data?.conversation;
+        if (saved && typeof saved === "object" && !Array.isArray(saved)
+            && saved.conversation_id === body.conversation_id) {
+          conversation = saved;
+        }
+      } catch {
+        // Older servers and empty responses still acknowledge the write.
+      }
+    }
+    return { ok: resp.ok, status: resp.status, legacyFallback,
+      ...(conversation ? { conversation } : {}) };
+  } catch {
+    return { ok: false, error: "request_failed" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function reconcileAgentCatalogPreview(change, {
+  stateDir = getStateDir(),
+  fetchFn = globalThis.fetch,
+  readCodingAuthFn = readCodingAuth,
+  ensureFreshAccessTokenFn = ensureFreshAccessToken,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  expectedAccountStateDir,
+  accountSelectionRoot,
+} = {}) {
+  const limits = { summary: 4096, first_prompt_preview: 1024, last_message_preview: 1024 };
+  const field = change?.field;
+  const limit = Object.hasOwn(limits, field) ? limits[field] : 0;
+  const conversationId = safeText(change?.conversation_id, 96);
+  if (!limit || !conversationId) return { ok: false, error: "invalid_preview_change" };
+  const resolved = await resolveRelayAuth({ stateDir, readCodingAuthFn, ensureFreshAccessTokenFn, expectedAccountStateDir, accountSelectionRoot });
+  if (resolved.error) return { ok: false, error: resolved.error };
+  if (typeof fetchFn !== "function") return { ok: false, error: "fetch_unavailable" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    // Catalog sync trims and truncates before the common redactor replaces
+    // line breaks. Apply that same ordering to both sides of the comparison.
+    const projected = (value) => redactAgentActivityText(String(value ?? "").trim().slice(0, limit), limit);
+    const body = { conversation_id: conversationId, [field]: {
+      expected: projected(change.previous_value),
+      value: projected(change.next_value),
+    } };
+    const response = await fetchFn(`${apiBase()}/cli/v1/agent/catalog/conversations/reconcile-previews`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${resolved.token}`,
+        "X-OriginRouter-Device-Id": resolved.credential.deviceId },
+      body: JSON.stringify(body), signal: controller.signal,
+    });
+    if (!response.ok) return { ok: false, status: response.status };
+    const json = await response.json();
+    const current = json?.data?.previews?.[field];
+    if (json?.code !== 0 || typeof current !== "string") {
+      return { ok: false, error: "invalid_preview_response" };
+    }
+    return { ok: true, applied: current === body[field].value, current };
+  } catch {
+    return { ok: false, error: "request_failed" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function reportAgentHistoryManifest(action, body, {
+  stateDir = getStateDir(), fetchFn = globalThis.fetch, readCodingAuthFn = readCodingAuth,
+  ensureFreshAccessTokenFn = ensureFreshAccessToken, timeoutMs = 30_000,
+  expectedAccountStateDir, accountSelectionRoot,
+} = {}) {
+  if (!["start", "complete", "status"].includes(action)) return { ok: false, error: "invalid_manifest_action" };
+  const resolved = await resolveRelayAuth({ stateDir, readCodingAuthFn, ensureFreshAccessTokenFn,
+    expectedAccountStateDir, accountSelectionRoot });
+  if (resolved.error) return { ok: false, error: resolved.error };
+  if (typeof fetchFn !== "function") return { ok: false, error: "fetch_unavailable" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchFn(`${apiBase()}/cli/v1/agent/history/manifests/${action}`, {
+      method: "POST", headers: { "Content-Type": "application/json",
+        Authorization: `Bearer ${resolved.token}`, "X-OriginRouter-Device-Id": resolved.credential.deviceId },
+      body: JSON.stringify(body), signal: controller.signal,
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch {}
+    if (!relayAccountIsCurrent(expectedAccountStateDir, accountSelectionRoot)) return { ok: false, error: "account_changed" };
+    const pending = payload?.data?.pending_chunk_ids;
+    const validPending = Array.isArray(pending) && typeof payload?.data?.published === "boolean" && Array.isArray(body?.chunk_ids)
+      && pending.every((id) => typeof id === "string" && body.chunk_ids.includes(id))
+      && new Set(pending).size === pending.length;
+    const valid = payload?.code === 0 && (action === "start"
+      ? payload?.data?.state === "syncing" : action === "complete"
+        ? payload?.data?.state === "stored" : validPending);
+    return { ok: response.ok && valid, status: response.status,
+      ...(action === "status" && valid ? { pendingChunkIds: pending, published: payload.data.published } : {}),
+      error: response.ok ? (valid ? null : "invalid_manifest_response")
+        : (typeof payload?.detail?.code === "string" ? payload.detail.code : `http_${response.status}`) };
   } catch {
     return { ok: false, error: "request_failed" };
   } finally {
@@ -542,6 +711,8 @@ export async function reportAgentHistoryChunk(document, {
   readCodingAuthFn = readCodingAuth,
   ensureFreshAccessTokenFn = ensureFreshAccessToken,
   timeoutMs = 30_000,
+  expectedAccountStateDir,
+  accountSelectionRoot,
 } = {}) {
   if (!document || typeof document !== "object") {
     return { ok: false, error: "invalid_history_chunk" };
@@ -550,6 +721,8 @@ export async function reportAgentHistoryChunk(document, {
     stateDir,
     readCodingAuthFn,
     ensureFreshAccessTokenFn,
+    expectedAccountStateDir,
+    accountSelectionRoot,
   });
   if (resolved.error) return { ok: false, error: resolved.error };
   const { credential: auth, token } = resolved;
@@ -572,11 +745,12 @@ export async function reportAgentHistoryChunk(document, {
     });
     let payload = null;
     try { payload = await response.json(); } catch {}
+    if (!relayAccountIsCurrent(expectedAccountStateDir, accountSelectionRoot)) return { ok: false, error: "account_changed" };
     return {
-      ok: response.ok,
+      ok: response.ok && payload?.code === 0,
       status: response.status,
       data: payload?.data,
-      error: response.ok ? null : payload?.detail?.code || payload?.code || `http_${response.status}`,
+      error: response.ok ? (payload?.code === 0 ? null : "invalid_history_response") : payload?.detail?.code || payload?.code || `http_${response.status}`,
       retryable: response.status >= 500 || response.status === 429,
     };
   } catch {
@@ -592,6 +766,8 @@ export async function reportAgentSessionHeartbeat(sessionId, {
   readCodingAuthFn = readCodingAuth,
   ensureFreshAccessTokenFn = ensureFreshAccessToken,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  expectedAccountStateDir,
+  accountSelectionRoot: selectionRoot,
 } = {}) {
   const normalizedSessionId = safeText(sessionId, 64);
   if (!normalizedSessionId) return { ok: false, error: "invalid_session_id" };
@@ -599,6 +775,8 @@ export async function reportAgentSessionHeartbeat(sessionId, {
     stateDir,
     readCodingAuthFn,
     ensureFreshAccessTokenFn,
+    expectedAccountStateDir,
+    accountSelectionRoot: selectionRoot,
   });
   if (resolved.error) return { ok: false, error: resolved.error };
   const { credential: auth, token } = resolved;
@@ -634,6 +812,8 @@ export function startAgentSessionHeartbeat({
   stateDir = getStateDir(),
   intervalMs = DEFAULT_AGENT_SESSION_HEARTBEAT_INTERVAL_MS,
   reportHeartbeatFn = reportAgentSessionHeartbeat,
+  expectedAccountStateDir,
+  accountSelectionRoot: selectionRoot,
 } = {}) {
   let stopped = false;
   let inFlight = false;
@@ -643,7 +823,8 @@ export function startAgentSessionHeartbeat({
     if (stopped || inFlight) return;
     inFlight = true;
     try {
-      await reportHeartbeatFn(sessionId, { stateDir });
+      await reportHeartbeatFn(sessionId, { stateDir, expectedAccountStateDir,
+        accountSelectionRoot: selectionRoot });
     } catch {
       // Presence is best-effort. The stale-session timeout is the fallback.
     } finally {
@@ -753,6 +934,8 @@ export async function pollResolvedApprovals({
   ensureFreshAccessTokenFn = ensureFreshAccessToken,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   limit = 20,
+  expectedAccountStateDir,
+  accountSelectionRoot: selectionRoot,
 } = {}) {
   const normalizedSessionId = safeText(sessionId, 64);
   if (!normalizedSessionId) {
@@ -762,6 +945,8 @@ export async function pollResolvedApprovals({
     stateDir,
     readCodingAuthFn,
     ensureFreshAccessTokenFn,
+    expectedAccountStateDir,
+    accountSelectionRoot: selectionRoot,
   });
   if (resolved.error) {
     return { ok: false, error: resolved.error, approvals: [] };
@@ -789,6 +974,9 @@ export async function pollResolvedApprovals({
       return { ok: false, status: resp.status, approvals: [] };
     }
     const json = await resp.json().catch(() => ({}));
+    if (!relayAccountIsCurrent(expectedAccountStateDir, selectionRoot)) {
+      return { ok: false, error: "account_context_changed", approvals: [] };
+    }
     const items = Array.isArray(json?.data?.approvals) ? json.data.approvals : [];
     const approvals = items
       .map((item) => {
@@ -823,6 +1011,8 @@ export function startApprovalDecisionPolling({
   intervalMs = DEFAULT_APPROVAL_POLL_INTERVAL_MS,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   limit = 20,
+  expectedAccountStateDir,
+  accountSelectionRoot: selectionRoot,
 } = {}) {
   if (typeof onDecision !== "function") {
     return () => {};
@@ -844,9 +1034,12 @@ export function startApprovalDecisionPolling({
         ensureFreshAccessTokenFn,
         timeoutMs,
         limit,
+        expectedAccountStateDir,
+        accountSelectionRoot: selectionRoot,
       });
       if (!result.ok) return;
       for (const approval of result.approvals) {
+        if (!relayAccountIsCurrent(expectedAccountStateDir, selectionRoot)) return;
         if (!approval || seen.has(approval.approvalId)) continue;
         try {
           const applied = await onDecision({

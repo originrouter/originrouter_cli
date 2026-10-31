@@ -6,6 +6,7 @@ import {
 import { mapCodexAppServerEvent, mapCodexApprovalRequest } from "./codex/eventMapper.js";
 import { CODEX_MAIN_ALIAS } from "../config/routes.js";
 import { CodexJsonlScanner, readCodexConversationHistory } from "./codex/jsonlScanner.js";
+import { assertNoCodexBypassFlag } from "../runtime/codexAppServerPrimitives.js";
 import {
   permissionEventToInteraction,
   INTERACTION_SOURCES,
@@ -76,6 +77,11 @@ export class CodexAdapter extends TerminalAdapter {
   }
 
   buildLaunch() {
+    // The native TUI path starts Codex itself, so the same launch-line rule the
+    // app-server runtime applies has to hold here: a session launched with one
+    // of these flags has no approval path back to OriginRouter, and there is no
+    // later point at which that can be restored.
+    assertNoCodexBypassFlag(this.args);
     let args = this.args.slice();
     if (this.nativeConfig) {
       return {

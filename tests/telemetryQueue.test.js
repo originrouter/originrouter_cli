@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,6 +8,58 @@ import { gunzipSync } from "node:zlib";
 import { TelemetryQueue, normalizeTelemetryEvent } from "../src/telemetry/telemetryQueue.js";
 import { TelemetryUploader } from "../src/telemetry/telemetryUploader.js";
 import { buildRunBundle } from "../src/telemetry/runBundle.js";
+import { activateAccount } from "../src/persistence/accounts.js";
+import { makeOAuthCredential } from "./support/oauthCredential.js";
+
+test("telemetry upload stays bound to the queue account during account changes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "originrouter-telemetry-account-"));
+  const accountA = "sha256:telemetry-account-a";
+  const scopedA = activateAccount(root, accountA);
+  const queue = new TelemetryQueue({ stateDir: root });
+  let resolveAuth;
+  let startedAuth;
+  const waiting = new Promise((resolve) => { resolveAuth = resolve; });
+  const started = new Promise((resolve) => { startedAuth = resolve; });
+  let sends = 0;
+  const uploader = new TelemetryUploader({ queue, stateDir: root,
+    ensureFreshAccessTokenFn: async ({ stateDir }) => {
+      assert.equal(stateDir, scopedA);
+      startedAuth();
+      return waiting;
+    },
+    fetchFn: async () => { sends++; return { ok: true, status: 200, json: async () => ({}) }; },
+  });
+  try {
+    const pending = uploader.status();
+    await started;
+    activateAccount(root, "sha256:telemetry-account-b");
+    resolveAuth(makeOAuthCredential({ accountScope: accountA }));
+    assert.equal((await pending).error, "account_context_changed");
+    assert.equal((await uploader.status()).error, "account_context_changed");
+    assert.equal(sends, 0);
+  } finally {
+    queue.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("telemetry rejects a credential whose account does not own the queue", async () => {
+  const root = mkdtempSync(join(tmpdir(), "originrouter-telemetry-credential-"));
+  activateAccount(root, "sha256:telemetry-account-a");
+  const queue = new TelemetryQueue({ stateDir: root });
+  let sends = 0;
+  const uploader = new TelemetryUploader({ queue, stateDir: root,
+    ensureFreshAccessTokenFn: async () => makeOAuthCredential({ accountScope: "sha256:telemetry-account-b" }),
+    fetchFn: async () => { sends++; return { ok: true, status: 200, json: async () => ({}) }; },
+  });
+  try {
+    assert.equal((await uploader.status()).error, "account_context_changed");
+    assert.equal(sends, 0);
+  } finally {
+    queue.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("normalizeTelemetryEvent keeps Cloud gateway ids opaque and drops internal ids", () => {
   const event = normalizeTelemetryEvent({

@@ -40,6 +40,12 @@ export { executionEventProjection } from "./collaborationExecutionProjection.js"
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "expired"]);
 const COMPLETE_EVENTS = new Set(["agent.task.complete", "agent.task.completed"]);
 const FAILED_EVENTS = new Set(["agent.task.failed", "agent.task.aborted"]);
+
+function validUsageAmount(rawAmount) {
+  const amount = (typeof rawAmount === "number" || (typeof rawAmount === "string" && rawAmount.trim()))
+    ? Number(rawAmount) : NaN;
+  return Number.isSafeInteger(amount) && amount >= 0 ? amount : null;
+}
 export class CollaborationRuntime {
   constructor({
     store,
@@ -71,7 +77,12 @@ export class CollaborationRuntime {
     this.leaseTtlMs = Math.max(60_000, Number(leaseTtlMs) || 0);
     this.buffers = new Map();
     this.completedEvents = new Set();
-    this.accountBudgetBlocked = false;
+    const savedAccountBlock = this.store.getAccountBudgetBlockedState();
+    this.accountBudgetStateKnown = savedAccountBlock != null || this.store.hasAccountBudgetBlockedRuns();
+    this.accountBudgetBlocked = savedAccountBlock ?? this.store.hasAccountBudgetBlockedRuns();
+    this.accountBudgetBlockEpoch = 0;
+    this.accountBudgetStatusRequest = null;
+    this.accountBudgetStatusQueue = Promise.resolve();
     this.queue = Promise.resolve();
     this.outboxFlush = Promise.resolve();
     this.outboxDeliveries = new Map();
@@ -80,6 +91,7 @@ export class CollaborationRuntime {
     this.capabilityRequests = new Map();
     this.workspaceTrustRequests = new Map();
     this.workspaceBrowseRequests = new Map();
+    this.retryStarts = new Map();
     this.unsubscribe = registry?.subscribe?.((notification) => this.enqueue(notification)) || (() => {});
     this.configurationPlanner = new CollaborationConfigurationPlanner({
       store: this.store,
@@ -468,15 +480,15 @@ export class CollaborationRuntime {
     return this.store.getRun(run.run_id);
   }
 
-  async confirm(runId) {
-    const run = this.coordinator.confirm(runId);
+  async confirm(runId, options) {
+    const run = this.coordinator.confirm(runId, options);
     void this.syncRun(runId);
     await this.dispatchForState(runId);
     return this.store.getRun(run.run_id);
   }
 
-  async revisePlan(runId, feedback) {
-    const run = this.store.requestAdaptivePlanRevision(runId, feedback);
+  async revisePlan(runId, feedback, options) {
+    const run = this.store.requestAdaptivePlanRevision(runId, feedback, options);
     void this.syncRun(runId);
     await this.dispatchForState(runId);
     return this.store.getRun(run.run_id);
@@ -544,6 +556,9 @@ export class CollaborationRuntime {
     const before = this.store.getRun(runId, { includeMessages: false });
     const run = this.store.updateBudget(runId, budget);
     void this.syncRun(runId);
+    if (before?.state !== "budget_exhausted" && run.state === "budget_exhausted") {
+      await this.interruptBudgetAgents(before);
+    }
     if (before?.state === "budget_exhausted" && run.state !== "budget_exhausted") {
       void this.dispatchForState(runId, { recovery: true }).catch((error) => this.fail(runId, error));
     }
@@ -571,6 +586,7 @@ export class CollaborationRuntime {
   async pause(runId) {
     const before = this.store.getRun(runId, { includeMessages: false });
     const run = this.store.pauseRun(runId);
+    this.invalidateInterruptedInteractions(runId);
     const remotePauses = [];
     for (const [role, agent] of Object.entries(before?.agents || {})) {
       if (!agent.current_task_id || !agent.originrouter_session_id && agent.device_id === this.deviceId) continue;
@@ -611,6 +627,50 @@ export class CollaborationRuntime {
     return run;
   }
 
+  async interruptBudgetAgents(run) {
+    if (!run) return;
+    this.invalidateInterruptedInteractions(run.run_id);
+    const pending = [];
+    for (const [role, agent] of Object.entries(run.agents || {})) {
+      const taskId = agent.current_task_id || (activeRoles(run).includes(role) ? run.task_ids[0] : "");
+      if (!taskId) continue;
+      if (agent.device_id === this.deviceId || agent.device_id === "local") {
+        if (agent.originrouter_session_id) {
+          try {
+            this.registry.enqueueCommand(agent.originrouter_session_id, {
+              type: "terminal.interrupt", sessionId: agent.originrouter_session_id,
+            });
+          } catch {}
+        }
+        continue;
+      }
+      if (!this.relayClient) continue;
+      const task = run.tasks?.find((item) => item.task_id === taskId);
+      const assignmentId = compactId(run.template_id === ADAPTIVE_TEMPLATE_ID
+        ? `assign-${run.run_id}-${role}-${task?.task_key || taskId}`
+        : `assign-${run.run_id}-${role}`, 96);
+      const deliveryId = compactId(`budget-cancel-${run.run_id}-${role}-${agent.fencing_token || 0}`, 96);
+      pending.push(this.sendRemoteDurable("collaboration.remote.cancel", {
+        protocolVersion: "1", sourceDeviceId: this.deviceId,
+        targetDeviceId: agent.device_id, assignmentId, runId: run.run_id,
+        taskId, role, attempt: agent.attempt, fencingToken: agent.fencing_token,
+        reason: "budget_exhausted", deliveryId,
+      }, { outboxId: `cancel:${deliveryId}` }).catch(() => null));
+    }
+    await Promise.all(pending);
+  }
+
+  invalidateInterruptedInteractions(runId) {
+    for (const item of this.store.listAttention(runId)) {
+      if (!item.payload?.interaction_id || !item.payload?.session_id) continue;
+      this.store.resolveAttention(runId, item.attention_id, {
+        expectedRevision: item.revision,
+        resolvedBy: "collaboration-runtime",
+        resolution: "interrupted",
+      });
+    }
+  }
+
   async resume(runId) {
     const run = this.store.resumeRun(runId);
     void this.syncRun(runId);
@@ -618,15 +678,22 @@ export class CollaborationRuntime {
     return this.store.getRun(run.run_id);
   }
 
-  async retry(runId, taskReference = "") {
+  async retry(runId, taskReference = "", requestId = "") {
     if (safeText(taskReference, 195)) {
       const run = this.store.retryAdaptiveTask(runId, taskReference);
       void this.syncRun(runId);
       await this.dispatchForState(runId, { recovery: true });
       return this.store.getRun(run.run_id);
     }
-    const run = this.store.retryRun(runId);
-    return this.start(run.run_id);
+    const result = requestId ? this.store.retryRunOnce(runId, requestId) : { run: this.store.retryRun(runId), created: true };
+    if (!result.run) throw new Error("The retry Run no longer exists.");
+    if (result.run.state !== "created") return result.run;
+    const retryRunId = result.run.run_id;
+    if (this.retryStarts.has(retryRunId)) return this.retryStarts.get(retryRunId);
+    const starting = this.start(retryRunId);
+    this.retryStarts.set(retryRunId, starting);
+    try { return await starting; }
+    finally { if (this.retryStarts.get(retryRunId) === starting) this.retryStarts.delete(retryRunId); }
   }
 
   async capabilitiesForDevice(deviceId) {
@@ -818,13 +885,15 @@ export class CollaborationRuntime {
       this.registry.enqueueCommand(sessionId, command);
       return;
     }
-    await this.sendRemoteDurable("collaboration.remote.interaction.resolve", {
+    const delivery = await this.sendRemoteDurable("collaboration.remote.interaction.resolve", {
       protocolVersion: "1",
       sourceDeviceId: this.deviceId,
       targetDeviceId: agent.device_id,
       runId: run.run_id,
       taskId,
       role,
+      attempt: agent.attempt,
+      fencingToken: agent.fencing_token,
       sessionId,
       interactionId,
       command,
@@ -832,19 +901,33 @@ export class CollaborationRuntime {
     }, {
       outboxId: `interaction:${compactId(deliveryKey, 160)}`,
     });
+    if (delivery?.cancelled) {
+      throw Object.assign(new Error("The Agent interaction was interrupted; wait for a new request."), { code: "COLLABORATION_INTERACTION_STALE" });
+    }
   }
 
   async superviseInteractionRequest({ run, role, taskId, sessionId, request, createdAt }) {
     const interactionId = safeText(request?.interactionId, 191);
     const agent = run.agents?.[role];
     if (!interactionId || !agent) return { handled: false, decision: null };
+    if (this.accountBudgetBlocked || run.account_budget_blocked
+        || ["paused", "budget_exhausted"].includes(run.state) || TERMINAL_STATES.has(run.state)) {
+      return { handled: true, decision: null };
+    }
     let decision;
     try {
+      const savedPermission = run.supervisor_snapshot_digest
+        ? this.store.getPermissionSnapshot?.("run", run.run_id) || null
+        : null;
+      if (run.supervisor_snapshot_digest && savedPermission?.digest !== run.supervisor_snapshot_digest) {
+        throw Object.assign(new Error("The saved Session permission snapshot is missing or changed."), { code: "COLLABORATION_PERMISSION_SNAPSHOT_INVALID" });
+      }
       decision = await this.approvalSupervisor.evaluate({
         request,
         agent,
         run,
         workspaceRoot: this.workspaceRoot(agent),
+        sessionPermissionSnapshot: run.supervisor_snapshot_digest ? savedPermission.snapshot : null,
       });
     } catch (error) {
       decision = {
@@ -852,6 +935,26 @@ export class CollaborationRuntime {
         reason: safeText(error?.code || error?.message, 256) || "supervisor_evaluation_failed",
         layers: [],
       };
+    }
+    const currentRun = this.store.getRun(run.run_id, { includeMessages: false });
+    const currentAgent = currentRun?.agents?.[role];
+    if (!currentRun || this.accountBudgetBlocked || currentRun.account_budget_blocked
+        || ["paused", "budget_exhausted"].includes(currentRun.state) || TERMINAL_STATES.has(currentRun.state)
+        || currentRun.state !== run.state
+        || (currentAgent?.attempt || 0) !== (agent.attempt || 0)
+        || (currentAgent?.fencing_token || 0) !== (agent.fencing_token || 0)
+        || (currentAgent?.current_task_id || "") !== (agent.current_task_id || "")) {
+      return { handled: true, decision: null };
+    }
+    if (!currentRun || currentRun.supervisor_permission_profile !== run.supervisor_permission_profile
+        || currentRun.supervisor_policy_id !== run.supervisor_policy_id
+        || currentRun.supervisor_snapshot_digest !== run.supervisor_snapshot_digest
+        || (currentRun.approval_revision || 0) !== (run.approval_revision || 0)) {
+      return { handled: false, decision: { effect: "ask", reason: "session_permission_changed", layers: [] } };
+    }
+    if (!currentAgent || ["agent_id", "runtime", "device_id", "workspace_id", "permission_profile", "approval_policy_id"]
+      .some((key) => (currentAgent[key] || "") !== (agent[key] || ""))) {
+      return { handled: false, decision: { effect: "ask", reason: "agent_permission_changed", layers: [] } };
     }
     if (decision.effect === "ask") return { handled: false, decision };
     const command = {
@@ -900,7 +1003,15 @@ export class CollaborationRuntime {
       .find((candidate) => candidate.attention_id === attentionId);
     if (!item) throw new Error("collaboration attention item not found");
     if (item.status !== "pending") return { item, duplicate: true };
+    if (TERMINAL_STATES.has(run.state)) {
+      throw Object.assign(new Error("The collaboration has ended; its pending request can no longer be resolved."), { code: "COLLABORATION_RUN_TERMINAL" });
+    }
     const action = safeText(input.action || input.resolution, 64).toLowerCase();
+    if ((this.accountBudgetBlocked || run.account_budget_blocked
+        || ["paused", "budget_exhausted"].includes(run.state))
+        && !(item.kind === "agent_recovery" && action === "cancel")) {
+      throw Object.assign(new Error("Resume the collaboration before resolving this request."), { code: "COLLABORATION_RUN_PAUSED" });
+    }
     if (!item.actions.includes(action)) {
       const error = new Error(`unsupported attention action '${action || "(empty)"}'`);
       error.code = "COLLABORATION_ATTENTION_ACTION_INVALID";
@@ -1019,7 +1130,7 @@ export class CollaborationRuntime {
       }
       return resolved;
     }
-    if (["approval", "confirmation", "questions", "form", "url", "input"].includes(item.kind)) {
+    if (["approval", "confirm", "confirmation", "questions", "form", "url", "input"].includes(item.kind)) {
       if (!sessionId || !interactionId) {
         const error = new Error("attention item is missing its Agent interaction binding");
         error.code = "COLLABORATION_ATTENTION_BINDING_MISSING";
@@ -1069,9 +1180,16 @@ export class CollaborationRuntime {
   }
 
   async recover() {
+    if (this.accountBudgetStateKnown) {
+      for (const runId of this.store.listAccountBudgetRunIds()) {
+        const before = this.store.getRun(runId, { includeMessages: false });
+        const result = this.store.setAccountBudgetBlocked(runId, this.accountBudgetBlocked);
+        if (result.changed && this.accountBudgetBlocked) await this.interruptBudgetAgents(before);
+      }
+    }
     await this.flushOutbox();
-    for (const item of this.store.listActiveRuns()) {
-      const run = this.store.getRun(item.run_id);
+    for (const runId of this.store.listAccountBudgetRunIds()) {
+      const run = this.store.getRun(runId);
       if (!run || run.state === "created" || TERMINAL_STATES.has(run.state)) continue;
       if (run.template_id === ADAPTIVE_TEMPLATE_ID) {
         void this.dispatchForState(run.run_id, { recovery: true })
@@ -1093,7 +1211,7 @@ export class CollaborationRuntime {
 
   async dispatchForState(runId, { recovery = false, resetAgentIdentity = false } = {}) {
     const run = this.store.getRun(runId);
-    if (!run || TERMINAL_STATES.has(run.state)) return run;
+    if (!run || TERMINAL_STATES.has(run.state) || this.accountBudgetBlocked) return run;
     void this.syncRun(runId);
     if (run.template_id === ADAPTIVE_TEMPLATE_ID) {
       return this.dispatchAdaptive(run, { recovery, resetAgentIdentity });
@@ -1102,7 +1220,7 @@ export class CollaborationRuntime {
     if (!role) return run;
     const prompt = this.promptFor(run, role, { recovery });
     if (!prompt) return run;
-    await this.dispatch(run, role, prompt, { resetAgentIdentity });
+    await this.dispatch(run, role, prompt, { retry: recovery, resetAgentIdentity });
     return this.store.getRun(runId);
   }
 
@@ -1226,6 +1344,10 @@ export class CollaborationRuntime {
     retry = false,
     resetAgentIdentity = false,
   } = {}) {
+    const currentRun = this.store.getRun(run.run_id, { includeMessages: false });
+    if (!currentRun || this.accountBudgetBlocked || currentRun.account_budget_blocked
+        || currentRun.state !== run.state || TERMINAL_STATES.has(currentRun.state)
+        || ["paused", "budget_exhausted"].includes(currentRun.state)) return;
     let agent = run.agents[role];
     if (!agent) throw new Error(`missing collaboration role: ${role}`);
     const effectiveTaskId = taskId || run.task_ids[0];
@@ -1280,6 +1402,9 @@ export class CollaborationRuntime {
         resetAgentIdentity,
         prompt,
       };
+      // Publish the assignment before awaiting delivery so a budget block can
+      // interrupt it even while the relay is still accepting the dispatch.
+      this.store.updateAgent(run.run_id, role, { status: "dispatching", currentTaskId: effectiveTaskId });
       let result;
       try {
         result = await this.sendRemoteDurable("collaboration.remote.dispatch", payload, {
@@ -1291,9 +1416,16 @@ export class CollaborationRuntime {
           return;
         }
         if (!retryableDeliveryError(error)) throw error;
-        this.store.updateAgent(run.run_id, role, { status: "waiting_device", currentTaskId: effectiveTaskId });
+        const current = this.store.getRun(run.run_id, { includeMessages: false });
+        if (!this.accountBudgetBlocked && !current?.account_budget_blocked
+            && current?.state === run.state && current.agents[role]?.fencing_token === agent.fencing_token) {
+          this.store.updateAgent(run.run_id, role, { status: "waiting_device", currentTaskId: effectiveTaskId });
+        }
         return;
       }
+      const current = this.store.getRun(run.run_id, { includeMessages: false });
+      if (!current || this.accountBudgetBlocked || current.account_budget_blocked || current.state !== run.state
+          || current.agents[role]?.fencing_token !== agent.fencing_token) return;
       const data = result?.data || result || {};
       if (data.accepted === false && !data.queued) {
         const error = new Error(data.reason || "remote collaboration dispatch rejected");
@@ -1361,6 +1493,12 @@ export class CollaborationRuntime {
         }
         throw error;
       }
+      const current = this.store.getRun(run.run_id, { includeMessages: false });
+      if (!current || this.accountBudgetBlocked || current.account_budget_blocked || current.state !== run.state
+          || current.agents[role]?.fencing_token !== agent.fencing_token) {
+        try { this.registry.enqueueCommand(launch.sessionId, { type: "session.stop", sessionId: launch.sessionId }); } catch {}
+        return;
+      }
       this.store.updateAgent(run.run_id, role, {
         status: "starting",
         originrouterSessionId: launch.sessionId,
@@ -1370,6 +1508,12 @@ export class CollaborationRuntime {
       active = true;
     }
     if (!active) throw new Error(`collaboration Agent ${role} did not become ready`);
+    const latest = this.store.getRun(run.run_id, { includeMessages: false });
+    if (!latest || this.accountBudgetBlocked || latest.account_budget_blocked || latest.state !== run.state
+        || latest.agents[role]?.fencing_token !== agent.fencing_token) {
+      try { this.registry.enqueueCommand(sessionId, { type: "session.stop", sessionId }); } catch {}
+      return;
+    }
     if (["planning", "plan_design", "read_only", "discussion"].includes(effectivePhase)) {
       this.registry.enqueueCommand(sessionId, { type: "agent.mode.set", sessionId, mode: "plan" });
     } else {
@@ -1406,14 +1550,19 @@ export class CollaborationRuntime {
     }
     if (notification.type === "registered" || notification.type === "updated") {
       const nativeSessionId = notification.payload.nativeSessionId || notification.payload.native_session_id;
+      const run = this.store.getRun(binding.run_id, { includeMessages: false });
+      const interrupted = !run || ["paused", "budget_exhausted"].includes(run.state) || TERMINAL_STATES.has(run.state);
       this.store.updateAgent(binding.run_id, binding.role, {
-        status: notification.type === "registered" ? "running" : undefined,
+        status: notification.type === "registered" && !interrupted ? "running" : undefined,
         ...(nativeSessionId ? { nativeSessionId } : {}),
       });
       return;
     }
     if (notification.type === "unregistered") {
-      this.store.updateAgent(binding.run_id, binding.role, { status: notification.payload.status || "stopped" });
+      const run = this.store.getRun(binding.run_id, { includeMessages: false });
+      if (run && !["paused", "budget_exhausted"].includes(run.state) && !TERMINAL_STATES.has(run.state)) {
+        this.store.updateAgent(binding.run_id, binding.role, { status: notification.payload.status || "stopped" });
+      }
       return;
     }
     if (notification.type !== "event") return;
@@ -1433,6 +1582,8 @@ export class CollaborationRuntime {
       createdAt: event.createdAt,
     });
     if (event.type === "agent.interaction.requested") {
+      if (!currentRun || this.accountBudgetBlocked || currentRun.account_budget_blocked
+          || ["paused", "budget_exhausted"].includes(currentRun.state) || TERMINAL_STATES.has(currentRun.state)) return;
       const interactionId = safeText(event.interactionId || event.callId, 191);
       if (interactionId) {
         const kind = safeText(event.kind, 64) || "input";
@@ -1501,6 +1652,11 @@ export class CollaborationRuntime {
       }
       return;
     }
+    // Interrupting a turn can produce a late failure/completion. Keep the
+    // recorded event, but do not let it override the stopped Run's state.
+    if ((FAILED_EVENTS.has(event.type) || COMPLETE_EVENTS.has(event.type))
+        && (!currentRun || ["paused", "budget_exhausted"].includes(currentRun.state)
+          || TERMINAL_STATES.has(currentRun.state))) return;
     if (FAILED_EVENTS.has(event.type)) {
       const error = new Error(safeText(event.error || event.reason, 2048)
         || "Collaboration Agent command failed.");
@@ -1510,6 +1666,8 @@ export class CollaborationRuntime {
     }
     if (event.type === "agent.usage") {
       const usageId = `usage-${notification.sessionId}-${event.eventId || event.localSequence}`;
+      const accountReport = this.accountUsageReport(binding.run_id, usageId, event);
+      const accountReportOutboxId = compactId(`account-usage:${usageId}`, 191);
       const usage = this.store.recordUsage(binding.run_id, {
         eventId: usageId,
         agentId: this.store.getRun(binding.run_id, { includeMessages: false })?.agents?.[binding.role]?.agent_id,
@@ -1517,8 +1675,9 @@ export class CollaborationRuntime {
         amountMicros: event.amountMicros,
         currency: event.currency,
         costSource: event.costSource,
+        accountReport, accountReportOutboxId,
       });
-      void this.reportUsage(binding.run_id, usageId, event);
+      if (accountReport && !usage.duplicate) void this.deliverAccountUsage(accountReportOutboxId);
       await this.handleBudgetResult(binding.run_id, binding.role, notification.sessionId, usage);
       return;
     }
@@ -1595,7 +1754,9 @@ export class CollaborationRuntime {
       };
     }
     if (operation === "configuration_accept") {
-      return this.configurationPlanner.accept(input.configuration_id ?? input.configurationId);
+      return this.configurationPlanner.accept(input.configuration_id ?? input.configurationId, {
+        expectedProposalToken: input.expected_proposal_token ?? input.expectedProposalToken ?? "",
+      });
     }
     if (operation === "configuration_cancel") {
       return { configuration: await this.configurationPlanner.cancel(input.configuration_id ?? input.configurationId) };
@@ -1623,15 +1784,18 @@ export class CollaborationRuntime {
       return page;
     }
     if (operation === "start") return { run: await this.start(runId) };
-    if (operation === "confirm") return { run: await this.confirm(runId) };
+    if (operation === "confirm") return { run: await this.confirm(runId, { expectedPlanRevision: input.expected_plan_revision }) };
     if (operation === "replan") {
-      return { run: await this.revisePlan(runId, input.feedback) };
+      return { run: await this.revisePlan(runId, input.feedback, { expectedPlanRevision: input.expected_plan_revision }) };
     }
     if (operation === "pause") return { run: await this.pause(runId) };
     if (operation === "resume") return { run: await this.resume(runId) };
     if (operation === "cancel") return { run: await this.cancel(runId) };
     if (operation === "retry") {
-      return { run: await this.retry(runId, safeText(input.task_id ?? input.taskId, 195)) };
+      return { run: await this.retry(runId, safeText(input.task_id ?? input.taskId, 195), safeText(input.request_id ?? input.requestId, 128)) };
+    }
+    if (operation === "retry_lookup") {
+      return { run: this.store.retryForRequest(runId, input.request_id ?? input.requestId) };
     }
     if (operation === "budget") return { run: await this.updateBudget(runId, input.budget || {}) };
     if (operation === "approval") return { run: await this.updateSupervisorApproval(runId, input) };
@@ -1823,52 +1987,71 @@ export class CollaborationRuntime {
     }
     if (payload.type === "collaboration.budget.status") {
       if (isForeignRelayFrame(payload, this.deviceId)) return true;
-      const blocked = Boolean(payload.blocked);
-      this.accountBudgetBlocked = blocked;
-      const requestedRunId = safeText(payload.run_id ?? payload.runId, 195);
-      const runIds = requestedRunId
-        ? [requestedRunId]
-        : this.store.listActiveRuns({ limit: 500 }).map((run) => run.run_id);
-      for (const runId of runIds) {
-        const before = this.store.getRun(runId, { includeMessages: false });
-        if (!before) continue;
-        const roles = activeRoles(before);
-        const result = this.store.setAccountBudgetBlocked(runId, blocked);
-        const run = result.run;
-        if (!run || !result.changed) continue;
-        this.store.appendMessage(runId, {
-          task_id: run.task_ids[0],
-          type: "task.progress",
-          idempotency_key: `account-budget-${blocked ? "blocked" : "resumed"}-${compactId(run.updated_at, 80)}`,
-          sender: { kind: "coordinator", device_id: this.deviceId },
-          recipient: { kind: "user" },
-          payload: {
-            content: blocked
-              ? "Daily or weekly account budget exhausted; the Coordinator paused further work."
-              : result.restored
-                ? "Account budget is available again; the Coordinator resumed the paused phase."
-                : "Account budget is available again; this run remains paused by its task budget.",
-            budget_status: blocked ? "account_exhausted" : "account_available",
-            account_budget: true,
-          },
-        });
-        if (blocked) {
-          for (const role of roles) {
-            const agent = before.agents[role];
-            if (!agent?.originrouter_session_id) continue;
-            try {
-              this.registry.enqueueCommand(agent.originrouter_session_id, {
-                type: "terminal.interrupt",
-                sessionId: agent.originrouter_session_id,
-              });
-            } catch {}
+      // Relay callbacks can overlap while a remote interrupt is in flight.
+      // Apply whole-account transitions in delivery order, not interleaved.
+      const operation = this.accountBudgetStatusQueue.then(async () => {
+        const blocked = Boolean(payload.blocked);
+        if (Number(payload.status_protocol) >= 1) {
+          if (blocked) {
+            this.accountBudgetBlockEpoch += 1;
+          } else {
+            const requestId = safeText(payload.request_id, 96);
+            const pending = this.accountBudgetStatusRequest;
+            if (!requestId) {
+              const hasBlockedRun = this.store.hasAccountBudgetBlockedRuns();
+              if (!this.accountBudgetBlocked && !hasBlockedRun) return true;
+              // A pushed clear can be older than a later block. Ask for a fresh
+              // account snapshot before allowing any automatic recovery.
+              void this.refreshAccountBudgetStatus().catch(() => {});
+              return true;
+            }
+            if (!pending || pending.id !== requestId) return true;
+            if (pending.blockEpoch !== this.accountBudgetBlockEpoch) {
+              void this.refreshAccountBudgetStatus().catch(() => {});
+              return true;
+            }
+            this.accountBudgetStatusRequest = null;
           }
-        } else if (result.restored) {
-          void this.dispatchForState(runId, { recovery: true })
-            .catch((error) => this.fail(runId, error));
         }
-        void this.syncRun(runId);
-      }
+        this.store.setAccountBudgetBlockedState(blocked);
+        this.accountBudgetStateKnown = true;
+        this.accountBudgetBlocked = blocked;
+        // The Server's policy applies to the whole account. Older Servers may
+        // attach the reporting Run ID, but the resulting status is still global.
+        const runIds = this.store.listAccountBudgetRunIds();
+        for (const runId of runIds) {
+          const before = this.store.getRun(runId, { includeMessages: false });
+          if (!before) continue;
+          const result = this.store.setAccountBudgetBlocked(runId, blocked);
+          const run = result.run;
+          if (!run || !result.changed) continue;
+          this.store.appendMessage(runId, {
+            task_id: run.task_ids[0],
+            type: "task.progress",
+            idempotency_key: `account-budget-${blocked ? "blocked" : "resumed"}-${compactId(run.updated_at, 80)}`,
+            sender: { kind: "coordinator", device_id: this.deviceId },
+            recipient: { kind: "user" },
+            payload: {
+              content: blocked
+                ? "Daily or weekly account budget exhausted; the Coordinator paused further work."
+                : result.restored
+                  ? "Account budget is available again; the Coordinator resumed the paused phase."
+                  : "Account budget is available again; this run remains paused by its task budget.",
+              budget_status: blocked ? "account_exhausted" : "account_available",
+              account_budget: true,
+            },
+          });
+          if (blocked) {
+            await this.interruptBudgetAgents(before);
+          } else if (result.restored) {
+            void this.dispatchForState(runId, { recovery: true })
+              .catch((error) => this.fail(runId, error));
+          }
+          void this.syncRun(runId);
+        }
+      });
+      this.accountBudgetStatusQueue = operation.catch(() => {});
+      await operation;
       return true;
     }
     if (payload.type === "collaboration.mcp.request") {
@@ -1947,6 +2130,7 @@ export class CollaborationRuntime {
       if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const run = this.store.getRun(payload.runId);
       if (!run || !run.task_ids.includes(payload.taskId)) return true;
+      if (["paused", "budget_exhausted"].includes(run.state) || TERMINAL_STATES.has(run.state)) return true;
       const role = safeText(payload.role, 32);
       if (run.template_id === ADAPTIVE_TEMPLATE_ID) {
         if (run.agents?.[role]?.current_task_id !== payload.taskId) return true;
@@ -1995,6 +2179,8 @@ export class CollaborationRuntime {
         createdAt: payload.createdAt,
       });
       if (payload.event?.type === "agent.interaction.requested") {
+        if (this.accountBudgetBlocked || run.account_budget_blocked
+            || ["paused", "budget_exhausted"].includes(run.state) || TERMINAL_STATES.has(run.state)) return true;
         const interactionId = safeText(payload.event?.payload?.interaction_id, 191);
         if (interactionId) {
           const kind = safeText(payload.event?.payload?.kind, 64) || "input";
@@ -2065,11 +2251,17 @@ export class CollaborationRuntime {
       const assignment = this.store.findRemoteAssignmentBySession(payload.sessionId);
       if (!assignment
           || assignment.run_id !== safeText(payload.runId, 195)
-          || assignment.role !== safeText(payload.role, 32)) {
+          || assignment.role !== safeText(payload.role, 32)
+          || assignment.task_id !== safeText(payload.taskId, 195)
+          || assignment.source_device_id !== safeText(payload.sourceDeviceId, 191)) {
         const error = new Error("remote Agent interaction binding is unavailable");
         error.code = "COLLABORATION_REMOTE_INTERACTION_STALE";
         throw error;
       }
+      if (["paused", "budget_exhausted", "cancelled", "failed"].includes(assignment.status)
+          || payload.attempt == null || payload.fencingToken == null
+          || Number(payload.attempt) !== Number(assignment.attempt)
+          || Number(payload.fencingToken) !== Number(assignment.fencing_token)) return true;
       this.registry.enqueueCommand(assignment.originrouter_session_id, {
         ...(payload.command || {}),
         type: "agent.interaction.resolve",
@@ -2082,9 +2274,16 @@ export class CollaborationRuntime {
       if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const assignment = this.store.getRemoteAssignment(payload.assignmentId)
         || this.store.findRemoteAssignmentBySession(payload.sessionId);
-      if (!assignment
-          || assignment.run_id !== safeText(payload.runId, 195)
-          || assignment.role !== safeText(payload.role, 32)) return true;
+      if (assignment && (assignment.run_id !== safeText(payload.runId, 195)
+          || assignment.role !== safeText(payload.role, 32)
+          || assignment.task_id !== safeText(payload.taskId, 195)
+          || assignment.source_device_id !== safeText(payload.sourceDeviceId, 191))) return true;
+      // Remember a pause that overtakes its dispatch. Recovery uses a newer
+      // fence, so a delayed pause cannot interrupt the resumed assignment.
+      this.store.recordRemoteCancellation({ ...payload, reason: "paused" });
+      if (!assignment) return true;
+      if ((payload.fencingToken != null && Number(payload.fencingToken) !== Number(assignment.fencing_token))
+          || (payload.attempt != null && Number(payload.attempt) !== Number(assignment.attempt))) return true;
       if (assignment.originrouter_session_id) {
         try {
           this.registry.enqueueCommand(assignment.originrouter_session_id, {
@@ -2101,41 +2300,31 @@ export class CollaborationRuntime {
       const run = this.store.getRun(payload.runId, { includeMessages: false });
       const role = safeText(payload.role, 32);
       if (!run || !run.agents[role] || !run.task_ids.includes(payload.taskId)) return true;
-      if (!this.acceptsFencing(run, role, payload)) return true;
+      // Usage can arrive after recovery has issued a newer fence. A historic
+      // fence is accepted only for a dispatch sent to this exact device.
+      if (!(this.acceptsFencing(run, role, payload)
+            && safeText(payload.sourceDeviceId, 191) === run.agents[role].device_id)
+          && !this.store.hasDispatchedRemoteAttempt(payload)) return true;
+      const usageId = `usage-${safeText(payload.usageId, 160)}`;
+      const accountReport = this.accountUsageReport(run.run_id, usageId, payload);
+      const accountReportOutboxId = compactId(`account-usage:${usageId}`, 191);
       const usage = this.store.recordUsage(run.run_id, {
-        eventId: `usage-${safeText(payload.usageId, 160)}`,
+        eventId: usageId,
         agentId: run.agents[role].agent_id,
         sampledTokens: payload.sampledTokens,
         amountMicros: payload.amountMicros,
         currency: payload.currency,
         costSource: payload.costSource,
+        accountReport, accountReportOutboxId,
       });
-      void this.reportUsage(run.run_id, `usage-${safeText(payload.usageId, 160)}`, payload);
+      if (accountReport && !usage.duplicate) void this.deliverAccountUsage(accountReportOutboxId);
       await this.handleBudgetResult(run.run_id, role, null, usage);
-      if (usage.exhausted) {
-        const deliveryId = compactId(`budget-cancel-${run.run_id}-${role}-${run.agents[role].fencing_token}`, 96);
-        await this.sendRemoteDurable("collaboration.remote.cancel", {
-          protocolVersion: "1",
-          sourceDeviceId: this.deviceId,
-          targetDeviceId: run.agents[role].device_id,
-          assignmentId: safeText(payload.assignmentId, 195),
-          runId: run.run_id,
-          taskId: run.task_ids[0],
-          role,
-          attempt: run.agents[role].attempt,
-          fencingToken: run.agents[role].fencing_token,
-          reason: "budget_exhausted",
-          deliveryId,
-        }, {
-          outboxId: `cancel:${deliveryId}`,
-        });
-      }
       return true;
     }
     if (payload.type === "collaboration.remote.cancel") {
       if (isForeignRelayFrame(payload, this.deviceId)) return true;
       const budgetExhausted = safeText(payload.reason, 96) === "budget_exhausted";
-      if (!budgetExhausted) this.store.recordRemoteCancellation(payload);
+      this.store.recordRemoteCancellation(payload);
       const assignment = this.store.getRemoteAssignment(payload.assignmentId);
       if (!assignment || assignment.run_id !== payload.runId) return true;
       if (payload.fencingToken != null
@@ -2158,6 +2347,7 @@ export class CollaborationRuntime {
         const run = this.store.getRun(payload.runId, { includeMessages: false });
         const role = safeText(payload.role, 32);
         if (!run || !this.acceptsFencing(run, role, payload)) return true;
+        if (["paused", "budget_exhausted"].includes(run.state) || TERMINAL_STATES.has(run.state)) return true;
         const error = Object.assign(
           new Error(safeText(payload.message, 2048) || "Remote collaboration Agent failed."),
           { code: safeText(payload.code, 96) },
@@ -2275,15 +2465,19 @@ export class CollaborationRuntime {
   }
 
   async handleRemoteAgentNotification(assignment, notification) {
+    assignment = this.store.getRemoteAssignment(assignment.assignment_id);
+    if (!assignment || assignment.originrouter_session_id !== notification.sessionId) return;
     if (notification.type === "registered" || notification.type === "updated") {
       const nativeSessionId = notification.payload.nativeSessionId || notification.payload.native_session_id;
+      const interrupted = ["paused", "budget_exhausted", "cancelled", "failed"].includes(assignment.status);
       this.store.updateRemoteAssignment(assignment.assignment_id, {
-        status: notification.type === "registered" ? "running" : assignment.status,
+        status: notification.type === "registered" && !interrupted ? "running" : assignment.status,
         ...(nativeSessionId ? { nativeSessionId } : {}),
       });
       return;
     }
     if (notification.type === "unregistered") {
+      if (["paused", "budget_exhausted", "cancelled", "failed"].includes(assignment.status)) return;
       this.store.updateRemoteAssignment(assignment.assignment_id, {
         status: notification.payload.status || "stopped",
       });
@@ -2295,7 +2489,29 @@ export class CollaborationRuntime {
     });
     const event = notification.payload || {};
     const projectedEvent = executionEventProjection(event);
-    await this.sendRemoteDurable("collaboration.remote.event", {
+    let usageOutbox = null;
+    if (event.type === "agent.usage") {
+      const usageId = `${notification.sessionId}-${event.eventId || event.localSequence}`;
+      usageOutbox = this.store.enqueueOutbox({
+        outboxId: `usage:${compactId(usageId, 160)}`,
+        runId: assignment.run_id,
+        assignmentId: assignment.assignment_id,
+        messageType: "collaboration.remote.usage",
+        targetDeviceId: assignment.source_device_id,
+        payload: {
+          protocolVersion: "1", sourceDeviceId: this.deviceId,
+          targetDeviceId: assignment.source_device_id, assignmentId: assignment.assignment_id,
+          runId: assignment.run_id, taskId: assignment.task_id, role: assignment.role,
+          attempt: assignment.attempt, fencingToken: assignment.fencing_token, usageId,
+          sampledTokens: Math.max(0, Math.floor(Number(event.sampledTokens) || 0)),
+          amountMicros: validUsageAmount(event.amountMicros),
+          currency: safeText(event.currency, 3).toUpperCase(), costSource: safeText(event.costSource, 32),
+        },
+      });
+      if (usageOutbox.state === "pending") this.scheduleOutboxRetry(1);
+    }
+    try {
+      await this.sendRemoteDurable("collaboration.remote.event", {
       protocolVersion: "1",
       sourceDeviceId: this.deviceId,
       targetDeviceId: assignment.source_device_id,
@@ -2309,9 +2525,22 @@ export class CollaborationRuntime {
       sessionId: notification.sessionId,
       createdAt: event.createdAt,
       event: projectedEvent,
-    }, {
-      outboxId: `event:${compactId(`${assignment.assignment_id}-${event.eventId || event.localSequence}`, 160)}`,
-    });
+      }, {
+        outboxId: `event:${compactId(`${assignment.assignment_id}-${event.eventId || event.localSequence}`, 160)}`,
+      });
+    } catch (error) {
+      // The projection is already durable; a transient failure must not stop
+      // the separate usage, result or error message from being queued.
+      if (!retryableDeliveryError(error)) throw error;
+    }
+    // The relay send above can yield while a pause or cancellation arrives.
+    // Re-read the assignment before applying a late terminal event.
+    if (FAILED_EVENTS.has(event.type) || COMPLETE_EVENTS.has(event.type)) {
+      const latest = this.store.getRemoteAssignment(assignment.assignment_id);
+      if (!latest || latest.fencing_token !== assignment.fencing_token
+          || latest.attempt !== assignment.attempt
+          || ["paused", "budget_exhausted", "cancelled"].includes(latest.status)) return;
+    }
     if (FAILED_EVENTS.has(event.type)) {
       const message = safeText(event.error || event.reason, 2048)
         || "Remote collaboration Agent command failed.";
@@ -2335,25 +2564,7 @@ export class CollaborationRuntime {
       return;
     }
     if (event.type === "agent.usage") {
-      const usageId = `${notification.sessionId}-${event.eventId || event.localSequence}`;
-      await this.sendRemoteDurable("collaboration.remote.usage", {
-        protocolVersion: "1",
-        sourceDeviceId: this.deviceId,
-        targetDeviceId: assignment.source_device_id,
-        assignmentId: assignment.assignment_id,
-        runId: assignment.run_id,
-        taskId: assignment.task_id,
-        role: assignment.role,
-        attempt: assignment.attempt,
-        fencingToken: assignment.fencing_token,
-        usageId,
-        sampledTokens: Math.max(0, Math.floor(Number(event.sampledTokens) || 0)),
-        amountMicros: event.amountMicros == null ? null : Math.max(0, Math.floor(Number(event.amountMicros) || 0)),
-        currency: safeText(event.currency, 3).toUpperCase(),
-        costSource: safeText(event.costSource, 32),
-      }, {
-        outboxId: `usage:${compactId(usageId, 160)}`,
-      });
+      if (usageOutbox.state === "pending") await this.deliverOutbox(usageOutbox);
       return;
     }
     const key = `remote:${assignment.assignment_id}`;
@@ -2422,7 +2633,9 @@ export class CollaborationRuntime {
       targetDeviceId: payload.targetDeviceId,
       payload,
     });
-    if (item.state === "delivered") return { accepted: true, duplicate: true };
+    if (["delivered", "cancelled"].includes(item.state)) {
+      return { accepted: true, duplicate: true, cancelled: item.state === "cancelled" };
+    }
     return this.deliverOutbox(item);
   }
 
@@ -2436,14 +2649,58 @@ export class CollaborationRuntime {
   }
 
   async _deliverOutbox(item) {
+    // A snapshot being flushed may already have been delivered by a live
+    // notification before this item gets its turn in the queue.
+    const currentItem = this.store.getOutbox(item.outbox_id);
+    if (!currentItem || currentItem.state !== "pending") {
+      return { accepted: true, duplicate: true, cancelled: currentItem?.state === "cancelled" };
+    }
+    item = currentItem;
+    if (item.message_type === "collaboration.remote.interaction.resolve") {
+      const run = this.store.getRun(item.run_id, { includeMessages: false });
+      const agent = run?.agents?.[safeText(item.payload?.role, 32)];
+      if (!run || !agent || this.accountBudgetBlocked || run.account_budget_blocked
+          || ["paused", "budget_exhausted"].includes(run.state) || TERMINAL_STATES.has(run.state)
+          || Number(item.payload?.fencingToken || 0) !== Number(agent.fencing_token || 0)
+          || Number(item.payload?.attempt || 0) !== Number(agent.attempt || 0)
+          || safeText(item.payload?.taskId, 195) !== safeText(agent.current_task_id, 195)) {
+        this.store.cancelOutbox(item.outbox_id, "stale_or_paused_interaction");
+        return { accepted: true, cancelled: true };
+      }
+    }
+    if (item.message_type === "collaboration.remote.dispatch") {
+      const run = this.store.getRun(item.run_id, { includeMessages: false });
+      const agent = run?.agents?.[safeText(item.payload?.role, 32)];
+      if (!run || !agent || this.accountBudgetBlocked || run.account_budget_blocked
+          || ["paused", "budget_exhausted"].includes(run.state) || TERMINAL_STATES.has(run.state)
+          || Number(item.payload?.fencingToken || 0) !== Number(agent.fencing_token || 0)) {
+        this.store.cancelOutbox(item.outbox_id, "stale_or_paused_dispatch");
+        return { accepted: true, cancelled: true };
+      }
+    }
     this.store.markOutboxAttempt(item.outbox_id);
     try {
-      const result = await this.relayClient.send(item.message_type, item.payload);
+      const result = item.message_type === "collaboration.usage.report" && this.relayClient.sendAcknowledged
+        ? await this.relayClient.sendAcknowledged(item.message_type, item.payload)
+        : await this.relayClient.send(item.message_type, item.payload);
       const delivery = result?.data || result || {};
+      if (item.message_type === "collaboration.usage.report" && delivery.accepted !== true) {
+        throw Object.assign(new Error(delivery.reason || "usage report was not acknowledged"), { code: safeText(delivery.reason, 96) || "COLLABORATION_USAGE_UNACKNOWLEDGED" });
+      }
       if (delivery.accepted === false && !delivery.queued) {
         const error = new Error(delivery.reason || "collaboration relay rejected message");
         error.code = safeText(delivery.reason, 96) || "COLLABORATION_RELAY_REJECTED";
         throw error;
+      }
+      if (item.message_type === "collaboration.usage.report"
+          && typeof delivery.budget?.blocked === "boolean") {
+        await this.handleRelayEvent({
+          type: "collaboration.budget.status", targetDeviceId: this.deviceId,
+          status_protocol: 1, blocked: delivery.budget.blocked,
+        });
+        // A report response can itself be delayed. Reconfirm a newly observed
+        // block so a later policy change can eventually resume the Run.
+        if (delivery.budget.blocked) void this.refreshAccountBudgetStatus().catch(() => {});
       }
       this.store.markOutboxDelivered(item.outbox_id);
       this.applyOutboxDelivery(item, delivery);
@@ -2474,7 +2731,9 @@ export class CollaborationRuntime {
     if (item.message_type !== "collaboration.remote.dispatch") return;
     const run = this.store.getRun(item.run_id, { includeMessages: false });
     const role = safeText(item.payload?.role, 32);
-    if (!run?.agents?.[role]) return;
+    if (!run?.agents?.[role] || ["paused", "budget_exhausted"].includes(run.state)
+        || TERMINAL_STATES.has(run.state)
+        || Number(item.payload?.fencingToken || 0) !== Number(run.agents[role].fencing_token || 0)) return;
     this.store.updateAgent(run.run_id, role, {
       status: delivery.queued || delivery.reason === "queued"
         ? "waiting_device"
@@ -2484,15 +2743,23 @@ export class CollaborationRuntime {
 
   async flushOutbox() {
     this.outboxFlush = this.outboxFlush.catch(() => {}).then(async () => {
-      const items = this.store.listPendingOutbox({ limit: 500 });
+      const highWater = this.store.pendingOutboxHighWater();
+      let cursor = 0;
       let delivered = 0;
-      for (const item of items) {
-        try {
-          await this.deliverOutbox(item);
-          delivered += 1;
-        } catch {}
+      let cancelled = 0;
+      while (cursor < highWater) {
+        const items = this.store.listPendingOutbox({ limit: 500, afterRowId: cursor, throughRowId: highWater });
+        if (!items.length) break;
+        for (const item of items) {
+          cursor = item.queue_sequence;
+          try {
+            const result = await this.deliverOutbox(item);
+            if (result?.cancelled) cancelled += 1;
+            else delivered += 1;
+          } catch {}
+        }
       }
-      return { pending: items.length - delivered, delivered };
+      return { pending: this.store.countPendingOutboxThrough(highWater), delivered, ...(cancelled ? { cancelled } : {}) };
     });
     return this.outboxFlush;
   }
@@ -2666,11 +2933,7 @@ export class CollaborationRuntime {
         role,
       },
     });
-    if (result.exhausted && sessionId) {
-      try {
-        this.registry.enqueueCommand(sessionId, { type: "terminal.interrupt", sessionId });
-      } catch {}
-    }
+    if (result.exhausted) await this.interruptBudgetAgents(run);
     void this.syncRun(runId);
   }
 
@@ -2774,24 +3037,50 @@ export class CollaborationRuntime {
     return { synced, failed };
   }
 
-  async reportUsage(runId, usageId, usage) {
-    if (!this.relayClient) return;
-    await this.relayClient.send("collaboration.usage.report", {
+  accountUsageReport(runId, usageId, usage) {
+    if (!this.relayClient) return null;
+    return {
       sourceDeviceId: this.deviceId,
       usageId: safeText(usageId, 191),
       runId,
       sampledTokens: Math.max(0, Math.floor(Number(usage.sampledTokens) || 0)),
-      amountMicros: usage.amountMicros == null ? null : Math.max(0, Math.floor(Number(usage.amountMicros) || 0)),
+      amountMicros: validUsageAmount(usage.amountMicros),
       currency: safeText(usage.currency, 3).toUpperCase(),
       costSource: safeText(usage.costSource, 32),
-    });
+    };
+  }
+
+  async deliverAccountUsage(outboxId) {
+    try {
+      const item = this.store.getOutbox(outboxId);
+      if (item?.state === "pending") await this.deliverOutbox(item);
+    } catch {
+      // Delivery failure remains in the outbox and is retried when appropriate.
+    }
   }
 
   async refreshAccountBudgetStatus() {
     if (!this.relayClient) return { accepted: false, reason: "relay_unavailable" };
-    return this.relayClient.send("collaboration.budget.status.request", {
+    const requestId = randomUUID();
+    this.accountBudgetStatusRequest = { id: requestId, blockEpoch: this.accountBudgetBlockEpoch };
+    const payload = {
       sourceDeviceId: this.deviceId,
-    });
+      requestId,
+    };
+    const response = this.relayClient.sendAcknowledged
+      ? await this.relayClient.sendAcknowledged("collaboration.budget.status.request", payload)
+      : await this.relayClient.send("collaboration.budget.status.request", payload);
+    const result = response?.data || response || {};
+    if (result.accepted === false) {
+      throw Object.assign(new Error(result.reason || "account budget status was rejected"), { code: safeText(result.reason, 96) || "COLLABORATION_BUDGET_STATUS_REJECTED" });
+    }
+    if (typeof result.budget?.blocked === "boolean") {
+      await this.handleRelayEvent({
+        type: "collaboration.budget.status", targetDeviceId: this.deviceId,
+        status_protocol: 1, request_id: requestId, blocked: result.budget.blocked,
+      });
+    }
+    return response;
   }
 
   async failFromNotification(notification, error) {

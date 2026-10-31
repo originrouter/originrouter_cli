@@ -130,6 +130,11 @@ export function buildCollaborationCapabilities({
       collaboration_event: 2,
       collaboration_attention: 1,
       capability_snapshot: 1,
+      coordinator_workspace_selection: 1,
+      collaboration_workflow_selection: 1,
+      collaboration_supervisor_selection: 1,
+      collaboration_proposal_confirmation: 1,
+      collaboration_permission_snapshots: 1,
       agent_mcp_gateway: 1,
     },
     actions: {

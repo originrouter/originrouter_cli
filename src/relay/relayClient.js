@@ -83,6 +83,14 @@ export class RelayClient {
     );
   }
 
+  async sendAcknowledged(type, payload = {}) {
+    const envelope = { type, deviceId: this.deviceId, ...payload };
+    return postJson(`${this.relayUrl}/relay/v1/messages`, {
+      target_device_id: payload.targetDeviceId || payload.deviceId || this.deviceId,
+      payload: envelope,
+    }, { authToken: this.authToken });
+  }
+
   async sendEnvelope(envelope) {
     if (!envelope || envelope.protocol !== "e2ee-v2") {
       throw new Error("invalid E2EE relay envelope");

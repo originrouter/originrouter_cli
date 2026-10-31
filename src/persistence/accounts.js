@@ -42,6 +42,10 @@ export function isAccountStateDir(stateDir) {
     && /^[a-f0-9]{64}$/i.test(basename(stateDir));
 }
 
+export function accountSelectionRoot(stateDir) {
+  return isAccountStateDir(stateDir) ? dirname(dirname(stateDir)) : stateDir;
+}
+
 export function activeAccountStateDir(stateDir) {
   // Several long-lived components pass their already-resolved account
   // directory to another account-aware helper. Keep the operation idempotent

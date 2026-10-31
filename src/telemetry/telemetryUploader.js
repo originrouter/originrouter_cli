@@ -1,4 +1,6 @@
 import { getStateDir } from "../persistence/state.js";
+import { basename, resolve } from "node:path";
+import { accountNamespace, accountSelectionRoot, activeAccountStateDir, isAccountStateDir } from "../persistence/accounts.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import { accessTokenFor, OAUTH_RESOURCES } from "../runtime/authContract.js";
 import { DEFAULT_ORIGINROUTER_CONTROL_BASE_URL } from "../config/providerRoutes.js";
@@ -40,7 +42,12 @@ export class TelemetryUploader {
     maxArchiveBytes = MAX_ARCHIVE_BYTES,
   } = {}) {
     this.queue = queue;
-    this.stateDir = stateDir;
+    // The queue is account-scoped at construction; its credentials must be
+    // resolved from that same directory even if the active account changes.
+    this.stateDir = queue?.stateDir || stateDir;
+    this.expectedAccountStateDir = queue?.stateDir || null;
+    this.accountSelectionRoot = this.expectedAccountStateDir
+      ? accountSelectionRoot(this.expectedAccountStateDir) : null;
     this.fetchFn = fetchFn;
     this.ensureFreshAccessTokenFn = ensureFreshAccessTokenFn;
     this.timeoutMs = timeoutMs;
@@ -49,13 +56,24 @@ export class TelemetryUploader {
     this.timer = null;
   }
 
+  accountContextIsCurrent(credential = null) {
+    if (!this.expectedAccountStateDir) return true;
+    if (resolve(activeAccountStateDir(this.accountSelectionRoot)) !== resolve(this.expectedAccountStateDir)) return false;
+    if (!credential) return true;
+    const expected = isAccountStateDir(this.expectedAccountStateDir)
+      ? basename(this.expectedAccountStateDir).toLowerCase() : null;
+    return accountNamespace(credential.accountScope) === expected;
+  }
+
   async request(path, { expectedAccountSessionId = "", ...options } = {}) {
     if (typeof this.fetchFn !== "function") return { ok: false, error: "fetch_unavailable" };
+    if (!this.accountContextIsCurrent()) return { ok: false, error: "account_context_changed" };
     const auth = await authForTelemetry({
       stateDir: this.stateDir,
       ensureFreshAccessTokenFn: this.ensureFreshAccessTokenFn,
     }).catch(() => null);
     if (!auth) return { ok: false, error: "login_required" };
+    if (!this.accountContextIsCurrent(auth.credential)) return { ok: false, error: "account_context_changed" };
     if (expectedAccountSessionId && auth.credential.sessionId !== expectedAccountSessionId) {
       return { ok: false, error: "account_session_changed" };
     }
@@ -72,6 +90,7 @@ export class TelemetryUploader {
         signal: controller.signal,
       });
       const data = await response.json().catch(() => ({}));
+      if (!this.accountContextIsCurrent(auth.credential)) return { ok: false, error: "account_context_changed" };
       this.accountSessionId = auth.credential.sessionId || "";
       return { ok: response.ok, status: response.status, data };
     } catch {
@@ -86,11 +105,12 @@ export class TelemetryUploader {
   }
 
   async currentAccountSessionId() {
+    if (!this.accountContextIsCurrent()) return "";
     const auth = await authForTelemetry({
       stateDir: this.stateDir,
       ensureFreshAccessTokenFn: this.ensureFreshAccessTokenFn,
     }).catch(() => null);
-    return auth?.credential?.sessionId || "";
+    return auth && this.accountContextIsCurrent(auth.credential) ? auth.credential.sessionId || "" : "";
   }
 
   async flush({ limit = 50 } = {}) {
@@ -261,6 +281,7 @@ export class TelemetryUploader {
   }
 
   async _uploadArchive(grant, built) {
+    if (!this.accountContextIsCurrent()) return { ok: false, error: "account_context_changed" };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.max(this.timeoutMs, 60_000));
     try {

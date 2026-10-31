@@ -90,11 +90,15 @@ cases.push({
     assert.equal(out.env.ANTHROPIC_BASE_URL,
       `${DEFAULT_ORIGINROUTER_BASE_URL}/coding`);
     assert.equal(out.env.ANTHROPIC_API_KEY, "or_at_coding_test");
-    assert.equal(out.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
-    // Every auxiliary family inherits the primary model when unconfigured.
-    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "claude-sonnet-4-6");
-    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "claude-sonnet-4-6");
-    assert.equal(out.env.ANTHROPIC_DEFAULT_FABLE_MODEL, "claude-sonnet-4-6");
+    // The agent is started holding the alias, not the concrete model. The
+    // per-session coding proxy substitutes the concrete model per request,
+    // so a running session's model can be changed under it.
+    assert.equal(out.env.ANTHROPIC_MODEL, MAIN_ALIAS);
+    // Every auxiliary family carries its own alias. Which concrete model
+    // that alias resolves to is the route's business, not the env's.
+    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, OPUS_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, HAIKU_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_FABLE_MODEL, FABLE_ALIAS);
     assert.equal(out.env.ANTHROPIC_SMALL_FAST_MODEL, undefined);
   },
 });
@@ -127,10 +131,13 @@ cases.push({
     const out = await buildAgentProviderEnv("claude", routed2, {
       proxyStatus: () => ({ state: "stopped" }),
     });
-    assert.equal(out.env.ANTHROPIC_MODEL, "claude-sonnet-4-6");
-    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "claude-haiku-4-5");
+    // The auxiliary slot keeps its own alias even when the route gave it a
+    // model of its own: the alias names the slot, and the gateway resolves
+    // that slot's route model per request.
+    assert.equal(out.env.ANTHROPIC_MODEL, MAIN_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, HAIKU_ALIAS);
     // Families that were not given a model still inherit main.
-    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "claude-sonnet-4-6");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_OPUS_MODEL, OPUS_ALIAS);
   },
 });
 
@@ -145,8 +152,8 @@ cases.push({
     const out = await buildAgentProviderEnv("claude", cfg, {
       proxyStatus: () => ({ state: "stopped" }),
     });
-    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "claude-sonnet-4-6");
-    assert.equal(out.env.ANTHROPIC_DEFAULT_FABLE_MODEL, "claude-sonnet-4-6");
+    assert.equal(out.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, HAIKU_ALIAS);
+    assert.equal(out.env.ANTHROPIC_DEFAULT_FABLE_MODEL, FABLE_ALIAS);
   },
 });
 
@@ -323,7 +330,7 @@ cases.push({
     assert.equal(out.source, "originrouter-coding");
     assert.equal(out.env.OPENAI_BASE_URL, "https://api.easytransnote.com/coding/v1");
     assert.equal(out.env.OPENAI_API_KEY, "or_at_coding_test");
-    assert.equal(out.env.OPENAI_MODEL, "gpt-5-codex");
+    assert.equal(out.env.OPENAI_MODEL, CODEX_MAIN_ALIAS);
   },
 });
 
