@@ -146,4 +146,66 @@ assert.throws(
   ]);
 }
 
+// The reasoning levels are the reader's own words about a model the device
+// does not know. They survive a save, they travel with a shared model, and
+// clearing them is a statement — "this one does not reason" — not an
+// omission.
+{
+  const provider = normalizeProviderModels({
+    name: "work",
+    type: "proxy",
+    models: [
+      { id: "gpt-5.4", enabled: true, remoteEnabled: true, effortLevels: ["low", "medium", "high"] },
+      { id: "plain", enabled: true, remoteEnabled: true, effortLevels: [] },
+      { id: "custom", enabled: true, remoteEnabled: true, effortLevels: [" ultra ", "ultra"] },
+    ],
+  });
+  assert.deepEqual(provider.models[0].effortLevels, ["low", "medium", "high"]);
+  assert.equal(provider.models[1].effortLevels, undefined);
+  assert.deepEqual(provider.models[2].effortLevels, ["ultra"]);
+  assert.deepEqual(remoteShareModelEntries(provider), [
+    {
+      provider: "work/gpt-5.4",
+      sourceProvider: "work",
+      model: "gpt-5.4",
+      effortLevels: ["low", "medium", "high"],
+    },
+    {
+      provider: "work/plain",
+      sourceProvider: "work",
+      model: "plain",
+    },
+    {
+      provider: "work/custom",
+      sourceProvider: "work",
+      model: "custom",
+      effortLevels: ["ultra"],
+    },
+  ]);
+
+  assert.throws(
+    () => normalizeProviderModels({
+      name: "work",
+      type: "proxy",
+      models: [{ id: "gpt-5.4", effortLevels: "low" }],
+    }),
+    /effort levels must be an array/,
+  );
+
+  // A save that clears the levels clears them: the list is replaced whole.
+  const added = addProvider({}, {
+    name: "work",
+    type: "proxy",
+    engine: "litellm",
+    litellmProvider: "openai",
+    apiKey: "sk-test",
+    models: [{ id: "gpt-5.4", effortLevels: ["low", "high"] }],
+  });
+  assert.deepEqual(added.providers["work"].models[0].effortLevels, ["low", "high"]);
+  const updated = applyProviderUpdate(added, "work", {
+    models: [{ id: "gpt-5.4", enabled: true, remoteEnabled: false, effortLevels: [] }],
+  });
+  assert.equal(updated.providers["work"].models[0].effortLevels, undefined);
+}
+
 console.log("provider model tests ok");

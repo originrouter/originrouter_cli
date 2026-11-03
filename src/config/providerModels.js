@@ -1,5 +1,7 @@
 const MAX_PROVIDER_MODELS = 256;
 const MAX_MODEL_ID_LENGTH = 512;
+const MAX_MODEL_EFFORT_LEVELS = 16;
+const MAX_EFFORT_LEVEL_LENGTH = 64;
 const PRICE_FIELDS = Object.freeze([
   "input",
   "output",
@@ -75,6 +77,41 @@ function normalizeModelId(value, { strict = true } = {}) {
   return id;
 }
 
+// The reasoning levels a model takes, as the reader wrote them.
+//
+// The device does not know what a model the reader brought with them can
+// do — only the reader does — so these are their words, kept verbatim: the
+// App sends one of them as `reasoning_effort` when the model is picked.
+// An empty list is the reader saying "this one does not reason".
+function normalizeModelEffortLevels(value, { strict = true } = {}) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) {
+    if (strict) throw new Error("model effort levels must be an array");
+    return [];
+  }
+  const levels = [];
+  const seen = new Set();
+  for (const raw of value) {
+    if (typeof raw !== "string") {
+      if (strict) throw new Error("model effort levels must be strings");
+      continue;
+    }
+    const level = raw.trim();
+    if (!level) continue;
+    if (level.length > MAX_EFFORT_LEVEL_LENGTH) {
+      if (strict) throw new Error(`model effort level exceeds ${MAX_EFFORT_LEVEL_LENGTH} characters`);
+      continue;
+    }
+    if (seen.has(level)) continue;
+    seen.add(level);
+    levels.push(level);
+    if (levels.length > MAX_MODEL_EFFORT_LEVELS) {
+      throw new Error(`model effort levels cannot exceed ${MAX_MODEL_EFFORT_LEVELS} entries`);
+    }
+  }
+  return levels;
+}
+
 export function normalizeProviderModelEntries(value, {
   strict = true,
   legacyModel = null,
@@ -105,11 +142,15 @@ export function normalizeProviderModelEntries(value, {
     const pricing = object
       ? normalizeModelPricing(object.pricing, { strict })
       : null;
+    const effortLevels = object
+      ? normalizeModelEffortLevels(object.effortLevels, { strict })
+      : [];
     entries.push({
       id,
       enabled,
       remoteEnabled,
       ...(pricing ? { pricing } : {}),
+      ...(effortLevels.length ? { effortLevels } : {}),
     });
     if (entries.length > MAX_PROVIDER_MODELS) {
       throw new Error(`provider models cannot exceed ${MAX_PROVIDER_MODELS} entries`);
@@ -171,6 +212,10 @@ export function remoteShareModelEntries(provider, { legacyRemoteEnabled = false 
       sourceProvider: provider.name,
       model: entry.id,
       ...(entry.pricing ? { pricing: entry.pricing } : {}),
+      // The levels travel with the shared model: a reader on the other
+      // side picks a level the model really takes, not one this device
+      // guessed.
+      ...(entry.effortLevels?.length ? { effortLevels: entry.effortLevels } : {}),
     }));
 }
 
