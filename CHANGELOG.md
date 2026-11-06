@@ -52,6 +52,21 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
   `availableSessionModels` — a third derivation of the same rule — is gone
   with it.
 
+### Security
+
+- **DPoP (RFC 9449): a device proves it holds the key it registered.** After
+  login the CLI registers a short-lived Ed25519 key, proves possession of it,
+  and from then on its control-plane and relay requests carry a proof signed
+  by that key instead of trusting the bearer token alone. A token copied out
+  of a log or a backup no longer buys anything on its own: the thief has no
+  private key. The registration is signed by the device's long-term E2EE key,
+  so a stolen access token cannot register a key of its own.
+
+  Nothing changes for a device that has not registered: a device that has not
+  logged in since this shipped, an older server that does not have the routes,
+  or a server whose migration has not run all keep sending bearer tokens.
+  `ORIGINROUTER_DPOP=off` turns the feature off entirely.
+
 ## 0.5.1 - 2026-10-15
 
 ### Added
