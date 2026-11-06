@@ -66,8 +66,13 @@ import { AsyncMessageQueue } from "./asyncMessageQueue.js";
 import {
   claudeEffortSettings,
   CLAUDE_EFFORT_LEVELS,
+  effortLevelsForModel,
   normalizeAgentEffort,
 } from "./agentEffort.js";
+import {
+  loadEffortCatalogue,
+  readerEffortLevels,
+} from "./modelEffortCatalog.js";
 import {
   applyLaunchSessionModel,
   clearSessionModel,
@@ -804,19 +809,77 @@ export async function runClaudeSdkSession(rawArgs) {
   // thinking off with a flag of its own, so `max` is not among them — it
   // exists only as the launch flag, and a session that is already running
   // has no way to take it.
-  const reportSessionEffort = (requestId = null, { accepted = null, reason = null } = {}) =>
-    sendAgentEvent({
+  //
+  // The list is the model's, not the runtime's: the catalogue says what the
+  // model behind the route takes, and the runtime's own vocabulary only
+  // narrows it further. A model nobody knows anything about has no levels
+  // we can offer, and the device says so rather than publishing the
+  // runtime's vocabulary as if every model could take all of it.
+  const effortCataloguePromise = (() => {
+    let promise = null;
+    return () => {
+      if (!promise) {
+        // Asked for once per session, the first time a level is needed: it
+        // is a network call, and a session that never publishes a level
+        // should not pay for it.
+        promise = loadEffortCatalogue({ stateDir }).catch(() => []);
+      }
+      return promise;
+    };
+  })();
+  // The model whose levels this session is judged by.
+  //
+  // Claude runs under a route alias, and the alias is not a model: the model
+  // behind it is named by the route, and the reader's own pick replaces it
+  // while the session runs. The levels belong to the model that answers, so
+  // they are read from that one.
+  const sessionEffortModelId = () =>
+    sessionModel?.model ||
+    providerResult.routes?.main?.model ||
+    providerResult.provider?.model ||
+    "";
+  const sessionEffortLevels = async () => {
+    const modelId = sessionEffortModelId();
+    // The reader's own words come first: a model they brought with them is
+    // a model the cloud's catalogue says nothing about, and they wrote down
+    // what it takes when they configured the provider. Then the catalogue —
+    // the same coding list the App reads.
+    const declared = readerEffortLevels(config, modelId, providerResult.provider?.name);
+    const catalogue = await effortCataloguePromise();
+    const known = declared?.length
+      ? declared
+      : effortLevelsForModel(modelId, catalogue);
+    // A model neither source knows has no levels we can offer. That is not
+    // the runtime's whole vocabulary: a level the model cannot take is a row
+    // that fails when it is tapped, and the App does not offer rows that
+    // fail.
+    if (!known?.length) return [];
+    // Only the levels this runtime can take survive, and `none` is always
+    // among them: it is the absence of thinking rather than a level of it,
+    // and the catalogue never lists it because a model that reasons still
+    // has a way to be told not to.
+    return CLAUDE_EFFORT_LEVELS.filter(
+      (level) => level === "none" || known.includes(level),
+    );
+  };
+  const reportSessionEffort = async (requestId = null, { accepted = null, reason = null } = {}) => {
+    const levels = await sessionEffortLevels();
+    await sendAgentEvent({
       type: "agent.effort.status",
       provider: "claude",
       runtime: "claude-sdk",
       sessionId,
       effort: sessionEffort,
-      effortControl: "supported",
-      availableEfforts: CLAUDE_EFFORT_LEVELS,
+      // A session whose model has no levels we know has nothing to offer:
+      // saying `supported` beside an empty list is a contradiction the App
+      // would have to resolve by guessing.
+      effortControl: levels.length ? "supported" : "unsupported",
+      availableEfforts: levels,
       requestId,
       accepted,
       reason,
     });
+  };
   const applyEffort = async (payload) => {
     const requested = normalizeAgentEffort(payload?.effort);
     if (!requested) {
@@ -826,10 +889,12 @@ export async function runClaudeSdkSession(rawArgs) {
       });
       return false;
     }
-    if (!CLAUDE_EFFORT_LEVELS.includes(requested)) {
+    const levels = await sessionEffortLevels();
+    if (!levels.includes(requested)) {
       // Refused here rather than hidden in the App: `max` is a launch flag,
-      // and accepting it would leave a session claiming an effort it does
-      // not run on.
+      // and a level the model does not take is a row that fails when it is
+      // tapped — accepting it would leave a session claiming an effort it
+      // does not run on.
       await reportSessionEffort(payload?.requestId || null, {
         accepted: false,
         reason: "effort_level_unsupported",
@@ -855,6 +920,38 @@ export async function runClaudeSdkSession(rawArgs) {
       });
       return false;
     }
+  };
+
+  // The levels move under the session when the model does.
+  //
+  // A model change replaces the model the levels were read from, and the
+  // level the reader chose can belong to a model that is no longer running.
+  // The device says so: the levels are published again, and a level the new
+  // model does not take is dropped rather than left standing on a row the
+  // App would keep offering.
+  const reconcileEffortWithModel = async () => {
+    const levels = await sessionEffortLevels();
+    if (!sessionEffort || levels.includes(sessionEffort)) {
+      await reportSessionEffort();
+      return;
+    }
+    sessionEffort = null;
+    if (queryRef) {
+      try {
+        // The level is cleared from the flag layer rather than replaced:
+        // the model that is running now is the one that decides how much
+        // thinking to do.
+        await queryRef.applyFlagSettings({
+          effortLevel: null,
+          alwaysThinkingEnabled: true,
+        });
+      } catch {
+        // The runtime refused the reset. The status still tells the truth:
+        // the session is on no level of its own, and the next turn carries
+        // whatever the model does on its own.
+      }
+    }
+    await reportSessionEffort();
   };
 
   // Per-session model selection. The agent's own model string never changes:
@@ -894,6 +991,9 @@ export async function runClaudeSdkSession(rawArgs) {
         clearSessionModel(stateDir, sessionId);
         sessionModel = null;
         await reportSessionModel(payload?.requestId || null, { accepted: true });
+        // The model the levels were read from is gone, so the levels are
+        // read again: the route's model may take a different set.
+        await reconcileEffortWithModel();
         return true;
       }
       // Refused here, not merely hidden in the App: on a transport with no
@@ -932,6 +1032,10 @@ export async function runClaudeSdkSession(rawArgs) {
       });
       sessionModel = { provider: target.provider, model: target.model };
       await reportSessionModel(payload?.requestId || null, { accepted: true });
+      // The levels belong to the model that answers, and the model just
+      // changed: the levels are read again, and a level the new model does
+      // not take is dropped rather than left standing.
+      await reconcileEffortWithModel();
       return true;
     } catch (error) {
       await reportSessionModel(payload?.requestId || null, {

@@ -125,12 +125,12 @@ import {
   withCodexTurnPermission,
 } from "./codexAppServerPrimitives.js";
 import {
-  CODEX_EFFORT_LEVELS,
   effortLevelsForModel,
   normalizeAgentEffort,
 } from "./agentEffort.js";
 import {
   loadEffortCatalogue,
+  readerEffortLevels,
 } from "./modelEffortCatalog.js";
 
 export {
@@ -360,12 +360,20 @@ export async function runCodexAppServerSession(rawArgs) {
     "";
   // The levels that model takes.
   //
-  // A model we know nothing about gets the runtime's whole vocabulary: we
-  // have no better answer, and offering every level the app-server can take
-  // is what we did before the models said otherwise.
+  // The reader's own words come first: a model they brought with them is a
+  // model the cloud's catalogue says nothing about, and they wrote down what
+  // it takes when they configured the provider. Then the catalogue — the
+  // coding list the App reads too — and then the table of what we know
+  // ourselves.
+  //
+  // A model none of them knows has no levels we can offer. That is not the
+  // runtime's whole vocabulary: a level the model cannot take is a row that
+  // fails when it is tapped, and the App does not offer rows that fail.
   const sessionEffortLevels = () => {
-    const levels = effortLevelsForModel(sessionEffortModelId(), effortCatalogue);
-    return levels.length ? levels : [...CODEX_EFFORT_LEVELS];
+    const modelId = sessionEffortModelId();
+    const declared = readerEffortLevels(config, modelId, providerResult.provider?.name);
+    if (declared?.length) return declared;
+    return effortLevelsForModel(modelId, effortCatalogue);
   };
   const invalidScopes = invalidAutonomyScopes(options.autonomyAllowedScopes);
   if (invalidScopes.length) {
@@ -564,19 +572,24 @@ export async function runCodexAppServerSession(rawArgs) {
   // send it to the model, and a model that cannot take one answers with an
   // error instead of a run. So the device publishes the levels the model
   // behind the alias actually has, and refuses the rest.
-  const reportSessionEffort = (requestId = null, { accepted = null, reason = null } = {}) =>
-    sendAgentEvent({
+  const reportSessionEffort = (requestId = null, { accepted = null, reason = null } = {}) => {
+    const levels = sessionEffortLevels();
+    return sendAgentEvent({
       type: "agent.effort.status",
       provider: "codex",
       runtime: "codex-app-server",
       sessionId,
       effort: sessionEffort,
-      effortControl: "supported",
-      availableEfforts: sessionEffortLevels(),
+      // A session whose model has no levels we know has nothing to offer:
+      // saying `supported` beside an empty list is a contradiction the App
+      // would have to resolve by guessing.
+      effortControl: levels.length ? "supported" : "unsupported",
+      availableEfforts: levels,
       requestId,
       accepted,
       reason,
     });
+  };
   const applyEffort = async (payload) => {
     const requested = normalizeAgentEffort(payload?.effort);
     if (!requested) {

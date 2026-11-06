@@ -1,29 +1,28 @@
 // The reasoning levels a model supports.
 //
-// Two sources, resolved in the order the rest of the CLI resolves things.
+// Three sources, resolved in the order the rest of the CLI resolves things.
 //
-//   1. The catalogue. Ours: a model entry in the cloud's coding catalogue
-//      carries `metadata.reasoning.effort_levels`, and the catalogue is
-//      where we say what a model can do. It wins.
-//   2. What we know ourselves. The table below is what Codex's own model
+//   1. What the reader wrote. A model they brought with them is a model the
+//      cloud says nothing about: only they know what it takes, and they
+//      wrote the levels down when they configured the provider.
+//   2. The catalogue. Ours: a model entry in the coding catalogue carries
+//      `extra_properties.reasoning.effort_levels`, and the catalogue is
+//      where we say what a model can do. It wins over what we know
+//      ourselves.
+//   3. What we know ourselves. The table below is what Codex's own model
 //      catalogue says about the models it knows, kept here so a device that
 //      cannot reach the cloud still answers with the model's own levels
 //      rather than with the runtime's whole vocabulary.
 //
-// A model neither source knows is a model whose levels we do not know. That
-// is not the same as a model with no levels: the caller says what to offer
+// A model no source knows is a model whose levels we do not know. That is
+// not the same as a model with no levels: the caller says what to offer
 // when the answer is empty, and the answer is empty only when we truly have
 // nothing to say.
 
-import { accessTokenFor, OAUTH_RESOURCES } from "./authContract.js";
 import { ensureFreshAccessToken } from "./oauthTokenRefresher.js";
-import { effortLevelsForModel, effortLevelsFromMetadata } from "./agentEffort.js";
-import { DEFAULT_ORIGINROUTER_AI_SERVER_BASE_URL } from "../config/providerRoutes.js";
-
-// The catalogue is asked for once, at session start, and the session waits
-// for it. A cloud that cannot be reached must not hold the session up for
-// long: the levels we know ourselves are enough to answer with.
-const REQUEST_TIMEOUT_MS = 5_000;
+import { effortLevelsForModel, effortLevelsFromList } from "./agentEffort.js";
+import { providerModelEntries } from "../config/providerModels.js";
+import { fetchCodingModelCatalogue } from "./codingModelCatalogue.js";
 
 // The levels Codex's own catalogue gives the models it ships with.
 //
@@ -116,101 +115,71 @@ export function knownEffortModelIds() {
   return Object.keys(CODEX_MODEL_EFFORT_LEVELS);
 }
 
-function trimBaseUrl(value) {
-  return String(value || "").replace(/\/+$/, "");
-}
-
-function nonEmptyString(value) {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-async function signedInToken({
-  stateDir,
-  resource,
-  ensureFreshAccessTokenFn = ensureFreshAccessToken,
-}) {
-  const credential = await ensureFreshAccessTokenFn({ stateDir, resource });
-  const token = accessTokenFor(credential, resource)?.token;
-  if (!token) {
-    throw new Error("OriginRouter Cloud and remote routes require `originrouter login`.");
-  }
-  return token;
-}
-
-async function requestJson(fetchFn, url, options = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  let response;
-  try {
-    response = await fetchFn(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-  let payload = null;
-  try {
-    payload = await response.json();
-  } catch {
-    // The status below is the useful, non-sensitive diagnostic.
-  }
-  if (!response.ok) {
-    const message = payload?.message || payload?.error || `request failed (${response.status})`;
-    throw new Error(String(message));
-  }
-  if (!payload || typeof payload !== "object") {
-    throw new Error("OriginRouter returned an invalid JSON response.");
-  }
-  return payload;
-}
-
 // The cloud's coding catalogue, as a list of models with their levels.
 //
-// The catalogue is asked for the same `/ai/model` list the App's model picker
-// reads, so the device and the App are looking at one list. A failure here
-// is not fatal: the levels we know ourselves are enough to answer.
+// The catalogue is the agent channel's own list — the one the API serves at
+// `/coding/v1/models` and the one the App's model picker reads — so the
+// levels the device publishes and the models the App offers come out of one
+// list. A failure here is not fatal: the levels we know ourselves are enough
+// to answer.
 export async function fetchCloudEffortCatalogue({
   stateDir,
   fetchFn = globalThis.fetch,
   env = process.env,
   ensureFreshAccessTokenFn = ensureFreshAccessToken,
 } = {}) {
-  const token = await signedInToken({
+  const catalogue = await fetchCodingModelCatalogue({
     stateDir,
-    resource: OAUTH_RESOURCES.AI,
+    fetchFn,
+    env,
     ensureFreshAccessTokenFn,
   });
-  const baseUrl = trimBaseUrl(
-    env.ORIGINROUTER_AI_SERVER_BASE_URL || DEFAULT_ORIGINROUTER_AI_SERVER_BASE_URL,
-  );
-  const payload = await requestJson(fetchFn, `${baseUrl}/ai/model`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({ v: "coding" }),
-  });
-  if (payload.code !== 1) {
-    throw new Error("OriginRouter Cloud model catalogue request was rejected.");
-  }
-  const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
-  const groups = data?.model_list;
-  if (!Array.isArray(groups)) return [];
-  const models = [];
-  const seen = new Set();
-  for (const group of groups) {
-    if (!group || typeof group !== "object" || !Array.isArray(group.models)) continue;
-    for (const entry of group.models) {
-      const id = nonEmptyString(entry?.id);
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      models.push({
-        id,
-        name: nonEmptyString(entry?.name) || id,
-        effortLevels: effortLevelsFromMetadata(entry?.metadata),
-      });
+  return catalogue.map((model) => ({
+    id: model.id,
+    name: model.name,
+    effortLevels: model.effortLevels,
+  }));
+}
+
+// The levels the reader wrote for a model of their own.
+//
+// A model the reader brought with them is a model the cloud says nothing
+// about: the catalogue lists the OriginRouter models, and this one is not
+// one of them. Only the reader knows what it takes — they wrote the levels
+// down when they configured the provider — so their words are the answer.
+//
+// The declaration belongs to a provider, because that is where it was
+// written: the same model id can sit under two providers with two different
+// answers, and the provider the session runs on is the one that answers.
+//
+// Null means there is no declaration to read. A declaration the reader
+// emptied is the same thing as none: it says "this model does not reason",
+// and a model that does not reason is a model we know nothing about, so the
+// catalogue and the table below still get their say.
+export function readerEffortLevels(config, modelId, providerName = null) {
+  const id = String(modelId || "").trim();
+  if (!id) return null;
+  const wanted = id.toLowerCase();
+  const providers = Object.entries(config?.providers || {});
+  let fallback = null;
+  for (const [name, provider] of providers) {
+    for (const entry of providerModelEntries(provider)) {
+      // The server resolves a model id without regard to case, so a
+      // declaration written as `GLM-5.3-flash` is a declaration about the
+      // model the catalogue calls `glm-5.3-flash`.
+      if (String(entry.id || "").trim().toLowerCase() !== wanted) continue;
+      if (!Array.isArray(entry.effortLevels)) continue;
+      // A level no runtime can take is dropped: it would be a row that fails
+      // when it is tapped.
+      const levels = effortLevelsFromList(entry.effortLevels);
+      if (!levels.length) continue;
+      if (providerName && (name === providerName || provider?.name === providerName)) {
+        return levels;
+      }
+      if (!fallback) fallback = levels;
     }
   }
-  return models;
+  return fallback;
 }
 
 // The catalogue the device answers with: what the cloud says, and what we

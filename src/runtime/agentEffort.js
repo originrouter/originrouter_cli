@@ -140,10 +140,17 @@ export function effortLevelsFromMetadata(metadata) {
 // `{id, metadata}`. An empty answer means the catalogue does not know this
 // model — which is a different thing from the model having no levels, and
 // the caller decides what to do about it.
+//
+// The id is matched without regard to case, because that is how the server
+// resolves a model id: a request that names `GLM-5.3-Flash` runs the model
+// the catalogue calls `glm-5.3-flash`, so the levels must be the same ones.
 export function effortLevelsForModel(modelId, catalogue) {
   const id = String(modelId || "").trim();
   if (!id || !Array.isArray(catalogue)) return [];
-  const entry = catalogue.find((item) => String(item?.id || "").trim() === id);
+  const wanted = id.toLowerCase();
+  const entry = catalogue.find(
+    (item) => String(item?.id || "").trim().toLowerCase() === wanted,
+  );
   if (!entry) return [];
   if (Array.isArray(entry.effortLevels) && entry.effortLevels.length) {
     return entry.effortLevels
@@ -169,4 +176,12 @@ function readEffortLevelList(value) {
     levels.push(level);
   }
   return levels;
+}
+
+// The levels a reader wrote, in the order they wrote them.
+//
+// A level no runtime can take is dropped: it would be a row that fails when
+// it is tapped.
+export function effortLevelsFromList(value) {
+  return readEffortLevelList(value);
 }
