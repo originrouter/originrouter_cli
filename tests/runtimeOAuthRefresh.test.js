@@ -183,3 +183,44 @@ test("forced refresh reuses a token already rotated by another request", async (
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("a bundled refresh stores every audience the answer carried", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "originrouter-refresh-bundle-"));
+  try {
+    writeCodingAuth(stateDir, expiredCodingCredential());
+    const before = readCodingAuth(stateDir);
+    const updated = await ensureFreshAccessToken({
+      stateDir,
+      resource: "originrouter.coding",
+      fetchFn: async () => ({
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            access_token: "or_at_coding_bundle",
+            refresh_token: "or_rt_bundle",
+            expires_in: 600,
+            refresh_expires_in: 2_592_000,
+            scope: "coding.invoke",
+            access_tokens: {
+              "originrouter.control": { access_token: "or_at_control_bundle", expires_in: 600 },
+              "originrouter.coding": { access_token: "or_at_coding_bundle", expires_in: 600 },
+              "originrouter.relay": { access_token: "or_at_relay_bundle", expires_in: 600 },
+            },
+          };
+        },
+      }),
+    });
+    // The token this call asked for is the one it asked for.
+    assert.equal(updated.accessTokens.coding.token, "or_at_coding_bundle");
+    // The rest of the bundle is kept, so nobody has to spend the new refresh
+    // token asking for tokens the answer already handed over.
+    assert.equal(updated.accessTokens.control.token, "or_at_control_bundle");
+    assert.equal(updated.accessTokens.relay.token, "or_at_relay_bundle");
+    // An audience the answer did not mention keeps what was already stored.
+    assert.equal(updated.accessTokens.ai.token, before.accessTokens.ai.token);
+    assert.equal(updated.refreshToken, "or_rt_bundle");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});

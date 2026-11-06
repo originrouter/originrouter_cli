@@ -57,18 +57,41 @@ export async function ensureFreshAccessToken({
       error.code = "OAUTH_RESOURCE_UNSUPPORTED";
       throw error;
     }
+    // A refresh may answer with every audience the session is allowed, not
+    // just the one this call asked for. Taking only the requested audience
+    // would throw the rest away and then ask for them again later, one
+    // request per resource — and every one of those requests spends the
+    // refresh token we just stored. Store everything the answer carried.
+    const refreshedAt = Date.now();
+    const bundled = response.access_tokens;
+    const accessTokens = { ...stored.accessTokens };
+    if (bundled && typeof bundled === "object") {
+      for (const [entry, value] of Object.entries(OAUTH_RESOURCES)) {
+        const bundleKey = entry.toLowerCase();
+        const audience = bundled[value];
+        const token = audience?.access_token;
+        if (typeof token !== "string" || !token.startsWith("or_at_")) continue;
+        accessTokens[bundleKey] = {
+          token,
+          expiresAt:
+            refreshedAt + Number(audience.expires_in || response.expires_in || 600) * 1000,
+          scopes: String(audience.scope || response.scope || "")
+            .split(" ")
+            .filter(Boolean),
+        };
+      }
+    }
+    accessTokens[key] = {
+      token: response.access_token,
+      expiresAt: refreshedAt + Number(response.expires_in || 600) * 1000,
+      scopes: String(response.scope || "").split(" ").filter(Boolean),
+    };
     const updated = {
       ...stored,
       refreshToken: response.refresh_token,
-      refreshExpiresAt: Date.now() + Number(response.refresh_expires_in || 2592000) * 1000,
-      accessTokens: {
-        ...stored.accessTokens,
-        [key]: {
-          token: response.access_token,
-          expiresAt: Date.now() + Number(response.expires_in || 600) * 1000,
-          scopes: String(response.scope || "").split(" ").filter(Boolean),
-        },
-      },
+      refreshExpiresAt:
+        Date.now() + Number(response.refresh_expires_in || 2592000) * 1000,
+      accessTokens,
     };
     writeCodingAuth(stateDir, updated);
     return updated;
