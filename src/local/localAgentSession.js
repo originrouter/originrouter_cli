@@ -93,6 +93,22 @@ import {
 import { LocalAgentBridgeClient } from "./localAgentBridgeClient.js";
 import { createTerminalOutputPump } from "./terminalOutputPump.js";
 import {
+  conversationAlreadyOpenMessage,
+  conversationSwitchBlockedMessage,
+} from "./agentConflictMessages.js";
+import { findLiveClaudeSession } from "./claudeLiveSessions.js";
+import {
+  acquireThreadLock,
+  releaseThreadLockOnExit,
+} from "./threadLock.js";
+import {
+  parseResumeArgv,
+  readHandoffNote,
+  resolveHandoverTarget,
+  rewriteResumeArgv,
+  spawnReplacementWrapper,
+} from "./sessionHandover.js";
+import {
   CLAUDE_AVAILABLE_MODES,
   CODEX_AVAILABLE_MODES,
   buildModeStatusEvent,
@@ -122,6 +138,31 @@ export async function runLocalAgentSession(agent, rawArgs) {
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
 
   const { options, passthrough } = extractOriginRouterOptions(rawArgs);
+  // A note left by the run we are replacing. It travels in the environment
+  // because the agent's own UI takes over the screen, and anything printed
+  // before it starts is scrolled away.
+  const handoffNote = readHandoffNote();
+  // A conversation that somebody else has open must not be opened again.
+  //
+  // Claude Code keeps a conversation in a single transcript file and does not
+  // lock it, so two processes writing to it at the same time fork and
+  // corrupt the history. It refuses to start a second process on a
+  // conversation that is open in a terminal — but only in its own agent
+  // picker, and only for conversations it knows about, so the check belongs
+  // here as well: this is the one place that knows which conversation is
+  // being asked for, before anything is started.
+  //
+  // The registry says which conversation somebody is sitting in; the lock
+  // says which one two of our own runs reached for at the same moment.
+  const requestedResumeId = parseResumeArgv(passthrough);
+  if (requestedResumeId) {
+    const holder = findLiveClaudeSession(requestedResumeId);
+    if (holder) {
+      process.stderr.write(`${conversationAlreadyOpenMessage({ holder })}\n`);
+      process.exitCode = 1;
+      return;
+    }
+  }
   const relayConfig = readLocalApiConfig();
   const configuredRelayUrl =
     options.relay ||
@@ -289,6 +330,21 @@ export async function runLocalAgentSession(agent, rawArgs) {
   let stopSessionHeartbeat = () => {};
   let localAgentBridge = null;
   let relayViaDaemon = false;
+  // Take the conversation id the daemon resolved for this run, if it has one.
+  //
+  // The id the runtime minted is this attempt's name, not the conversation's
+  // name: a run that resumes a conversation the catalog already holds is
+  // filed under the row that already holds it, and the label it was launched
+  // with is dropped. Without this the runtime keeps naming the attempt —
+  // the catalog moves the run onto the conversation's row, the permission
+  // tracker moves it back onto the label, and the App's rail shows one
+  // conversation once per attempt.
+  const adoptResolvedConversation = () => {
+    const resolved = String(localAgentBridge?.resolvedConversationId || "").trim();
+    if (!resolved || resolved === conversationId) return false;
+    conversationId = resolved;
+    return true;
+  };
   const autonomySupported = agent === "claude";
   const invalidScopes = invalidAutonomyScopes(options.autonomyAllowedScopes);
   if (invalidScopes.length) {
@@ -360,7 +416,88 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // Declared before `runtimeReporter` because the reporter's `nativeSessionId`
   // getter closes over it; a `let` below the reporter would be a TDZ error on
   // the first report.
-  let nativeSessionId = "";
+  // The provider's id for the conversation this run is in. A reader who
+  // named one — `--resume <id>` — has already said what it is, so the run
+  // carries it from the first moment rather than from the moment the agent
+  // announces it. The run's own id is filled in when the agent reports; if
+  // the two disagree, the agent did not resume what was asked for and the
+  // agent's word wins.
+  let nativeSessionId = requestedResumeId || "";
+  // The provider's id for the conversation this run is in, as it was when
+  // the run started. A later, different id means the agent changed
+  // conversations underneath us — `/resume`, `/branch` or `/clear` — and the
+  // run has to be closed and the other conversation opened as a new run
+  // rather than renamed.
+  let runNativeSessionId = "";
+  let conversationSwitch = null;
+  let handoverStarted = false;
+  // The pid of the agent process we started. Claude Code registers itself
+  // in `~/.claude/sessions/<pid>.json`, so the live-session registry names
+  // our own child; "is this conversation open elsewhere" has to exclude it.
+  let agentChildPid = null;
+  // The lock we hold on the conversation this run is in. One writer per
+  // conversation: Claude Code keeps a conversation in a single transcript
+  // file and does not lock it, so two runs of the same conversation at the
+  // same time fork its history.
+  let threadLock = null;
+  const observeNativeSessionId = (nextId, { transcriptPath = null } = {}) => {
+    const id = String(nextId || "").trim().slice(0, 191);
+    if (!id) return null;
+    if (!runNativeSessionId) {
+      runNativeSessionId = id;
+      nativeSessionId = id;
+      void verifyConversationOwnership(id);
+      return null;
+    }
+    if (id === runNativeSessionId) return null;
+    if (conversationSwitch) return conversationSwitch;
+    conversationSwitch = {
+      fromNativeSessionId: runNativeSessionId,
+      toNativeSessionId: id,
+      transcriptPath: transcriptPath || null,
+    };
+    return conversationSwitch;
+  };
+  // The conversation this run holds the lock on. The lock is keyed by the
+  // provider's conversation id, because that is the transcript two runs
+  // would be writing to.
+  let lockedNativeSessionId = "";
+  // Take the lock on a conversation, if we do not hold it already.
+  const claimConversation = (nativeId) => {
+    const id = String(nativeId || "").trim();
+    if (!id) return { ok: true };
+    if (lockedNativeSessionId === id) return { ok: true };
+    const lock = acquireThreadLock(id);
+    if (!lock.ok) {
+      return {
+        ok: false,
+        holder: { originrouter: true, pid: lock.holder?.pid ?? null },
+      };
+    }
+    releaseThreadLockOnExit(lock);
+    threadLock = lock;
+    lockedNativeSessionId = id;
+    return { ok: true };
+  };
+  // Check that the conversation the agent just joined is ours to write to.
+  //
+  // The registry names whoever is sitting in the conversation right now; our
+  // own agent is in it too, so it is excluded. The lock catches two of our
+  // own runs reaching for the same conversation at the same moment, which
+  // the registry cannot see because both are still starting up.
+  const verifyConversationOwnership = async (nativeId) => {
+    const claim = claimConversation(nativeId);
+    if (!claim.ok) {
+      await refuseConversationOpen({ holder: claim.holder });
+      return;
+    }
+    const holder = findLiveClaudeSession(nativeId, {
+      excludePids: agentChildPid ? [agentChildPid] : [],
+    });
+    if (holder) {
+      await refuseConversationOpen({ holder });
+    }
+  };
   // The title the agent gives the conversation, once it has one, and the
   // title this session was launched with. Neither is final until the agent
   // speaks: Claude Code writes an `ai-title` record into the transcript and
@@ -460,7 +597,12 @@ export async function runLocalAgentSession(agent, rawArgs) {
       createdAt: event.createdAt || Math.floor(Date.now() / 1000),
     };
     if (transientEvent.type === "agent.session_id" && transientEvent.sessionId) {
-      nativeSessionId = String(transientEvent.sessionId).slice(0, 191);
+      // The transcript scanner reports the conversation id it is reading.
+      // After a `/resume` that is the new conversation, so it goes through
+      // the same observer as the hook: a change of id is a change of
+      // conversation, wherever it is noticed first.
+      const switched = observeNativeSessionId(transientEvent.sessionId);
+      if (switched) void performHandover(switched);
     }
     activityLastAt = transientEvent.createdAt || activityLastAt;
     updateAgentActivitySnapshot(activitySnapshot, transientEvent);
@@ -777,7 +919,21 @@ export async function runLocalAgentSession(agent, rawArgs) {
           //
           // Collaboration workers keep their own `collab-*` prefix — that is
           // generated by `collaborationRuntime` and never reaches this function.
-          if (nextNativeSessionId) nativeSessionId = nextNativeSessionId;
+          //
+          // A *different* id is a different conversation. Claude Code fires
+          // this hook again when the reader switches conversation with
+          // `/resume`, forks with `/branch` or starts over with `/clear`, and
+          // the running process follows it to the new transcript. The old
+          // code took the new id in silence, so the run went on claiming to
+          // be the conversation it had left. The run is closed and the other
+          // conversation opened as a new run instead.
+          const switched = observeNativeSessionId(nextNativeSessionId, {
+            transcriptPath: event.transcriptPath || null,
+          });
+          if (switched) {
+            void performHandover(switched);
+            return;
+          }
           await localAgentBridge?.update({
             transcriptPath: event.transcriptPath,
             nativeSessionId,
@@ -934,6 +1090,99 @@ export async function runLocalAgentSession(agent, rawArgs) {
     activityLastAt = exitedAt;
   };
 
+  // Refuse to open a conversation that is already running.
+  //
+  // The agent is stopped first: it is writing to a transcript somebody else
+  // is writing to, and every second it keeps going makes the history harder
+  // to unpick.
+  const refuseConversationOpen = async ({ holder }) => {
+    if (handoverStarted) return;
+    handoverStarted = true;
+    try {
+      await executor.stop();
+    } catch {
+      // The agent may already be gone. The refusal stands either way.
+    }
+    await finalizeSession({ code: 1, signal: null });
+    process.stderr.write(`${conversationAlreadyOpenMessage({ holder })}\n`);
+    process.exitCode = 1;
+  };
+
+  // Hand the terminal over to another conversation.
+  //
+  // The reader switched conversation inside the agent's own UI: `/resume`,
+  // `/branch` or `/clear`. The agent has already moved to the new
+  // conversation, so this run is over. It must not go on claiming to be the
+  // conversation it left, and it must not go on writing to a transcript that
+  // another run may be holding.
+  //
+  // Closing this run and opening the other one as a new run is the honest
+  // shape of what happened, and re-executing the wrapper is the cheap way to
+  // do it: a fresh wrapper mints its own session id and resolves its own
+  // conversation, and neither of those can be done from inside a running
+  // wrapper — its session id is captured by value in a dozen places.
+  //
+  // The reader does not have to do anything: the terminal comes back with
+  // the other conversation already open.
+  const performHandover = async (switchInfo) => {
+    if (handoverStarted) return;
+    handoverStarted = true;
+    const { fromNativeSessionId, toNativeSessionId } = switchInfo;
+
+    // The agent is writing to the new conversation right now. Stop it before
+    // it writes any more.
+    try {
+      await executor.stop();
+    } catch {
+      // The agent may already be gone; the handover goes on either way.
+    }
+
+    // Close this run, so the App sees it end rather than keep a live dot on
+    // a run whose process has gone.
+    await finalizeSession({ code: 0, signal: "SIGTERM" });
+
+    // The conversation the reader asked for may be open somewhere else. We
+    // cannot open it too, so we go back to the one they came from.
+    const holder = findLiveClaudeSession(toNativeSessionId, {
+      excludePids: agentChildPid ? [agentChildPid] : [],
+    });
+    const target = resolveHandoverTarget({
+      fromNativeSessionId,
+      toNativeSessionId,
+      transcriptPath: switchInfo.transcriptPath,
+      cwd,
+      holder,
+    });
+
+    const note = target.reason === "target-open"
+      ? conversationSwitchBlockedMessage({ holder: target.holder })
+      : "";
+
+    // The replacement stays in this process group. A detached child would get
+    // its own group, and the terminal's foreground group — the one holding
+    // the keyboard — would be gone.
+    //
+    // The terminal is handed over already restored: `finalizeSession` has
+    // run `cleanup()`, which puts the line discipline back. Node saves the
+    // mode it finds on the first `setRawMode(true)`, so a replacement that
+    // inherited raw mode would restore raw mode when it exited and leave the
+    // reader's shell unusable.
+    const child = spawnReplacementWrapper({
+      argv: rewriteResumeArgv(
+        process.argv.slice(2),
+        target.resumeNativeSessionId,
+      ),
+      note,
+    });
+    child.on("error", (error) => {
+      process.stderr.write(`[originrouter] ${error.message}\n`);
+      process.exit(1);
+    });
+    child.on("exit", (code) => {
+      process.exit(code ?? 0);
+    });
+  };
+
   if (typeof adapter.beforeStart === "function") {
     await adapter.beforeStart({
       cwd,
@@ -990,6 +1239,10 @@ export async function runLocalAgentSession(agent, rawArgs) {
     // it here means every sync carries the newest name, however often it
     // happens.
     refreshAgentTitle();
+    // A later report may have told the daemon which conversation this run
+    // holds. Take it before the snapshot is built, so the report names the
+    // conversation.
+    adoptResolvedConversation();
     const snapshot = {
       conversationId,
       agentType: agent,
@@ -1028,6 +1281,10 @@ export async function runLocalAgentSession(agent, rawArgs) {
     await localAgentBridge?.update({ title: sessionTitle() });
     await syncCatalog("running");
   };
+  if (handoffNote) {
+    process.stderr.write(`${handoffNote}\n`);
+  }
+
   const started = await executor.start({
     command: launch.command,
     args: launch.args,
@@ -1043,6 +1300,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
       }
     },
     onExit: ({ code, signal }) => {
+      // The handover stopped the agent on purpose and is closing the run
+      // itself; this path would exit the process out from under it.
+      if (handoverStarted) return;
       terminalOutputPump.flush();
       process.exitCode = code ?? (signal ? 1 : 0);
       Promise.race([
@@ -1067,6 +1327,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
       console.error(error.message);
     },
   });
+  agentChildPid = started.pid ?? null;
 
   send("session.started", {
     command: launch.command,
@@ -1154,6 +1415,15 @@ export async function runLocalAgentSession(agent, rawArgs) {
     conversationId,
     runId: options.runId || sessionId,
     agent,
+    // The conversation the reader asked for, when they named one. It is the
+    // provider's own id for that conversation, and it is known before the
+    // agent has started — so the run can be filed under the conversation it
+    // is about to resume instead of under a row of its own.
+    //
+    // Without it, every resume minted a second row for the same
+    // conversation, and the App's rail showed that conversation once per
+    // attempt.
+    nativeSessionId: requestedResumeId || "",
     title: sessionTitle(),
     titleIsCustom: Boolean(requestedTitle && !agentTitle),
     deviceId: effectiveDeviceId,
@@ -1203,6 +1473,10 @@ export async function runLocalAgentSession(agent, rawArgs) {
         ? adapter.getTranscriptPath()
         : null,
   });
+  // The daemon's catalog knows which conversation this run belongs to. Take
+  // its word for it before anything is reported, so the first report already
+  // names the conversation and not the attempt.
+  adoptResolvedConversation();
   controlReady = true;
   void syncCatalog("running");
   stopSessionHeartbeat = startAgentSessionHeartbeat({

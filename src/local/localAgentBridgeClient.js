@@ -59,6 +59,11 @@ export class LocalAgentBridgeClient {
     this.flushingEvents = false;
     this.maxPendingEvents = 256;
     this.closed = false;
+    // What the daemon last said about this session. The daemon's catalog may
+    // know the conversation this run belongs to — a resumed conversation is
+    // the row that already holds it — and the run has to be told, so the
+    // device and the cloud name the same conversation.
+    this.registeredSession = null;
   }
 
   get connected() {
@@ -91,12 +96,13 @@ export class LocalAgentBridgeClient {
     const endpoint = this.endpointProvider(this.stateDir);
     if (!endpoint) return false;
     try {
-      await request(
+      const registered = await request(
         endpoint,
         "POST",
         "/agent/local/sessions/register",
         this.sessionMetadata,
       );
+      this.adoptRegisteredSession(registered);
       this.setEndpoint(endpoint);
       // Delivered requests are no longer in the outbox, but can still be
       // waiting in the native terminal when the daemon loses its memory.
@@ -131,17 +137,35 @@ export class LocalAgentBridgeClient {
     this.sessionMetadata = { ...this.sessionMetadata, ...payload };
     if (this.closed || !(await this.connect())) return false;
     try {
-      await request(
+      const updated = await request(
         this.endpoint,
         "POST",
         `/agent/local/sessions/${encodeURIComponent(this.sessionId)}/update`,
         payload,
       );
+      this.adoptRegisteredSession(updated);
       return true;
     } catch {
       this.setEndpoint(null);
       return false;
     }
+  }
+
+  // The daemon answers with the session as it now stands. Its catalog may
+  // have folded this run into the row of the conversation it belongs to —
+  // a resumed conversation is the row that already holds it — and the
+  // runtime has to be told, or it keeps naming the attempt instead of the
+  // conversation.
+  adoptRegisteredSession(response) {
+    const session = response?.session || response?.data?.session || null;
+    if (!session || typeof session !== "object") return null;
+    this.registeredSession = session;
+    return session;
+  }
+
+  // The conversation the daemon resolved for this run, when it knows one.
+  get resolvedConversationId() {
+    return String(this.registeredSession?.conversation_id || "").trim();
   }
 
   async sendEvent(event) {
