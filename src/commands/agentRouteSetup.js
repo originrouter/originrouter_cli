@@ -59,26 +59,60 @@ export const RECOMMENDED_CLOUD_MODELS = Object.freeze({
   ]),
 });
 
-// Fresh installations use these exact route values. The ordered lists above
-// are still used only by an explicit `agent setup --cloud`, which can adapt
-// to models currently available to the signed-in account.
+// The models a low-tier account may name.
+//
+// The cloud cuts the catalogue a free or go account receives down to this
+// set, so it is not a guess about what such an account can run: it is the
+// set the request path accepts without downgrading. The order is the order
+// we would rather run them in — the cheapest capable model first.
+//
+// This list is the last fallback, not a preference. An account that can run
+// a paid model never reaches it: the preferences above and the family
+// fallback come first, and a paid Claude model beats a cheap DeepSeek on
+// every account that has one.
+export const LOW_TIER_CLOUD_MODELS = Object.freeze([
+  "deepseek-v4.1-flash",
+  "MiniMax-M3.1-Flash",
+  "gpt-6-luna",
+  "gemini-3.8-flash",
+  "gemini-3.5-flash-lite",
+  "glm-5.3-flash",
+  "composer-2.5",
+]);
+
+// The models are matched without regard to case.
+//
+// The server resolves a model id without regard to case too — a request that
+// names `GLM-5.3-Flash` runs the model the catalogue calls `glm-5.3-flash` —
+// so the device must pick the same model the server would.
+function sameModel(left, right) {
+  return String(left || "").trim().toLowerCase() === String(right || "").trim().toLowerCase();
+}
 
 function firstAvailable(models, preferences, family, fallback = null) {
   for (const id of preferences) {
-    const match = models.find((model) => model.id === id);
+    const match = models.find((model) => sameModel(model?.id, id));
     if (match) return match;
   }
-  return models.find((model) => family(model.id)) || fallback;
+  return models.find((model) => family(model?.id)) || fallback;
 }
 
 export function recommendedCloudRouteModels(models) {
   if (!Array.isArray(models) || models.length === 0) {
     throw new Error("No OriginRouter Cloud coding models are available for this account.");
   }
+  // The last resort: the models a free or go account may name. The catalogue
+  // such an account receives holds nothing else, so this is where it lands —
+  // on a model its requests really run.
+  const lowTier =
+    LOW_TIER_CLOUD_MODELS.map((id) =>
+      models.find((model) => sameModel(model?.id, id)),
+    ).find(Boolean) || null;
   const claudeMain = firstAvailable(
     models,
     RECOMMENDED_CLOUD_MODELS.claudeMain,
-    (id) => id.startsWith("claude-"),
+    (id) => String(id || "").toLowerCase().startsWith("claude-"),
+    lowTier,
   );
   // The auxiliary families inherit the primary model, except Haiku: it is the
   // cheap model a device answers its small tasks with, so it is resolved
@@ -86,13 +120,17 @@ export function recommendedCloudRouteModels(models) {
   const claudeHaiku = firstAvailable(
     models,
     RECOMMENDED_CLOUD_MODELS.claudeHaiku,
-    (id) => id.includes("haiku"),
+    (id) => String(id || "").toLowerCase().includes("haiku"),
     claudeMain,
   );
   const codexMain = firstAvailable(
     models,
     RECOMMENDED_CLOUD_MODELS.codexMain,
-    (id) => id.startsWith("gpt-") || id.includes("codex"),
+    (id) => {
+      const text = String(id || "").toLowerCase();
+      return text.startsWith("gpt-") || text.includes("codex");
+    },
+    lowTier,
   );
   if (!claudeMain || !codexMain) {
     throw new Error(
@@ -166,11 +204,52 @@ export function applyRecommendedCloudRoutes(config, models) {
   return applyCloudRoutes(config, recommendedCloudRouteModels(models));
 }
 
-export function applyDefaultCloudRoutes(config = {}) {
-  return applyCloudRoutes(config, {
+// The routes a device starts on when it has none of its own.
+//
+// The selection is what the catalogue answered for this account; without one
+// the bundled defaults are used. The bundled defaults are paid models, so an
+// account that cannot run them is answered by the catalogue instead — the
+// whole point of asking it.
+export function applyDefaultCloudRoutes(config = {}, selection = null) {
+  return applyCloudRoutes(config, selection || {
     claudeMain: { id: DEFAULT_CLOUD_ROUTE_MODELS.claudeMain },
     claudeHaiku: { id: DEFAULT_CLOUD_ROUTE_MODELS.claudeHaiku },
     codexMain: { id: DEFAULT_CLOUD_ROUTE_MODELS.codexMain },
+  });
+}
+
+// The route slots one agent answers with.
+//
+// A selection is what the catalogue answered for this account, so the slots
+// are the models that account may really run. Without one the device's
+// bundled profile answers.
+function routeSlotsFor(agent, selection = null) {
+  if (!selection) return defaultRouteSlots(agent);
+  if (agent === "claude") {
+    return {
+      main: selection.claudeMain.id,
+      ...(selection.claudeHaiku ? { haiku: selection.claudeHaiku.id } : {}),
+    };
+  }
+  if (agent === "codex") return { main: selection.codexMain.id };
+  return {};
+}
+
+// The agents that have no route at all.
+//
+// An agent with no route leaves the alias map with no initial value, and the
+// session with no model to start on. This is the check that decides whether
+// anything has to be filled in, and it is cheap enough to run on every
+// command.
+//
+// A device that asked for the native environment is never missing anything:
+// the answer it gave is that OriginRouter does not speak for its agents.
+export function agentsMissingRoutes(config) {
+  const cfg = config || {};
+  if (cfg.agentRouteMode === AGENT_ROUTE_MODE_NATIVE) return [];
+  return ROUTE_AGENTS.filter((agent) => {
+    const routes = getAgentRoutes(cfg, agent);
+    return !ROUTE_DEFS[agent].slots.some((slot) => routes[slot]);
   });
 }
 
@@ -191,16 +270,14 @@ export function applyDefaultCloudRoutes(config = {}) {
 //     own agents' environment; a Cloud route it cannot use is worse than no
 //     route at all.
 //   - a device that asked for the native environment keeps that answer.
-export function carryOverDefaultRoutes(config, { hasCredential = false } = {}) {
+//   - the models are the ones this account may really run. The catalogue is
+//     cut to the account's tier, so a selection answers with models the
+//     requests will run on, and the device does not name a paid model an
+//     account cannot afford.
+export function carryOverDefaultRoutes(config, { hasCredential = false, selection = null } = {}) {
   const cfg = config || {};
   if (!hasCredential) return { config: cfg, changed: false };
-  if (cfg.agentRouteMode === AGENT_ROUTE_MODE_NATIVE) {
-    return { config: cfg, changed: false };
-  }
-  const missing = ROUTE_AGENTS.filter((agent) => {
-    const routes = getAgentRoutes(cfg, agent);
-    return !ROUTE_DEFS[agent].slots.some((slot) => routes[slot]);
-  });
+  const missing = agentsMissingRoutes(cfg);
   if (missing.length === 0) return { config: cfg, changed: false };
 
   let next = cfg;
@@ -215,12 +292,12 @@ export function carryOverDefaultRoutes(config, { hasCredential = false } = {}) {
     next = addProvider(next, {
       name: providerName,
       type: "originrouter",
-      model: DEFAULT_CLOUD_ROUTE_MODELS.claudeMain,
+      model: selection ? selection.claudeMain.id : DEFAULT_CLOUD_ROUTE_MODELS.claudeMain,
       auth: { type: "oauth" },
     });
   }
   for (const agent of missing) {
-    const slots = defaultRouteSlots(agent);
+    const slots = routeSlotsFor(agent, selection);
     if (!slots.main) continue;
     next = replaceAgentRoutes(next, agent, {
       main: { provider: providerName, model: slots.main },
@@ -231,17 +308,40 @@ export function carryOverDefaultRoutes(config, { hasCredential = false } = {}) {
   return { config: next, changed: true, carried: missing };
 }
 
-// A missing config.json is the first-install marker: the bundled defaults are
-// written once. Once it exists, the person's routes are preserved — but an
-// agent with no route at all still gets the device default, so an upgrade
-// never leaves a device without a model to start on.
-export function initializeDefaultCloudRoutes({
+// What the catalogue says this account's routes should be.
+//
+// The catalogue is cut to the account's tier, so its answer names the models
+// the requests will really run on. It costs a request, so it is asked only
+// when a route has to be written — and a failure is not fatal: the bundled
+// defaults still leave the agent with a model to start on, which is better
+// than no route at all.
+async function catalogueSelection({ stateDir, hasCredential, loadCloudModelsFn }) {
+  if (!hasCredential) return null;
+  try {
+    const models = await loadCloudModelsFn({ stateDir });
+    return recommendedCloudRouteModels(models);
+  } catch {
+    return null;
+  }
+}
+
+// A missing config.json is the first-install marker: the defaults are written
+// once. Once it exists, the person's routes are preserved — but an agent with
+// no route at all still gets the device default, so an upgrade never leaves a
+// device without a model to start on.
+//
+// Which models those defaults name is the catalogue's answer, not ours: the
+// bundled profile is paid models, and writing them into a free account's
+// config makes the device name a model the account's requests will never run.
+// Before login there is no account to ask about, so the bundled profile stands.
+export async function initializeDefaultCloudRoutes({
   stateDir,
   existsFn = existsSync,
   writeConfigFn = writeConfig,
   activeAccountStateDirFn = activeAccountStateDir,
   readConfigFn = readConfig,
   hasCredentialFn = readCodingAuth,
+  loadCloudModelsFn = loadCloudModels,
 } = {}) {
   if (!stateDir) throw new Error("stateDir is required to initialize default Agent routes");
   // Route configuration is account-scoped after login. Checking only the
@@ -252,14 +352,19 @@ export function initializeDefaultCloudRoutes({
   // required. Before login, activeAccountStateDir() naturally resolves to the
   // root state directory, preserving first-install behaviour.
   const configStateDir = activeAccountStateDirFn(stateDir);
+  const hasCredential = Boolean(hasCredentialFn(stateDir));
   if (!existsFn(join(configStateDir, "config.json"))) {
-    const result = applyDefaultCloudRoutes();
+    const selection = await catalogueSelection({ stateDir, hasCredential, loadCloudModelsFn });
+    const result = applyDefaultCloudRoutes({}, selection);
     writeConfigFn(result.config);
     return { status: "initialized", ...result };
   }
-  const carried = carryOverDefaultRoutes(readConfigFn(), {
-    hasCredential: Boolean(hasCredentialFn(stateDir)),
-  });
+  const config = readConfigFn();
+  // Nothing is missing, so nothing is asked: this runs on every command, and
+  // a device with a complete route table must not wait on the network for it.
+  if (agentsMissingRoutes(config).length === 0) return { status: "existing" };
+  const selection = await catalogueSelection({ stateDir, hasCredential, loadCloudModelsFn });
+  const carried = carryOverDefaultRoutes(config, { hasCredential, selection });
   if (!carried.changed) return { status: "existing" };
   writeConfigFn(carried.config);
   return { status: "carried", ...carried };

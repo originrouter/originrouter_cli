@@ -1400,10 +1400,18 @@ export async function main(argv) {
     return;
   }
 
-  // Seed bundled Cloud defaults once for a fresh CLI state. It is a strict
-  // no-op once config.json exists, so later logins and upgrades never revisit
-  // a person's route choices.
-  initializeDefaultCloudRoutes({ stateDir: ensureStateDir() });
+  // Seed the Cloud defaults once for a fresh CLI state. It is a strict no-op
+  // once config.json has a route table, so later logins and upgrades never
+  // revisit a person's route choices. The models are the catalogue's answer
+  // for this account — a free account gets the models its requests really
+  // run — so the seeding waits for it; the catalogue is asked only when
+  // there is something to write.
+  try {
+    await initializeDefaultCloudRoutes({ stateDir: ensureStateDir() });
+  } catch {
+    // A route table that cannot be seeded is not a reason to fail the
+    // command the person actually ran.
+  }
 
   if (command === "status") {
     const stateDir = ensureStateDir();
