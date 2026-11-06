@@ -254,3 +254,55 @@ test("reconnect restores a delivered native request, but not a finished request"
     globalThis.fetch = originalFetch;
   }
 });
+
+test("the daemon's resolved conversation reaches the runtime", async () => {
+  // The daemon's catalog may know the conversation this run belongs to: a
+  // resumed conversation is the row that already holds it. The runtime has
+  // to be told, or it keeps naming the attempt — and the App's rail shows
+  // one conversation once per attempt.
+  const originalFetch = globalThis.fetch;
+  const endpoint = { baseUrl: "http://127.0.0.1:7437", token: "test" };
+  globalThis.fetch = async (url) => {
+    if (url.endsWith("/register")) {
+      return new Response(JSON.stringify({
+        session: { session_id: "resumed", conversation_id: "conversation-first" },
+      }), { status: 200 });
+    }
+    if (url.endsWith("/update")) {
+      return new Response(JSON.stringify({
+        session: { session_id: "resumed", conversation_id: "conversation-first" },
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+  const client = new LocalAgentBridgeClient({
+    stateDir: "/tmp/originrouter-resolved-conversation-test", sessionId: "resumed",
+    endpointProvider: () => endpoint,
+  });
+  try {
+    await client.start({ sessionId: "resumed", conversationId: "conversation-attempt" });
+    assert.equal(client.resolvedConversationId, "conversation-first");
+    await client.update({ status: "running" });
+    assert.equal(client.resolvedConversationId, "conversation-first");
+  } finally {
+    await client.close();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a daemon that names no conversation leaves the runtime's own label alone", async () => {
+  const originalFetch = globalThis.fetch;
+  const endpoint = { baseUrl: "http://127.0.0.1:7437", token: "test" };
+  globalThis.fetch = async () => new Response(JSON.stringify({ ok: true }), { status: 200 });
+  const client = new LocalAgentBridgeClient({
+    stateDir: "/tmp/originrouter-no-resolved-conversation-test", sessionId: "plain",
+    endpointProvider: () => endpoint,
+  });
+  try {
+    await client.start({ sessionId: "plain", conversationId: "conversation-attempt" });
+    assert.equal(client.resolvedConversationId, "");
+  } finally {
+    await client.close();
+    globalThis.fetch = originalFetch;
+  }
+});
