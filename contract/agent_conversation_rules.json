@@ -1,0 +1,163 @@
+{
+  "contract_version": "2026-11-06.1",
+  "about": [
+    "The rules that decide what a conversation is called, and which row holds it.",
+    "",
+    "Three implementations keep them: the server (a Python rule and a MySQL CASE),",
+    "the CLI (a JavaScript rule and a SQLite CASE), and the App (a Dart rule).",
+    "They were written separately and they drifted. This file is the one place the",
+    "cases live; each repository holds a copy and a test that checks its own",
+    "implementation against it. The copies are pinned by checksum, so a change to",
+    "the cases has to be made in every repository at once.",
+    "",
+    "What is in here, and who answers it:",
+    "",
+    "  placeholders  - which titles mean \"we have no name\". The server, the CLI",
+    "                 and the App all answer it.",
+    "  title_merges - which title a row keeps when a report arrives. The server",
+    "                 and the CLI answer it; the App does not write titles.",
+    "  survivors    - which row of a group of rows holds the conversation. The",
+    "                 server and the CLI answer it; the App never picks a row.",
+    "",
+    "The cases are well-formed. A report that carries the custom flag with no title",
+    "is not one of them: the flag describes a name, and a report with no name has",
+    "no flag. The three implementations disagreed about that one shape and none of",
+    "them can be reached by a report a device sends, so the server and the CLI",
+    "normalise it away at the boundary instead of answering it here."
+  ],
+  "placeholders": [
+    {"agent_type": "claude", "title": "agent session", "is_placeholder": true},
+    {"agent_type": "claude", "title": "Agent Session", "is_placeholder": true},
+    {"agent_type": "claude", "title": "  agent session  ", "is_placeholder": true},
+    {"agent_type": "claude", "title": "claude session", "is_placeholder": true},
+    {"agent_type": "claude", "title": "Claude Session", "is_placeholder": true},
+    {"agent_type": "claude", "title": "claude code", "is_placeholder": true},
+    {"agent_type": "claude", "title": "Claude Code", "is_placeholder": true},
+    {"agent_type": "claude", "title": "claude", "is_placeholder": true},
+    {"agent_type": "claude", "title": "CLAUDE", "is_placeholder": true},
+    {"agent_type": "codex", "title": "codex session", "is_placeholder": true},
+    {"agent_type": "codex", "title": "Codex Code", "is_placeholder": true},
+    {"agent_type": "codex", "title": "codex", "is_placeholder": true},
+    {"agent_type": "claude", "title": "codex session", "is_placeholder": false},
+    {"agent_type": "claude", "title": "Codex", "is_placeholder": false},
+    {"agent_type": "claude", "title": "Refactor the parser", "is_placeholder": false},
+    {"agent_type": "claude", "title": "我的会话", "is_placeholder": false},
+    {"agent_type": "claude", "title": "agent session extra", "is_placeholder": false},
+    {"agent_type": "codex", "title": "claude session", "is_placeholder": false}
+  ],
+  "title_merges": [
+    {
+      "name": "the report wins between two names",
+      "existing": {"title": "Refactor the parser", "is_custom": false, "agent_type": "claude"},
+      "incoming": {"title": "Fix checkout callback", "is_custom": false, "agent_type": "claude"},
+      "expected": {"title": "Fix checkout callback", "is_custom": false}
+    },
+    {
+      "name": "a name somebody chose is never replaced by an automatic one",
+      "existing": {"title": "My name", "is_custom": true, "agent_type": "claude"},
+      "incoming": {"title": "Agent produced", "is_custom": false, "agent_type": "claude"},
+      "expected": {"title": "My name", "is_custom": true}
+    },
+    {
+      "name": "a name somebody chose is replaced by a newer one somebody chose",
+      "existing": {"title": "My name", "is_custom": true, "agent_type": "claude"},
+      "incoming": {"title": "Another name", "is_custom": true, "agent_type": "claude"},
+      "expected": {"title": "Another name", "is_custom": true}
+    },
+    {
+      "name": "a placeholder never displaces a name",
+      "existing": {"title": "Refactor the parser", "is_custom": false, "agent_type": "claude"},
+      "incoming": {"title": "claude session", "is_custom": false, "agent_type": "claude"},
+      "expected": {"title": "Refactor the parser", "is_custom": false}
+    },
+    {
+      "name": "the agent's own name never displaces a name",
+      "existing": {"title": "Refactor the parser", "is_custom": false, "agent_type": "claude"},
+      "incoming": {"title": "Claude Code", "is_custom": false, "agent_type": "claude"},
+      "expected": {"title": "Refactor the parser", "is_custom": false}
+    },
+    {
+      "name": "a name displaces a placeholder",
+      "existing": {"title": "claude session", "is_custom": false, "agent_type": "claude"},
+      "incoming": {"title": "Fix the parser", "is_custom": false, "agent_type": "claude"},
+      "expected": {"title": "Fix the parser", "is_custom": false}
+    },
+    {
+      "name": "a report with no title changes nothing",
+      "existing": {"title": "Real name", "is_custom": false, "agent_type": "claude"},
+      "incoming": {"title": "", "is_custom": false, "agent_type": "claude"},
+      "expected": {"title": "Real name", "is_custom": false}
+    },
+    {
+      "name": "a report with a name fills an empty title",
+      "existing": {"title": "", "is_custom": false, "agent_type": "claude"},
+      "incoming": {"title": "Fix the parser", "is_custom": false, "agent_type": "claude"},
+      "expected": {"title": "Fix the parser", "is_custom": false}
+    },
+    {
+      "name": "a person may choose a name that looks like our default",
+      "existing": {"title": "Real name", "is_custom": false, "agent_type": "claude"},
+      "incoming": {"title": "Claude Code", "is_custom": true, "agent_type": "claude"},
+      "expected": {"title": "Claude Code", "is_custom": true}
+    },
+    {
+      "name": "a placeholder replaces a placeholder",
+      "existing": {"title": "claude session", "is_custom": false, "agent_type": "claude"},
+      "incoming": {"title": "agent session", "is_custom": false, "agent_type": "claude"},
+      "expected": {"title": "agent session", "is_custom": false}
+    },
+    {
+      "name": "the agent types are judged by their own set",
+      "existing": {"title": "codex session", "is_custom": false, "agent_type": "codex"},
+      "incoming": {"title": "Claude Code", "is_custom": false, "agent_type": "claude"},
+      "expected": {"title": "Claude Code", "is_custom": false}
+    },
+    {
+      "name": "another agent's name is a name here",
+      "existing": {"title": "Codex", "is_custom": false, "agent_type": "claude"},
+      "incoming": {"title": "claude session", "is_custom": false, "agent_type": "claude"},
+      "expected": {"title": "Codex", "is_custom": false}
+    },
+    {
+      "name": "the same name twice",
+      "existing": {"title": "Real name", "is_custom": false, "agent_type": "claude"},
+      "incoming": {"title": "Real name", "is_custom": false, "agent_type": "claude"},
+      "expected": {"title": "Real name", "is_custom": false}
+    }
+  ],
+  "survivors": [
+    {
+      "name": "the row that was last active",
+      "rows": [
+        {"conversation_id": "c1", "last_activity_at": 100},
+        {"conversation_id": "c2", "last_activity_at": 200}
+      ],
+      "expected": "c2"
+    },
+    {
+      "name": "a tie goes to the smallest id",
+      "rows": [
+        {"conversation_id": "c1", "last_activity_at": 100},
+        {"conversation_id": "c2", "last_activity_at": 100}
+      ],
+      "expected": "c1"
+    },
+    {
+      "name": "a tie goes to the smallest id, whichever order they come back in",
+      "rows": [
+        {"conversation_id": "c2", "last_activity_at": 100},
+        {"conversation_id": "c1", "last_activity_at": 100}
+      ],
+      "expected": "c1"
+    },
+    {
+      "name": "the newest of three",
+      "rows": [
+        {"conversation_id": "c1", "last_activity_at": 50},
+        {"conversation_id": "c2", "last_activity_at": 100},
+        {"conversation_id": "c3", "last_activity_at": 75}
+      ],
+      "expected": "c2"
+    }
+  ]
+}

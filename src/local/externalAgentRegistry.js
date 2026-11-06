@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { defaultConversationTitle } from "../agent/agentTitleSource.js";
+import { defaultConversationTitle, looksLikePlaceholderTitle } from "../agent/agentTitleSource.js";
 import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
 
 import { readClaudeConversationHistory } from "../runtime/claudeConversationHistory.js";
@@ -105,6 +105,29 @@ function turnStateForEvent(event, fallback = "unknown") {
     return fallback === "idle" ? "idle" : "running";
   }
   return fallback;
+}
+
+// Whether a run now holds a different conversation than it did.
+//
+// The provider's own id is what says which conversation this is: our own
+// conversation id is minted per launch, so it cannot. The label the runtime
+// sends is the label of the run, and it can change under the run — the
+// catalog finds the row that already holds this conversation and moves the
+// run onto it — without the reader going anywhere.
+//
+// So the provider's id decides whenever both sides know it. The label
+// decides only when it is the only evidence there is: the run is learning
+// which conversation it is in, or neither side knows the provider's id. A
+// payload that says nothing about the conversation is not evidence of a
+// change.
+function conversationChangedFor(session, payload = {}) {
+  const native = safeText(payload.nativeSessionId, 191);
+  const held = safeText(session?.nativeSessionId, 191);
+  if (native && held) return native !== held;
+  if (held && !native) return false;
+  const label = safeText(payload.conversationId, 96);
+  const heldLabel = safeText(session?.conversationLabel, 96);
+  return Boolean(label && heldLabel && label !== heldLabel);
 }
 
 // Turn activity is latched by turn events alone (see `turnStateForEvent`).
@@ -226,11 +249,12 @@ export class ExternalAgentRegistry {
     if (!sessionId) throw new Error("sessionId is required");
     const existing = this.sessions.get(sessionId);
     const incomingConversationId = safeText(payload?.conversationId, 96);
-    const conversationChanged = Boolean(
-      existing &&
-        incomingConversationId &&
-        incomingConversationId !== existing.conversationId,
-    );
+    const conversationChanged = existing
+      ? conversationChangedFor(existing, {
+        conversationId: incomingConversationId,
+        nativeSessionId: payload?.nativeSessionId,
+      })
+      : false;
     const session = {
       sessionId,
       sessionKind: existing?.sessionKind === "collaboration"
@@ -250,6 +274,14 @@ export class ExternalAgentRegistry {
       conversationId:
         incomingConversationId ||
         existing?.conversationId ||
+        sessionId,
+      // The label the runtime named. It is the label of this run, and it is
+      // kept apart from the conversation's own id: the catalog may find the
+      // row that already holds this conversation and move the run onto it,
+      // and the label then changes without the reader going anywhere.
+      conversationLabel:
+        incomingConversationId ||
+        existing?.conversationLabel ||
         sessionId,
       nativeSessionId:
         safeText(payload?.nativeSessionId, 191) ||
@@ -387,13 +419,33 @@ export class ExternalAgentRegistry {
       const existingConversation = this.catalog?.listConversations?.({
         conversationId: session.conversationId, includeArchived: true, limit: 1,
       })?.[0];
-      this.catalog?.upsertSession({
+      const conversation = this.catalog?.upsertSession({
         ...payload, sessionKind: session.sessionKind,
         // A registration can carry an old launch title across reconnects.
         // It may name a new conversation, but it cannot undo a later rename.
         titleIsCustom: payload.titleIsCustom === true && !existingConversation?.title_is_custom,
       });
-    } catch {}
+      // The catalog may know a better label for this conversation: a
+      // resumed conversation is the row that already holds it, and every run
+      // of one conversation carries the same id.
+      //
+      // The label is not the identity — the provider's id is — so a label
+      // that changes here is not the reader switching conversation, and the
+      // run keeps the history it has.
+      const adopted = safeText(conversation?.conversation_id, 96);
+      if (adopted && adopted !== session.conversationId) {
+        session.conversationId = adopted;
+      }
+      this.adoptConversationTitle(session, conversation);
+    } catch (error) {
+      // The catalog refused the write. The run still works — it is the
+      // App's view of the conversation that is degraded — but a failure
+      // that is not reported is a failure nobody can fix.
+      console.error(
+        `[agent-registry] the catalog refused the write for ${sessionId}: `
+        + `${error?.message || error}`,
+      );
+    }
     this.notify("registered", sessionId, {
       ...payload,
       session: this.project(session),
@@ -404,8 +456,19 @@ export class ExternalAgentRegistry {
   update(sessionId, payload = {}) {
     const session = this.require(sessionId);
     const nextConversationId = safeText(payload.conversationId, 96);
-    if (nextConversationId && nextConversationId !== session.conversationId) {
-      session.conversationId = nextConversationId;
+    // A run that now holds a different conversation starts over: the events
+    // and the pending interactions it collected belong to the conversation it
+    // left.
+    //
+    // Which conversation it holds is decided by the provider's id, not by the
+    // label — the label is the run's own, and the catalog may move the run
+    // onto the row that already holds this conversation without the reader
+    // going anywhere.
+    if (conversationChangedFor(session, payload)) {
+      if (nextConversationId) {
+        session.conversationId = nextConversationId;
+        session.conversationLabel = nextConversationId;
+      }
       session.events = [];
       session.eventIds = new Set();
       session.eventSequence = 0;
@@ -414,6 +477,8 @@ export class ExternalAgentRegistry {
       session.pendingInteractionKinds = new Map();
       session.currentStep = "Running locally";
       session.turnState = "idle";
+    } else if (nextConversationId && nextConversationId !== session.conversationLabel) {
+      session.conversationLabel = nextConversationId;
     }
     if (payload.nativeSessionId) {
       session.nativeSessionId = safeText(payload.nativeSessionId, 191);
@@ -425,18 +490,63 @@ export class ExternalAgentRegistry {
     // The title the agent produced, once it has one. The session's own copy
     // is what the rail falls back to when the conversation row has nothing
     // better to say.
+    //
+    // A placeholder never displaces a real name. Until the agent has named
+    // the conversation, the runtime reports the placeholder we wrote — and
+    // that must not wipe a name the run already carries.
     if (payload.title !== undefined) {
-      session.title = safeText(payload.title, 191) || session.title;
+      const incoming = safeText(payload.title, 191);
+      const agent = safeText(session.agent, 32) || "unknown";
+      if (incoming && (
+        !looksLikePlaceholderTitle(incoming, agent)
+        || looksLikePlaceholderTitle(session.title, agent)
+      )) {
+        session.title = incoming;
+      }
     }
     if (payload.turnState || payload.turn_state) {
       session.turnState = safeText(payload.turnState || payload.turn_state, 32);
     }
     session.lastSeenAtMs = this.now();
     try {
-      this.catalog?.updateSession(sessionId, payload);
-    } catch {}
+      const conversation = this.catalog?.updateSession(sessionId, payload);
+      // The label of a conversation can change under a run — a resumed
+      // conversation adopts the row that already holds it — without the
+      // reader having gone anywhere. The provider's id is what says which
+      // conversation this is, so a label the catalog vouches for is taken
+      // without treating it as a switch.
+      const adopted = safeText(conversation?.conversation_id, 96);
+      if (adopted && adopted !== session.conversationId) {
+        session.conversationId = adopted;
+      }
+      this.adoptConversationTitle(session, conversation);
+    } catch (error) {
+      console.error(
+        `[agent-registry] the catalog refused the update for ${sessionId}: `
+        + `${error?.message || error}`,
+      );
+    }
     this.notify("updated", sessionId, payload);
     return this.project(session);
+  }
+
+  // The name a run shows is the conversation's name.
+  //
+  // A resumed run has no name of its own until the agent produces one, and
+  // until then the runtime reports the placeholder we wrote. The
+  // conversation it resumes does have a name — the catalog holds it — so
+  // the run takes it, and a placeholder never displaces a real one.
+  //
+  // This is the same rule the catalog and the server keep: a name somebody
+  // chose is never lost, a placeholder never displaces a name, and between
+  // two real names the newest wins.
+  adoptConversationTitle(session, conversation) {
+    const agent = safeText(session?.agent, 32) || "unknown";
+    const conversationTitle = safeText(conversation?.title, 191);
+    if (!conversationTitle) return;
+    if (looksLikePlaceholderTitle(conversationTitle, agent)) return;
+    if (!looksLikePlaceholderTitle(session?.title, agent)) return;
+    session.title = conversationTitle;
   }
 
   heartbeat(sessionId) {

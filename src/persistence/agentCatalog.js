@@ -226,6 +226,8 @@ export class AgentCatalog {
       INSERT INTO catalog_meta(key, value) VALUES ('schema_version', ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `).run(String(SCHEMA_VERSION));
+    this.repairDuplicateConversations();
+    this.ensureProviderConversationIndex();
   }
 
   close() {
@@ -378,16 +380,406 @@ export class AgentCatalog {
     return { migrated, skipped: false };
   }
 
+  // The conversation a provider id names.
+  //
+  // The provider's own id for a conversation is the one fact that survives
+  // every attempt at it. Our own conversation id is minted per launch, so a
+  // resumed conversation used to get a row of its own for every attempt at
+  // it — and the App's rail showed the same conversation once per attempt.
+  //
+  // The row that answers is the one that was last active: it is the
+  // conversation the reader was last in. A tie goes to the smallest id, so
+  // the answer never depends on the order the rows happen to come back in —
+  // the index on `(agent_type, native_session_id)` has no order of its own.
+  //
+  // The server and the fold in `sql/054` pick the same row with the same
+  // rule. If the three ever disagreed, the device would report the
+  // conversation the fold had just removed, and the duplicate would be back.
+  conversationIdForNativeSession(agentType, nativeSessionId) {
+    const agent = safeText(agentType, 32);
+    const native = safeText(nativeSessionId, 191);
+    if (!agent || !native) return "";
+    const row = this.db.prepare(`
+      SELECT conversation_id FROM agent_conversations
+      WHERE agent_type = ? AND native_session_id = ?
+      ORDER BY last_activity_at DESC, conversation_id ASC
+      LIMIT 1
+    `).get(agent, native);
+    return row?.conversation_id || "";
+  }
+
+  // Every row that names the same provider conversation is the same
+  // conversation.
+  //
+  // The survivor is the row that was last active; the others are folded into
+  // it. Their runs move across, their artifacts move with them, and their
+  // fields are merged: a name somebody chose is never lost to an automatic
+  // one, a placeholder never displaces a real name, and the conversation
+  // keeps the oldest start and the latest activity.
+  //
+  // The tie-break is the smallest id, the same rule the server and the fold
+  // in `sql/054` use. The three have to agree: the device reports the
+  // survivor's conversation id to the server, and a different row would
+  // undo the fold.
+  //
+  // Returns the survivor, or nothing when the conversation is not here.
+  mergeConversationsForNativeSession(agentType, nativeSessionId) {
+    const agent = safeText(agentType, 32);
+    const native = safeText(nativeSessionId, 191);
+    if (!agent || !native) return null;
+    const rows = this.db.prepare(`
+      SELECT * FROM agent_conversations
+      WHERE agent_type = ? AND native_session_id = ?
+      ORDER BY last_activity_at DESC, conversation_id ASC
+    `).all(agent, native);
+    if (!rows.length) return null;
+    const survivor = rows[0];
+    if (rows.length === 1) return survivor;
+    const merge = this.db.transaction(() => {
+      for (const loser of rows.slice(1)) {
+        this._foldConversationInto(survivor, loser);
+      }
+    });
+    merge();
+    return this.db.prepare(
+      "SELECT * FROM agent_conversations WHERE conversation_id = ?",
+    ).get(survivor.conversation_id);
+  }
+
+  // Fold one conversation row into another.
+  //
+  // The survivor is read back from the table rather than taken from the
+  // caller: the fold runs once per loser, and the row the caller holds is the
+  // one from before the first fold. Judging every loser against that stale
+  // copy lost a name — a real name that one loser contributed was wiped by
+  // the next loser, whose placeholder was read against the stale copy as
+  // "nothing better than what the survivor had".
+  _foldConversationInto(survivor, loser) {
+    const survivorId = survivor.conversation_id;
+    const loserId = loser.conversation_id;
+    const held = this.db.prepare(
+      "SELECT * FROM agent_conversations WHERE conversation_id = ?",
+    ).get(survivorId) || survivor;
+    // The runs and the artifacts belong to the conversation, not to the row
+    // that happened to write them down.
+    this.db.prepare("UPDATE agent_runs SET conversation_id = ? WHERE conversation_id = ?")
+      .run(survivorId, loserId);
+    this.db.prepare("UPDATE agent_launch_receipts SET conversation_id = ? WHERE conversation_id = ?")
+      .run(survivorId, loserId);
+    this.db.prepare("UPDATE agent_catalog_insert_queue SET conversation_id = ? WHERE conversation_id = ?")
+      .run(survivorId, loserId);
+    this.db.prepare("UPDATE agent_catalog_preview_queue SET conversation_id = ? WHERE conversation_id = ?")
+      .run(survivorId, loserId);
+    // The artifacts move with the conversation, and they are moved rather
+    // than copied: the artifact id is the primary key, so copying a row
+    // while the original is still on the table is a constraint violation —
+    // and the fold is the one place that cannot afford to fail, because it
+    // is what keeps one conversation in one row.
+    //
+    // A survivor that already holds the same artifact — the same kind of
+    // thing at the same place — keeps its own row and takes the earlier
+    // sighting and the later sighting of the two.
+    for (const artifact of this.db.prepare(
+      "SELECT * FROM agent_artifacts WHERE conversation_id = ?",
+    ).all(loserId)) {
+      const twin = this.db.prepare(`
+        SELECT artifact_id FROM agent_artifacts
+        WHERE conversation_id = ? AND kind = ? AND locator = ?
+      `).get(survivorId, artifact.kind, artifact.locator);
+      if (twin) {
+        this.db.prepare(`
+          UPDATE agent_artifacts SET
+            display_value = ?,
+            first_seen_at = MIN(first_seen_at, ?),
+            last_seen_at = MAX(last_seen_at, ?)
+          WHERE artifact_id = ?
+        `).run(
+          artifact.display_value, artifact.first_seen_at, artifact.last_seen_at,
+          twin.artifact_id,
+        );
+        this.db.prepare("DELETE FROM agent_artifacts WHERE artifact_id = ?")
+          .run(artifact.artifact_id);
+        continue;
+      }
+      this.db.prepare(
+        "UPDATE agent_artifacts SET conversation_id = ? WHERE artifact_id = ?",
+      ).run(survivorId, artifact.artifact_id);
+    }
+    // The name. A name somebody chose is never lost; a placeholder never
+    // displaces a real name; between two real names the newer row wins,
+    // because that is the conversation the reader was last in.
+    const survivorCustom = Boolean(held.title_is_custom);
+    const loserCustom = Boolean(loser.title_is_custom);
+    const survivorIsPlaceholder = looksLikePlaceholderTitle(held.title, held.agent_type);
+    const loserIsPlaceholder = looksLikePlaceholderTitle(loser.title, loser.agent_type);
+    let title = held.title || loser.title;
+    let titleIsCustom = survivorCustom;
+    if (loserCustom && !survivorCustom) {
+      title = loser.title;
+      titleIsCustom = true;
+    } else if (!survivorCustom && survivorIsPlaceholder && !loserIsPlaceholder) {
+      title = loser.title;
+    }
+    this.db.prepare(`
+      UPDATE agent_conversations SET
+        title = ?, title_is_custom = ?,
+        summary = CASE WHEN summary = '' THEN ? ELSE summary END,
+        first_prompt_preview = CASE WHEN first_prompt_preview = '' THEN ? ELSE first_prompt_preview END,
+        last_message_preview = CASE WHEN last_message_preview = '' THEN ? ELSE last_message_preview END,
+        workspace_id = COALESCE(workspace_id, ?),
+        transcript_locator = CASE WHEN transcript_locator = '' THEN ? ELSE transcript_locator END,
+        permission_state_json = COALESCE(permission_state_json, ?),
+        created_at = MIN(created_at, ?),
+        last_activity_at = MAX(last_activity_at, ?),
+        archived_at = COALESCE(archived_at, ?)
+      WHERE conversation_id = ?
+    `).run(
+      title, titleIsCustom ? 1 : 0,
+      loser.summary, loser.first_prompt_preview, loser.last_message_preview,
+      loser.workspace_id, loser.transcript_locator, loser.permission_state_json,
+      loser.created_at, loser.last_activity_at, loser.archived_at,
+      survivorId,
+    );
+    this.db.prepare("DELETE FROM agent_conversations WHERE conversation_id = ?").run(loserId);
+  }
+
+  // The provider's id belongs to the row that holds it.
+  //
+  // Another row that already holds it means this conversation is that
+  // conversation: the fold is what the catalog does everywhere else, and the
+  // unique index over (agent, provider id) says the same thing in the
+  // database. A write that broke it would throw where the conversation was
+  // only being recorded.
+  //
+  // The fold keeps the row that was last active; a tie goes to the smallest
+  // id. That is the rule the server and `sql/054` use, and the three have
+  // to agree: the device reports the survivor's id, and a different row
+  // would undo the fold.
+  //
+  // Returns the id of the row that holds the conversation afterwards, and
+  // whether that row already holds the provider's id.
+  foldIntoNativeSessionHolder(conversationId, nativeSessionId) {
+    const id = safeText(conversationId, 96);
+    const native = safeText(nativeSessionId, 191);
+    if (!id || !native) return { conversationId: id, holdsNativeId: false };
+    const mine = this.db.prepare(
+      "SELECT * FROM agent_conversations WHERE conversation_id = ?",
+    ).get(id);
+    if (!mine) return { conversationId: id, holdsNativeId: false };
+    const holder = this.db.prepare(`
+      SELECT * FROM agent_conversations
+      WHERE agent_type = ? AND native_session_id = ? AND conversation_id <> ?
+      ORDER BY last_activity_at DESC, conversation_id ASC
+      LIMIT 1
+    `).get(mine.agent_type, native, id);
+    if (!holder) return { conversationId: id, holdsNativeId: false };
+    // The survivor is the row that was last active; a tie goes to the
+    // smallest id. The order is the one the fold itself uses.
+    const ordered = this.db.prepare(`
+      SELECT * FROM agent_conversations
+      WHERE conversation_id IN (?, ?)
+      ORDER BY last_activity_at DESC, conversation_id ASC
+    `).all(id, holder.conversation_id);
+    const survivor = ordered[0];
+    const loser = ordered[1];
+    const fold = this.db.transaction(() => {
+      this._foldConversationInto(survivor, loser);
+    });
+    fold();
+    return {
+      conversationId: survivor.conversation_id,
+      holdsNativeId: survivor.conversation_id === holder.conversation_id,
+    };
+  }
+
+  // A row that named one attempt at a conversation, and the attempt turned
+  // out to belong to a conversation that already has a row of its own.
+  // Nothing points at it any more, so it goes — a row nobody can reach is
+  // a conversation that never existed.
+  dropEmptyConversation(conversationId) {
+    const id = safeText(conversationId, 96);
+    if (!id) return false;
+    const runs = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM agent_runs WHERE conversation_id = ?",
+    ).get(id)?.count || 0;
+    if (runs > 0) return false;
+    const artifacts = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM agent_artifacts WHERE conversation_id = ?",
+    ).get(id)?.count || 0;
+    if (artifacts > 0) return false;
+    this.db.prepare("DELETE FROM agent_catalog_insert_queue WHERE conversation_id = ?").run(id);
+    this.db.prepare("DELETE FROM agent_catalog_preview_queue WHERE conversation_id = ?").run(id);
+    this.db.prepare("DELETE FROM agent_launch_receipts WHERE conversation_id = ?").run(id);
+    this.db.prepare("DELETE FROM agent_conversations WHERE conversation_id = ?").run(id);
+    return true;
+  }
+
+  // The rows written before the provider's id was used to identify a
+  // conversation: one row per attempt at the same conversation. They are one
+  // conversation, and the repair folds them into one row.
+  //
+  // It runs once. The marker in `catalog_meta` says it has been done, so the
+  // catalog does not pay for it again.
+  //
+  // The marker must not lie. A fold that fails leaves the duplicates exactly
+  // where they were, and a marker that says "done" would keep them there for
+  // good — the one failure nobody is told about is the one that cannot be
+  // repaired later. So a group that fails is reported, the marker is written
+  // only when every group folded, and a catalog that could not finish tries
+  // again the next time it opens.
+  repairDuplicateConversations() {
+    const markerKey = "conversation_native_merge_v2";
+    const marker = this.db.prepare(
+      "SELECT value FROM catalog_meta WHERE key = ?",
+    ).get(markerKey);
+    if (marker) return { merged: 0, skipped: true };
+    let merged = 0;
+    const failures = [];
+    const groups = this.db.prepare(`
+      SELECT agent_type, native_session_id FROM agent_conversations
+      WHERE native_session_id <> ''
+      GROUP BY agent_type, native_session_id
+      HAVING COUNT(*) > 1
+    `).all();
+    for (const group of groups) {
+      try {
+        const survivor = this.mergeConversationsForNativeSession(
+          group.agent_type, group.native_session_id,
+        );
+        if (survivor) merged += 1;
+      } catch (error) {
+        failures.push(
+          `${group.agent_type}:${group.native_session_id}: ${error?.message || error}`,
+        );
+      }
+    }
+    if (failures.length) {
+      // No marker: the next open tries again.
+      console.error(
+        `[agent-catalog] the duplicate repair did not finish `
+        + `(${failures.length} of ${groups.length}): ${failures.join("; ")}`,
+      );
+      return { merged, failed: failures.length, skipped: false };
+    }
+    this.setMeta(markerKey, JSON.stringify({ merged, at: iso(this.now()) }));
+    // The first version of this marker was written even when the fold had
+    // failed, so it said "done" over rows that were still there. It goes
+    // now that the truth is on record.
+    this.db.prepare(
+      "DELETE FROM catalog_meta WHERE key = 'conversation_native_merge_v1'",
+    ).run();
+    return { merged, failed: 0, skipped: false };
+  }
+
+  // The database's own word for the rule the code keeps: one provider
+  // conversation is one row.
+  //
+  // The index cannot be made while two rows hold the same provider
+  // conversation, so the fold runs first — the same fold the repair does.
+  // A fold that fails is reported and the index is left for the next open:
+  // a rule the database cannot state yet is not a reason to stop working.
+  //
+  // The index is partial. A row with no provider id is not part of the
+  // rule — a conversation the provider has not named yet is its own
+  // conversation — and a partial index is what says so: SQLite compares no
+  // two rows that are not in it.
+  ensureProviderConversationIndex() {
+    // The rule is already in the database. There is nothing left to do, and
+    // nothing left that can break: the index is what says a second row for
+    // one provider conversation cannot be written at all.
+    const existing = this.db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'idx_agent_conversations_provider'
+    `).get();
+    if (existing) return true;
+    const groups = this.db.prepare(`
+      SELECT agent_type, native_session_id FROM agent_conversations
+      WHERE native_session_id <> ''
+      GROUP BY agent_type, native_session_id
+      HAVING COUNT(*) > 1
+    `).all();
+    const failures = [];
+    for (const group of groups) {
+      try {
+        this.mergeConversationsForNativeSession(
+          group.agent_type, group.native_session_id,
+        );
+      } catch (error) {
+        failures.push(
+          `${group.agent_type}:${group.native_session_id}: ${error?.message || error}`,
+        );
+      }
+    }
+    if (failures.length) {
+      console.error(
+        `[agent-catalog] the provider index was not made `
+        + `(${failures.length} of ${groups.length}): ${failures.join("; ")}`,
+      );
+      return false;
+    }
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_conversations_provider
+        ON agent_conversations(agent_type, native_session_id)
+        WHERE native_session_id <> ''
+    `);
+    return true;
+  }
+
   upsertSession(payload = {}) {
     const sessionId = safeText(payload.sessionId || payload.originrouterSessionId, 64);
     if (!sessionId) throw new Error("sessionId is required");
     const existingRun = this.db.prepare(
       "SELECT run_id, conversation_id, started_by FROM agent_runs WHERE originrouter_session_id = ?",
     ).get(sessionId);
-    const conversationId = safeText(
+    const agent = safeText(payload.agent || payload.agentType, 32) || "unknown";
+    // A conversation is identified by the provider's own id for it, and a
+    // run is one attempt at that conversation. Resuming a conversation is
+    // therefore a second run of the first one — not a second conversation.
+    //
+    // Without this lookup every resume minted a new conversation row, so the
+    // same conversation appeared in the App's rail once per attempt. The
+    // index on `(agent_type, native_session_id)` has been here all along;
+    // nothing ever asked the question it was built for.
+    const nativeSessionId = safeText(payload.nativeSessionId, 191);
+    // The label this attempt was launched under. It is the label of the
+    // attempt, not the identity of the conversation.
+    const requestedConversationId = safeText(
       payload.conversationId || existingRun?.conversation_id || sessionId,
       96,
     );
+    // The row the label names, when it is here.
+    const labelled = this.db.prepare(
+      "SELECT conversation_id, agent_type, native_session_id FROM agent_conversations WHERE conversation_id = ?",
+    ).get(requestedConversationId);
+    // The agent the conversation is under: what the report says, or what the
+    // row already has when the report says nothing. The provider's id is
+    // scoped to an agent, so the row that holds the conversation is the one
+    // under this agent — and the unique index over (agent, provider id) is
+    // what says that in the database.
+    const effectiveAgent = agent !== "unknown"
+      ? agent
+      : (labelled?.agent_type || "unknown");
+    // The provider's id the conversation will hold: the report's own, or the
+    // one the row already holds when the report does not say. A report that
+    // says nothing about the provider's id does not unbind the conversation
+    // from it.
+    const effectiveNative = nativeSessionId || labelled?.native_session_id || "";
+    // The conversation that already holds this provider conversation, with
+    // the rows that named it folded into one.
+    const owner = effectiveNative
+      ? this.mergeConversationsForNativeSession(effectiveAgent, effectiveNative)
+      : null;
+    const ownerId = owner?.conversation_id || "";
+    // The provider's id decides which conversation this is — so the row that
+    // already holds it is the row to write to.
+    //
+    // The label is the row to write to only when no row holds the provider's
+    // id yet: then the label is the conversation's own row, and it takes the
+    // id. A label whose row names a *different* provider conversation is not
+    // that conversation either — the provider's id belongs to the row that
+    // holds it under this agent, and the database refuses a second row for
+    // one conversation.
+    const conversationId = ownerId || requestedConversationId;
     const requestedRunId = safeText(payload.runId || existingRun?.run_id || sessionId, 96);
     // Runtime re-registration must not erase ownership recorded by the
     // collaboration supervisor. Persist it in the existing provenance field.
@@ -405,7 +797,6 @@ export class AgentCatalog {
       && requestedRunOwner.originrouter_session_id !== sessionId
       ? stableId("agent_run", requestedRunId, sessionId)
       : requestedRunId;
-    const agent = safeText(payload.agent || payload.agentType, 32) || "unknown";
     const defaultTitle = defaultConversationTitle(agent);
     const requestedTitle = safeText(payload.title, 256);
     const title = requestedTitle || defaultTitle;
@@ -556,6 +947,14 @@ export class AgentCatalog {
       );
     });
     write();
+    // The attempt was launched under a label of its own, and it turned out to
+    // belong to a conversation that already had a row. Nothing points at the
+    // label any more, so it goes.
+    if (conversationId !== requestedConversationId) {
+      try {
+        this.dropEmptyConversation(requestedConversationId);
+      } catch {}
+    }
     return this.getConversation(conversationId);
   }
 
@@ -672,7 +1071,7 @@ export class AgentCatalog {
       "SELECT conversation_id FROM agent_runs WHERE originrouter_session_id = ?",
     ).get(safeText(sessionId, 64));
     if (!run) return false;
-    const conversationId = run.conversation_id;
+    let conversationId = run.conversation_id;
     const createdAt = iso(event.createdAt || this.now());
     const rawType = safeText(event.type || event.eventType, 96);
     const type = rawType === "agent.task.completed"
@@ -705,8 +1104,21 @@ export class AgentCatalog {
       }
     }
     if (type === "agent.session_id" && event.sessionId) {
-      updates.push("native_session_id = ?");
-      values.push(safeText(event.sessionId, 191));
+      const native = safeText(event.sessionId, 191);
+      // The provider's id belongs to the row that holds it. Another row that
+      // already holds it means this conversation is that conversation, and
+      // the fold is what the catalog does everywhere else — the unique
+      // index over (agent, provider id) says the same thing in the
+      // database, and a write that broke it would throw where the
+      // conversation was only being recorded.
+      const held = this.foldIntoNativeSessionHolder(conversationId, native);
+      if (held.conversationId && held.conversationId !== conversationId) {
+        conversationId = held.conversationId;
+      }
+      if (!held.holdsNativeId) {
+        updates.push("native_session_id = ?");
+        values.push(native);
+      }
     }
     if (type === "agent.session.start" && event.transcriptPath) {
       updates.push("transcript_locator = ?");
