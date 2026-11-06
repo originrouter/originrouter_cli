@@ -93,7 +93,7 @@ const signedIn = async () => makeOAuthCredential();
   const calls = [];
   const models = await loadCloudModels({
     stateDir: "/tmp/route-sources-test",
-    env: { ORIGINROUTER_AI_SERVER_BASE_URL: "https://ai.example/" },
+    env: { ORIGINROUTER_CODING_BASE_URL: "https://coding.example/" },
     ensureFreshAccessTokenFn: signedIn,
     fetchFn: async (url, options) => {
       calls.push({ url, options });
@@ -101,25 +101,28 @@ const signedIn = async () => makeOAuthCredential();
         ok: true,
         status: 200,
         json: async () => ({
-          code: 1,
-          data: {
-            model_list: [
-              {
-                origin_name: "official-originrouter",
-                models: [
-                  { id: "claude-1", name: "Claude One" },
-                  { id: "claude-1", name: "duplicate" },
-                ],
+          object: "list",
+          data: [
+            {
+              id: "claude-1",
+              name: "Claude One",
+              extra_properties: {
+                origin: "anthropic",
+                origin_name: "Anthropic",
+                reasoning: { enabled: true, effort_levels: ["low", "medium", "high"] },
               },
-            ],
-          },
+            },
+            { id: "claude-1", name: "duplicate" },
+          ],
         }),
       };
     },
   });
-  assert.deepEqual(models, [{ id: "claude-1", name: "Claude One", origin: "OriginRouter Cloud" }]);
-  assert.equal(calls[0].url, "https://ai.example/ai/model");
-  assert.equal(calls[0].options.headers.Authorization, "Bearer or_at_ai_test");
+  assert.deepEqual(models, [{ id: "claude-1", name: "Claude One", origin: "Anthropic" }]);
+  // The coding channel's own list: the one the App's model picker reads, and
+  // the only one cut to what this account may actually run.
+  assert.equal(calls[0].url, "https://coding.example/coding/v1/models");
+  assert.equal(calls[0].options.headers.Authorization, "Bearer or_at_coding_test");
   const selected = await chooseCloudModel(models, "claude-1");
   assert.equal(selected.id, "claude-1");
 }

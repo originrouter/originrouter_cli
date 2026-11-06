@@ -52,13 +52,12 @@ const ALIASES = Object.freeze({
 
 // Official OriginRouter Coding API gateway. All /coding/v1/messages,
 // /coding/v1/chat/completions, and /coding/v1/responses traffic uses this
-// fixed host. Model-catalog requests use DEFAULT_ORIGINROUTER_AI_SERVER_BASE_URL.
-// Used when a provider record's `baseUrl` is null/undefined.
+// fixed host, and so does the coding model catalogue the agent channel reads
+// (`/coding/v1/models`) — it is the account's own list, which is what makes
+// it the right one to ask. Used when a provider record's `baseUrl` is
+// null/undefined.
 //
 export const DEFAULT_ORIGINROUTER_BASE_URL = "https://api.easytransnote.com";
-
-// AI model catalogue host. This is not used for Coding inference traffic.
-export const DEFAULT_ORIGINROUTER_AI_SERVER_BASE_URL = "https://server.easytransnote.com";
 
 // Stage 10: the unified App/CLI control plane. Keep this separate
 // from DEFAULT_ORIGINROUTER_BASE_URL so auth/control migration does

@@ -7,9 +7,9 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-import { DEFAULT_ORIGINROUTER_AI_SERVER_BASE_URL } from "../config/providerRoutes.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import { accessTokenFor, OAUTH_RESOURCES } from "../runtime/authContract.js";
+import { fetchCodingModelCatalogue } from "../runtime/codingModelCatalogue.js";
 
 const CONTROL_CANDIDATES = Object.freeze([
   {
@@ -129,56 +129,30 @@ function remoteShareCatalog(value) {
   return out;
 }
 
-function displayOrigin(value) {
-  const origin = nonEmptyString(value) || "OriginRouter";
-  const normalized = origin.toLowerCase().replace(/[^a-z0-9]/g, "");
-  return normalized === "officaloriginrouter" || normalized === "officialoriginrouter"
-    ? "OriginRouter Cloud"
-    : origin;
-}
-
-/// Reads the exact `/ai/model` catalogue used by App Agent Control.
+/// Reads the catalogue the coding channel serves — the same list the App's
+/// model picker reads, cut to what this account may actually use.
+///
+/// The console catalogue (`/ai/model`) is not the list to read here: it
+/// answers "what could this account buy", it is not cut by tier, and a
+/// device that routes to a model from it routes to a model the account's
+/// requests will not run.
 export async function loadCloudModels({
   stateDir,
   fetchFn = globalThis.fetch,
   env = process.env,
   ensureFreshAccessTokenFn = ensureFreshAccessToken,
 } = {}) {
-  const token = await signedInToken({
+  const catalogue = await fetchCodingModelCatalogue({
     stateDir,
-    resource: OAUTH_RESOURCES.AI,
+    fetchFn,
+    env,
     ensureFreshAccessTokenFn,
   });
-  const baseUrl = trimBaseUrl(
-    env.ORIGINROUTER_AI_SERVER_BASE_URL || DEFAULT_ORIGINROUTER_AI_SERVER_BASE_URL
-  );
-  const payload = await requestJson(fetchFn, `${baseUrl}/ai/model`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({ v: "coding" }),
-  });
-  if (payload.code !== 1) {
-    throw new Error("OriginRouter Cloud model catalogue request was rejected.");
-  }
-
-  const groups = unwrapData(payload).model_list;
-  if (!Array.isArray(groups)) return [];
-  const seen = new Set();
-  const models = [];
-  for (const group of groups) {
-    if (!group || typeof group !== "object" || !Array.isArray(group.models)) continue;
-    const origin = displayOrigin(group.origin_name || group.origin_key);
-    for (const entry of group.models) {
-      const id = nonEmptyString(entry?.id);
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      models.push({ id, name: nonEmptyString(entry.name) || id, origin });
-    }
-  }
-  return models;
+  return catalogue.map((model) => ({
+    id: model.id,
+    name: model.name,
+    origin: model.origin,
+  }));
 }
 
 /// Lists only account-authorized CLI grants. The server enforces the same
