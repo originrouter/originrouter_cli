@@ -59,6 +59,7 @@ import {
   readDevice,
   writeConfig,
 } from "./persistence/state.js";
+import { installDpopFetch } from "./security/dpopRegistration.js";
 import { handleLocalApiCommand, handleLocalConfigCommand, handleTokenCommand } from "./commands/localApi.js";
 import { handleRemoteCommand } from "./commands/remote.js";
 import { handleCompatibility } from "./commands/compatibility.js";
@@ -1354,6 +1355,13 @@ async function printDoctor(args = []) {
 
 export async function main(argv) {
   const [command, ...args] = argv;
+
+  // Every control-plane and relay request this process makes goes out
+  // through this `fetch`, so putting the proof wrapper here covers the
+  // call sites that do not know DPoP exists. It changes a request only
+  // when this device has registered a key for the deployment it is going
+  // to; everything else goes out exactly as it was written.
+  installDpopFetch({ stateDir: getStateDir() });
 
   if (!command) {
     if (process.stdin.isTTY && process.stdout.isTTY) {

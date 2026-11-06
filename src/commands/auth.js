@@ -29,6 +29,7 @@ import {
   ensureDeviceE2eeDirectoryCacheMigrated,
   storeDeviceE2eeDirectoryCache,
 } from "../security/deviceE2eeDirectoryCache.js";
+import { ensureDpopRegistered } from "../security/dpopRegistration.js";
 import {
   clearCodingAuth,
   readCodingAuth,
@@ -301,6 +302,24 @@ export async function handleLogin(args, {
     } catch (error) {
       registrationError = error;
     }
+    // The DPoP key is anchored to the identity registered just above, so it
+    // can only be registered once that has happened. A device that cannot
+    // register one — a server that has never heard of it, a device with no
+    // identity — stays on bearer tokens, which is where it started.
+    let dpop = { status: "skipped" };
+    try {
+      dpop = await ensureDpopRegistered({
+        stateDir,
+        controlBaseUrl:
+          process.env.ORIGINROUTER_CONTROL_BASE_URL ||
+          DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
+        accessToken: credential.accessTokens.control.token,
+        deviceId: credential.deviceId,
+        accountScope: credential.accountScope || enrollmentScope,
+      });
+    } catch (error) {
+      dpop = { status: "failed", code: error?.code || error?.message };
+    }
     console.log(`Device:  ${credential.deviceId}`);
     console.log(`Session: ${credential.sessionId}`);
     console.log(`E2EE key fingerprint: ${e2ee.public_identity.key_id}`);
@@ -309,6 +328,11 @@ export async function handleLogin(args, {
         ? "waiting for approval in the App"
         : "trusted"
       : `identity saved locally; registration pending (${registrationError?.code || "server unavailable"})`}`);
+    console.log(`DPoP:    ${dpop.status === "active"
+      ? "key registered"
+      : dpop.status === "disabled"
+        ? "off"
+        : `not registered (${dpop.code || dpop.status})`}`);
     if (registered?.trust_status === "pending") {
       console.log("Compare this fingerprint with the pending-device entry in the App before approving it.");
     }

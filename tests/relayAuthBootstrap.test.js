@@ -13,12 +13,14 @@ test("relay auth off does not require a login", async () => {
     fallbackDeviceId: "fallback-device",
     forceAuth: false,
   });
-  assert.deepEqual(result, {
-    relayUrl: "https://relay.example.test",
-    deviceId: "fallback-device",
-    authToken: null,
-    authState: "off",
-  });
+  assert.equal(result.relayUrl, "https://relay.example.test");
+  assert.equal(result.deviceId, "fallback-device");
+  assert.equal(result.authToken, null);
+  assert.equal(result.authState, "off");
+  // The proof provider is there even when the relay is off: it answers with
+  // nothing when there is no token, and the client then falls back to a
+  // bearer request exactly as it did before.
+  assert.equal(typeof result.proofProvider, "function");
 });
 
 test("relay auth selects the relay audience token", async () => {

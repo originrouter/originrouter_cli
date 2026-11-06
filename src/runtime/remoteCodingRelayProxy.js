@@ -20,6 +20,7 @@ import {
   verifyAndPinRemotePublicKey,
 } from "../crypto/remoteCodingE2ee.js";
 import { newRequestId, RemoteCodingRelayClient } from "../relay/remoteCodingRelayClient.js";
+import { createDpopProofProvider } from "../security/dpopRegistration.js";
 import { rewriteModelInBody } from "./agentModelRewrite.js";
 import {
   sessionIdFromCredential,
@@ -50,6 +51,7 @@ export class RemoteCodingRelayProxy {
     targetDeviceId = null,
     authToken = null,
     fetchFn = globalThis.fetch,
+    proofProvider = null,
     modelResolverForSession = null,
   }) {
     this.relayUrl = relayUrl;
@@ -63,7 +65,17 @@ export class RemoteCodingRelayProxy {
     this.modelResolverForSession = typeof modelResolverForSession === "function"
       ? modelResolverForSession
       : null;
-    this._client = new RemoteCodingRelayClient({ relayUrl, deviceId, authToken, fetchFn });
+    this._client = new RemoteCodingRelayClient({
+      relayUrl,
+      deviceId,
+      authToken,
+      fetchFn,
+      // This proxy's fetch is injected, so the wrapper that adds proofs to
+      // the CLI's own requests never sees it. The relay client asks for the
+      // headers instead, and gets a proof when this device has registered a
+      // key with the relay's deployment.
+      proofProvider: proofProvider || createDpopProofProvider({ stateDir }),
+    });
     this._server = null;
     this._port = null;
     // Stage 9.2.1: track in-flight sockets so stop() can destroy them

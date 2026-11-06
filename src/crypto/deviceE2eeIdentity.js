@@ -27,6 +27,7 @@ const ROTATION_DOMAIN = "originrouter/device-key-rotation/v2\n";
 const ENROLLMENT_DOMAIN = "originrouter/device-login/v2\n";
 const REMOVAL_DOMAIN = "originrouter/device-removal/v2\n";
 const LOCAL_AUTH_DOMAIN = "originrouter/local-e2ee-device-auth/v1\n";
+const DPOP_REGISTRATION_DOMAIN = "originrouter/dpop-registration/v1\n";
 const FILE_MODE = 0o600;
 
 function scopeSegment(accountScope) {
@@ -447,6 +448,51 @@ export function signCurrentDeviceRemoval(identity, { now = new Date(), accountEp
     signature: sign(
       null,
       Buffer.from(`${REMOVAL_DOMAIN}${canonicalJson(value)}`),
+      createPrivateKey({ key: identity.signing_private_jwk, format: "jwk" }),
+    ).toString("base64url"),
+  };
+}
+
+/**
+ * Sign the registration of a DPoP key with this device's long-term key.
+ *
+ * The server holds this device's long-term key already, and it holds the
+ * thumbprint of the key being registered only after this signature arrives.
+ * That is what makes the registration something a stolen access token
+ * cannot do: the token is not what proves the device here, the device's
+ * own key is.
+ *
+ * The value that gets signed is the same one the server builds for itself
+ * — the same six members, in the same canonical form — so the signature
+ * covers the thumbprint and nothing else that the server did not ask for.
+ */
+export function signDeviceE2eeDpopRegistration(
+  identity,
+  { deviceId, jkt, now = new Date() } = {},
+) {
+  const publicIdentity = identity?.public_identity;
+  if (!publicIdentity || !verifyDeviceE2eeIdentity(publicIdentity)) {
+    throw new Error("invalid device E2EE identity");
+  }
+  const thumbprint = String(jkt || "").trim();
+  if (!thumbprint) throw new Error("invalid DPoP thumbprint");
+  const target = String(deviceId || "").trim();
+  if (!target || target !== publicIdentity.device_id) {
+    throw new Error("the DPoP registration names another device");
+  }
+  const value = {
+    action: "register_dpop_key",
+    protocol: DEVICE_E2EE_PROTOCOL,
+    device_id: target,
+    key_id: publicIdentity.key_id,
+    jkt: thumbprint,
+    created_at: now.toISOString(),
+  };
+  return {
+    ...value,
+    signature: sign(
+      null,
+      Buffer.from(`${DPOP_REGISTRATION_DOMAIN}${canonicalJson(value)}`),
       createPrivateKey({ key: identity.signing_private_jwk, format: "jwk" }),
     ).toString("base64url"),
   };

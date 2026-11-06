@@ -12,7 +12,18 @@ export async function postJson(url, body, options = {}) {
     ...(options.headers || {}),
   };
   if (options.authToken) {
-    headers.Authorization = `Bearer ${options.authToken}`;
+    // The proof is made here rather than left to the fetch wrapper, so that
+    // the request is held to the key whichever fetch it is sent with.
+    const proof = await options.proofProvider?.({
+      method: "POST",
+      url,
+      token: options.authToken,
+    });
+    if (proof) {
+      Object.assign(headers, proof);
+    } else {
+      headers.Authorization = `Bearer ${options.authToken}`;
+    }
   }
   const response = await fetch(url, {
     method: "POST",
@@ -32,6 +43,7 @@ export class RelayClient {
     relayUrl,
     deviceId,
     authToken = null,
+    proofProvider = null,
     heartbeatIntervalMs = 15_000,
     heartbeatTimeoutMs = 45_000,
     e2eeAckTimeoutMs = 30_000,
@@ -40,6 +52,10 @@ export class RelayClient {
     this.relayUrl = relayUrl;
     this.deviceId = deviceId;
     this.authToken = authToken;
+    // The WebSocket handshake cannot go through `fetch`, so it cannot be
+    // covered by the fetch wrapper. It asks this instead, and gets the same
+    // answer for the same reasons.
+    this.proofProvider = proofProvider;
     this.heartbeatIntervalMs = Math.max(10, Number(heartbeatIntervalMs) || 15_000);
     this.heartbeatTimeoutMs = Math.max(
       this.heartbeatIntervalMs * 2,
@@ -100,7 +116,7 @@ export class RelayClient {
         target_device_id: payload.targetDeviceId || payload.deviceId || this.deviceId,
         payload: envelope,
       },
-      { authToken: this.authToken },
+      { authToken: this.authToken, proofProvider: this.proofProvider },
     );
   }
 
@@ -109,7 +125,7 @@ export class RelayClient {
     return postJson(`${this.relayUrl}/relay/v1/messages`, {
       target_device_id: payload.targetDeviceId || payload.deviceId || this.deviceId,
       payload: envelope,
-    }, { authToken: this.authToken });
+    }, { authToken: this.authToken, proofProvider: this.proofProvider });
   }
 
   async sendEnvelope(envelope) {
@@ -168,7 +184,7 @@ export class RelayClient {
         target_device_id: envelope.target_device_id,
         payload: envelope,
       },
-      { authToken: this.authToken },
+      { authToken: this.authToken, proofProvider: this.proofProvider },
     );
   }
 
@@ -209,7 +225,16 @@ export class RelayClient {
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const headers = {};
     if (this.authToken) {
-      headers.Authorization = `Bearer ${this.authToken}`;
+      const proof = await this.proofProvider?.({
+        method: "GET",
+        url: url.toString(),
+        token: this.authToken,
+      });
+      if (proof) {
+        Object.assign(headers, proof);
+      } else {
+        headers.Authorization = `Bearer ${this.authToken}`;
+      }
     }
     await new Promise((resolve, reject) => {
       const ws = new WebSocket(url, { headers });

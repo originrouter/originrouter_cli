@@ -19,11 +19,21 @@ function relayWsUrl(relayUrl, deviceId) {
 }
 
 export class RemoteCodingRelayClient {
-  constructor({ relayUrl, deviceId, authToken = null, fetchFn = globalThis.fetch }) {
+  constructor({
+    relayUrl,
+    deviceId,
+    authToken = null,
+    fetchFn = globalThis.fetch,
+    proofProvider = null,
+  }) {
     this.relayUrl = relayUrl;
     this.deviceId = deviceId;
     this.authToken = authToken;
     this.fetchFn = fetchFn;
+    // The WebSocket handshake cannot go through `fetch`, so it cannot be
+    // covered by the fetch wrapper. It asks this instead, and gets the same
+    // answer for the same reasons.
+    this.proofProvider = proofProvider;
     this._waiters = new Map();
     this._cryptoContexts = new Map();
     this._closed = false;
@@ -40,14 +50,41 @@ export class RemoteCodingRelayClient {
     this._connectPromise = null;
   }
 
+  /**
+   * The headers a relay request should carry.
+   *
+   * The proof is made here rather than left to the fetch wrapper, because
+   * this client's fetch is injected: a caller that hands it a plain fetch
+   * would otherwise send a bearer request to a server that has learned to
+   * ask for one.
+   */
+  async _authHeaders(method, url) {
+    if (!this.authToken) return {};
+    const proof = await this.proofProvider?.({ method, url, token: this.authToken });
+    if (proof) return proof;
+    return { Authorization: `Bearer ${this.authToken}` };
+  }
+
   async subscribe() {
     if (this._closed) throw new Error("client closed");
     if (this._ws && this._ws.readyState === WebSocket.OPEN) return;
     if (this._connectPromise) return this._connectPromise;
+    const headers = {};
+    const url = relayWsUrl(this.relayUrl, this.deviceId);
+    if (this.authToken) {
+      const proof = await this.proofProvider?.({
+        method: "GET",
+        url: url.toString(),
+        token: this.authToken,
+      });
+      if (proof) {
+        Object.assign(headers, proof);
+      } else {
+        headers.Authorization = `Bearer ${this.authToken}`;
+      }
+    }
     this._connectPromise = new Promise((resolve, reject) => {
-      const headers = {};
-      if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
-      const ws = new WebSocket(relayWsUrl(this.relayUrl, this.deviceId), { headers });
+      const ws = new WebSocket(url, { headers });
       this._ws = ws;
       ws.once("open", () => {
         this._connectPromise = null;
@@ -137,12 +174,9 @@ export class RemoteCodingRelayClient {
   }
 
   async getTargetE2ee(targetDeviceId) {
-    const headers = {};
-    if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
-    const response = await this.fetchFn(
-      `${this.relayUrl}/relay/v1/devices/${encodeURIComponent(targetDeviceId)}/e2ee`,
-      { method: "GET", headers },
-    );
+    const url = `${this.relayUrl}/relay/v1/devices/${encodeURIComponent(targetDeviceId)}/e2ee`;
+    const headers = await this._authHeaders("GET", url);
+    const response = await this.fetchFn(url, { method: "GET", headers });
     let body = {};
     try { body = await response.json(); } catch {}
     if (!response.ok) {
@@ -177,9 +211,12 @@ export class RemoteCodingRelayClient {
   }
 
   async _postRelayMessage(envelope) {
-    const headers = { "Content-Type": "application/json" };
-    if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
-    const response = await this.fetchFn(`${this.relayUrl}/relay/v1/messages`, {
+    const url = `${this.relayUrl}/relay/v1/messages`;
+    const headers = {
+      "Content-Type": "application/json",
+      ...(await this._authHeaders("POST", url)),
+    };
+    const response = await this.fetchFn(url, {
       method: "POST",
       headers,
       body: JSON.stringify({

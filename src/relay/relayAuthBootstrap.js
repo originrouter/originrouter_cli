@@ -19,6 +19,7 @@
 
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import { accessTokenFor, OAUTH_RESOURCES } from "../runtime/authContract.js";
+import { createDpopProofProvider } from "../security/dpopRegistration.js";
 
 export class RelayAuthBootstrapError extends Error {
   constructor(code) {
@@ -46,6 +47,7 @@ export async function buildRelayClientOptions({
       deviceId: fallbackDeviceId,
       authToken: null,
       authState: "off",
+      proofProvider: createDpopProofProvider({ stateDir }),
     };
   }
 
@@ -71,5 +73,9 @@ export async function buildRelayClientOptions({
     authToken: relayToken.token,
     authState: "on",
     tokenExpiresAt: Math.floor(relayToken.expiresAt / 1000),
+    // The relay's own handshake and posts carry a proof when this device
+    // has registered a key for the relay's deployment, and a bearer token
+    // when it has not.
+    proofProvider: createDpopProofProvider({ stateDir }),
   };
 }

@@ -72,6 +72,11 @@ import {
   ensureDeviceE2eeDirectoryCacheMigrated,
   storeDeviceE2eeDirectoryCache,
 } from "../security/deviceE2eeDirectoryCache.js";
+import {
+  createDpopProofProvider,
+  ensureDpopRegistered,
+  installDpopFetch,
+} from "../security/dpopRegistration.js";
 import { DeviceE2eeRelayTransport } from "../security/deviceE2eeRelayTransport.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import { refreshCompatibilityPack } from "../compatibility/updater.js";
@@ -95,6 +100,12 @@ import {
 export async function startDaemon(args) {
   const { options } = parseOptions(args);
   const stateDir = ensureStateDir();
+  // Every control-plane and relay request this process makes goes out
+  // through this `fetch`, so putting the proof wrapper here covers the
+  // call sites that do not know DPoP exists. It changes a request only
+  // when this device has registered a key for the deployment it is going
+  // to; everything else goes out exactly as it was written.
+  installDpopFetch({ stateDir });
   const localApiConfig = readLocalApiConfig();
 
   // Stage 6: ensure the bearer token file exists before binding the API.
@@ -178,6 +189,7 @@ export async function startDaemon(args) {
     relayUrl,
     deviceId: effectiveDeviceId,
     authToken: null,
+    proofProvider: createDpopProofProvider({ stateDir }),
   });
   const storedDeviceE2eeIdentity = readDeviceE2eeIdentity(stateDir, { accountScope });
   let deviceE2eeIdentity;
@@ -835,6 +847,31 @@ export async function startDaemon(args) {
     }
     return activateDeviceE2eeIdentity(stored, "identity file changed");
   };
+  /**
+   * Keep this device's DPoP registration in step with the server.
+   *
+   * The DPoP key is anchored to the long-term identity registered just
+   * above, so it can only be registered once that has happened. A device
+   * that cannot register one — a server that has never heard of it, a
+   * server whose migration has not run, a device with no identity — stays
+   * on bearer tokens, which is where it started. Nothing here is allowed
+   * to stop the daemon from working.
+   */
+  const syncDpopRegistration = async ({ accessToken, deviceId }) => {
+    try {
+      return await ensureDpopRegistered({
+        stateDir,
+        controlBaseUrl: relayUrl,
+        accessToken,
+        deviceId,
+      });
+    } catch (error) {
+      console.warn(
+        `[daemon] DPoP registration: ${error?.code || error?.message || "failed"}`,
+      );
+      return null;
+    }
+  };
   const syncDeviceE2eeIdentity = async ({ deviceId = effectiveDeviceId } = {}) => {
     const credential = await ensureFreshAccessToken({ stateDir });
     const nextAccountScope = credential?.accountScope || null;
@@ -868,6 +905,7 @@ export async function startDaemon(args) {
         console.warn("[daemon] device E2EE identity is waiting for approval in the App");
       }
     }
+    await syncDpopRegistration({ accessToken, deviceId: authenticatedDeviceId });
     const directory = await getCliDeviceE2eeDirectory({
       controlBaseUrl: relayUrl,
       accessToken,
