@@ -220,6 +220,12 @@ export class ManagedAgentSupervisor {
         "The requested workspace has not been trusted for remote Agent launches.",
       );
     }
+    const applicability = aiReviewPolicy?.applicability;
+    if (applicability &&
+        ((applicability.device_id && applicability.device_id !== this.deviceId) ||
+         (applicability.workspace_reference && ![workspaceReference, workspace.workspace_id, workspace.canonical_path].includes(applicability.workspace_reference)))) {
+      throw launchError('AI_REVIEW_POLICY_NOT_APPLICABLE', 'The AI approval template does not apply to this device or workspace.');
+    }
     // A detached collaboration cannot answer an OS privacy or credential
     // dialog. Refuse before spawn so the remote controller gets a useful,
     // recoverable error rather than a Run that appears to be frozen.

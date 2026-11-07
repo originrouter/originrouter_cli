@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,6 +36,17 @@ const supervisor = new ManagedAgentSupervisor({
     return child;
   },
 });
+
+const restrictedTemplate = {
+  allowed_scopes: ['read_tools'], applicability: {device_id: 'other-device'},
+  instructions: 'Review reads', name: 'Restricted', protocol_version: '1', template_id: 'ait_restricted123',
+};
+const policySnapshot = {...restrictedTemplate, version: 1,
+  content_hash: createHash('sha256').update(JSON.stringify(restrictedTemplate)).digest('hex')};
+await assert.rejects(supervisor.start({launchId:'wrong-device',sessionId:'wrong-device',agentType:'codex',
+  workspaceId:workspace.workspace_id,permissionProfile:'ai_review',aiReviewPolicy:policySnapshot}),
+  {code:'AI_REVIEW_POLICY_NOT_APPLICABLE'});
+assert.equal(spawns.length, 0);
 
 const launched = await supervisor.start({
   launchId: "launch-1",
