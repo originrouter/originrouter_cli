@@ -14,7 +14,8 @@ export class RemoteEnvironmentService {
       onChanged:(id, account) => this.manager.invalidateTarget(id, account)});
     this.manager = managerFactory({accountProvider:() => this.store.dir(),
       targetProvider:(id, account) => this.store.get(id, account),
-      credentialProvider:(target, account) => this.store.getCredential(target, account)});
+      credentialProvider:(target, account) => this.store.getCredential(target, account),
+      settingsProvider:(account) => this.store.settings(account)});
     // Retry removal of obsolete keychain entries left by a crash or a locked
     // store. A failure remains recorded and is reported by list/save/delete.
     void this.store.collectGarbage().catch(() => {});
@@ -25,7 +26,20 @@ export class RemoteEnvironmentService {
         const account = this.store.dir();
         return {targets:this.store.list().map((target) => ({...target, connection:this.manager.statusFor(target.id, account)})),
           sessions:this.manager.managementSessions(account),
+          settings:this.store.settings(account),
           pendingCredentialCleanup:this.store.pendingCleanup()};
+      }
+      case 'set_behavior': {
+        const account = this.store.dir();
+        const next = {...this.store.settings(account)};
+        for (const key of ['killRemoteProcesses','backgroundTasks']) {
+          if (body[key] === undefined) continue;
+          if (typeof body[key] !== 'boolean') throw fail('REMOTE_ENV_INVALID', `${key} must be a boolean`);
+          next[key] = body[key];
+        }
+        const settings = this.store.setSettings(next, account);
+        this.store.checkAccount(account);
+        return {settings};
       }
       case 'close_session': {
         const account = this.store.dir();

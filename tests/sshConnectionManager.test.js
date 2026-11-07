@@ -21,7 +21,7 @@ const { privateKey: clientKey } = generateKeyPairSync('rsa', { modulusLength: 20
 const parsedClientKey = utils.parseKey(clientKey);
 const hostFingerprint = sshHostFingerprint(utils.parseKey(privateKey).getPublicSSH());
 
-async function fixture() {
+async function fixture({settings = undefined} = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'or-ssh-test-')));
   mkdirSync(join(root, 'one'));
   mkdirSync(join(root, 'two'));
@@ -31,6 +31,8 @@ async function fixture() {
   const connections = new Set();
   const children = new Set();
   const commands = [];
+  const signals = [];
+  const exitGroup = (child, name) => { try { process.kill(-child.pid, name); } catch {} };
   const server = new Server({ hostKeys: [privateKey] }, (client) => {
     count++;
     connections.add(client);
@@ -46,6 +48,15 @@ async function fixture() {
     });
     client.on('ready', () => client.on('session', (accept) => {
       const session = accept();
+      let running = null;
+      // sshd turns a signal request into a killpg of the session's process
+      // group: the exec child is a session leader (setsid), so one request
+      // reaches the command and everything it started.
+      session.on('signal', (acceptSignal, _reject, {name}) => {
+        signals.push(name);
+        if (running && running.exitCode == null && running.signalCode == null) exitGroup(running, `SIG${name}`);
+        acceptSignal?.();
+      });
       session.on('exec', (acceptExec, reject, info) => {
         commands.push(info.command);
         // A server can process an exec request and then fail or lose its
@@ -55,12 +66,14 @@ async function fixture() {
           return reject();
         }
         const stream = acceptExec();
-        const child = spawn('/bin/sh', ['-c', info.command], { cwd:root, stdio:['ignore','pipe','pipe'] });
+        const child = spawn('/bin/sh', ['-c', info.command], { cwd:root, detached:true, stdio:['ignore','pipe','pipe'] });
+        running = child;
         children.add(child);
         child.stdout.pipe(stream, {end:false});
         child.stderr.pipe(stream.stderr, {end:false});
-        child.on('close', (code, signal) => { children.delete(child); try { stream.exit(code ?? 1, signal || undefined); stream.end(); } catch {} });
-        stream.on('close', () => { if (child.exitCode == null) child.kill('SIGKILL'); });
+        child.on('close', (code, exitSignal) => { children.delete(child); if (running === child) running = null; try { stream.exit(code ?? 1, exitSignal || undefined); stream.end(); } catch {} });
+        // Closing the channel is not a signal: like sshd, the remote process
+        // keeps running until the host is told to end it.
         stream.on('error', () => {});
       });
     }));
@@ -68,12 +81,16 @@ async function fixture() {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const target = { id:'host-1', revision:1, host:'127.0.0.1', port:server.address().port, username:'test', hostFingerprint, defaultDirectory:root };
   let account = 'user-a';
+  let behavior = settings === undefined ? null : settings;
   const manager = new SshConnectionManager({targetProvider:async (id) => id === target.id ? target : null,
-    credentialProvider:async () => credential, accountProvider:async () => account, idleMs:100 });
-  return {root, target, manager, commands, get count(){return count;}, get authenticationAttempts(){return authenticationAttempts;}, setAccount(value){account=value;},
+    credentialProvider:async () => credential, accountProvider:async () => account, idleMs:100,
+    ...(behavior === null ? {} : {settingsProvider:() => behavior})});
+  return {root, target, manager, commands, signals,
+    get count(){return count;}, get authenticationAttempts(){return authenticationAttempts;}, setAccount(value){account=value;},
+    setBehavior(value) { behavior = value; },
     setCredential(value) { credential = value; },
     disconnect() { for (const conn of connections) conn.end(); },
-    async stop() { manager.shutdown(); for (const child of children) child.kill('SIGKILL'); for (const conn of connections) conn.end();
+    async stop() { manager.shutdown(); for (const child of children) { exitGroup(child, 'SIGKILL'); child.kill('SIGKILL'); } for (const conn of connections) conn.end();
       await new Promise((resolve) => server.close(resolve)); rmSync(root, {recursive:true,force:true}); }};
 }
 
@@ -487,4 +504,173 @@ test('after a command times out, queued commands cannot start on that session', 
     await assert.rejects(f.manager.chdir('agent', opened.handle, f.root), {code:'REMOTE_ENV_SESSION_UNCERTAIN'});
     assert.deepEqual(await f.manager.close('agent', opened.handle), {closed:true});
   } finally { await f.stop(); }
+});
+
+test('closing a session ends the remote processes it started', async () => {
+  const f = await fixture();
+  const marker = join(f.root, 'killed-marker');
+  try {
+    const opened = await f.manager.open('agent', 'host-1');
+    const running = f.manager.run('agent', opened.handle, `sleep 0.5; printf alive > '${marker}'`);
+    const rejected = assert.rejects(running, {code:'REMOTE_ENV_OUTCOME_UNKNOWN'});
+    while (!f.commands.some((command) => command.includes('killed-marker'))) await new Promise((resolve) => setTimeout(resolve, 5));
+    await f.manager.close('agent', opened.handle);
+    await rejected;
+    // The signal request reaches the session's process group, so the command
+    // dies instead of finishing its work on the host.
+    assert.ok(f.signals.length >= 1, 'the session is closed with a signal request');
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.equal(existsSync(marker), false);
+  } finally { await f.stop(); }
+});
+
+test('turning the behavior off leaves the remote process running after the session closes', async () => {
+  const f = await fixture({settings:{killRemoteProcesses:false, backgroundTasks:true}});
+  const marker = join(f.root, 'survived-marker');
+  try {
+    const opened = await f.manager.open('agent', 'host-1');
+    const rejected = f.manager.run('agent', opened.handle, `sleep 0.5; printf alive > '${marker}'`);
+    while (!f.commands.some((command) => command.includes('survived-marker'))) await new Promise((resolve) => setTimeout(resolve, 5));
+    // Only the channel ends; the host is never told to end the command.
+    await f.manager.close('agent', opened.handle);
+    await assert.rejects(rejected, {code:'REMOTE_ENV_OUTCOME_UNKNOWN'});
+    const deadline = Date.now() + 3000;
+    while (!existsSync(marker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(existsSync(marker), true);
+    assert.deepEqual(f.signals, []);
+  } finally { await f.stop(); }
+});
+
+test('a command is never re-parsed by the shell that carries it', async () => {
+  const f = await fixture();
+  try {
+    const opened = await f.manager.open('agent', 'host-1');
+    const command = "printf '%s' 'a)b('; printf '|%s' \"it's\"; printf '|%s' 'x\"y'; printf '|%s' '$HOME'";
+    const result = await f.manager.run('agent', opened.handle, command);
+    assert.equal(result.stdout, 'a)b(|it\'s|x"y|$HOME');
+    assert.equal(result.exitCode, 0);
+  } finally { await f.stop(); }
+});
+
+test('an Agent ending ends the remote processes it started', async () => {
+  const f = await fixture();
+  const marker = join(f.root, 'owner-detach-marker');
+  try {
+    const opened = await f.manager.open('agent', 'host-1');
+    const rejected = f.manager.run('agent', opened.handle, `sleep 0.5; printf alive > '${marker}'`);
+    while (!f.commands.some((command) => command.includes('owner-detach-marker'))) await new Promise((resolve) => setTimeout(resolve, 5));
+    f.manager.closeOwner('agent');
+    await assert.rejects(rejected, {code:'REMOTE_ENV_OUTCOME_UNKNOWN'});
+    assert.ok(f.signals.length >= 1, 'detach sends a signal request, not only a channel close');
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.equal(existsSync(marker), false);
+  } finally { await f.stop(); }
+});
+
+test('an Agent ending leaves the remote process running when the behavior is off', async () => {
+  const f = await fixture({settings:{killRemoteProcesses:false, backgroundTasks:true}});
+  const marker = join(f.root, 'owner-detach-survived');
+  try {
+    const opened = await f.manager.open('agent', 'host-1');
+    const rejected = f.manager.run('agent', opened.handle, `sleep 0.5; printf alive > '${marker}'`);
+    while (!f.commands.some((command) => command.includes('owner-detach-survived'))) await new Promise((resolve) => setTimeout(resolve, 5));
+    f.manager.closeOwner('agent');
+    // The channel ending does not tell the host anything about the command.
+    await assert.rejects(Promise.race([rejected, new Promise((resolve) => setTimeout(resolve, 1500))]), {code:'REMOTE_ENV_OUTCOME_UNKNOWN'});
+    const deadline = Date.now() + 3000;
+    while (!existsSync(marker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(existsSync(marker), true);
+    assert.deepEqual(f.signals, []);
+  } finally { await f.stop(); }
+});
+
+test('a background task ends with the session that started it', async () => {
+  const f = await fixture();
+  try {
+    const opened = await f.manager.open('agent', 'host-1');
+    const job = await f.manager.start('agent', opened.handle, 'sleep 5; printf never');
+    await f.manager.close('agent', opened.handle);
+    await assert.rejects(f.manager.jobOutput('agent', opened.handle, job.jobId), {code:'REMOTE_ENV_SESSION_NOT_FOUND'});
+    // The job's exec was still confirming when the session closed, so the
+    // signal is sent as soon as its channel exists.
+    const deadline = Date.now() + 3000;
+    while (!f.signals.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(f.signals.length >= 1, 'closing the session signals the job');
+  } finally { await f.stop(); }
+});
+
+test('a background task runs alongside the session, reports new output, and can be stopped', async () => {
+  const f = await fixture();
+  try {
+    const opened = await f.manager.open('agent', 'host-1');
+    // The job holds its own channel, so the session is still usable while it runs.
+    const started = await f.manager.start('agent', opened.handle, 'printf one; sleep 0.2; printf two');
+    assert.equal((await f.manager.run('agent', opened.handle, 'printf foreground')).stdout, 'foreground');
+    const deadline = Date.now() + 3000;
+    let read = await f.manager.jobOutput('agent', opened.handle, started.jobId);
+    while (!read.done && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      read = await f.manager.jobOutput('agent', opened.handle, started.jobId);
+    }
+    assert.equal(read.output, 'onetwo');
+    assert.equal(read.done, true);
+    assert.equal(read.exitCode, 0);
+
+    const slow = await f.manager.start('agent', opened.handle, 'sleep 5; printf never');
+    const killed = await f.manager.killJob('agent', opened.handle, slow.jobId);
+    assert.deepEqual(killed, {killed:true, ended:true});
+    const after = await f.manager.jobOutput('agent', opened.handle, slow.jobId);
+    assert.equal(after.done, true);
+    assert.equal(after.terminated, true);
+    assert.deepEqual(await f.manager.killJob('agent', opened.handle, slow.jobId), {killed:false, ended:true});
+    await assert.rejects(f.manager.jobOutput('agent', opened.handle, 'rj_missing'), {code:'REMOTE_ENV_JOB_NOT_FOUND'});
+    await f.manager.close('agent', opened.handle);
+  } finally { await f.stop(); }
+});
+
+test('background reads keep the offset the caller was given and report a moved window', async () => {
+  const f = await fixture();
+  try {
+    const opened = await f.manager.open('agent', 'host-1');
+    const job = await f.manager.start('agent', opened.handle, 'printf 1234567890', {maxOutputBytes:4});
+    const deadline = Date.now() + 3000;
+    let read = await f.manager.jobOutput('agent', opened.handle, job.jobId);
+    while (!read.done && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      read = await f.manager.jobOutput('agent', opened.handle, job.jobId);
+    }
+    assert.equal(read.nextOffset, 10);
+    assert.equal(read.output, '7890');
+    assert.equal((await f.manager.jobOutput('agent', opened.handle, job.jobId, {fromByte:2})).lost, true);
+    assert.equal((await f.manager.jobOutput('agent', opened.handle, job.jobId, {fromByte:8})).output, '90');
+    await f.manager.close('agent', opened.handle);
+  } finally { await f.stop(); }
+});
+
+test('turning background tasks off refuses to start one', async () => {
+  const f = await fixture({settings:{killRemoteProcesses:true, backgroundTasks:false}});
+  try {
+    const opened = await f.manager.open('agent', 'host-1');
+    await assert.rejects(f.manager.start('agent', opened.handle, 'printf no'), {code:'REMOTE_ENV_BACKGROUND_DISABLED'});
+    assert.equal((await f.manager.run('agent', opened.handle, 'printf ok')).stdout, 'ok');
+    await f.manager.close('agent', opened.handle);
+  } finally { await f.stop(); }
+});
+
+test('a behavior that was never written leaves the device promise intact', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'or-remote-behavior-'));
+  const secrets = new Map();
+  const service = new RemoteEnvironmentService({stateDir, vault:{
+    put:async (key,value) => secrets.set(key,value), get:async (key) => secrets.get(key), remove:async (key) => secrets.delete(key)},
+  });
+  try {
+    assert.deepEqual((await service.handle('list')).settings, {killRemoteProcesses:true, backgroundTasks:true});
+    assert.deepEqual(await service.handle('set_behavior', {backgroundTasks:false}),
+      {settings:{killRemoteProcesses:true, backgroundTasks:false}});
+    assert.deepEqual((await service.handle('list')).settings, {killRemoteProcesses:true, backgroundTasks:false});
+    await assert.rejects(service.handle('set_behavior', {killRemoteProcesses:'no'}), {code:'REMOTE_ENV_INVALID'});
+    assert.deepEqual((await service.handle('list')).settings, {killRemoteProcesses:true, backgroundTasks:false});
+    await service.handle('set_behavior', {killRemoteProcesses:false, backgroundTasks:true});
+    assert.deepEqual(await service.manager.behavior(), {killRemoteProcesses:false, backgroundTasks:true});
+  } finally { service.close(); rmSync(stateDir,{recursive:true,force:true}); }
 });

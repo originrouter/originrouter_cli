@@ -187,6 +187,12 @@ await open;
 // single test command. It cannot execute arbitrary commands on this machine.
 const sshKey = generateKeyPairSync("rsa", {modulusLength:2048,
   privateKeyEncoding:{type:"pkcs1",format:"pem"},publicKeyEncoding:{type:"spki",format:"pem"}}).privateKey;
+// The manager delivers each command inside a quoted here-document, so the
+// fixture records the command text it would run rather than the whole script.
+function commandOf(script) {
+  const match = /<<'([^']+)'\n([\s\S]*)\n\1\n/.exec(script);
+  return match ? match[2] : script;
+}
 const sshCommands = [];
 const sshServer = new ssh2.Server({hostKeys:[sshKey]}, (connection) => {
   connection.on("error", () => {});
@@ -196,10 +202,11 @@ const sshServer = new ssh2.Server({hostKeys:[sshKey]}, (connection) => {
   });
   connection.on("ready", () => connection.on("session", (accept) => {
     accept().on("exec", (acceptExec, _reject, info) => {
-      sshCommands.push(info.command);
+      const command = commandOf(info.command);
+      sshCommands.push(command);
       const stream = acceptExec();
-      if (info.command === "pwd -P") { stream.write("/fixture\n"); stream.exit(0); }
-      else if (info.command.includes("printf e2e-approved-command")) { stream.write("e2e-approved-command"); stream.exit(0); }
+      if (command === "pwd -P") { stream.write("/fixture\n"); stream.exit(0); }
+      else if (command.includes("printf e2e-approved-command")) { stream.write("e2e-approved-command"); stream.exit(0); }
       else { stream.stderr.write("unsupported fixture command"); stream.exit(1); }
       stream.end();
     });

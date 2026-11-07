@@ -10,6 +10,17 @@ import { loopbackDialHost } from "../local/localApiHttp.js";
 import { ensureStateDir, readDaemonState } from "../persistence/state.js";
 import { optionValue } from "../commands/shared/cliArgs.js";
 
+// How the device tools are meant to be used, across calls. MCP clients do not
+// have to show this to the model, so the same guidance also lives in the
+// descriptions of the tools themselves.
+const DEVICE_TOOL_INSTRUCTIONS = [
+  "The remote_env_* tools reach hosts the user configured on this device.",
+  "Open a session with remote_env_open, reuse the returned handle for every later call,",
+  "and close it with remote_env_close when the work is done.",
+  "A timeout ends the remote command and reports it; a disconnect leaves the remote outcome unknown,",
+  "and that session must not run further commands — investigate the host before closing it.",
+].join(" ");
+
 function localApi() {
   const stateDir = ensureStateDir();
   const state = readDaemonState();
@@ -73,7 +84,7 @@ export async function runAgentGatewayMcpServer(args = process.argv.slice(2)) {
   const server = new McpServer({
     name: "originrouter-agent-gateway",
     version: "0.1.0",
-  });
+  }, deviceTools ? {instructions: DEVICE_TOOL_INSTRUCTIONS} : undefined);
 
   if (!deviceTools) {
   server.registerTool("list_participants", {
@@ -168,13 +179,20 @@ export async function runAgentGatewayMcpServer(args = process.argv.slice(2)) {
     deviceTool("scheduled_run", "Start an existing scheduled task now; it will not overlap an active execution.", {id,baseRevision:z.number().int().min(1).optional()}, "scheduled.run");
     deviceTool("scheduled_delete", "Delete an existing scheduled task without stopping an already running Agent.", {id,baseRevision:z.number().int().min(1).optional()}, "scheduled.delete");
     deviceTool("remote_env_list", "List SSH hosts configured by the user on this CLI device. No credentials are returned.", {}, "remote.list");
-    deviceTool("remote_env_open", "Open a session to a configured SSH host, reusing the device's verified connection. Returns a session handle and working directory.", {id}, "remote.open");
-    deviceTool("remote_env_exec", "Run a command through an open SSH session. The command uses the session working directory unless cwd is supplied. Output can be truncated; a timeout or disconnect means the remote outcome is unknown and must not be automatically retried. A session with an unknown outcome cannot run further commands; investigate the host before explicitly closing it and opening another.", {
+    deviceTool("remote_env_open", "Open a session to a configured SSH host, reusing the device's verified connection. Returns a session handle and working directory. The handle stays valid for every later call until you close the session.", {id}, "remote.open");
+    deviceTool("remote_env_exec", "Run a command through an open SSH session. The command uses the session working directory unless cwd is supplied. Output can be truncated. Set run_in_background for a long command: the call returns a job id right away, and you read it with remote_env_job_read and stop it with remote_env_job_kill. A timeout ends the command on the host and reports it as timed out; a disconnect means the remote outcome is unknown and must not be automatically retried. A session with an unknown outcome cannot run further commands; investigate the host before explicitly closing it and opening another.", {
       handle,command:z.string().min(1).max(8192),cwd:z.string().min(1).max(4096).optional(),
       timeoutMs:z.number().int().min(1).max(600000).optional(),maxOutputBytes:z.number().int().min(1).max(1048576).optional(),
+      runInBackground:z.boolean().optional(),
     }, "remote.exec");
+    deviceTool("remote_env_job_read", "Read what a background remote task has produced so far. Keep the nextOffset the read returns and pass it back as fromByte to read only what is new. A read reported as lossy means the retained window moved past the offset you asked for.", {
+      handle,jobId:z.string().min(1).max(191),fromByte:z.number().int().min(0).optional(),
+    }, "remote.job_read");
+    deviceTool("remote_env_job_kill", "Stop a background remote task. This ends the remote process the task started.", {
+      handle,jobId:z.string().min(1).max(191),
+    }, "remote.job_kill");
     deviceTool("remote_env_chdir", "Change the working directory for one SSH session; path must be absolute.", {handle,path:z.string().min(1).max(4096)}, "remote.chdir");
-    deviceTool("remote_env_close", "Close an SSH session; other sessions can continue to use the same transport.", {handle}, "remote.close");
+    deviceTool("remote_env_close", "Close an SSH session; other sessions can continue to use the same transport. Closing a session ends the remote processes it started, unless the device was told to leave them running.", {handle}, "remote.close");
   }
 
   const transport = new StdioServerTransport();

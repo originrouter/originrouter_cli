@@ -74,6 +74,7 @@ export class RemoteTargetStore {
     );
     CREATE TABLE IF NOT EXISTS deleted_target_ids (id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS credential_gc (ref TEXT PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
     this.db = db; this.openDir = dir; return db;
   }
@@ -105,6 +106,37 @@ export class RemoteTargetStore {
   public(row) { return {...JSON.parse(row.document),revision:row.revision,authKind:row.auth_kind,updatedAt:new Date(row.updated_ms).toISOString()}; }
   list() { return this.database().prepare('SELECT * FROM targets ORDER BY updated_ms DESC, id').all().map((row) => this.public(row)); }
   pendingCleanup() { return this.database().prepare('SELECT COUNT(*) AS n FROM credential_gc').get().n; }
+  /**
+   * What the device does with the remote processes a session starts.
+   *
+   * Both behaviors are on unless the reader turned one off: a setting that was
+   * never written, or a value this device cannot read, leaves the behavior
+   * the device promised.
+   */
+  settings(dir = this.dir()) {
+    this.checkAccount(dir);
+    const rows = this.database().prepare('SELECT key, value FROM settings').all();
+    const values = {};
+    for (const row of rows) values[row.key] = row.value !== 'false';
+    return {
+      killRemoteProcesses: values.killRemoteProcesses !== false,
+      backgroundTasks: values.backgroundTasks !== false,
+    };
+  }
+  setSettings(patch, dir = this.dir()) {
+    this.checkAccount(dir);
+    const next = {
+      killRemoteProcesses: patch?.killRemoteProcesses !== false,
+      backgroundTasks: patch?.backgroundTasks !== false,
+    };
+    const db = this.database();
+    const write = db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
+    db.transaction(() => {
+      write.run('killRemoteProcesses', String(next.killRemoteProcesses));
+      write.run('backgroundTasks', String(next.backgroundTasks));
+    }).immediate();
+    return next;
+  }
   get(id, dir = this.dir()) {
     this.checkAccount(dir);
     const row = this.database().prepare('SELECT * FROM targets WHERE id=?').get(id);

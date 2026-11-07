@@ -88,7 +88,7 @@ export class DeviceToolService {
       }
       return opened;
     }
-    if (['remote.exec','remote.chdir','remote.close'].includes(operation)) {
+    if (['remote.exec','remote.chdir','remote.close','remote.job_read','remote.job_kill'].includes(operation)) {
       const handle=string(input.handle,'handle',191);
       const info=await this.remote.manager.sessionInfo(sessionId,handle);
       if (info.outcomeUnknown && operation !== 'remote.close') throw fail('REMOTE_ENV_SESSION_UNCERTAIN','A previous command may still be running. Inspect the host independently before closing this session and opening another.');
@@ -96,7 +96,7 @@ export class DeviceToolService {
       const target=publicTarget(this.remote.store.get(info.targetId,account));
       if (target.revision !== info.revision) throw fail('REMOTE_ENV_CONFLICT','Remote target changed');
       const context={target,handle,cwd:info.cwd,...(info.outcomeUnknown ? {outcomeUnknown:true} : {})};
-      let command, cwd, path, timeoutMs, maxOutputBytes;
+      let command, cwd, path, timeoutMs, maxOutputBytes, jobId, fromByte, runInBackground = false;
       if (operation === 'remote.exec') {
         command=string(input.command,'command',8192);
         if (Buffer.byteLength(command) > 8192) throw fail('DEVICE_TOOL_INVALID','Command is too large');
@@ -104,12 +104,22 @@ export class DeviceToolService {
         if (!cwd.startsWith('/') || /[\r\n]/.test(cwd)) throw fail('DEVICE_TOOL_INVALID','cwd must be an absolute path');
         timeoutMs=input.timeoutMs ?? 60_000; maxOutputBytes=input.maxOutputBytes ?? 131_072;
         if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 600_000 || !Number.isInteger(maxOutputBytes) || maxOutputBytes < 1 || maxOutputBytes > 1_048_576) throw fail('DEVICE_TOOL_INVALID','Invalid execution limit');
-        Object.assign(context,{command,cwd,timeoutMs,maxOutputBytes});
+        runInBackground=input.runInBackground === true;
+        Object.assign(context,{command,cwd,timeoutMs,maxOutputBytes,runInBackground});
       }
       if (operation === 'remote.chdir') {
         path=string(input.path,'path',4096);
         if (!path.startsWith('/') || /[\r\n]/.test(path)) throw fail('DEVICE_TOOL_INVALID','path must be an absolute path');
         context.path=path;
+      }
+      if (operation === 'remote.job_read' || operation === 'remote.job_kill') {
+        jobId=string(input.jobId,'job id',191);
+        context.jobId=jobId;
+        if (operation === 'remote.job_read') {
+          fromByte=input.fromByte ?? 0;
+          if (!Number.isInteger(fromByte) || fromByte < 0 || fromByte > 1_073_741_824) throw fail('DEVICE_TOOL_INVALID','fromByte must be a byte offset');
+          context.fromByte=fromByte;
+        }
       }
       await this.approve(sessionId,operation,context,signal); sameAccount(this.accountProvider,account);
       const current=await this.remote.manager.sessionInfo(sessionId,handle);
@@ -117,8 +127,13 @@ export class DeviceToolService {
       if (current.outcomeUnknown && operation !== 'remote.close') throw fail('REMOTE_ENV_SESSION_UNCERTAIN','A previous command may still be running. Inspect the host independently before closing this session and opening another.');
       sameAccount(this.accountProvider,account);
       checkSignal(signal);
-      if (operation === 'remote.exec') return this.remote.manager.run(sessionId,handle,command,{cwd,timeoutMs,maxOutputBytes,signal});
+      if (operation === 'remote.exec') {
+        if (runInBackground) return this.remote.manager.start(sessionId,handle,command,{cwd,maxOutputBytes});
+        return this.remote.manager.run(sessionId,handle,command,{cwd,timeoutMs,maxOutputBytes,signal});
+      }
       if (operation === 'remote.chdir') return this.remote.manager.chdir(sessionId,handle,path,{signal});
+      if (operation === 'remote.job_read') return this.remote.manager.jobOutput(sessionId,handle,jobId,{fromByte});
+      if (operation === 'remote.job_kill') return this.remote.manager.killJob(sessionId,handle,jobId);
       return this.remote.manager.close(sessionId,handle);
     }
     throw fail('DEVICE_TOOL_INVALID','Unknown device tool operation');

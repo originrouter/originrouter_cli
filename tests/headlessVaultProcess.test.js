@@ -36,7 +36,7 @@ test('a restarted headless service reconnects to a real SSH server using its enc
     client.on('authentication',(ctx) => ctx.username==='test' && ctx.method==='password' && ctx.password==='restart-fixture-password' ? ctx.accept() : ctx.reject());
     client.on('ready',() => client.on('session',(accept) => accept().on('exec',(acceptExec,_reject,info) => {
       commands.push(info.command); const stream=acceptExec();
-      if(info.command==='pwd -P'){stream.write('/fixture\n');stream.exit(0);}
+      if(info.command.includes('pwd -P')){stream.write('/fixture\n');stream.exit(0);}
       else if(info.command.includes('printf restart-ok')){stream.write('restart-ok');stream.exit(0);}
       else {stream.exit(1);}
       stream.end();
