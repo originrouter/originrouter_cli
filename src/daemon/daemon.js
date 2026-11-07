@@ -49,6 +49,12 @@ import { AgentCatalog } from "../persistence/agentCatalog.js";
 import { readSessions } from "../persistence/sessionLog.js";
 import { ExternalAgentRegistry } from "../local/externalAgentRegistry.js";
 import { RuntimeTaskStore } from "../runtime/runtimeTaskStore.js";
+import { ScheduledTaskStore } from "../runtime/scheduledTaskStore.js";
+import { ScheduledTaskScheduler } from "../runtime/scheduledTaskScheduler.js";
+import { closeScheduledTaskApi } from "./scheduledTaskShutdown.js";
+import { RemoteEnvironmentService } from "../remoteEnvironment/remoteEnvironmentService.js";
+import { DeviceToolApprovalBroker } from "../mcp/deviceToolApprovalBroker.js";
+import { DeviceToolService } from "../mcp/deviceToolService.js";
 import { RuntimeSupervisor } from "../runtime/runtimeSupervisor.js";
 import { SupervisorJudgeClient } from "../runtime/supervisorJudgeClient.js";
 import { ManagedAgentSupervisor } from "./managedAgentSupervisor.js";
@@ -383,13 +389,21 @@ export async function startDaemon(args) {
   // without the account relay keeps the built-in rules only.
   const runtimeTasksOnAccount = relayMode !== "local";
   const runtimeTaskStore = new RuntimeTaskStore({ stateDir, aiJudgeAvailable: runtimeTasksOnAccount });
+  externalAgentRegistry.runtimeTaskStore = runtimeTaskStore;
   const supervisorJudge = runtimeTasksOnAccount ? new SupervisorJudgeClient({ stateDir }) : null;
   const runtimeSupervisor = new RuntimeSupervisor({
     registry: externalAgentRegistry,
     store: runtimeTaskStore,
     judge: supervisorJudge ? (request) => supervisorJudge.judge(request) : null,
     onEscalated: runtimeTasksOnAccount
-      ? (escalation) => reportSupervisorEscalation(escalation, { stateDir })
+      // The result was swallowed before: a push the server refused left no
+      // trace anywhere. Say so in the daemon log.
+      ? (escalation) => reportSupervisorEscalation(escalation, { stateDir }).then((result) => {
+        if (!result?.ok) {
+          console.error(`[runtime-supervisor] escalation push not accepted: ${result?.status || result?.error || "unknown"}`);
+        }
+        return result;
+      })
       : null,
   }).start();
   const externalAgentRelayRouter = new ExternalAgentRelayRouter({
@@ -406,6 +420,15 @@ export async function startDaemon(args) {
     relayUrl,
     agentBudgetStore,
   });
+  const scheduledTaskStore = new ScheduledTaskStore({ stateDir });
+  const scheduledTaskScheduler = new ScheduledTaskScheduler({
+    store: scheduledTaskStore, supervisor: managedAgentSupervisor,
+    registry: externalAgentRegistry, runtimeSupervisor, catalog: agentCatalog,
+  }).start();
+  const remoteEnvironmentService = new RemoteEnvironmentService({stateDir});
+  const deviceToolApprovalBroker = new DeviceToolApprovalBroker({registry:externalAgentRegistry, accountProvider:() => remoteEnvironmentService.store.dir()});
+  const deviceToolService = new DeviceToolService({broker:deviceToolApprovalBroker, registry:externalAgentRegistry,
+    scheduled:scheduledTaskScheduler, remote:remoteEnvironmentService, accountProvider:() => remoteEnvironmentService.store.dir()});
   const collaborationRuntime = new CollaborationRuntime({
     store: collaborationStore,
     coordinator: collaborationCoordinator,
@@ -457,6 +480,8 @@ export async function startDaemon(args) {
     agentBudgetStore,
     runtimeTaskStore,
     runtimeSupervisor,
+    scheduledTaskScheduler,
+    remoteEnvironmentService,
     stateDir,
     telemetry,
     compatibilityAutomaticUpdates:
@@ -567,6 +592,9 @@ export async function startDaemon(args) {
     agentBudgetStore,
     runtimeTaskStore,
     runtimeSupervisor,
+    scheduledTaskScheduler,
+    remoteEnvironmentService,
+    deviceToolService,
     collaborationStore,
     collaborationCoordinator,
     collaborationRuntime,
@@ -731,6 +759,10 @@ export async function startDaemon(args) {
     shuttingDown = true;
     console.log(`[daemon] received ${signal}, shutting down…`);
     runtimeSupervisor.stop();
+    scheduledTaskScheduler.stop();
+    deviceToolService.close();
+    deviceToolApprovalBroker.close();
+    remoteEnvironmentService.close();
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (accountBudgetTimer) clearInterval(accountBudgetTimer);
     if (agentActivitySyncTimer) clearInterval(agentActivitySyncTimer);
@@ -753,7 +785,12 @@ export async function startDaemon(args) {
       console.error(`[daemon] remote share proxy stop: ${e.message}`);
     }
     try {
-      await localApi.close();
+      // Stop accepting HTTP work immediately. An in-flight run request may
+      // still be waiting for a launch receipt, so don't let server.close()
+      // block the bounded scheduler drain indefinitely.
+      if (!await closeScheduledTaskApi(localApi, scheduledTaskScheduler)) {
+        console.error('[scheduled-tasks] launch did not settle before shutdown; its outcome remains uncertain');
+      }
     } catch (e) {
       console.error(`[daemon] local api close: ${e.message}`);
     }
@@ -776,6 +813,11 @@ export async function startDaemon(args) {
       agentBudgetStore.close();
     } catch (e) {
       console.error(`[daemon] agent budget store close: ${e.message}`);
+    }
+    try {
+      scheduledTaskStore.close();
+    } catch (e) {
+      console.error(`[scheduled-tasks] shutdown: ${e.message}`);
     }
     try {
       agentCatalog.close();
@@ -1143,8 +1185,8 @@ export async function startDaemon(args) {
 
       const relayOptions = relayOptionsResult.options;
       relayAuthState = relayOptions.authState || "on";
-      relayCarriesAuthToken = relayOptions.authState === "on";
       relayAuthError = null;
+      relayCarriesAuthToken = relayOptions.authState === "on";
       relayClient.deviceId = relayOptions.deviceId;
       relayClient.setAuthToken(relayOptions.authToken);
       effectiveDeviceId = relayOptions.deviceId;
