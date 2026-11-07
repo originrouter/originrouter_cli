@@ -23,6 +23,7 @@ import test from "node:test";
 import {
   createDpopFetch,
   createDpopProofProvider,
+  createDpopRecovery,
   deploymentFor,
   dpopAuthHeaders,
   dpopEnabled,
@@ -636,6 +637,152 @@ test("the wrapped fetch leaves a request it does not recognise alone", async () 
     assert.equal(seen[0].init.headers.DPoP, undefined);
     assert.equal(wrapped.dpop, true);
     assert.equal(wrapped.raw, inner);
+  } finally {
+    removeStateDir(stateDir);
+  }
+});
+
+test("a refusal that says the key is wrong is reported to the caller", async () => {
+  const stateDir = makeStateDir();
+  try {
+    const refusals = [];
+    const inner = async () => ({
+      ok: false,
+      status: 401,
+      headers: new Headers({
+        "www-authenticate": 'DPoP, error="dpop_proof_required"',
+      }),
+      json: async () => ({ detail: { code: "dpop_proof_required" } }),
+    });
+    const wrapped = createDpopFetch({
+      stateDir,
+      fetchFn: inner,
+      onRefusal: async (refusal) => {
+        refusals.push(refusal);
+      },
+    });
+    await wrapped(`${CONTROL_BASE}/cli/v1/agent/approvals/decisions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(refusals.length, 1, "the refusal is reported");
+    assert.equal(refusals[0].code, "dpop_proof_required");
+    assert.equal(refusals[0].status, 401);
+    assert.match(refusals[0].url, /\/cli\/v1\/agent\/approvals\/decisions$/);
+  } finally {
+    removeStateDir(stateDir);
+  }
+});
+
+test("a refusal that does not name the key is not reported", async () => {
+  const stateDir = makeStateDir();
+  try {
+    const refusals = [];
+    const inner = async () => ({
+      ok: false,
+      status: 401,
+      headers: new Headers({ "www-authenticate": 'Bearer error="unauthorized"' }),
+      json: async () => ({ detail: { code: "unauthorized" } }),
+    });
+    const wrapped = createDpopFetch({
+      stateDir,
+      fetchFn: inner,
+      onRefusal: async (refusal) => {
+        refusals.push(refusal);
+      },
+    });
+    await wrapped(`${CONTROL_BASE}/cli/v1/agent/approvals/decisions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(refusals.length, 0, "a refusal about the token is not the key's fault");
+  } finally {
+    removeStateDir(stateDir);
+  }
+});
+
+test("a refusal outside the audiences that read proofs is not reported", async () => {
+  const stateDir = makeStateDir();
+  try {
+    const refusals = [];
+    const inner = async () => ({
+      ok: false,
+      status: 401,
+      headers: new Headers({
+        "www-authenticate": 'DPoP, error="dpop_proof_required"',
+      }),
+      json: async () => ({ detail: { code: "dpop_proof_required" } }),
+    });
+    const wrapped = createDpopFetch({
+      stateDir,
+      fetchFn: inner,
+      onRefusal: async (refusal) => {
+        refusals.push(refusal);
+      },
+    });
+    await wrapped(`${CONTROL_BASE}/ai/v1/ai-audit/reviews`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(refusals.length, 0, "a service that never asks for a proof cannot refuse one");
+  } finally {
+    removeStateDir(stateDir);
+  }
+});
+
+test("the recovery reads what it needs when it runs, not when it is set up", async () => {
+  const stateDir = makeStateDir();
+  try {
+    ensureDeviceE2eeIdentity(stateDir, { deviceId: DEVICE_ID });
+    const server = makeFakeServer();
+    let askedForBase = 0;
+    let askedForToken = 0;
+    const recovery = createDpopRecovery({
+      stateDir,
+      controlBaseUrl: () => {
+        askedForBase += 1;
+        return CONTROL_BASE;
+      },
+      accessToken: () => {
+        askedForToken += 1;
+        return TOKEN;
+      },
+      deviceId: () => DEVICE_ID,
+      fetchFn: server.send,
+    });
+    assert.equal(askedForBase, 0, "setting the recovery up asks for nothing");
+    assert.equal(askedForToken, 0, "setting the recovery up asks for nothing");
+
+    const result = await recovery();
+    assert.equal(askedForBase, 1);
+    assert.equal(askedForToken, 1);
+    assert.equal(result.status, "active", "the key is put back in place");
+    assert.deepEqual(server.calls.map((call) => call.path), [
+      "/cli/v1/dpop/status",
+      "/cli/v1/dpop/key",
+      "/cli/v1/dpop/proof",
+    ]);
+  } finally {
+    removeStateDir(stateDir);
+  }
+});
+
+test("a recovery with nothing to recover with does nothing", async () => {
+  const stateDir = makeStateDir();
+  try {
+    const server = makeFakeServer();
+    const recovery = createDpopRecovery({
+      stateDir,
+      controlBaseUrl: () => null,
+      accessToken: () => null,
+      deviceId: () => null,
+      fetchFn: server.send,
+    });
+    assert.equal(await recovery(), null);
+    assert.equal(server.calls.length, 0, "nothing was asked of the server");
   } finally {
     removeStateDir(stateDir);
   }

@@ -75,9 +75,11 @@ import {
 } from "../security/deviceE2eeDirectoryCache.js";
 import {
   createDpopProofProvider,
+  createDpopRecovery,
   ensureDpopRegistered,
   installDpopFetch,
 } from "../security/dpopRegistration.js";
+import { accessTokenFor, OAUTH_RESOURCES } from "../runtime/authContract.js";
 import { DeviceE2eeRelayTransport } from "../security/deviceE2eeRelayTransport.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import { refreshCompatibilityPack } from "../compatibility/updater.js";
@@ -106,7 +108,33 @@ export async function startDaemon(args) {
   // call sites that do not know DPoP exists. It changes a request only
   // when this device has registered a key for the deployment it is going
   // to; everything else goes out exactly as it was written.
-  installDpopFetch({ stateDir });
+  //
+  // A refusal that says the key is wrong is answered by putting a key
+  // back in place — the server holds a key this device cannot prove, and
+  // without that answer every request this process makes would be refused
+  // for as long as the mismatch lasts. The refused request is not waited
+  // for: the next one carries the new proof.
+  const restoreDpopKey = createDpopRecovery({
+    stateDir,
+    controlBaseUrl: () => relayUrl,
+    accessToken: async () => {
+      const credential = await ensureFreshAccessToken({ stateDir });
+      return accessTokenFor(credential, OAUTH_RESOURCES.CONTROL)?.token || null;
+    },
+    deviceId: () => effectiveDeviceId,
+  });
+  installDpopFetch({
+    stateDir,
+    onRefusal: async ({ code }) => {
+      console.warn(`[daemon] refused for ${code}; putting the key back in place`);
+      const restored = await restoreDpopKey();
+      if (restored && restored.status !== "active") {
+        console.warn(
+          `[daemon] the key was not put back: ${restored.status}${restored.code ? ` (${restored.code})` : ""}`,
+        );
+      }
+    },
+  });
   const localApiConfig = readLocalApiConfig();
 
   // Stage 6: ensure the bearer token file exists before binding the API.

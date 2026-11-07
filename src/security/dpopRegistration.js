@@ -222,6 +222,47 @@ export function isDpopRefusal(status, body) {
   return Number(status) === 401;
 }
 
+/**
+ * The reason a refusal gives, when the refusal names one.
+ *
+ * The server answers a request it will not accept with a challenge that
+ * names the error, so the reason is in the headers whether or not the
+ * body has been read — and a streamed response has no body to read at
+ * all. This is the same question `isDpopRefusal` asks of a body, asked
+ * of headers instead.
+ */
+export function dpopRefusalCode(status, headers) {
+  if (Number(status) !== 401) return null;
+  let challenge = "";
+  if (headers && typeof headers.get === "function") {
+    challenge = String(headers.get("www-authenticate") || "");
+  } else if (headers && typeof headers === "object") {
+    for (const [key, value] of Object.entries(headers)) {
+      if (String(key).toLowerCase() === "www-authenticate") {
+        challenge = String(value || "");
+        break;
+      }
+    }
+  }
+  const match = /error="([^"]+)"/i.exec(challenge);
+  const code = match ? match[1] : "";
+  if (!code.startsWith("dpop_")) return null;
+  if (code === "dpop_registry_unavailable") return null;
+  return code;
+}
+
+/**
+ * Whether a refusal says the key this device signs with is not the key
+ * the server holds.
+ *
+ * These two are the ones a new key answers. The others — a proof that
+ * did not match, a proof that was replayed — are about the request that
+ * carried them, and registering again would not change them.
+ */
+export function isDpopKeyMismatch(code) {
+  return code === "dpop_proof_required" || code === "dpop_key_not_registered";
+}
+
 function collectHeaders(input, init) {
   const out = {};
   const add = (source) => {
@@ -312,13 +353,32 @@ export function rewriteForDpop(input, init, { stateDir, accountScope = null } = 
  * nothing else. A request it does not recognise goes out byte for byte as
  * it was written.
  */
-export function createDpopFetch({ stateDir, fetchFn = null, accountScope = null } = {}) {
-  const options = { stateDir, accountScope };
+export function createDpopFetch({ stateDir, fetchFn = null, accountScope = null, onRefusal = null } = {}) {
+  const options = { stateDir, accountScope, onRefusal };
   const inner = fetchFn || globalThis.fetch;
   const wrapped = async (input, init = {}) => {
     const rewritten = rewriteForDpop(input, init, options);
-    if (!rewritten) return inner(input, init);
-    return inner(rewritten.input, rewritten.init);
+    const response = await inner(
+      rewritten ? rewritten.input : input,
+      rewritten ? rewritten.init : init,
+    );
+    // A refusal that says the key is wrong is answered by putting a key
+    // back in place, and the refusal itself is not waited for: the next
+    // request is the one that carries the new proof. The refusal is
+    // looked for in every response, including the ones that were not
+    // rewritten — a device whose local record has gone missing is exactly
+    // the device whose requests go out without a proof.
+    const hook = options.onRefusal;
+    if (typeof hook === "function") {
+      const url = requestUrl(input);
+      const code = dpopRefusalCode(response.status, response.headers);
+      if (code && isDpopKeyMismatch(code) && url && usesDpopAudience(url)) {
+        Promise.resolve()
+          .then(() => hook({ code, url, status: response.status }))
+          .catch(() => {});
+      }
+    }
+    return response;
   };
   wrapped.dpop = true;
   wrapped.raw = inner;
@@ -343,14 +403,15 @@ export function rawFetch() {
  * Calling this twice is not a problem: the second call updates the state
  * directory the first wrapper reads and leaves the wrapper in place.
  */
-export function installDpopFetch({ stateDir, fetchFn = null } = {}) {
+export function installDpopFetch({ stateDir, fetchFn = null, onRefusal = null } = {}) {
   if (fetchFn) ORIGINAL_FETCH = fetchFn;
   const current = globalThis.fetch;
   if (current?.dpop) {
     current.options.stateDir = stateDir;
+    if (onRefusal) current.options.onRefusal = onRefusal;
     return current;
   }
-  const wrapped = createDpopFetch({ stateDir, fetchFn: ORIGINAL_FETCH });
+  const wrapped = createDpopFetch({ stateDir, fetchFn: ORIGINAL_FETCH, onRefusal });
   globalThis.fetch = wrapped;
   return wrapped;
 }
@@ -608,6 +669,13 @@ export async function recoverDpopRegistration({
  * the daemon connects; this is the case where the device found out in the
  * middle of a request that its key no longer matches, and it is better
  * answered by the next request than by this one.
+ *
+ * The three things a registration needs — the address of the server, the
+ * token to register with, and the name of this device — are read when the
+ * recovery runs rather than when it is set up. The daemon knows all three
+ * only later: the address when it has resolved its endpoint, the token
+ * when it has one that has not expired, and the device when it has been
+ * told which one it is.
  */
 export function createDpopRecovery({
   stateDir,
@@ -628,11 +696,15 @@ export function createDpopRecovery({
     lastAttemptAt = moment;
     running = (async () => {
       try {
+        const base = typeof controlBaseUrl === "function" ? await controlBaseUrl() : controlBaseUrl;
+        const token = typeof accessToken === "function" ? await accessToken() : accessToken;
+        const device = typeof deviceId === "function" ? await deviceId() : deviceId;
+        if (!base || !token || !device) return null;
         return await recoverDpopRegistration({
           stateDir,
-          controlBaseUrl,
-          accessToken,
-          deviceId,
+          controlBaseUrl: base,
+          accessToken: token,
+          deviceId: device,
           fetchFn,
           accountScope,
         });
