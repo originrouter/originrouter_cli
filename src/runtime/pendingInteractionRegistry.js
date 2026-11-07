@@ -19,6 +19,7 @@ export class PendingInteractionRegistry {
 
   request(request, signal) {
     this.cleanup();
+    if (signal?.aborted) return Promise.reject(new Error("interaction_aborted"));
     const interactionId = request?.interactionId;
     if (!interactionId) throw new TypeError("interactionId is required");
     if (this.entries.has(interactionId)) {

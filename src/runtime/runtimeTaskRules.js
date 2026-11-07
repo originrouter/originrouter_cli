@@ -3,13 +3,15 @@
 // repo). This module is pure: card validation, error classification and the
 // built-in judges. The engine that applies them is runtimeSupervisor.js.
 
-export const RUNTIME_TASK_CHECKPOINTS = Object.freeze(["turn_ended", "abnormal_stop", "idle"]);
+export const RUNTIME_TASK_CHECKPOINTS = Object.freeze(["turn_ended", "abnormal_stop", "idle", "loop"]);
 export const RUNTIME_TASK_BUILTIN_RULES = Object.freeze(["retryable_error", "empty_reply", "always"]);
-export const RUNTIME_TASK_ACTIONS = Object.freeze(["send", "notify", "stop"]);
+export const RUNTIME_TASK_ACTIONS = Object.freeze(["send", "notify", "stop", "interrupt_and_continue"]);
 export const RUNTIME_TASK_TEMPLATES = Object.freeze([
   "auto_continue_on_error",
   "continue_empty_reply",
   "idle_reminder",
+  "loop_reminder",
+  "loop_recovery",
   "dont_stop_to_ask",
   "completion_check",
 ]);
@@ -86,6 +88,7 @@ export function normalizeRuntimeTaskCard(input, { aiJudgeAvailable = false } = {
   const judgeKind = oneOf(judgeInput.kind, ["builtin", "ai"], "judge.kind");
   let judge;
   if (judgeKind === "builtin") {
+    if (checkpoints.includes("loop")) throw invalid("loop detection requires AI judgement");
     const rule = oneOf(judgeInput.rule, RUNTIME_TASK_BUILTIN_RULES, "judge.rule");
     const reachable = RULE_CHECKPOINTS[rule];
     if (!checkpoints.every((checkpoint) => reachable.has(checkpoint))) {
@@ -105,14 +108,20 @@ export function normalizeRuntimeTaskCard(input, { aiJudgeAvailable = false } = {
 
   const actionInput = input.action && typeof input.action === "object" ? input.action : {};
   const actionKind = oneOf(actionInput.kind, RUNTIME_TASK_ACTIONS, "action.kind");
+  if (checkpoints.includes("loop") && !["notify", "interrupt_and_continue"].includes(actionKind)) {
+    throw invalid("a loop card can only notify or interrupt and continue");
+  }
+  if (actionKind === "interrupt_and_continue" && (checkpoints.length !== 1 || checkpoints[0] !== "loop")) {
+    throw invalid("interrupt and continue requires a loop checkpoint");
+  }
   let action;
-  if (actionKind === "send") {
+  if (actionKind === "send" || actionKind === "interrupt_and_continue") {
     // A message sent while the Agent is still running would have to
     // interrupt it first; that path is not built, so idle cards cannot send.
-    if (checkpoints.includes("idle")) throw invalid("an idle card can only notify or stop");
+    if (actionKind === "send" && checkpoints.some((checkpoint) => checkpoint === "idle" || checkpoint === "loop")) throw invalid("a running-turn card cannot send without interrupting");
     const message = text(actionInput.message, 2000);
     if (!message) throw invalid("action.message is required");
-    action = { kind: "send", message };
+    action = { kind: actionKind, message };
   } else {
     action = { kind: actionKind };
   }

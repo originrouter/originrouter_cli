@@ -31,15 +31,49 @@ export class SupervisorJudgeClient {
     this.timeoutMs = timeoutMs;
   }
 
-  async judge({ judgeId, runtime, snapshot, instruction }) {
-    const credential = await this.ensureFreshAccessTokenFn({
-      stateDir: this.stateDir,
-      resource: OAUTH_RESOURCES.AI,
-      fetchFn: this.fetchFn,
+  async judge(request) {
+    const controller = new AbortController();
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(Object.assign(new Error("supervisor judgement timed out"), { code: "SUPERVISOR_JUDGE_TIMEOUT" }));
+      }, this.timeoutMs);
     });
+    try {
+      return await Promise.race([this.judgeWithinDeadline(request, controller.signal), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async judgeWithinDeadline({ judgeId, runtime, snapshot, instruction }, signal) {
+    // Include token refresh and lock waits in the same deadline as the model
+    // call. A late refresh must never start a judgement after timeout.
+    const boundedFetch = (url, options = {}) => {
+      if (signal.aborted) return Promise.reject(Object.assign(new Error("supervisor judgement timed out"), { code: "SUPERVISOR_JUDGE_TIMEOUT" }));
+      return this.fetchFn(url, {
+        ...options,
+        signal: options.signal ? AbortSignal.any([signal, options.signal]) : signal,
+      });
+    };
+    let credential;
+    try {
+      credential = await this.ensureFreshAccessTokenFn({
+        stateDir: this.stateDir,
+        resource: OAUTH_RESOURCES.AI,
+        fetchFn: boundedFetch,
+      });
+    } catch (error) {
+      if (error?.code === "OAUTH_REFRESH_EXPIRED") {
+        throw Object.assign(new Error("OriginRouter login has expired"), {code:"SUPERVISOR_JUDGE_AUTH_REQUIRED"});
+      }
+      throw error;
+    }
+    if (signal.aborted) throw Object.assign(new Error("supervisor judgement timed out"), { code: "SUPERVISOR_JUDGE_TIMEOUT" });
     const token = accessTokenFor(credential, OAUTH_RESOURCES.AI)?.token;
     if (!token) throw Object.assign(new Error("OriginRouter AI access token is unavailable"), { code: "SUPERVISOR_JUDGE_AUTH_REQUIRED" });
-    const response = await this.fetchFn(this.endpoint, {
+    const response = await boundedFetch(this.endpoint, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -57,10 +91,12 @@ export class SupervisorJudgeClient {
         instruction: String(instruction || "").slice(0, 1000),
         policy: POLICY,
       }),
-      signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!response.ok) {
-      throw Object.assign(new Error(`supervisor judge HTTP ${response.status}`), { code: "SUPERVISOR_JUDGE_FAILED" });
+      const code = response.status === 401 ? "SUPERVISOR_JUDGE_AUTH_REQUIRED"
+        : response.status === 429 ? "SUPERVISOR_JUDGE_RATE_LIMITED"
+        : response.status === 503 ? "SUPERVISOR_JUDGE_UNAVAILABLE" : "SUPERVISOR_JUDGE_FAILED";
+      throw Object.assign(new Error(`supervisor judge HTTP ${response.status}`), { code });
     }
     const judgement = (await response.json())?.data?.judgement;
     const verdict = String(judgement?.verdict || "");
