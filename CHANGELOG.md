@@ -5,8 +5,111 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ## Unreleased
 
+## 0.6.0 - 2026-11-07
+
 ### Added
 
+- **A device can hold an SSH host.** A host the user configures is kept per
+  account with its own credentials, its own confirmed fingerprint and its own
+  connection. The fingerprint is what the user confirms once; a host whose key
+  changes is warned about and cannot be used until it is confirmed again.
+  Credentials live in the platform keyring, not in the store — the headless
+  vault is the variant for a device that has no keyring to talk to — so a host
+  can be edited without its credentials being replaced. One transport carries
+  several sessions, and a command that times out leaves the remote outcome
+  unknown: an unknown outcome freezes the session, and the next command is
+  refused until the host has been looked at, because running more commands on a
+  session whose state is unknown is how one timeout becomes two.
+- **A task can run on its own schedule.** A task the user wrote once can start
+  a run by itself: once at a time, every so many seconds, or every week on
+  given days and times in a named timezone. The schedule is stored per account
+  and every write carries the revision it was made against, so two devices
+  editing the same task cannot silently overwrite one another. The scheduler
+  launches through the same supervisor the App uses, so a scheduled run is
+  judged and recovered like any other run, and a run that is already active is
+  not started a second time. The launch is remembered before it is attempted:
+  if the daemon dies between the two, the task still says a run was due, which
+  is the difference between "ran" and "never ran".
+- **An Agent can act on the machine it runs on.** The scheduled tasks and the
+  SSH hosts the user configured are exposed as their own MCP server, mounted
+  next to the collaboration one, so a session that should not reach the device
+  is not given the server in the first place. Every operation is checked by
+  the daemon, not by the client that asked, and the approval is the user's
+  answer to the daemon's own question: one approval is tied to one session, one
+  account and one request, and an answer that arrives for a session that has
+  since been detached, for an account that has since changed, or after the
+  question has expired is refused. The tools say what they cannot do — a
+  timeout or a disconnect means the outcome is unknown and must not be retried.
+- **A run that hangs is judged, watched and recovered.** A turn that never
+  answered used to sit in the supervisor until its timeout, and the timeout was
+  the only thing that ever ended it. The supervisor now watches what the run
+  actually produced: the output sampler cuts a stream into samples, the loop
+  detector recognises a repeated cycle, and a judge asks a model whether a run
+  that has stopped moving is still working or is stuck. Recovery is durable —
+  what the supervisor knows about a session is written to the task store, so a
+  daemon that restarts mid-recovery finds the same uncertainty instead of
+  starting a second turn on a session that is still running. A run the user
+  stopped leaves a mark that survives the restart, and the supervisor refuses
+  to resume until the user asks again.
+- **The local API serves the devices and the runs.** The loopback API now
+  answers for the new surfaces: the SSH hosts, the scheduled tasks, and the
+  device tools an Agent asked for. The requests that carry credentials or run
+  commands are answered only on loopback; another device has to come through
+  the encrypted relay, which is the path that can be authenticated. Two kinds
+  of traffic are deliberately not kept: the streaming samples a run produces
+  are transient — a sample that arrives after a reconnect could belong to an
+  earlier turn — and an approval result is the same, a capability decision
+  that was true once and must not be replayed into a run the user has not seen.
+- **The daemon answers the requests the other devices send.** A device that
+  asks this one to hold a schedule or manage an SSH host sends it over the
+  encrypted relay. The session manager routes the request to the service that
+  owns it and answers under the request id that came with it; a service that is
+  not there answers with why, so the other device is not left waiting. The two
+  message types are protected, so their contents are encrypted the way the
+  rest of the device traffic is: a host the user configured carries a password
+  or a private key, and neither belongs in a message the relay can read.
+- **The device says what ends a session's processes.** Closing an SSH session
+  ended every process the session had started on the host. That was the safe
+  answer, but not always the wanted one: a user who started a long command in
+  the background had it killed by closing the session. Two settings, both on
+  by default, say whether closing a session ends the remote processes it
+  started and whether a command may run in the background at all; only an
+  explicit false turns one off, and a setting that was never written leaves
+  the behaviour the device promised. A background command travels inside a
+  quoted here-document and runs as a child of the shell that carries it, so no
+  byte of it is re-parsed by the shell that runs it and a signal ends the
+  command on the first signal.
+- **A conversation's name comes from the agent, and a chosen one stays.** A
+  conversation's title was whatever the App wrote into the launch request
+  ("Claude Code", "Codex") and nothing ever replaced it: the CLI reported that
+  literal on every event, the server kept it, and the rail showed it forever.
+  There are three kinds of title and one order between them — a title the user
+  set, then a title the agent produced, then a placeholder. The agent's own
+  name is read from the transcript (`ai-title` for Claude, `thread/name/updated`
+  for Codex) and reported lazily, so a name that lands mid-run reaches the next
+  event instead of waiting for the session to end. A placeholder never
+  displaces a name, and `title_is_custom` rises and never falls, so a later
+  sync cannot overwrite a rename.
+- **The device says which session a conversation belongs to.** The device is
+  the one side that knows both ids: its catalogue holds a conversation's runs,
+  and each run records the session id it was started under. The conversation
+  row now carries that `session_id`, and a conversation looked up by the id
+  the App holds is found again through its runs — the App reopens a session by
+  the session id, which for a session the App started is a different string
+  from the conversation id. The link goes to the cloud catalogue too, and the
+  sync cursor's namespace moves to v5, so the existing conversations are
+  reported once more to add it.
+- **A model keeps the levels the reader wrote for it.** The device does not
+  know what a model the reader brought with them can do — only the reader
+  does. So the levels live beside the pricing, in the provider's own record,
+  and are the reader's own words: kept verbatim, saved with the model, and
+  carried along when the model is shared with another device. The levels a
+  model has are then read in one order — the reader's own declaration, the
+  cloud's coding catalogue, the local table, and finally **empty**, which is an
+  honest answer: a level a model does not have, chosen anyway, fails when it
+  is pressed, and nothing stopped the reader from pressing it. Empty is
+  reported as "not supported", and the App greys that row out instead of
+  offering a list of levels that would fail.
 - **A session can name its own model.** The device route stays the default:
   a session that names no model runs on whatever the device is routed to, and
   changing the device's route never invalidates a session's own choice. The
@@ -40,6 +143,37 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ### Changed
 
+- **One provider conversation is one row, here too.** The identity of a
+  conversation is the provider's own id — the Claude Code session uuid — and
+  the device's catalogue now says so in the database rather than only in code:
+  a partial unique index on `(agent_type, native_session_id)`, where
+  `native_session_id <> ''` says in the index itself that a conversation the
+  agent has not named yet is its own conversation. The write path finds the
+  row that already holds the provider id and writes there, so a second row
+  cannot be written at all; the label of the current attempt only counts when
+  nobody holds it yet. The rule is shared with the server and the App through
+  `contract/agent_conversation_rules.json`, pinned by SHA-256, so the three
+  sides answer the same question the same way.
+- **A switched conversation is handed over, not torn down.** In the TUI,
+  `/resume` used to make the user watch the process be interrupted and read a
+  notice. It now stops the old process, rewrites the arguments to the new
+  conversation's resume and starts a new wrapper — the same terminal, and the
+  reader does nothing. The handover is decided by the provider's own id: the
+  first id a run reports is the conversation of that run, and a different id
+  later means the agent changed conversation underneath (`/resume`, `/branch`,
+  `/clear`) — not that it was renamed. One conversation has one writer at a
+  time, because two processes writing one transcript file split the history in
+  a way nobody can untangle afterwards; the lock is on the provider's
+  conversation id and it lapses with the process that held it.
+- **The device reads the coding catalogue the App reads.** The agent channel
+  read the console's `/ai/model`, which answers "what may this account buy"
+  and is not cut by tier, so the device and the App read two different lists:
+  the App listed the models the account can really run while the device
+  picked one a free account's request would be silently downgraded from. The
+  device now reads `GET /coding/v1/models` — the same list as the App's model
+  picker, answered by the token and the host that answer the request. A free
+  account is therefore given the models it can run: the default route asks the
+  catalogue for a model it can serve rather than naming a paid one.
 - The session's model is not invalidated by a device route change. A route is
   the default; a session's own choice is a fact about that session.
 - **The list of models a session may be pinned to is no longer carried on the
@@ -54,6 +188,38 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ### Fixed
 
+- **An interrupted turn is a turn that ended.** Interrupting a turn in the
+  terminal wrote one line to the transcript (`[Request interrupted by user]`)
+  and sent no event at all, so the device's `turn_state` stayed latched on
+  `running` and the App showed the stop button for a run that had already
+  stopped. The scanner knows the marker and reads it as the end of the turn.
+- **The process's end reaches the device's event tail.** `session.exited` and
+  `session.error` went to the relay frame and to the server's runtime-event
+  report, and to neither the local tail, so a runtime that crashed or was
+  killed left the App's last word as `agent.task.started` — a turn latched
+  open and a stop button for a session with nothing left to stop. They go
+  there too now, and they go out before the bridge closes, because a closed
+  bridge delivers nothing.
+- **The review template must apply to this device and workspace.** A review
+  template the user chose for one device or one workspace was used on any
+  device. The template says which device it was written for and which
+  workspace it belongs to, and a launch on a different one is refused: the
+  answer the template gives was written about somewhere else.
+- **A refresh answer carries more than the audience it asked for.** Surety
+  answers a refresh with every access token the session may use, not just the
+  one the call named; the refresher kept only the audience it asked for and
+  threw the rest away, so the next request for a different resource had to
+  refresh again — spending the refresh token it had just been handed to buy a
+  token the previous answer already carried.
+- **The relay's token is asked for when it is used.** The client held one
+  bearer, set when the relay connection opened, and sent it on every request
+  after that. The token lives about ten minutes, so from the moment it expired
+  every `POST /relay/v1/messages` was refused as unauthorized — once a minute
+  — until a reconnect put a new one in place. The relay now asks its provider
+  for a token at the moment a request goes out, including the WebSocket
+  handshake, which cannot be retried with a different token later. A provider
+  with nothing to give leaves the client on the token it holds, so a request
+  that would have gone out still goes out.
 - **A conversation that the local catalogue and the cloud name differently no
   longer fails every five minutes.** The cloud freezes a conversation's id on
   the first report that names it, and the local catalogue keeps the id of the
@@ -81,6 +247,36 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
   logged in since this shipped, an older server that does not have the routes,
   or a server whose migration has not run all keep sending bearer tokens.
   `ORIGINROUTER_DPOP=off` turns the feature off entirely.
+
+### Upgrade notes
+
+- **DPoP is on for a device that has logged in since the upgrade.** The server
+  has to have run `sql/056_originrouter_dpop_keys.sql` before a device's key
+  means anything there. Until it has, the server does not have the route and
+  the device carries on with bearer tokens exactly as before — the registration
+  is what turns the feature on, not the version. A device that has not logged
+  in since the upgrade is not affected at all, and `ORIGINROUTER_DPOP=off`
+  turns the feature off entirely.
+- **The device's catalogue folds its duplicate conversations once.** The
+  unique index on the provider's conversation id can only be made once the
+  rows that break it are gone, so the device folds them on the first open: one
+  conversation under several labels becomes one row, and the label of the row
+  that already held it stays. If a row cannot be folded, the device says so in
+  its log and leaves the index alone rather than refusing to start.
+- **A launch-time `--model` is now a session override, not the agent's own
+  model string.** In route mode the model has to be a route alias the proxy
+  can resolve — handing a concrete upstream id straight through named a model
+  the proxy could not resolve, and the request quietly meant something else. A
+  target that does not validate is reported and the device route stays in
+  force.
+- **A model's reasoning levels may now read as unsupported.** The levels are
+  read from the reader's own declaration first, then the cloud's coding
+  catalogue, then the local table, and finally empty. A model none of those
+  know now reports "not supported" and the App greys the row out, where before
+  it was offered the runtime's whole word list — levels that failed when they
+  were pressed, with nothing in the interface to stop it. The reader's own
+  declaration is the way to say what a model can do, and it is kept with the
+  model.
 
 ## 0.5.1 - 2026-10-15
 
