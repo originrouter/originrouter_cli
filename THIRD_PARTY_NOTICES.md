@@ -33,6 +33,14 @@ OriginRouter license. Its package license states that use is subject to the
 Anthropic legal agreements linked above. Components shipped within that SDK
 may carry separate licenses in their own distributions.
 
+## SSH and system credential storage
+
+Remote environments use `ssh2` and `@napi-rs/keyring`, both distributed under
+the MIT license. The platform-specific keyring binaries include additional
+third-party components; their license texts are included in the corresponding
+`@napi-rs/keyring-*` package as `LICENSE.third-party.md`. Linux builds include
+libdbus, distributed under AFL-2.1 or GPL-2.0-or-later.
+
 ## LiteLLM
 
 OriginRouter can create a user-local Python virtual environment and install a
