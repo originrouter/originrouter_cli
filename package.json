@@ -54,6 +54,7 @@
     "check:approval-policy-registry": "node ./scripts/generate-approval-policy-registry.mjs --check",
     "sign:compatibility-pack": "node ./scripts/sign-compatibility-pack.mjs",
     "release:compatibility": "node ./scripts/release-compatibility-patches.mjs",
+    "test:real-agent-offline": "node ./scripts/test-real-agent-offline.mjs",
     "test:relay-agent": "node ./tests/agentRelayPolicy.test.js && node ./tests/externalAgentRelayRouter.test.js",
     "test:audit": "node ./tests/operationRisk.test.js && node ./tests/aiOperationAudit.test.js && node ./tests/localAuditStore.test.js && node ./tests/auditEvidenceAdapter.test.js",
     "test:collaboration-auto": "node --test ./tests/collaborationAutoConfig.test.js",
