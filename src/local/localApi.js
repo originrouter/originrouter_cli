@@ -19,6 +19,7 @@
 // same process as the session manager.
 
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { networkInterfaces } from "node:os";
 import { resolve as resolvePath } from "node:path";
 import {
@@ -334,6 +335,9 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
     agentBudgetStore,
     runtimeTaskStore: ctx.runtimeTaskStore || null,
     runtimeSupervisor: ctx.runtimeSupervisor || null,
+    scheduledTaskScheduler: ctx.scheduledTaskScheduler || null,
+    remoteEnvironmentService: ctx.remoteEnvironmentService || null,
+    deviceToolService: ctx.deviceToolService || null,
     proxyRequestStore,
     collaborationStore,
     collaborationCoordinator,
@@ -742,6 +746,37 @@ async function dispatch(ctx, req, res) {
     if (req.method === "GET" && pathname === "/routes") {
       return handleRoutesList(ctx, res);
     }
+    if (pathname === "/remote-environments") {
+      if (req.method !== "POST") return sendError(res, 405, "method not allowed");
+      // These requests can carry SSH passwords and private keys. Direct LAN
+      // control is HTTP, so only permit loopback here; other devices must use
+      // the authenticated end-to-end encrypted relay.
+      if (!LOOPBACK_ADDRESSES.has(String(req.socket.remoteAddress || "").toLowerCase())) {
+        return sendError(res, 403, "remote environments require loopback or an encrypted device connection", {reason:"remote_env_e2ee_required"});
+      }
+      if (!ctx.remoteEnvironmentService) return sendError(res, 503, "remote environments are unavailable");
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      try { return sendOk(res, await ctx.remoteEnvironmentService.handle(String(body.action || ""), body.body || {})); }
+      catch (error) {
+        return sendError(res, error.code === "REMOTE_ENV_CONFLICT" ? 409 : 400, error.message || "remote environment request failed", {
+          reason:String(error.code || "remote_env_request_failed").toLowerCase(),
+        });
+      }
+    }
+    if (pathname === "/scheduled-tasks") {
+      if (req.method !== "POST") return sendError(res, 405, "method not allowed");
+      if (!ctx.scheduledTaskScheduler) return sendError(res, 503, "scheduled tasks are unavailable");
+      const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+      if (body.__error) return sendError(res, 400, body.__error);
+      try {
+        return sendOk(res, await ctx.scheduledTaskScheduler.handle(String(body.action || ""), body.body || {}));
+      } catch (error) {
+        return sendError(res, error.code === "SCHEDULED_TASK_CONFLICT" ? 409 : 400, error.message || "scheduled task request failed", {
+          reason: String(error.code || "scheduled_task_request_failed").toLowerCase(),
+        });
+      }
+    }
     const runtimeTaskMatch = pathname.match(/^\/runtime-tasks(?:\/(log))?$/);
     if (runtimeTaskMatch) {
       if (!ctx.runtimeTaskStore) return sendError(res, 503, "runtime tasks are unavailable");
@@ -868,14 +903,26 @@ async function dispatch(ctx, req, res) {
       });
     }
     if (req.method === "POST" && pathname === "/agent/local/mcp-gateway") {
-      if (!ctx.collaborationRuntime) {
-        return sendError(res, 503, "Agent MCP gateway unavailable", {
-          reason: "collaboration_mcp_unavailable",
-        });
-      }
       const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
       if (body.__error) return sendError(res, 400, body.__error);
       const sessionId = String(body.session_id || "").trim().slice(0, 64);
+      if (String(body.action || "").startsWith("device.")) {
+        if (!LOOPBACK_ADDRESSES.has(String(req.socket.remoteAddress || "").toLowerCase())) return sendError(res, 403, "Agent device tools require loopback", {reason:"device_tool_loopback_required"});
+        if (!ctx.deviceToolService) return sendError(res, 503, "Agent device tools are unavailable", {reason:"device_tool_unavailable"});
+        const controller = new AbortController();
+        const disconnected = () => { if (!res.writableEnded) controller.abort(); };
+        res.once("close", disconnected);
+        try {
+          const result = await ctx.deviceToolService.handle(sessionId, String(body.action).slice(7), body.payload || {}, {signal:controller.signal});
+          if (!controller.signal.aborted) return sendOk(res, result);
+        } catch (error) {
+          if (!controller.signal.aborted) return sendError(res, 409, error.message || "Agent device tool failed", {reason:error.code || "device_tool_failed"});
+        } finally { res.removeListener("close", disconnected); }
+        return;
+      }
+      if (!ctx.collaborationRuntime) {
+        return sendError(res, 503, "Agent MCP gateway unavailable", {reason:"collaboration_mcp_unavailable"});
+      }
       try {
         const result = await ctx.collaborationRuntime.handleMcpGatewayRequest({
           sessionId,
@@ -1459,7 +1506,7 @@ async function dispatch(ctx, req, res) {
     }
 
     const localAgentMatch = pathname.match(
-      /^\/agent\/local\/sessions\/([^/]+)\/(update|unregister|events|commands|snapshot|history|audit|message|interrupt|stop|interaction|mode|model|effort|autonomy)$/,
+      /^\/agent\/local\/sessions\/([^/]+)\/(update|unregister|events|observation|commands|snapshot|history|audit|message|interrupt|stop|interaction|mode|model|effort|autonomy)$/,
     );
     if (localAgentMatch) {
       const sessionId = decodeURIComponent(localAgentMatch[1]);
@@ -1519,7 +1566,54 @@ async function dispatch(ctx, req, res) {
           ctx.externalAgentRegistry.unregister(sessionId, body);
           return sendOk(res, { sessionId, status: body.status || "stopped" });
         }
+        if (action === "observation") {
+          // Streaming output is transient supervisor input. It is not added to
+          // session history, audit logs, account relay or the reconnect outbox.
+          const turnId = typeof body.turnId === "string" ? body.turnId : "";
+          const chunk = typeof body.text === "string" ? body.text : "";
+          if (!turnId || turnId.length > 191 || !chunk || chunk.length > 4096) {
+            return sendError(res, 400, "invalid output observation");
+          }
+          if (body.sequence != null && (!Number.isSafeInteger(body.sequence) || body.sequence < 1)) {
+            return sendError(res, 400, "invalid output observation sequence");
+          }
+          ctx.externalAgentRegistry.requireActive(sessionId);
+          ctx.externalAgentRegistry.notify("observation", sessionId, { turnId, text: chunk,
+            ...(body.sequence == null ? {} : {sequence:body.sequence}) });
+          return sendOk(res, { accepted: true });
+        }
         if (action === "events") {
+          if (body.event?.type === "user.text" && body.event.origin === "supervisor"
+            && /^local-message-supervisor_[0-9a-f-]{36}$/i.test(String(body.event.eventId || ""))
+            && typeof body.event.text === "string" && body.event.text.length <= 8192) {
+            const messageId = body.event.eventId.slice("local-message-".length);
+            try {
+              const queued = ctx.externalAgentRegistry.commandsAfter(sessionId, 0).commands.find((command) =>
+                command.type === "agent.message" && command.origin === "supervisor" && command.messageId === messageId
+                && String(command.message || "").trim() === body.event.text.trim());
+              if (queued) ctx.runtimeTaskStore?.appendLog({type:"agent.supervisor.receipt", sessionId, messageId,
+                  messageDigest:createHash("sha256").update(body.event.text.trim()).digest("hex"),
+                  createdAt:new Date().toISOString()});
+            } catch (error) { console.error(`[runtime-supervisor] receipt: ${error.code || error.message}`); }
+          }
+          if (body.event?.type === "agent.device_tool.approval_result") {
+            const event = body.event;
+            if (!/^dta_[0-9a-f-]{36}$/i.test(String(event.requestId || "")) || typeof event.accepted !== "boolean") return sendError(res, 400, "invalid device tool approval result");
+            ctx.externalAgentRegistry.requireActive(sessionId);
+            ctx.externalAgentRegistry.notify("device_tool_approval_result", sessionId, event);
+            return sendOk(res, {accepted:true});
+          }
+          if (body.event?.type === "agent.recovery.interrupt_result") {
+            const event = body.event;
+            if (typeof event.requestId !== "string" || !event.requestId || event.requestId.length > 96
+              || typeof event.turnId !== "string" || !event.turnId || event.turnId.length > 191
+              || typeof event.accepted !== "boolean") {
+              return sendError(res, 400, "invalid interrupt result");
+            }
+            ctx.externalAgentRegistry.requireActive(sessionId);
+            ctx.externalAgentRegistry.notify("recovery_result", sessionId, event);
+            return sendOk(res, { accepted: true });
+          }
           const sequence = ctx.externalAgentRegistry.appendEvent(sessionId, body.event || {});
           let session = { sessionId };
           try { session = ctx.externalAgentRegistry.require(sessionId); } catch {}

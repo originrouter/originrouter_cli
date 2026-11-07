@@ -196,9 +196,10 @@ function approvalPolicyCapabilitiesSummary(value) {
 }
 
 export class ExternalAgentRegistry {
-  constructor({ now = () => Date.now(), catalog = null } = {}) {
+  constructor({ now = () => Date.now(), catalog = null, runtimeTaskStore = null } = {}) {
     this.now = now;
     this.catalog = catalog;
+    this.runtimeTaskStore = runtimeTaskStore;
     this.sessions = new Map();
     // Cursors are process-local. Consumers use this id to detect a daemon
     // restart before applying a cursor from the previous process.
@@ -261,6 +262,9 @@ export class ExternalAgentRegistry {
         || isCollaborationSessionPayload({ ...payload, sessionId })
         ? "collaboration" : "interactive",
       agent: safeText(payload?.agent, 32) || "unknown",
+      runtime: safeText(payload?.runtime, 64) || existing?.runtime || "",
+      supportsRuntimeRecovery: payload?.supportsRuntimeRecovery === true,
+      supportsDeviceTools: payload?.supportsDeviceTools === true,
       // A session registers before it has a title of its own, so the
       // placeholder stands until the agent produces one.
       title:
@@ -799,6 +803,9 @@ export class ExternalAgentRegistry {
       sessionId: session.sessionId,
       sessionKind: session.sessionKind,
       agent: session.agent,
+      runtime: session.runtime,
+      supportsRuntimeRecovery: session.supportsRuntimeRecovery,
+      supportsDeviceTools: session.supportsDeviceTools,
       cwd: session.cwd,
       status,
       turnState: resolveTurnState(session, status),
@@ -819,7 +826,8 @@ export class ExternalAgentRegistry {
     const session = this.require(sessionId);
     if (session.agent === "claude") {
       return {
-        ...readClaudeConversationHistory(session.transcriptPath, options),
+        ...(this.runtimeTaskStore?.annotateHistory(sessionId, readClaudeConversationHistory(session.transcriptPath, options))
+          || readClaudeConversationHistory(session.transcriptPath, options)),
         conversationId: session.conversationId,
         nativeSessionId: session.nativeSessionId,
         detailProfile: session.detailProfile,
@@ -828,7 +836,8 @@ export class ExternalAgentRegistry {
     }
     if (session.agent === "codex") {
       return {
-        ...readCodexConversationHistory(session.transcriptPath, options),
+        ...(this.runtimeTaskStore?.annotateHistory(sessionId, readCodexConversationHistory(session.transcriptPath, options))
+          || readCodexConversationHistory(session.transcriptPath, options)),
         conversationId: session.conversationId,
         nativeSessionId: session.nativeSessionId,
         detailProfile: session.detailProfile,

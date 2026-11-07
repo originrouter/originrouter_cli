@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { startLocalApi, projectSession } from "../src/local/localApi.js";
 import { RuntimeTaskStore } from "../src/runtime/runtimeTaskStore.js";
@@ -236,6 +236,16 @@ try {
   liveCtx.proxyRequestStore = proxyRequestStore;
   liveCtx.externalAgentRegistry = new ExternalAgentRegistry({ catalog: agentCatalog });
   liveCtx.runtimeTaskStore = new RuntimeTaskStore({ stateDir: home });
+  const { ScheduledTaskStore } = await import("../src/runtime/scheduledTaskStore.js");
+  const { ScheduledTaskScheduler } = await import("../src/runtime/scheduledTaskScheduler.js");
+  const scheduledTaskStore = new ScheduledTaskStore({stateDir:home, now:() => Date.parse("2026-11-03T00:00:00Z")});
+  liveCtx.scheduledTaskScheduler = new ScheduledTaskScheduler({store:scheduledTaskStore});
+  const { RemoteEnvironmentService } = await import("../src/remoteEnvironment/remoteEnvironmentService.js");
+  const sshSecrets = new Map();
+  const sshService = new RemoteEnvironmentService({stateDir:home, vault:{
+    put:async (key,value) => sshSecrets.set(key,value), get:async (key) => sshSecrets.get(key), remove:async (key) => sshSecrets.delete(key),
+  }});
+  liveCtx.remoteEnvironmentService = sshService;
   let runtimeTaskCardsChanged = 0;
   liveCtx.runtimeSupervisor = { cardsChanged: () => { runtimeTaskCardsChanged += 1; } };
   serverHandle = await startLocalApi(liveCtx, { port: 0 });
@@ -303,6 +313,44 @@ try {
     assert.equal(log.status, 200);
     assert.deepEqual(log.body.entries, []);
     assert.equal((await putJson("/runtime-tasks/log", {})).status, 405);
+  }
+
+  // Scheduled tasks use the same authenticated local control boundary.
+  {
+    assert.equal((await postJson("/scheduled-tasks", {action:"list"}, {noAuth:true})).status, 401);
+    const task = {id:"st_local",name:"Scheduled",schedule:{kind:"once",at:"2026-11-03T01:00:00Z"},
+      launch:{agentType:"claude",workspaceId:"workspace-a",initialMessage:"test",permissionProfile:"manual"}};
+    const saved = await postJson("/scheduled-tasks", {action:"save",body:{baseRevision:0,task}});
+    assert.equal(saved.status, 200);
+    assert.equal(saved.body.task.revision, 1);
+    const list = await postJson("/scheduled-tasks", {action:"list"});
+    assert.equal(list.body.tasks[0].id, "st_local");
+    const stale = await postJson("/scheduled-tasks", {action:"save",body:{baseRevision:0,task}});
+    assert.equal(stale.status, 409);
+    assert.equal(stale.body.reason, "scheduled_task_conflict");
+    scheduledTaskStore.close();
+  }
+
+  {
+    const fingerprint = `SHA256:${"A".repeat(43)}`;
+    const target = {id:"ssh_local",name:"Host",host:"example.test",username:"alice",hostFingerprint:fingerprint};
+    assert.equal((await postJson("/remote-environments", {action:"list"}, {noAuth:true})).status, 401);
+    const saved = await postJson("/remote-environments", {action:"save",body:{target,confirmedFingerprint:fingerprint,
+      credential:{kind:"password",password:"local-api-secret"}}});
+    assert.equal(saved.status,200);
+    assert.equal(saved.body.target.id,"ssh_local");
+    const list = await postJson("/remote-environments", {action:"list"});
+    assert.equal(list.body.targets[0].id,"ssh_local");
+    assert.equal(JSON.stringify(list.body).includes("local-api-secret"),false);
+    const lan = Object.values(networkInterfaces()).flat().find((item) => item?.family === "IPv4" && !item.internal)?.address;
+    if (lan && serverHandle.bindAddress === "0.0.0.0") {
+      const response = await fetch(`http://${lan}:${serverHandle.port}/remote-environments`, {
+        method:"POST", headers:{...AUTH,"Content-Type":"application/json"}, body:JSON.stringify({action:"list"}),
+      });
+      assert.equal(response.status,403);
+      assert.equal((await response.json()).reason,"remote_env_e2ee_required");
+    }
+    sshService.close();
   }
 
   // ============================================================
@@ -1612,6 +1660,25 @@ try {
     assert.equal(stopped.body.accepted, true);
     const stopCommand = await getJson("/agent/local/sessions/external-claude-1/commands?after=5");
     assert.equal(stopCommand.body.commands[0].type, "session.stop");
+
+    const transient = [];
+    const stopListening = liveCtx.externalAgentRegistry.subscribe((entry) => {
+      if (entry.type === "observation") transient.push(entry);
+    });
+    const beforeObservation = liveCtx.externalAgentRegistry.eventsAfter(0).events.length;
+    const observed = await postJson("/agent/local/sessions/external-claude-1/observation", {
+      turnId: "turn-1", text: "private streamed sample", sequence: 42,
+    });
+    stopListening();
+    assert.equal(observed.status, 200);
+    assert.equal(transient.length, 1);
+    assert.equal(transient[0].payload.text, "private streamed sample");
+    assert.equal(transient[0].payload.sequence, 42);
+    assert.equal(liveCtx.externalAgentRegistry.eventsAfter(0).events.length, beforeObservation);
+    const invalidObservation = await postJson("/agent/local/sessions/external-claude-1/observation", {
+      turnId: "turn-1", text: "x".repeat(4097),
+    });
+    assert.equal(invalidObservation.status, 400);
 
     await postJson("/agent/local/sessions/external-claude-1/events", {
       event: { type: "agent.text", text: "live reply" },

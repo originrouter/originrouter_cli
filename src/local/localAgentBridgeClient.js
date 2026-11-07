@@ -168,6 +168,33 @@ export class LocalAgentBridgeClient {
     return String(this.registeredSession?.conversation_id || "").trim();
   }
 
+  // Unlike normal events, output samples are never persisted or replayed:
+  // a sample delivered after a daemon reconnect could belong to an old turn.
+  async sendObservation(turnId, text, sequence = null) {
+    if (this.closed || !this.endpoint || !turnId || !text) return false;
+    try {
+      await request(
+        this.endpoint,
+        "POST",
+        `/agent/local/sessions/${encodeURIComponent(this.sessionId)}/observation`,
+        { turnId, text, ...(sequence == null ? {} : { sequence }) },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Approval results are ephemeral capability decisions. Never persist or
+  // replay them across daemon reconnection; an unconfirmed result fails shut.
+  async sendDeviceToolApprovalResult(event) {
+    if (this.closed || !this.endpoint) return false;
+    try {
+      await request(this.endpoint, "POST", `/agent/local/sessions/${encodeURIComponent(this.sessionId)}/events`, {event});
+      return true;
+    } catch { return false; }
+  }
+
   async sendEvent(event) {
     if (this.closed) return false;
     if (["agent.autonomy.status", "agent.mode.status", "agent.detail.status", "agent.model.status", "agent.effort.status"].includes(event?.type)) {
