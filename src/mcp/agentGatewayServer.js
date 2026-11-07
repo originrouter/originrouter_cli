@@ -22,7 +22,7 @@ function localApi() {
   return { baseUrl: `http://${urlHost}:${state.localApiPort}`, token };
 }
 
-async function gatewayRequest(sessionId, action, payload = {}) {
+async function gatewayRequest(sessionId, action, payload = {}, signal) {
   const api = localApi();
   const response = await fetch(`${api.baseUrl}/agent/local/mcp-gateway`, {
     method: "POST",
@@ -31,6 +31,7 @@ async function gatewayRequest(sessionId, action, payload = {}) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ session_id: sessionId, action, payload }),
+    signal,
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok || result.ok === false) {
@@ -66,6 +67,7 @@ async function toolResult(operation) {
 
 export async function runAgentGatewayMcpServer(args = process.argv.slice(2)) {
   const sessionId = String(optionValue(args, "--originrouter-session") || "").trim();
+  const deviceTools = args.includes("--device-tools");
   if (!sessionId) throw new Error("--originrouter-session is required");
 
   const server = new McpServer({
@@ -73,6 +75,7 @@ export async function runAgentGatewayMcpServer(args = process.argv.slice(2)) {
     version: "0.1.0",
   });
 
+  if (!deviceTools) {
   server.registerTool("list_participants", {
     description: "List the other OriginRouter collaboration participants that this Agent may contact.",
     inputSchema: {},
@@ -142,6 +145,37 @@ export async function runAgentGatewayMcpServer(args = process.argv.slice(2)) {
       message: "The delegated Agent is still working. Call get_task_result with this task id.",
     };
   }));
+
+  } else {
+    const deviceTool = (name, description, inputSchema, operation) => server.registerTool(name, {
+      description, inputSchema,
+    }, async (input, extra) => toolResult(() => gatewayRequest(sessionId, `device.${operation}`, input, extra.signal)));
+    const id = z.string().min(1).max(191);
+    const handle = z.string().min(1).max(191);
+    const schedule = z.discriminatedUnion("kind", [
+      z.object({kind:z.literal("once"),at:z.string().min(1).max(64)}).strict(),
+      z.object({kind:z.literal("interval"),anchor:z.string().min(1).max(64),seconds:z.number().int().min(60).max(31622400)}).strict(),
+      z.object({kind:z.literal("weekly"),timezone:z.string().min(1).max(100),days:z.array(z.number().int().min(1).max(7)).min(1).max(7),hour:z.number().int().min(0).max(23),minute:z.number().int().min(0).max(59)}).strict(),
+    ]);
+    deviceTool("scheduled_list", "List scheduled Agent tasks on this CLI device. Existing permission rules apply.", {}, "scheduled.list");
+    deviceTool("scheduled_history", "Read recent executions of an Agent schedule on this device.", {taskId:id.optional()}, "scheduled.history");
+    deviceTool("scheduled_save", "Create or update a scheduled Agent task on this CLI device. Scheduled launches follow the specified permission profile; this operation is reviewed under the current session's permissions. AI approval requires a user-selected template in the App and cannot be configured with this tool. Times require explicit UTC offsets; weekly times use the given IANA timezone.", {
+      task:z.object({id:id.optional(), name:z.string().min(1).max(120), enabled:z.boolean().optional(), schedule,
+        launch:z.object({agentType:z.enum(["claude","codex"]),workspaceId:id,initialMessage:z.string().min(1).max(8192),
+          permissionProfile:z.enum(["manual","guarded","unrestricted"]).optional(),provider:id.optional(),model:id.optional()}).strict(),
+      }).strict(), baseRevision:z.number().int().min(0).optional(),
+    }, "scheduled.save");
+    deviceTool("scheduled_run", "Start an existing scheduled task now; it will not overlap an active execution.", {id,baseRevision:z.number().int().min(1).optional()}, "scheduled.run");
+    deviceTool("scheduled_delete", "Delete an existing scheduled task without stopping an already running Agent.", {id,baseRevision:z.number().int().min(1).optional()}, "scheduled.delete");
+    deviceTool("remote_env_list", "List SSH hosts configured by the user on this CLI device. No credentials are returned.", {}, "remote.list");
+    deviceTool("remote_env_open", "Open a session to a configured SSH host, reusing the device's verified connection. Returns a session handle and working directory.", {id}, "remote.open");
+    deviceTool("remote_env_exec", "Run a command through an open SSH session. The command uses the session working directory unless cwd is supplied. Output can be truncated; a timeout or disconnect means the remote outcome is unknown and must not be automatically retried. A session with an unknown outcome cannot run further commands; investigate the host before explicitly closing it and opening another.", {
+      handle,command:z.string().min(1).max(8192),cwd:z.string().min(1).max(4096).optional(),
+      timeoutMs:z.number().int().min(1).max(600000).optional(),maxOutputBytes:z.number().int().min(1).max(1048576).optional(),
+    }, "remote.exec");
+    deviceTool("remote_env_chdir", "Change the working directory for one SSH session; path must be absolute.", {handle,path:z.string().min(1).max(4096)}, "remote.chdir");
+    deviceTool("remote_env_close", "Close an SSH session; other sessions can continue to use the same transport.", {handle}, "remote.close");
+  }
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
