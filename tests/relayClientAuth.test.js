@@ -6,6 +6,10 @@
 //   3. setAuthToken(newToken) updates the bearer on subsequent calls
 //   4. authToken: null after setAuthToken() clears the header
 //   5. WebSocket connectEvents also carries Authorization when authToken is set
+//   6. A half-open WebSocket is terminated so the daemon can refresh auth
+//   7. A token that went stale after the connection opened is not what a later
+//      request carries: the provider is asked, and the proof is made over the
+//      token that is actually sent
 
 import http from "node:http";
 import assert from "node:assert/strict";
@@ -175,6 +179,70 @@ try {
     wss.close();
   }
   console.log("[6] half-open WebSocket watchdog reconnect trigger ok");
+
+  // 7. The token is asked for when a request is sent, not captured when the
+  // connection was opened. A client that held the connect-time token would
+  // send it forever; the server would refuse it as unauthorized from the
+  // moment it expired, and only a reconnect would fix it.
+  {
+    const { server, captured } = await makeCapture();
+    let current = "or_at_fresh_at_connect";
+    const proofs = [];
+    const c = new RelayClient({
+      relayUrl: `http://127.0.0.1:${PORT}`,
+      deviceId: "d1",
+      authToken: current,
+      proofProvider: async ({ token, url, method }) => {
+        proofs.push({ token, url, method });
+        return { Authorization: `DPoP ${token}`, DPoP: `proof-for-${token}` };
+      },
+    });
+    c.setAuthTokenProvider(async () => current);
+    // The connect-time token was fine; ten minutes later it is not, and the
+    // store has a new one.
+    await c.send("before", {});
+    current = "or_at_after_refresh";
+    await c.sendAcknowledged("after", {});
+    assert.equal(captured.requests[0].headers.authorization, "DPoP or_at_fresh_at_connect");
+    assert.equal(captured.requests[1].headers.authorization, "DPoP or_at_after_refresh");
+    assert.equal(
+      captured.requests[1].headers.dpop,
+      "proof-for-or_at_after_refresh",
+      "the proof must be made over the token the request carries",
+    );
+    assert.deepEqual(proofs.map((p) => p.token), [
+      "or_at_fresh_at_connect",
+      "or_at_after_refresh",
+    ]);
+
+    // The handshake asks too: a socket opened with a token that has expired
+    // is a socket that is refused, and only opening it again would help.
+    current = "or_at_ws_fresh";
+    const connPromise = c.connectEvents(() => {});
+    await delay(150);
+    const wsReq = captured.requests.find((r) => r.url.startsWith("/relay/v1/devices/d1/ws"));
+    assert.equal(wsReq.headers.authorization, "DPoP or_at_ws_fresh");
+    c.disconnect();
+    await connPromise.catch(() => {});
+    server.close();
+  }
+  console.log("[7] a stale token is not reused -> fresh token and a proof over it ok");
+
+  // 8. A provider with nothing to give falls back to the token the client
+  // holds, so a request that would have gone out still goes out.
+  {
+    const { server, captured } = await makeCapture();
+    const c = new RelayClient({
+      relayUrl: `http://127.0.0.1:${PORT}`,
+      deviceId: "d1",
+      authToken: "or_at_held",
+    });
+    c.setAuthTokenProvider(async () => null);
+    await c.send("fallback", {});
+    assert.equal(captured.requests[0].headers.authorization, "Bearer or_at_held");
+    server.close();
+  }
+  console.log("[8] an empty provider -> the held token is still sent ok");
 
   console.log("relay client auth ok");
 } catch (err) {

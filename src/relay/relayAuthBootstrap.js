@@ -33,6 +33,31 @@ export function isRelayAuthOn() {
   return (process.env.ORIGINROUTER_RELAY_AUTH || "off") === "on";
 }
 
+/**
+ * The relay's own access token, fresh at the moment it is asked for.
+ *
+ * The relay token lives about ten minutes. A client that captured one when
+ * its connection opened and kept using it would be refused as unauthorized
+ * from then on, so the token is asked for again each time a request goes
+ * out. The credential is read from the same store the rest of the CLI uses,
+ * and a refresh happens here when the stored one is close to expiring.
+ *
+ * Returns null when there is no credential to read — an installation that is
+ * not signed in, or a relay that runs without the account's token at all.
+ */
+export async function freshRelayAccessToken({
+  stateDir,
+  fetchFn = globalThis.fetch,
+  ensureFreshAccessTokenFn = ensureFreshAccessToken,
+} = {}) {
+  const stored = await ensureFreshAccessTokenFn({
+    stateDir,
+    resource: OAUTH_RESOURCES.RELAY,
+    fetchFn,
+  });
+  return accessTokenFor(stored, OAUTH_RESOURCES.RELAY)?.token || null;
+}
+
 export async function buildRelayClientOptions({
   stateDir,
   relayUrl,

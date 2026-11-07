@@ -34,6 +34,7 @@ import {
   relayModeDescription,
 } from "../relay/agentRelayPolicy.js";
 import { RelayClient } from "../relay/relayClient.js";
+import { freshRelayAccessToken } from "../relay/relayAuthBootstrap.js";
 import { resolveRelayEndpoint } from "../relay/relayEndpointSelector.js";
 import { parseOptions } from "../utils/options.js";
 import { SessionManager } from "./sessionManager.js";
@@ -185,11 +186,35 @@ export async function startDaemon(args) {
   let sessionId = initialCredential?.sessionId || null;
   let relayAuthState = "pending";
   let relayAuthError = null;
+  // Whether this relay is one that carries the account's token. It is read
+  // from the plan that opened the connection, so a custom relay running
+  // without auth is never handed the token — the provider below asks for
+  // one only when the plan said the relay takes one.
+  let relayCarriesAuthToken = false;
   const relayClient = new RelayClient({
     relayUrl,
     deviceId: effectiveDeviceId,
     authToken: null,
     proofProvider: createDpopProofProvider({ stateDir }),
+  });
+  // The relay's bearer is asked for when a request is sent, not captured
+  // when the connection was opened. The token lives about ten minutes, and
+  // the one captured at connect time was the only one the client had: every
+  // request made after it expired was refused as unauthorized until the
+  // next reconnect. Asking for it at the moment it is used removes the
+  // window in which the client holds a token that no longer works.
+  relayClient.setAuthTokenProvider(async () => {
+    if (!relayCarriesAuthToken) return null;
+    try {
+      return await freshRelayAccessToken({ stateDir });
+    } catch (error) {
+      // A refresh that cannot be made is not a reason to send no request at
+      // all: the client falls back to the token it holds, and the request
+      // says what the server makes of it. Returning null asks for exactly
+      // that fallback.
+      console.error(`[relay-auth] token refresh: ${error?.code || error?.message || error}`);
+      return null;
+    }
   });
   const storedDeviceE2eeIdentity = readDeviceE2eeIdentity(stateDir, { accountScope });
   let deviceE2eeIdentity;
@@ -668,6 +693,7 @@ export async function startDaemon(args) {
   // a running proxy after `kill originrouter-daemon` is surprising.
   let shuttingDown = false;
   let heartbeatTimer = null;
+  let accountBudgetTimer = null;
   let agentActivitySyncTimer = null;
   let deviceE2eeRefreshTimer = null;
   let authContextTimer = null;
@@ -678,6 +704,7 @@ export async function startDaemon(args) {
     console.log(`[daemon] received ${signal}, shutting down…`);
     runtimeSupervisor.stop();
     if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (accountBudgetTimer) clearInterval(accountBudgetTimer);
     if (agentActivitySyncTimer) clearInterval(agentActivitySyncTimer);
     if (deviceE2eeRefreshTimer) clearInterval(deviceE2eeRefreshTimer);
     if (authContextTimer) clearInterval(authContextTimer);
@@ -923,11 +950,23 @@ export async function startDaemon(args) {
   heartbeatTimer = setInterval(() => {
     if (!relayConnected) return;
     reportLocalControlHeartbeat().catch(() => {});
-    // Account limits reset at UTC boundaries even when no new usage arrives.
-    // Reconcile missed status pushes as well as the first read on reconnect.
-    collaborationRuntime.refreshAccountBudgetStatus().catch(() => {});
   }, 60_000);
   heartbeatTimer.unref?.();
+  // The account's budget is read on a clock of its own, not on the
+  // heartbeat's. The Server pushes the moment the budget is exhausted or
+  // restored, so this read is a reconciliation sweep rather than the way
+  // the daemon learns about it: it covers a push that was missed while the
+  // device was away, and a limit that resets at a UTC boundary with no
+  // usage to announce it. Five minutes is the clock the App reads its own
+  // account facts on, and it is often enough that a run which meets the
+  // limit stops within minutes rather than at the next hour.
+  accountBudgetTimer = setInterval(() => {
+    if (!relayConnected) return;
+    collaborationRuntime.refreshAccountBudgetStatus().catch((error) => {
+      console.error(`[collaboration-budget] ${error.message}`);
+    });
+  }, 5 * 60_000);
+  accountBudgetTimer.unref?.();
   agentActivitySyncTimer = setInterval(() => {
     if (!relayConnected) return;
     void syncAgentActivityHistory().then((result) => {
@@ -1076,6 +1115,7 @@ export async function startDaemon(args) {
 
       const relayOptions = relayOptionsResult.options;
       relayAuthState = relayOptions.authState || "on";
+      relayCarriesAuthToken = relayOptions.authState === "on";
       relayAuthError = null;
       relayClient.deviceId = relayOptions.deviceId;
       relayClient.setAuthToken(relayOptions.authToken);
@@ -1225,6 +1265,7 @@ export async function startDaemon(args) {
         localApiCtx.deviceId = effectiveDeviceId;
         sessionManager.deviceId = effectiveDeviceId;
         relayAuthState = relayOptions.authState || "on";
+        relayCarriesAuthToken = relayOptions.authState === "on";
         relayAuthError = null;
       } catch (reErr) {
         relayAuthState = "unavailable";

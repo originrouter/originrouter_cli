@@ -6,23 +6,43 @@ import WebSocket from "ws";
 //   WSS  /relay/v1/devices/{device_id}/ws
 //   POST /relay/v1/messages
 
+/**
+ * The bearer a request is sent with.
+ *
+ * It may be given as the token itself or as a function that is asked at the
+ * moment the request goes out. The function is the honest way to hold a
+ * token that expires: a token that was fresh when the connection opened is
+ * stale ten minutes later, and a request that carries a stale token is
+ * refused as unauthorized — the proof cannot save it, because the proof is
+ * bound to the very token that expired.
+ */
+async function resolveAuthToken(authToken) {
+  if (typeof authToken === "function") {
+    const token = await authToken();
+    return token || null;
+  }
+  return authToken || null;
+}
+
 export async function postJson(url, body, options = {}) {
   const headers = {
     "Content-Type": "application/json",
     ...(options.headers || {}),
   };
-  if (options.authToken) {
+  const token = await resolveAuthToken(options.authToken);
+  if (token) {
     // The proof is made here rather than left to the fetch wrapper, so that
-    // the request is held to the key whichever fetch it is sent with.
+    // the request is held to the key whichever fetch it is sent with. It is
+    // made over the token this request carries, so the two agree.
     const proof = await options.proofProvider?.({
       method: "POST",
       url,
-      token: options.authToken,
+      token,
     });
     if (proof) {
       Object.assign(headers, proof);
     } else {
-      headers.Authorization = `Bearer ${options.authToken}`;
+      headers.Authorization = `Bearer ${token}`;
     }
   }
   const response = await fetch(url, {
@@ -44,6 +64,7 @@ export class RelayClient {
     deviceId,
     authToken = null,
     proofProvider = null,
+    authTokenProvider = null,
     heartbeatIntervalMs = 15_000,
     heartbeatTimeoutMs = 45_000,
     e2eeAckTimeoutMs = 30_000,
@@ -56,6 +77,9 @@ export class RelayClient {
     // covered by the fetch wrapper. It asks this instead, and gets the same
     // answer for the same reasons.
     this.proofProvider = proofProvider;
+    // Where the bearer is asked for, when it has to be fresh at the moment
+    // the request is sent. See [_resolveAuthToken].
+    this.authTokenProvider = authTokenProvider;
     this.heartbeatIntervalMs = Math.max(10, Number(heartbeatIntervalMs) || 15_000);
     this.heartbeatTimeoutMs = Math.max(
       this.heartbeatIntervalMs * 2,
@@ -81,6 +105,32 @@ export class RelayClient {
       } catch {}
       this._ws = null;
     }
+  }
+
+  /**
+   * Ask for the bearer when a request is sent, rather than holding the one
+   * that was current when the connection was opened.
+   *
+   * The client used to keep a single token and use it for every request.
+   * That token was fresh when the relay connection opened and stale ten
+   * minutes later, and only a reconnect replaced it — so every request made
+   * in between was refused as unauthorized. The provider is asked instead,
+   * and the token it returns is the one the proof is made over.
+   *
+   * A provider that has no token to give (a relay that runs without auth, or
+   * a credential that has gone) falls back to the token the client already
+   * holds, so a request that would have gone out still goes out.
+   */
+  setAuthTokenProvider(provider) {
+    this.authTokenProvider = typeof provider === "function" ? provider : null;
+  }
+
+  async _resolveAuthToken() {
+    if (this.authTokenProvider) {
+      const token = await this.authTokenProvider();
+      if (token) return token;
+    }
+    return this.authToken || null;
   }
 
   /**
@@ -116,7 +166,7 @@ export class RelayClient {
         target_device_id: payload.targetDeviceId || payload.deviceId || this.deviceId,
         payload: envelope,
       },
-      { authToken: this.authToken, proofProvider: this.proofProvider },
+      { authToken: () => this._resolveAuthToken(), proofProvider: this.proofProvider },
     );
   }
 
@@ -125,7 +175,7 @@ export class RelayClient {
     return postJson(`${this.relayUrl}/relay/v1/messages`, {
       target_device_id: payload.targetDeviceId || payload.deviceId || this.deviceId,
       payload: envelope,
-    }, { authToken: this.authToken, proofProvider: this.proofProvider });
+    }, { authToken: () => this._resolveAuthToken(), proofProvider: this.proofProvider });
   }
 
   async sendEnvelope(envelope) {
@@ -184,7 +234,7 @@ export class RelayClient {
         target_device_id: envelope.target_device_id,
         payload: envelope,
       },
-      { authToken: this.authToken, proofProvider: this.proofProvider },
+      { authToken: () => this._resolveAuthToken(), proofProvider: this.proofProvider },
     );
   }
 
@@ -224,16 +274,19 @@ export class RelayClient {
     const url = new URL(`${this.relayUrl.replace(/\/+$/, "")}/relay/v1/devices/${encodeURIComponent(this.deviceId)}/ws`);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const headers = {};
-    if (this.authToken) {
+    // The handshake is the one request that cannot be retried with a
+    // different token later, so it asks for one that is fresh now.
+    const token = await this._resolveAuthToken();
+    if (token) {
       const proof = await this.proofProvider?.({
         method: "GET",
         url: url.toString(),
-        token: this.authToken,
+        token,
       });
       if (proof) {
         Object.assign(headers, proof);
       } else {
-        headers.Authorization = `Bearer ${this.authToken}`;
+        headers.Authorization = `Bearer ${token}`;
       }
     }
     await new Promise((resolve, reject) => {
