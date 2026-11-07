@@ -52,6 +52,21 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
   `availableSessionModels` — a third derivation of the same rule — is gone
   with it.
 
+### Fixed
+
+- **A conversation that the local catalogue and the cloud name differently no
+  longer fails every five minutes.** The cloud freezes a conversation's id on
+  the first report that names it, and the local catalogue keeps the id of the
+  attempt that was last active; when the two disagree, every route that looks
+  the conversation up by id (`reconcile-previews`, `history/manifests/start`)
+  answers 404, and the queued previews and the transcript never drain.
+  `scripts/align-catalog-conversation-id.sql` puts the local row back under
+  the id the cloud froze — one transaction over the local sqlite, the daemon
+  keeps running, nothing on the cloud is touched, and the transcript is not
+  uploaded again. `docs/agent-conversation-id-alignment.md` says what happened
+  and when the same shape appears again (the same conversation used on a
+  second device).
+
 ### Security
 
 - **DPoP (RFC 9449): a device proves it holds the key it registered.** After
