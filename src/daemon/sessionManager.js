@@ -62,6 +62,8 @@ export class SessionManager {
     agentBudgetStore = null,
     runtimeTaskStore = null,
     runtimeSupervisor = null,
+    scheduledTaskScheduler = null,
+    remoteEnvironmentService = null,
     onLocalControlChanged = null,
     stateDir = ensureStateDir(),
     compatibilityAutomaticUpdates = true,
@@ -83,6 +85,8 @@ export class SessionManager {
     this.agentBudgetStore = agentBudgetStore;
     this.runtimeTaskStore = runtimeTaskStore;
     this.runtimeSupervisor = runtimeSupervisor;
+    this.scheduledTaskScheduler = scheduledTaskScheduler;
+    this.remoteEnvironmentService = remoteEnvironmentService;
     this.onLocalControlChanged = onLocalControlChanged;
     this.stateDir = stateDir;
     this.compatibilityAutomaticUpdates = compatibilityAutomaticUpdates;
@@ -905,6 +909,32 @@ export class SessionManager {
   }
 
   handleEvent(payload) {
+    if (payload.type === "remote_environments.request") {
+      const requestId = String(payload.requestId || "").slice(0, 96);
+      if (!requestId) return false;
+      Promise.resolve().then(() => {
+        if (!this.remoteEnvironmentService) throw Object.assign(new Error("remote environments are unavailable"), {code:"REMOTE_ENV_UNAVAILABLE"});
+        return this.remoteEnvironmentService.handle(String(payload.action || ""), payload.body || {});
+      }).then((result) => this.relayClient.send("remote_environments.result", {requestId, ...result}))
+        .catch((error) => this.relayClient.send("remote_environments.result", {
+          requestId, error:error.message || "remote environment request failed",
+          reason:String(error.code || "remote_env_request_failed").toLowerCase(),
+        })).catch(() => {});
+      return true;
+    }
+    if (payload.type === "scheduled_tasks.request") {
+      const requestId = String(payload.requestId || "").slice(0, 96);
+      if (!requestId) return false;
+      Promise.resolve().then(() => {
+        if (!this.scheduledTaskScheduler) throw Object.assign(new Error("scheduled tasks are unavailable"), { code:"SCHEDULED_TASKS_UNAVAILABLE" });
+        return this.scheduledTaskScheduler.handle(String(payload.action || ""), payload.body || {});
+      }).then((result) => this.relayClient.send("scheduled_tasks.result", { requestId, ...result }))
+        .catch((error) => this.relayClient.send("scheduled_tasks.result", {
+          requestId, error:error.message || "scheduled task request failed",
+          reason:String(error.code || "scheduled_task_request_failed").toLowerCase(),
+        })).catch((error) => console.error(`[scheduled-tasks] ${error.message}`));
+      return true;
+    }
     if (payload.type === "runtime_tasks.request") {
       // The cards hold the messages a user wants sent to their Agents, so
       // they travel only inside the E2EE envelope (see

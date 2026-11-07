@@ -246,3 +246,45 @@ test("a runtime-task request is answered through the chain", async () => {
   assert.equal(changed, 1, "only the write that landed re-arms the supervisor");
   runtime.close();
 });
+
+
+test("a scheduled-task request is answered through the encrypted relay dispatch", async () => {
+  const { ScheduledTaskStore } = await import("../src/runtime/scheduledTaskStore.js");
+  const { ScheduledTaskScheduler } = await import("../src/runtime/scheduledTaskScheduler.js");
+  const { dispatch, sent, sessionManager, runtime } = fixture();
+  const store = new ScheduledTaskStore({stateDir:mkdtempSync(join(tmpdir(), "or-relay-scheduled-")), now:() => Date.parse("2026-11-03T00:00:00Z")});
+  sessionManager.scheduledTaskScheduler = new ScheduledTaskScheduler({store});
+  await dispatch({type:"scheduled_tasks.request", requestId:"st-save", action:"save", body:{baseRevision:0, task:{
+    id:"st_a", name:"Build", schedule:{kind:"once",at:"2026-11-03T01:00:00Z"},
+    launch:{agentType:"claude",workspaceId:"workspace-a",initialMessage:"test"},
+  }}});
+  await settle();
+  await dispatch({type:"scheduled_tasks.request", requestId:"st-list", action:"list"});
+  await settle();
+  const answers = Object.fromEntries(sent.filter((entry) => entry.type === "scheduled_tasks.result").map((entry) => [entry.payload.requestId, entry.payload]));
+  assert.equal(answers["st-save"].task.id, "st_a");
+  assert.equal(answers["st-list"].tasks[0].launch.initialMessage, "test");
+  store.close(); runtime.close();
+});
+
+test("remote environment management is routed and never returns its credential", async () => {
+  const { RemoteEnvironmentService } = await import("../src/remoteEnvironment/remoteEnvironmentService.js");
+  const { dispatch, sent, sessionManager, runtime } = fixture();
+  const values = new Map();
+  const vault = {put:async (k,v) => values.set(k,v), get:async (k) => values.get(k), remove:async (k) => values.delete(k)};
+  const service = new RemoteEnvironmentService({stateDir:mkdtempSync(join(tmpdir(), "or-relay-ssh-")),vault});
+  sessionManager.remoteEnvironmentService = service;
+  const fingerprint = `SHA256:${"A".repeat(43)}`;
+  await dispatch({type:"remote_environments.request",requestId:"save",action:"save",body:{
+    target:{id:"ssh_a",name:"host",host:"example.com",username:"u",hostFingerprint:fingerprint},
+    confirmedFingerprint:fingerprint,credential:{kind:"password",password:"private-value"},
+  }});
+  await settle();
+  await dispatch({type:"remote_environments.request",requestId:"list",action:"list"});
+  await settle();
+  const answers = sent.filter((item) => item.type === "remote_environments.result");
+  assert.equal(answers.length,2);
+  assert.equal(answers.find((item) => item.payload.requestId === "list").payload.targets[0].id,"ssh_a");
+  assert.equal(JSON.stringify(answers).includes("private-value"),false);
+  service.close(); runtime.close();
+});
