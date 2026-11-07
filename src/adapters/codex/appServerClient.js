@@ -112,6 +112,7 @@ export class CodexAppServerClient {
     this.completedTurnOrder = [];
     this.currentTurnId = null;
     this.turnOpen = false;
+    this.interruptingTurns = new Set();
     this.rpcTimeoutMs = options.rpcTimeoutMs ?? CODEX_RPC_TIMEOUT_MS;
     this.approvalTimeoutMs = options.approvalTimeoutMs ?? CODEX_APPROVAL_TIMEOUT_MS;
     this._approvalTimers = new Map();
@@ -263,6 +264,7 @@ export class CodexAppServerClient {
     this.completedTurnOrder.length = 0;
     this.turnOpen = false;
     this.currentTurnId = null;
+    this.interruptingTurns.clear();
   }
 
   // Stage 8.4: the single cleanup point for child exit. Rejects pending
@@ -333,7 +335,14 @@ export class CodexAppServerClient {
   }
 
   interruptTurn(threadId, turnId) {
-    return this.request("turn/interrupt", { threadId, turnId });
+    // Codex may publish thread idle before its definitive turn/completed
+    // notification. Once interruption is requested, idle alone is not proof
+    // that the turn ended normally (or even that interruption succeeded).
+    if (turnId) this.interruptingTurns.add(turnId);
+    return this.request("turn/interrupt", { threadId, turnId }).catch((error) => {
+      if (turnId) this.interruptingTurns.delete(turnId);
+      throw error;
+    });
   }
 
   updateThreadSettings(params = {}) {
@@ -444,10 +453,10 @@ export class CodexAppServerClient {
     // invariant is preserved by `completedTurnIds`.
     if (!this.turnOpen && !turnId) return;
     if (turnId && this.completedTurnIds.has(turnId)) {
-      this.turnOpen = false;
-      this.currentTurnId = null;
+      // A late duplicate from the previous turn must not clear a newer turn.
       return;
     }
+    if (turnId && this.turnOpen && this.currentTurnId && turnId !== this.currentTurnId) return;
     if (turnId) {
       this.completedTurnIds.add(turnId);
       this.completedTurnOrder.push(turnId);
@@ -658,6 +667,7 @@ export class CodexAppServerClient {
 
     if (method === "turn/completed") {
       const turnId = this.extractTurnId(params);
+      if (turnId) this.interruptingTurns.delete(turnId);
       const status = this.extractTurnStatus(params) || "complete";
       const error = params.turn?.error || params.error || null;
       this.closeTurnIfOpen({ turnId, status, error, source: "turn/completed" });
@@ -668,7 +678,7 @@ export class CodexAppServerClient {
     // turn/completed; the thread-level status flip is the alternative signal.
     if (method === "thread/status/changed") {
       const statusType = params.status?.type || params.status;
-      if (statusType === "idle" && this.turnOpen) {
+      if (statusType === "idle" && this.turnOpen && !this.interruptingTurns.has(this.currentTurnId)) {
         this.closeTurnIfOpen({
           turnId: this.currentTurnId,
           status: "complete",

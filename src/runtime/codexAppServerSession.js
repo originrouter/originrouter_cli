@@ -1,3 +1,4 @@
+import { RuntimeOutputSampler, codexStreamDelta } from "./runtimeOutputSampler.js";
 import { createAgentPermissionStateTracker } from "./agentPermissionStateTracker.js";
 import process from "node:process";
 import { randomUUID } from "node:crypto";
@@ -73,6 +74,7 @@ import { resolveRelayEndpoint } from "../relay/relayEndpointSelector.js";
 import { LocalAgentBridgeClient } from "../local/localAgentBridgeClient.js";
 import { createTelemetryPipeline } from "../telemetry/index.js";
 import { codexAgentGatewayConfigArgs } from "../mcp/agentGatewayConfig.js";
+import { createDeviceToolApprovalHandler } from "./deviceToolApproval.js";
 import {
   buildInteractionRequest,
   INTERACTION_KINDS,
@@ -520,7 +522,26 @@ export async function runCodexAppServerSession(rawArgs) {
     ...event,
     provider: event.provider || "originrouter",
   });
-  const agentEventQueue = createSerialAgentEventQueue(sendAgentEvent);
+  // Deliver samples in the same order as turn lifecycle events, but only to
+  // the local daemon; sampled output must not become transcript or audit data.
+  let outputSampleSequence = 0;
+  const outputSampler = new RuntimeOutputSampler({onChunk:(turnId, text) => enqueueOutputSample(turnId, text),
+    onGap:() => { outputSampleSequence += 1; }});
+  let queuedOutputSamples = 0;
+  const agentEventQueue = createSerialAgentEventQueue((event) => {
+    if (event.type === "_supervisor.output") {
+      return localAgentBridge?.sendObservation(event.turnId, event.text, event.sequence);
+    }
+    return sendAgentEvent(event);
+  });
+  const enqueueOutputSample = (turnId, text) => {
+    if (!text) return;
+    const sequence = ++outputSampleSequence;
+    if (queuedOutputSamples >= 8) return;
+    queuedOutputSamples += 1;
+    void agentEventQueue.enqueue({ type: "_supervisor.output", turnId, text, sequence })
+      .finally(() => { queuedOutputSamples -= 1; });
+  };
   emitGatewayResponseIds = async (ids) => {
     const gatewayResponseIds = [...new Set((Array.isArray(ids) ? ids : [])
       .filter((value) => typeof value === "string" && value.trim())
@@ -799,7 +820,7 @@ export async function runCodexAppServerSession(rawArgs) {
       availableDetailProfiles: AGENT_DETAIL_PROFILES,
     });
 
-  const requestRemoteInteraction = (request) => {
+  const requestRemoteInteraction = (request, signal) => {
     const reviewPolicyAtRequest = aiReviewPolicy;
     const profileAtRequest = autonomyProfile;
     return resolveWithAutonomy({
@@ -814,7 +835,7 @@ export async function runCodexAppServerSession(rawArgs) {
       approvalPolicy,
       workspaceApprovalPolicy,
       stateDir,
-      requestInteraction: (item) => interactions.request(item),
+      requestInteraction: (item) => interactions.request(item, signal),
       onPolicyObserved: ({ request: item, evaluation }) =>
         sendAgentEvent({
           type: "agent.approval_policy.shadow",
@@ -846,6 +867,12 @@ export async function runCodexAppServerSession(rawArgs) {
       : interactions.markResult(resolved.interactionId, "applied", {
           responseId: resolved.responseId,
         });
+
+  const deviceToolApproval = createDeviceToolApprovalHandler({
+    sessionId, provider:"codex", runtime:"codex-app-server", requestInteraction:requestRemoteInteraction,
+    markApplied:markInteractionApplied, revision:() => permissionState.revision,
+    sendResult:(event) => localAgentBridge?.sendDeviceToolApprovalResult(event) || Promise.resolve(false),
+  });
 
   client.onServerRequest(async ({ id, method, params }) => {
     const interactionId = requestInteractionId(method, params, id);
@@ -1075,10 +1102,23 @@ export async function runCodexAppServerSession(rawArgs) {
       }
       return;
     }
-    if (rawEvent.type === "task_started")
+    if (rawEvent.type === "task_started") {
       currentTurnId = rawEvent.turn_id || currentTurnId;
-    if (rawEvent.type === "task_complete" || rawEvent.type === "turn_aborted")
+      outputSampler.reset(currentTurnId);
+    }
+    if (rawEvent.type === "codex.notification" && rawEvent.method === "item/agentMessage/delta") {
+      const delta = codexStreamDelta(rawEvent, currentTurnId, threadId);
+      if (delta != null) {
+        for (const chunk of outputSampler.add(currentTurnId, delta)) enqueueOutputSample(currentTurnId, chunk);
+      }
+      return;
+    }
+    if (rawEvent.type === "task_complete" || rawEvent.type === "turn_aborted") {
+      const endingTurn = currentTurnId;
+      enqueueOutputSample(endingTurn, outputSampler.flush(endingTurn));
+      outputSampler.reset();
       currentTurnId = null;
+    }
     for (const event of mapCodexAppServerEvent(rawEvent)) {
       void agentEventQueue.enqueue(applyConfiguredPricing(event, {
         // A session override moves the session onto another provider, so the
@@ -1152,6 +1192,8 @@ export async function runCodexAppServerSession(rawArgs) {
   const stopSession = async (signal = null, code = 0) => {
     if (stopped) return;
     stopped = true;
+    outputSampler.reset();
+    deviceToolApproval.close();
     stopHeartbeat();
     await agentEventQueue.drain();
     await interactions.cancelAll("session_stopped");
@@ -1183,6 +1225,8 @@ export async function runCodexAppServerSession(rawArgs) {
   };
 
   const handleRemoteEvent = async (payload) => {
+    if (payload?.type === "agent.device_tool.approval") return deviceToolApproval.start(payload);
+    if (payload?.type === "agent.device_tool.cancel") return deviceToolApproval.cancel(payload.requestId);
     if (!payload) return false;
     if (payload.type === "agent.interactions.snapshot.request") {
       const sessionIds = Array.isArray(payload.sessionIds)
@@ -1310,6 +1354,11 @@ export async function runCodexAppServerSession(rawArgs) {
         return false;
       }
     }
+    if (payload.type === "agent.supervisor.interrupt") {
+      if (!threadId || !currentTurnId || payload.turnId !== currentTurnId) return false;
+      await client.interruptTurn(threadId, currentTurnId);
+      return true;
+    }
     if (payload.type === "terminal.interrupt" && currentTurnId) {
       await client.interruptTurn(threadId, currentTurnId);
       return true;
@@ -1357,14 +1406,15 @@ export async function runCodexAppServerSession(rawArgs) {
     await client.connect({
       cwd,
       env: { ...process.env, ...providerResult.env },
-      configArgs: String(options.runId || "").startsWith("acr_")
-        ? codexAgentGatewayConfigArgs(sessionId)
-        : [],
-      modelProvider: providerResult.env.OPENAI_BASE_URL
+      configArgs: [
+        ...(String(options.runId || "").startsWith("acr_") ? codexAgentGatewayConfigArgs(sessionId, {stateDir}) : []),
+        ...codexAgentGatewayConfigArgs(sessionId, {deviceTools:true,stateDir}),
+      ],
+      modelProvider: (providerResult.env.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL)
         ? {
             id: "originrouter_proxy",
             name: "OriginRouter Route",
-            baseUrl: providerResult.env.OPENAI_BASE_URL,
+            baseUrl: providerResult.env.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL,
             envKey: "OPENAI_API_KEY",
             wireApi: "responses",
           }
@@ -1423,6 +1473,12 @@ export async function runCodexAppServerSession(rawArgs) {
       onCommand: async (payload) => {
         try {
           const applied = await handleRemoteEvent(payload);
+          if (payload?.type === "agent.supervisor.interrupt") {
+            await localAgentBridge?.sendEvent({
+              type: "agent.recovery.interrupt_result", requestId: payload.requestId,
+              turnId: payload.turnId, accepted: applied !== false,
+            });
+          }
           if (payload?.type === "agent.message") {
             await localAgentBridge?.sendEvent({
               type: "agent.message.result",
@@ -1432,6 +1488,13 @@ export async function runCodexAppServerSession(rawArgs) {
           }
           return applied;
         } catch (error) {
+          if (payload?.type === "agent.supervisor.interrupt") {
+            await localAgentBridge?.sendEvent({
+              type: "agent.recovery.interrupt_result", requestId: payload.requestId,
+              turnId: payload.turnId, accepted: false,
+            });
+            return false;
+          }
           const reason = String(error?.code || error?.message || "agent_command_failed")
             .slice(0, 512);
           await localAgentBridge?.sendEvent({
@@ -1468,6 +1531,8 @@ export async function runCodexAppServerSession(rawArgs) {
       startedAt: new Date().toISOString(),
       nativeSessionId: threadId,
       runtime: "codex-app-server",
+      supportsRuntimeRecovery: true,
+      supportsDeviceTools: true,
       provider: providerResult.provider?.name,
       model,
       permissionProfile: "workspace-write:on-request",

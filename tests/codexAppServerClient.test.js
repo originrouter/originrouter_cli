@@ -169,6 +169,42 @@ for (const status of ["cancelled", "canceled", "aborted"]) {
 
 // ---- 5. Protocol lock raw (lifecycle-only) ----
 
+// Real Codex can report idle before the interrupted turn's final event. An
+// idle fallback must not turn that interruption into a successful completion.
+{
+  const { client, events } = makeClient();
+  client.request = async () => ({});
+  feed(client, {jsonrpc:"2.0",method:"turn/started",params:{turn:{id:"t-interrupt"}}});
+  await client.interruptTurn("thread-1", "t-interrupt");
+  feed(client, {jsonrpc:"2.0",method:"thread/status/changed",params:{status:{type:"idle"}}});
+  assert.equal(events.filter((event) => event.type === "task_complete").length, 0);
+  feed(client, {jsonrpc:"2.0",method:"turn/completed",params:{turn:{id:"t-interrupt",status:"interrupted"}}});
+  assert.equal(events.filter((event) => event.type === "turn_aborted").length, 1);
+}
+
+// A duplicate late completion from the previous turn must not wipe the
+// current turn, including a turn started by runtime supervision.
+{
+  const { client, events } = makeClient();
+  feed(client, {jsonrpc:"2.0",method:"turn/started",params:{turn:{id:"old"}}});
+  feed(client, {jsonrpc:"2.0",method:"turn/completed",params:{turn:{id:"old",status:"complete"}}});
+  feed(client, {jsonrpc:"2.0",method:"turn/started",params:{turn:{id:"new"}}});
+  feed(client, {jsonrpc:"2.0",method:"turn/completed",params:{turn:{id:"old",status:"complete"}}});
+  assert.equal(client.currentTurnId, "new");
+  assert.equal(client.turnOpen, true);
+  feed(client, {jsonrpc:"2.0",method:"turn/completed",params:{turn:{id:"new",status:"complete"}}});
+  assert.deepEqual(events.filter((event) => event.type === "task_complete").map((event) => event.turn_id), ["old", "new"]);
+}
+
+{
+  const { client, events } = makeClient();
+  client.request = async () => { throw new Error("rejected"); };
+  feed(client, {jsonrpc:"2.0",method:"turn/started",params:{turn:{id:"t-rejected"}}});
+  await assert.rejects(client.interruptTurn("thread-1", "t-rejected"), /rejected/);
+  feed(client, {jsonrpc:"2.0",method:"thread/status/changed",params:{status:{type:"idle"}}});
+  assert.equal(events.filter((event) => event.type === "task_complete").length, 1);
+}
+
 {
   const { client, events } = makeClient();
   feed(client, { jsonrpc: "2.0", method: "turn/started", params: { turn: { id: "t-pl-raw" } } });

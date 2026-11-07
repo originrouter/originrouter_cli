@@ -1,3 +1,4 @@
+import { RuntimeOutputSampler, claudeStreamPart } from "./runtimeOutputSampler.js";
 import { createAgentPermissionStateTracker } from "./agentPermissionStateTracker.js";
 import process from "node:process";
 import { randomUUID } from "node:crypto";
@@ -45,6 +46,7 @@ import { resolveRelayEndpoint } from "../relay/relayEndpointSelector.js";
 import { buildProviderConfigEvent } from "../util/providerConfigEvent.js";
 import { LocalAgentBridgeClient } from "../local/localAgentBridgeClient.js";
 import { agentGatewayMcpConfig } from "../mcp/agentGatewayConfig.js";
+import { createDeviceToolApprovalHandler } from "./deviceToolApproval.js";
 import {
   defaultConversationTitle,
   looksLikePlaceholderTitle,
@@ -430,6 +432,23 @@ export async function runClaudeSdkSession(rawArgs) {
   });
   let originrouterCodingProxy = null;
   let localAgentBridge = null;
+  let supervisorTurnId = "";
+  let streamTurnId = "";
+  let outputSampleSequence = 0;
+  const outputSampler = new RuntimeOutputSampler({onChunk:(turnId, text) => enqueueOutputSample(turnId, text),
+    onGap:() => { outputSampleSequence += 1; }});
+  let outputSampleTail = Promise.resolve();
+  let queuedOutputSamples = 0;
+  const enqueueOutputSample = (turnId, text) => {
+    if (!text) return;
+    const sequence = ++outputSampleSequence;
+    if (queuedOutputSamples >= 8) return;
+    queuedOutputSamples += 1;
+    outputSampleTail = outputSampleTail
+      .then(() => localAgentBridge?.sendObservation(turnId, text, sequence))
+      .catch(() => false)
+      .finally(() => { queuedOutputSamples -= 1; });
+  };
   let runtimeSettingsOverride = null;
   let relayViaDaemon = false;
   // A launch-time --model becomes a session override rather than the agent's
@@ -667,6 +686,11 @@ export async function runClaudeSdkSession(rawArgs) {
   };
   const report = (type, extra = {}) => runtimeReporter.report(type, extra);
   const sendAgentEvent = async (event) => {
+    if (event.type === "agent.task.started") {
+      supervisorTurnId = String(event.id || `supervisor-turn-${randomUUID()}`);
+      outputSampler.reset(supervisorTurnId);
+      event = { ...event, supervisorTurnId };
+    }
     const transientEvent = {
       ...event,
       eventId: event.eventId || `ate_${randomUUID()}`,
@@ -1091,9 +1115,17 @@ export async function runClaudeSdkSession(rawArgs) {
     });
   };
 
+  const deviceToolApproval = createDeviceToolApprovalHandler({
+    sessionId, provider:"claude", runtime:"claude-sdk", requestInteraction,
+    markApplied:markInteractionApplied, revision:() => permissionState.revision,
+    sendResult:(event) => localAgentBridge?.sendDeviceToolApprovalResult(event) || Promise.resolve(false),
+  });
+
   const stopSession = async (signal = null, { exitProcess = false } = {}) => {
     if (stopped) return;
     stopped = true;
+    outputSampler.reset();
+    deviceToolApproval.close();
     stopHeartbeat();
     abortController.abort();
     messageQueue.close();
@@ -1126,6 +1158,8 @@ export async function runClaudeSdkSession(rawArgs) {
 
   const handleRemoteEvent = async (payload) => {
     if (!payload) return false;
+    if (payload.type === "agent.device_tool.approval") return deviceToolApproval.start(payload);
+    if (payload.type === "agent.device_tool.cancel") return deviceToolApproval.cancel(payload.requestId);
     if (payload.type === "agent.interactions.snapshot.request") {
       const sessionIds = Array.isArray(payload.sessionIds)
         ? payload.sessionIds
@@ -1218,6 +1252,11 @@ export async function runClaudeSdkSession(rawArgs) {
     }
     if (payload.type === "agent.autonomy.set") {
       return applyAutonomy(payload);
+    }
+    if (payload.type === "agent.supervisor.interrupt") {
+      if (!queryRef || !supervisorTurnId || payload.turnId !== supervisorTurnId) return false;
+      await queryRef.interrupt();
+      return true;
     }
     if (payload.type === "terminal.interrupt") {
       await queryRef?.interrupt().catch(() => {});
@@ -1472,8 +1511,9 @@ export async function runClaudeSdkSession(rawArgs) {
   try {
     runtimeSettingsOverride = createClaudeRuntimeSettingsOverride(providerResult);
     const originrouterMcp = String(options.runId || "").startsWith("acr_")
-      ? agentGatewayMcpConfig(sessionId)
+      ? agentGatewayMcpConfig(sessionId, {stateDir})
       : null;
+    const deviceMcp = agentGatewayMcpConfig(sessionId, {deviceTools:true,stateDir});
     queryRef = query({
       prompt: messageQueue,
       options: {
@@ -1487,8 +1527,9 @@ export async function runClaudeSdkSession(rawArgs) {
         model,
         fallbackModel: modelSelection.fallbackModel,
         settings: runtimeSettingsOverride?.path,
-        ...(originrouterMcp ? { mcpServers: { originrouter: originrouterMcp } } : {}),
+        mcpServers: { ...(originrouterMcp ? {originrouter: originrouterMcp} : {}), originrouter_device:deviceMcp },
         includeHookEvents: true,
+        includePartialMessages: true,
         forwardSubagentText: true,
         ...(typeof options.resume === "string"
           ? { resume: options.resume }
@@ -1511,6 +1552,12 @@ export async function runClaudeSdkSession(rawArgs) {
       onCommand: async (payload) => {
         try {
           const applied = await handleRemoteEvent(payload);
+          if (payload?.type === "agent.supervisor.interrupt") {
+            await localAgentBridge?.sendEvent({
+              type: "agent.recovery.interrupt_result", requestId: payload.requestId,
+              turnId: payload.turnId, accepted: applied !== false,
+            });
+          }
           if (payload?.type === "agent.message") {
             await localAgentBridge?.sendEvent({
               type: "agent.message.result",
@@ -1520,6 +1567,13 @@ export async function runClaudeSdkSession(rawArgs) {
           }
           return applied;
         } catch (error) {
+          if (payload?.type === "agent.supervisor.interrupt") {
+            await localAgentBridge?.sendEvent({
+              type: "agent.recovery.interrupt_result", requestId: payload.requestId,
+              turnId: payload.turnId, accepted: false,
+            });
+            return false;
+          }
           const reason = String(error?.code || error?.message || "agent_command_failed")
             .slice(0, 512);
           await localAgentBridge?.sendEvent({
@@ -1556,6 +1610,8 @@ export async function runClaudeSdkSession(rawArgs) {
       startedAt: new Date().toISOString(),
       nativeSessionId: claudeSessionId,
       runtime: "claude-sdk",
+      supportsRuntimeRecovery: true,
+      supportsDeviceTools: true,
       provider: providerResult.provider?.name,
       model,
       permissionProfile: currentMode,
@@ -1595,8 +1651,33 @@ export async function runClaudeSdkSession(rawArgs) {
     // the choice at all.
     await reportSessionEffort();
     process.stderr.write("[originrouter] Managed Claude session ready.\n");
+    // The launch start is announced before the local bridge exists. Replay
+    // that start locally so the daemon can bind streaming samples to it.
+    if (initialMessage && supervisorTurnId) {
+      await localAgentBridge?.sendEvent({
+        type: "agent.task.started", provider: "claude", id: supervisorTurnId,
+        supervisorTurnId, eventId: `supervisor-start-${randomUUID()}`,
+      });
+    }
     for await (const message of queryRef) {
-      for (const event of mapClaudeSdkMessage(message)) {
+      const streamPart = claudeStreamPart(message);
+      if (streamPart?.kind === "start") {
+        streamTurnId = supervisorTurnId;
+        if (outputSampler.turnId !== streamTurnId) outputSampler.reset(streamTurnId);
+      } else if (streamPart?.kind === "delta") {
+        for (const chunk of outputSampler.add(streamTurnId, streamPart.text)) {
+          enqueueOutputSample(streamTurnId, chunk);
+        }
+      } else if (streamPart?.kind === "end") {
+        const chunk = outputSampler.flush(streamTurnId);
+        if (chunk) enqueueOutputSample(streamTurnId, chunk);
+      }
+      for (const mapped of mapClaudeSdkMessage(message)) {
+        // The SDK result has its own message UUID, not the turn token used by
+        // the supervisor. Carry the token captured at stream start so an old
+        // or unidentifiable abort cannot authorize a continuation.
+        const event = streamTurnId && ["agent.task.completed", "agent.task.complete", "agent.task.failed", "agent.task.aborted"].includes(mapped.type)
+          ? {...mapped, supervisorTurnId:streamTurnId} : mapped;
         if (event.type === "agent.session_id" && event.sessionId) {
           claudeSessionId = event.sessionId;
           model = model || event.model;
@@ -1627,6 +1708,7 @@ export async function runClaudeSdkSession(rawArgs) {
     if (!stopped) await stopSession(null);
   } catch (error) {
     if (stopped) return;
+    deviceToolApproval.close();
     await localAgentBridge?.sendEvent({
       type: "agent.task.failed",
       error: String(error?.code || error?.message || "claude_sdk_failed").slice(0, 2048),
