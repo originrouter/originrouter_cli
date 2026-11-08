@@ -162,7 +162,7 @@ export async function handleProvidersUse(ctx, res, body) {
     return sendOk(res, {
       setProvider: name,
       setAgent: agent,
-      routes: { [agent]: projectRoutesForApi(result.routes[agent], agent) },
+      routes: { [agent]: projectRoutesForApi(result.routes[agent], agent, result.config) },
       proxy: result.proxy,
     });
   }
@@ -184,7 +184,7 @@ export async function handleProvidersUse(ctx, res, body) {
   return sendOk(res, {
     setProvider: name,
     setAgent: agent,
-    routes: { [agent]: projectRoutesForApi(result.routes[agent], agent) },
+    routes: { [agent]: projectRoutesForApi(result.routes[agent], agent, result.config) },
     proxy: result.proxy,
   });
 }
@@ -274,7 +274,7 @@ export async function handleProviderRemove(ctx, res, name) {
   // Project each agent's routes into the response.
   const projected = {};
   for (const agent of ROUTE_AGENTS) {
-    projected[agent] = projectRoutesForApi(result.routes[agent], agent);
+    projected[agent] = projectRoutesForApi(result.routes[agent], agent, result.config);
   }
   return sendOk(res, {
     removed: name,

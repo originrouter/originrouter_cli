@@ -12,6 +12,7 @@ import {
   readSessionModels,
   resolveLaunchModelTarget,
   resolvePricingTarget,
+  routeModelControl,
   sessionIdFromCredential,
   sessionIdFromHeaders,
   setSessionModel,
@@ -194,6 +195,56 @@ assert.equal(modelControlForTransport("remote-coding"), "supported");
 for (const source of ["inherited", "", null, undefined, "ROUTES"]) {
   assert.equal(modelControlForTransport(source), "unsupported", `source ${String(source)}`);
 }
+
+// --- what a launch may be told -------------------------------------------
+//
+// The same question asked before a session exists: the App reads the route it
+// is about to launch on and needs to know whether the device will honour the
+// model it sends. The answer follows the transport the route's provider type
+// makes — which is the branch tree the env builder walks — and the probes are
+// deliberately not consulted: whether the gateway is up right now decides
+// whether a session can start, not whether an override has a place to live.
+assert.equal(
+  routeModelControl({ providers: config.providers, routes: config.routes }, "claude"),
+  "supported",
+  "a proxy route has the compatibility gateway",
+);
+assert.equal(
+  routeModelControl({
+    providers: {
+      cloud: { name: "cloud", type: "originrouter", baseUrl: null },
+    },
+    routes: { claude: { main: { provider: "cloud", model: "" } } },
+  }, "claude"),
+  "supported",
+  "the cloud has the per-session auth proxy",
+);
+assert.equal(
+  routeModelControl({ providers: config.providers, routes: { codex: { main: { provider: "remote", model: "" } } } }, "codex"),
+  "supported",
+  "a remote route has the relay proxy",
+);
+assert.equal(
+  routeModelControl({ providers: config.providers, routes: {} }, "claude"),
+  "unsupported",
+  "no route is an inherited transport",
+);
+assert.equal(
+  routeModelControl({ providers: config.providers, routes: { claude: { main: { provider: "gone", model: "" } } } }, "claude"),
+  "unsupported",
+  "a route whose provider is gone has no gateway to name",
+);
+assert.equal(
+  routeModelControl({ providers: config.providers, routes: { claude: { main: { provider: "deepseek" } } } }, "codex"),
+  "unsupported",
+  "the answer belongs to the agent that was asked about",
+);
+assert.equal(
+  routeModelControl({ providers: config.providers, routes: { claude: { main: { provider: "direct" } } } }, "claude"),
+  "supported",
+  "a legacy anthropic record projects to a proxy, so it has the gateway too",
+);
+assert.equal(routeModelControl(null, "claude"), "unsupported");
 
 rmSync(stateDir, { recursive: true, force: true });
 console.log("sessionModels: ok");

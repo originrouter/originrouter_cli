@@ -1,4 +1,5 @@
 import { ROUTE_DEFS } from "../config/routes.js";
+import { routeModelControl } from "../proxy/sessionModels.js";
 
 export function flattenCollaborationSnapshot(snapshot) {
   if (!snapshot) return null;
@@ -35,14 +36,28 @@ export function placeholderProxyStatus() {
   };
 }
 
-export function projectRoutesForApi(routes, agent = "claude") {
+export function projectRoutesForApi(routes, agent = "claude", config = null) {
   // Project every slot defined for the agent, with missing slots becoming
   // null. Claude returns main plus the four auxiliary families; Codex returns
   // just { main } because that's all ROUTE_DEFS.codex.slots contains.
   const def = ROUTE_DEFS[agent];
   const slots = def ? def.slots : [];
+  // The whole agent's routes share one transport, and that transport is what
+  // decides whether a run here can be told which model to use — so the answer
+  // is the same on every slot, and it is the device's own statement rather
+  // than something the App could work out from `provider`/`model`.
+  //
+  // It is copied onto each slot rather than returned beside them because the
+  // App reads a slot as one row; a second top-level field would be a second
+  // thing to keep in step with the rows.
+  const modelControl = config ? routeModelControl(config, agent) : "";
   const out = {};
-  for (const slot of slots) out[slot] = (routes && routes[slot]) || null;
+  for (const slot of slots) {
+    const route = (routes && routes[slot]) || null;
+    out[slot] = route && modelControl
+      ? { ...route, modelControl }
+      : route;
+  }
   return out;
 }
 

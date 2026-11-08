@@ -62,12 +62,20 @@ function safeLocalControlRoutes(value) {
     const slot = safeText(item.slot, 32);
     const provider = safeText(item.provider, 64);
     if (!agent || !slot || !provider) continue;
-    routes.push({
+    const row = {
       agent,
       slot,
       provider,
       model: safeText(item.model, 256),
-    });
+    };
+    // The device's answer to "may a run here be told which model to use". It
+    // travels because the App cannot derive it, and it is the one thing that
+    // tells an old daemon (which silently ignores `--model`) from a current
+    // one. An empty answer is left off rather than sent as "": the App reads
+    // a missing key as 「不能」, so there is nothing to say twice.
+    const modelControl = safeText(item.modelControl, 16);
+    if (modelControl) row.modelControl = modelControl;
+    routes.push(row);
   }
   return routes;
 }

@@ -43,7 +43,7 @@ export function handleRoutesList(ctx, res) {
   // per-agent nested shape.
   const out = { routes: {}, aliases: {} };
   for (const agent of ROUTE_AGENTS) {
-    out.routes[agent] = projectRoutesForApi(getAgentRoutes(config, agent), agent);
+    out.routes[agent] = projectRoutesForApi(getAgentRoutes(config, agent), agent, config);
     out.aliases[agent] = { ...ROUTE_DEFS[agent].aliases };
   }
   return sendOk(res, out);
@@ -54,7 +54,7 @@ export function handleRoutesShow(ctx, res, agent) {
   const agentRoutes = getAgentRoutes(config, agent);
   return sendOk(res, {
     agent,
-    routes: projectRoutesForApi(agentRoutes, agent),
+    routes: projectRoutesForApi(agentRoutes, agent, config),
     routesHash: hashRoutes(getAllRoutes(config)),
   });
 }
@@ -102,7 +102,7 @@ export async function saveRoutesAndMaybeRestartProxy(ctx, nextConfig, prevConfig
       proxyInfo.error = err.message;
     }
   }
-  return { ok: true, routes, proxy: proxyInfo };
+  return { ok: true, routes, config: nextConfig, proxy: proxyInfo };
 }
 
 // PUT /routes/<agent>: replace the agent's full route set with the body.
@@ -123,7 +123,7 @@ export async function handleRoutesUpdate(ctx, res, agent, body) {
   const result = await saveRoutesAndMaybeRestartProxy(ctx, next, config);
   if (!result.ok) return sendError(res, 500, result.error);
   return sendOk(res, {
-    routes: { [agent]: projectRoutesForApi(result.routes[agent], agent) },
+    routes: { [agent]: projectRoutesForApi(result.routes[agent], agent, result.config) },
     proxy: result.proxy,
   });
 }
@@ -142,7 +142,7 @@ export async function handleRouteSlot(ctx, res, agent, slot, body) {
   const result = await saveRoutesAndMaybeRestartProxy(ctx, next, config);
   if (!result.ok) return sendError(res, 500, result.error);
   return sendOk(res, {
-    routes: { [agent]: projectRoutesForApi(result.routes[agent], agent) },
+    routes: { [agent]: projectRoutesForApi(result.routes[agent], agent, result.config) },
     proxy: result.proxy,
   });
 }
@@ -158,7 +158,7 @@ export async function handleRouteClear(ctx, res, agent, slot) {
   const result = await saveRoutesAndMaybeRestartProxy(ctx, next, config);
   if (!result.ok) return sendError(res, 500, result.error);
   return sendOk(res, {
-    routes: { [agent]: projectRoutesForApi(result.routes[agent], agent) },
+    routes: { [agent]: projectRoutesForApi(result.routes[agent], agent, result.config) },
     proxy: result.proxy,
   });
 }

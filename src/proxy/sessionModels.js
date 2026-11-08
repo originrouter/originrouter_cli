@@ -77,6 +77,39 @@ export function modelControlForTransport(source) {
 }
 
 /**
+ * Whether a run started on this agent's route may be told which model to use.
+ *
+ * This is the launch-time twin of [modelControlForTransport]: the same answer,
+ * asked before a session exists so the App can know whether to offer a model
+ * picker at all. It follows the branch tree `buildAgentProviderEnv` walks —
+ * the transport is whatever the route's provider type makes it, and the three
+ * gateway transports can rewrite a model while `inherited` cannot:
+ *
+ *   remote        → the relay proxy in front of the remote device
+ *   originrouter  → the per-session auth proxy in front of the cloud
+ *   proxy         → the compatibility gateway in front of LiteLLM
+ *   (no route)    → inherited: the agent talks to its endpoint directly
+ *
+ * The probes that decide whether a session can *start* (proxy running and its
+ * routes hash matching, the relay proxy up) are deliberately not consulted:
+ * they say whether the gateway is there right now, not whether this route has
+ * a place for an override to live. A route whose gateway is down is a route
+ * that cannot start, which is a different sentence.
+ */
+export function routeModelControl(config, agent) {
+  const name = String(agent || "").trim();
+  if (!name) return "unsupported";
+  const entry = config?.routes?.[name]?.main;
+  const record = entry?.provider ? config?.providers?.[entry.provider] : null;
+  const provider = record ? (routeProviderForRead(record) || record) : null;
+  if (!provider) return modelControlForTransport("inherited");
+  if (provider.type === "remote") return modelControlForTransport("remote-coding");
+  if (provider.type === "originrouter") return modelControlForTransport("originrouter-coding");
+  if (provider.type === "proxy") return modelControlForTransport("routes");
+  return modelControlForTransport("inherited");
+}
+
+/**
  * The providers this transport reaches directly, by name.
  *
  * A direct upstream — the OriginRouter cloud, a remote device — serves its

@@ -1,5 +1,6 @@
 import { getAllRoutes } from "../config/routes.js";
 import { normalizeProviderForRead } from "../config/providers.js";
+import { routeModelControl } from "../proxy/sessionModels.js";
 import { buildAgentRelayPlan } from "../relay/agentRelayPolicy.js";
 
 export function httpHost(address) {
@@ -184,7 +185,17 @@ export function localControlRouteSnapshot(config) {
   for (const [agent, slots] of Object.entries(routes)) {
     for (const [slot, route] of Object.entries(slots || {})) {
       if (!route?.provider) continue;
-      result.push({ agent, slot, provider: route.provider, model: route.model || "" });
+      result.push({
+        agent,
+        slot,
+        provider: route.provider,
+        model: route.model || "",
+        // Whether a run on this agent's route may be told which model to use.
+        // Stated per route because that is what the App asks: it reads the
+        // route it is about to launch on, and one agent's route can have a
+        // gateway the other's lacks.
+        modelControl: routeModelControl(config, agent),
+      });
     }
   }
   return result;
