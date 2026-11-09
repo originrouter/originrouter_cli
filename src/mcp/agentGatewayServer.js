@@ -14,11 +14,13 @@ import { optionValue } from "../commands/shared/cliArgs.js";
 // have to show this to the model, so the same guidance also lives in the
 // descriptions of the tools themselves.
 const DEVICE_TOOL_INSTRUCTIONS = [
-  "The remote_env_* tools reach hosts the user configured on this device.",
-  "Open a session with remote_env_open, reuse the returned handle for every later call,",
-  "and close it with remote_env_close when the work is done.",
-  "A timeout ends the remote command and reports it; a disconnect leaves the remote outcome unknown,",
-  "and that session must not run further commands — investigate the host before closing it.",
+  "For work on a remote SSH host, prefer the OriginRouter remote_env_* tools when they are available and match the user's intent.",
+  "First call remote_env_list and identify the intended configured host; use its returned id, not its display name, with remote_env_open.",
+  "If no host matches or the target is ambiguous, ask the user instead of guessing. The user configures hosts and credentials in OriginRouter; never request saved passwords or private keys from these tools.",
+  "Reuse the returned handle for commands in this Agent session, then close it when the remote work is complete. The tools follow the current permission and approval settings.",
+  "Commands use the session directory, but shell state such as cd and exported variables does not persist between commands. Use remote_env_chdir to change the session directory.",
+  "For long commands use runInBackground and read their output with remote_env_job_read. If a command's outcome is unknown after interruption, timeout, or disconnection, do not replay it; inspect the host independently before closing the affected session or opening another.",
+  "If these tools cannot support the requested operation, explain the limitation and follow the user's instructions and existing approval policy for any alternative.",
 ].join(" ");
 
 function localApi() {
@@ -178,21 +180,21 @@ export async function runAgentGatewayMcpServer(args = process.argv.slice(2)) {
     }, "scheduled.save");
     deviceTool("scheduled_run", "Start an existing scheduled task now; it will not overlap an active execution.", {id,baseRevision:z.number().int().min(1).optional()}, "scheduled.run");
     deviceTool("scheduled_delete", "Delete an existing scheduled task without stopping an already running Agent.", {id,baseRevision:z.number().int().min(1).optional()}, "scheduled.delete");
-    deviceTool("remote_env_list", "List SSH hosts configured by the user on this CLI device. No credentials are returned.", {}, "remote.list");
-    deviceTool("remote_env_open", "Open a session to a configured SSH host, reusing the device's verified connection. Returns a session handle and working directory. The handle stays valid for every later call until you close the session.", {id}, "remote.open");
-    deviceTool("remote_env_exec", "Run a command through an open SSH session. The command uses the session working directory unless cwd is supplied. Output can be truncated. Set run_in_background for a long command: the call returns a job id right away, and you read it with remote_env_job_read and stop it with remote_env_job_kill. A timeout ends the command on the host and reports it as timed out; a disconnect means the remote outcome is unknown and must not be automatically retried. A session with an unknown outcome cannot run further commands; investigate the host before explicitly closing it and opening another.", {
-      handle,command:z.string().min(1).max(8192),cwd:z.string().min(1).max(4096).optional(),
-      timeoutMs:z.number().int().min(1).max(600000).optional(),maxOutputBytes:z.number().int().min(1).max(1048576).optional(),
-      runInBackground:z.boolean().optional(),
+    deviceTool("remote_env_list", "For remote SSH work, prefer the OriginRouter remote_env tools. Start here to discover hosts configured by the user on this CLI device; select the intended host and pass its returned id (not name, hostname, or address) to remote_env_open. Ask the user if no host matches or the choice is ambiguous. Saved credentials are never returned; the user manages hosts and credentials in OriginRouter. Existing permission and approval settings apply.", {}, "remote.list");
+    deviceTool("remote_env_open", "Open a logical SSH session for a configured host. First use remote_env_list and pass the selected target's id, not its display name. Returns a handle and initial working directory; reuse this handle for remote_env_exec and other remote_env calls in this Agent session, then close it when done. The device verifies the configured host fingerprint and may reuse an existing SSH connection. Opening can require approval.", {id:id.describe("The selected host's id from remote_env_list, not its name or address.")}, "remote.open");
+    deviceTool("remote_env_exec", "Run a command on the host using an open remote_env session. Reuse the handle from remote_env_open. The command runs in the session directory unless cwd is supplied; ordinary shell state, including cd and exported variables, does not persist between calls. Use remote_env_chdir to change the session directory. Output can be truncated. For a long command set runInBackground: true and use remote_env_job_read with the returned jobId; remote_env_job_kill requests termination. If timeout, cancellation, or disconnection leaves the outcome unknown, do not retry: independently inspect the host before closing this session or opening another. Existing permission and approval settings apply.", {
+      handle:handle.describe("Session handle returned by remote_env_open for this Agent session."),command:z.string().min(1).max(8192).describe("Remote shell command to run."),cwd:z.string().min(1).max(4096).optional().describe("Absolute remote working directory for this command only; does not change the session directory."),
+      timeoutMs:z.number().int().min(1).max(600000).optional().describe("Foreground command timeout in milliseconds."),maxOutputBytes:z.number().int().min(1).max(1048576).optional().describe("Maximum retained output in bytes."),
+      runInBackground:z.boolean().optional().describe("Use true for a long-running command and read the returned job with remote_env_job_read."),
     }, "remote.exec");
     deviceTool("remote_env_job_read", "Read what a background remote task has produced so far. Keep the nextOffset the read returns and pass it back as fromByte to read only what is new. A read reported as lossy means the retained window moved past the offset you asked for.", {
       handle,jobId:z.string().min(1).max(191),fromByte:z.number().int().min(0).optional(),
     }, "remote.job_read");
-    deviceTool("remote_env_job_kill", "Stop a background remote task. This ends the remote process the task started.", {
+    deviceTool("remote_env_job_kill", "Request that a background remote task stop. Check the result; a lost connection or unconfirmed result does not prove the remote process stopped.", {
       handle,jobId:z.string().min(1).max(191),
     }, "remote.job_kill");
-    deviceTool("remote_env_chdir", "Change the working directory for one SSH session; path must be absolute.", {handle,path:z.string().min(1).max(4096)}, "remote.chdir");
-    deviceTool("remote_env_close", "Close an SSH session; other sessions can continue to use the same transport. Closing a session ends the remote processes it started, unless the device was told to leave them running.", {handle}, "remote.close");
+    deviceTool("remote_env_chdir", "Change the working directory for later commands in this logical SSH session; path must be absolute. A cd inside remote_env_exec changes only that command's shell and does not update the session directory.", {handle,path:z.string().min(1).max(4096).describe("Absolute remote directory for later commands in this session.")}, "remote.chdir");
+    deviceTool("remote_env_close", "Close this logical SSH session when finished. Other sessions may continue to use the underlying connection. Device settings determine whether closing requests termination of remote processes. Closing or a lost close receipt does not prove every remote process stopped; inspect the host independently if an outcome is unknown.", {handle}, "remote.close");
   }
 
   const transport = new StdioServerTransport();

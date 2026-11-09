@@ -62,6 +62,17 @@ test('MCP stdio, daemon and wrapper honor real approval and denial over local HT
     client=new Client({name:'device-tool-test',version:'1'});
     await client.connect(transport);
     const tools=await client.listTools();
+    assert.match(client.getInstructions(), /returned id, not its display name/);
+    assert.match(client.getInstructions(), /shell state.*does not persist/);
+    const remoteList = tools.tools.find((item) => item.name === 'remote_env_list');
+    const remoteOpen = tools.tools.find((item) => item.name === 'remote_env_open');
+    const remoteExec = tools.tools.find((item) => item.name === 'remote_env_exec');
+    assert.match(remoteList.description, /prefer the OriginRouter remote_env tools/);
+    assert.match(remoteOpen.description, /id, not its display name/);
+    assert.match(remoteExec.description, /runInBackground: true/);
+    assert.match(remoteExec.description, /does not persist between calls/);
+    assert.match(remoteExec.description, /outcome unknown/);
+    assert.match(remoteExec.inputSchema.properties.cwd.description, /does not change the session directory/);
     assert.ok(tools.tools.some((item) => item.name === 'scheduled_save'));
     const scheduleTool = tools.tools.find((item) => item.name === 'scheduled_save');
     const profiles = scheduleTool.inputSchema.properties.task.properties.launch.properties.permissionProfile.enum;

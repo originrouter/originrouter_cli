@@ -73,6 +73,10 @@ test('real Claude SDK calls the scheduled-task MCP tool and waits for approval',
     assert.equal(reply.status,200);
     await until(()=>messages.find((item)=>item.type==='result'));
     assert.equal(store.list()[0].name,'real-claude-task');assert.equal(requests.length,2);
+    const modelTools=JSON.stringify(requests[0].tools);
+    assert.match(modelTools,/prefer the OriginRouter remote_env tools/);
+    assert.match(modelTools,/id, not its display name/);
+    assert.match(modelTools,/does not persist between calls/);
   } finally {
     controller.abort();try{await session?.return();}catch{};await Promise.race([consume || Promise.resolve(),new Promise(r=>setTimeout(r,1000))]);
     if(server)await new Promise(r=>server.close(r));approval?.close();await bridge?.close();service.close();broker.close();store.close();await api?.close();

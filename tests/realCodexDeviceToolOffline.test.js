@@ -49,7 +49,7 @@ test('real Codex calls scheduled and SSH MCP tools and waits for user approval',
       connection.on('authentication',(ctx)=>ctx.method==='password'&&ctx.password==='fixture-secret'?ctx.accept():ctx.reject());
       connection.on('ready',()=>connection.on('session',(accept)=>accept().on('exec',(acceptExec,_reject,info)=>{
         const stream=acceptExec();
-        if(info.command === 'cd -- \'/srv\' && pwd -P') stream.write('/srv\n');
+        if(info.command.includes("cd -- '/srv' || exit 1") && info.command.includes('\npwd -P\n')) stream.write('/srv\n');
         else if(info.command.includes('printf ssh-ok')) stream.write('ssh-ok');
         else {stream.exit(1);stream.end();return;}
         stream.exit(0);stream.end();
@@ -105,6 +105,10 @@ test('real Codex calls scheduled and SSH MCP tools and waits for user approval',
     await fetch(`${base}/agent/local/sessions/s1/interaction`,{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({interactionId:sshPrompt.interactionId,responseId:'r2',action:'allow'})});
     await until(()=>events.find((event)=>event.type==='task_complete'));
     assert.equal(store.list()[0].name,'real-codex-task');assert.equal(requests.length,3);
+    const modelTools=JSON.stringify(requests[0].tools);
+    assert.match(modelTools,/prefer the OriginRouter remote_env tools/);
+    assert.match(modelTools,/id, not its display name/);
+    assert.match(modelTools,/does not persist between calls/);
     assert.ok(JSON.stringify(requests[2].input).includes('ssh-ok'));
   } finally {
     client?.disconnect();if(server)await new Promise(r=>server.close(r));approval?.close();await bridge?.close();service.close();broker.close();remote.close();
