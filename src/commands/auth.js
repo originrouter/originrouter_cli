@@ -29,7 +29,7 @@ import {
   ensureDeviceE2eeDirectoryCacheMigrated,
   storeDeviceE2eeDirectoryCache,
 } from "../security/deviceE2eeDirectoryCache.js";
-import { ensureDpopRegistered } from "../security/dpopRegistration.js";
+import { createDpopFetch, ensureDpopRegistered } from "../security/dpopRegistration.js";
 import {
   clearCodingAuth,
   readCodingAuth,
@@ -280,8 +280,22 @@ export async function handleLogin(args, {
     }
     persistOAuthCredential({ stateDir, credential });
     const e2ee = readDeviceE2eeIdentity(stateDir, { accountScope: credential.accountScope || enrollmentScope });
+    const controlFetch = createDpopFetch({stateDir, fetchFn, accountScope: credential.accountScope || enrollmentScope});
     let registered = null;
     let registrationError = null;
+    let dpop = { status: "skipped" };
+    try {
+      dpop = await ensureDpopRegistered({
+        stateDir,
+        controlBaseUrl: process.env.ORIGINROUTER_CONTROL_BASE_URL || DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
+        accessToken: credential.accessTokens.control.token,
+        deviceId: credential.deviceId,
+        accountScope: credential.accountScope || enrollmentScope,
+        fetchFn,
+      });
+    } catch (error) {
+      dpop = { status: "failed", code: error?.code || error?.message };
+    }
     try {
       registered = await registerCliDeviceE2eeIdentity({
         controlBaseUrl:
@@ -289,12 +303,14 @@ export async function handleLogin(args, {
           DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
         accessToken: credential.accessTokens.control.token,
         identity: e2ee.public_identity,
+        fetchFn: controlFetch,
       });
       const directory = await getCliDeviceE2eeDirectory({
         controlBaseUrl:
           process.env.ORIGINROUTER_CONTROL_BASE_URL ||
           DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
         accessToken: credential.accessTokens.control.token,
+        fetchFn: controlFetch,
       });
       storeDeviceE2eeDirectoryCache(stateDir, directory, {
         namespace: ensureDeviceE2eeDirectoryCacheMigrated(stateDir, credential),
@@ -306,20 +322,6 @@ export async function handleLogin(args, {
     // can only be registered once that has happened. A device that cannot
     // register one — a server that has never heard of it, a device with no
     // identity — stays on bearer tokens, which is where it started.
-    let dpop = { status: "skipped" };
-    try {
-      dpop = await ensureDpopRegistered({
-        stateDir,
-        controlBaseUrl:
-          process.env.ORIGINROUTER_CONTROL_BASE_URL ||
-          DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
-        accessToken: credential.accessTokens.control.token,
-        deviceId: credential.deviceId,
-        accountScope: credential.accountScope || enrollmentScope,
-      });
-    } catch (error) {
-      dpop = { status: "failed", code: error?.code || error?.message };
-    }
     console.log(`Device:  ${credential.deviceId}`);
     console.log(`Session: ${credential.sessionId}`);
     console.log(`E2EE key fingerprint: ${e2ee.public_identity.key_id}`);

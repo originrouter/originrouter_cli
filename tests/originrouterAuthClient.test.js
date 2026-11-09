@@ -33,6 +33,7 @@ test("requestDeviceCode sends RFC 8628 form data and all resources", async () =>
   assert.equal(call.init.headers["Content-Type"], "application/x-www-form-urlencoded");
   assert.equal(body.get("client_id"), "originrouter_cli");
   assert.equal(body.get("device_id"), "device-1");
+  assert.equal(body.has("device_name"), false);
   assert.deepEqual(body.getAll("resource"), [
     "originrouter.control",
     "originrouter.ai",

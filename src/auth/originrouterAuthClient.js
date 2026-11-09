@@ -87,7 +87,6 @@ async function requestJson(url, value, { timeoutMs = DEFAULT_TIMEOUT_MS, fetchFn
 export async function requestDeviceCode({
   suretyBaseUrl,
   deviceId,
-  deviceName,
   fetchFn = globalThis.fetch,
 }) {
   return requestForm(
@@ -101,7 +100,6 @@ export async function requestDeviceCode({
       ["resource", "originrouter.relay"],
       ["resource", "originrouter.memory"],
       ["device_id", deviceId],
-      ["device_name", deviceName || deviceId],
     ],
     { fetchFn },
   );

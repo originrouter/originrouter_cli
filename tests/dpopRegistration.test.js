@@ -15,7 +15,7 @@
 // unable to talk to its own server.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -42,6 +42,7 @@ import {
 } from "../src/security/dpopStore.js";
 import { ensureDeviceE2eeIdentity } from "../src/crypto/deviceE2eeIdentity.js";
 import { dpopThumbprint, generateDpopKeyPair } from "../src/crypto/dpopIdentity.js";
+import { activateAccount } from "../src/persistence/accounts.js";
 
 const CONTROL_BASE = "https://app.easytransnote.com";
 const TOKEN = "or_at_the_cli_token";
@@ -379,6 +380,26 @@ test("a server that cannot store keys yet leaves the device on bearer tokens", a
   }
 });
 
+test("a failed status read never replaces or registers a key", async () => {
+  const stateDir = makeStateDir();
+  try {
+    const { jkt } = registerLocalKey(stateDir);
+    let calls = 0;
+    const result = await ensureDpopRegistered({
+      stateDir, controlBaseUrl: CONTROL_BASE, accessToken: TOKEN, deviceId: DEVICE_ID,
+      fetchFn: async () => {
+        calls++;
+        return { ok: false, status: 503, json: async () => ({ detail: { code: 'dpop_registry_unavailable' } }) };
+      },
+    });
+    assert.equal(result.status, 'refused');
+    assert.equal(calls, 1);
+    assert.equal(dpopThumbprint(readDpopStore(stateDir).key.public_jwk), jkt);
+  } finally {
+    removeStateDir(stateDir);
+  }
+});
+
 test("a device with no identity does not register a key", async () => {
   const stateDir = makeStateDir();
   try {
@@ -650,9 +671,9 @@ test("a refusal that says the key is wrong is reported to the caller", async () 
       ok: false,
       status: 401,
       headers: new Headers({
-        "www-authenticate": 'DPoP, error="dpop_proof_required"',
+        "www-authenticate": 'DPoP, error="dpop_key_mismatch"',
       }),
-      json: async () => ({ detail: { code: "dpop_proof_required" } }),
+      json: async () => ({ detail: { code: "dpop_key_mismatch" } }),
     });
     const wrapped = createDpopFetch({
       stateDir,
@@ -667,12 +688,79 @@ test("a refusal that says the key is wrong is reported to the caller", async () 
     });
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(refusals.length, 1, "the refusal is reported");
-    assert.equal(refusals[0].code, "dpop_proof_required");
+    assert.equal(refusals[0].code, "dpop_key_mismatch");
     assert.equal(refusals[0].status, 401);
     assert.match(refusals[0].url, /\/cli\/v1\/agent\/approvals\/decisions$/);
   } finally {
     removeStateDir(stateDir);
   }
+});
+
+test("a read retries when registration completes during the first request", async () => {
+  const stateDir = makeStateDir();
+  try {
+    const seen = [];
+    let recovery = 0;
+    const wrapped = createDpopFetch({ stateDir, onRefusal: () => { recovery++; }, fetchFn: async (_url, init) => {
+      seen.push(init);
+      if (seen.length === 1) {
+        registerLocalKey(stateDir);
+        return { status: 401, headers: new Headers({"www-authenticate": 'DPoP, error="dpop_proof_required"'}) };
+      }
+      return { status: 200, headers: new Headers() };
+    }});
+    const result = await wrapped(`${CONTROL_BASE}/cli/v1/devices`, { headers: {Authorization: `Bearer ${TOKEN}`} });
+    assert.equal(result.status, 200);
+    assert.equal(seen.length, 2);
+    assert.ok(seen[1].headers.dpop);
+    assert.equal(recovery, 0);
+  } finally { removeStateDir(stateDir); }
+});
+
+test("an unreadable DPoP store does not silently send a bearer request", async () => {
+  const stateDir = makeStateDir();
+  try {
+    writeFileSync(join(stateDir, "dpop-key.json"), "{invalid");
+    let requests = 0;
+    const wrapped = createDpopFetch({ stateDir, fetchFn: async () => { requests++; return {status: 200}; } });
+    await assert.rejects(() => wrapped(`${CONTROL_BASE}/cli/v1/devices`, {headers: {Authorization: `Bearer ${TOKEN}`}}), {code: "dpop_key_unavailable"});
+    assert.equal(requests, 0);
+  } finally { removeStateDir(stateDir); }
+});
+
+test("a delayed refusal cannot retry or recover using another account", async () => {
+  const stateDir = makeStateDir();
+  try {
+    activateAccount(stateDir, "first");
+    let calls = 0;
+    let recovery = 0;
+    const wrapped = createDpopFetch({ stateDir, onRefusal: () => { recovery++; }, fetchFn: async () => {
+      calls++;
+      activateAccount(stateDir, "second");
+      registerLocalKey(stateDir);
+      return { status: 401, headers: new Headers({"www-authenticate": 'DPoP, error="dpop_proof_required"'}) };
+    }});
+    const result = await wrapped(`${CONTROL_BASE}/cli/v1/devices`, { headers: {Authorization: `Bearer ${TOKEN}`} });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(result.status, 401);
+    assert.equal(calls, 1);
+    assert.equal(recovery, 0);
+  } finally { removeStateDir(stateDir); }
+});
+
+test("a mutation is not replayed when registration appears in flight", async () => {
+  const stateDir = makeStateDir();
+  try {
+    let calls = 0;
+    const wrapped = createDpopFetch({ stateDir, fetchFn: async () => {
+      calls++;
+      registerLocalKey(stateDir);
+      return { status: 401, headers: new Headers({"www-authenticate": 'DPoP, error="dpop_proof_required"'}) };
+    }});
+    const result = await wrapped(`${CONTROL_BASE}/cli/v1/devices`, {method: "POST", body: "{}", headers: {Authorization: `Bearer ${TOKEN}`}});
+    assert.equal(result.status, 401);
+    assert.equal(calls, 1);
+  } finally { removeStateDir(stateDir); }
 });
 
 test("a refusal that does not name the key is not reported", async () => {

@@ -128,6 +128,7 @@ export function readDevice() {
   const path = join(ensureStateDir(), "device.json");
   const existing = readJson(path);
   if (!existing?.deviceId) return existing;
+  if (existing.displayNameSynced === true && typeof existing.displayName === "string" && existing.displayName.trim()) return existing;
   const rawDisplayName = String(existing.displayName || "").trim();
   const legacyHost = normalizedDeviceName(existing.host);
   const legacyAutomaticName = !rawDisplayName
@@ -227,6 +228,18 @@ export function updateDeviceDisplayName(
   const existing = readJson(path);
   if (!existing?.deviceId) return null;
   const updated = { ...existing, displayName: cliDeviceDisplayName(displayName) };
+  writePrivateJson(path, updated);
+  return updated;
+}
+
+// The account registry is authoritative for a synchronized name. Preserve it
+// exactly, including names that intentionally do not carry a CLI suffix.
+export function setSynchronizedDeviceDisplayName(displayName, stateDir = ensureStateDir(), accountScope = null) {
+  const path = join(stateDir, "device.json");
+  const existing = readJson(path);
+  const name = String(displayName || "").trim();
+  if (!existing?.deviceId || !name) return null;
+  const updated = { ...existing, displayName: name, displayNameSynced: true, displayNameAccountScope: accountScope };
   writePrivateJson(path, updated);
   return updated;
 }

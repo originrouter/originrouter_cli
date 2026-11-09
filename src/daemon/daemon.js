@@ -52,6 +52,7 @@ import { RuntimeTaskStore } from "../runtime/runtimeTaskStore.js";
 import { ScheduledTaskStore } from "../runtime/scheduledTaskStore.js";
 import { ScheduledTaskScheduler } from "../runtime/scheduledTaskScheduler.js";
 import { closeScheduledTaskApi } from "./scheduledTaskShutdown.js";
+import { syncDeviceName } from "./deviceNameSync.js";
 import { RemoteEnvironmentService } from "../remoteEnvironment/remoteEnvironmentService.js";
 import { DeviceToolApprovalBroker } from "../mcp/deviceToolApprovalBroker.js";
 import { DeviceToolService } from "../mcp/deviceToolService.js";
@@ -754,6 +755,7 @@ export async function startDaemon(args) {
   let deviceE2eeRefreshTimer = null;
   let authContextTimer = null;
   let compatibilityUpdateTimer = null;
+  let deviceNameTimer = null;
   const shutdown = async (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -769,6 +771,7 @@ export async function startDaemon(args) {
     if (deviceE2eeRefreshTimer) clearInterval(deviceE2eeRefreshTimer);
     if (authContextTimer) clearInterval(authContextTimer);
     if (compatibilityUpdateTimer) clearInterval(compatibilityUpdateTimer);
+    if (deviceNameTimer) clearInterval(deviceNameTimer);
     try {
       await sessionManager.shutdown(signal);
     } catch (e) {
@@ -991,6 +994,12 @@ export async function startDaemon(args) {
     const authenticatedDeviceId = credential.deviceId || deviceId;
     const identity = currentDeviceE2eeIdentity({deviceId: authenticatedDeviceId});
     const keyId = identity.public_identity.key_id;
+    const dpop = await syncDpopRegistration({ accessToken, deviceId: authenticatedDeviceId });
+    if (dpop?.status !== "active") {
+      throw Object.assign(new Error("Device authentication is not ready"), {
+        code: "dpop_registration_unavailable",
+      });
+    }
     if (registeredDeviceE2eeKeyId !== keyId) {
       const registered = await registerCliDeviceE2eeIdentity({
         controlBaseUrl: relayUrl,
@@ -1002,7 +1011,6 @@ export async function startDaemon(args) {
         console.warn("[daemon] device E2EE identity is waiting for approval in the App");
       }
     }
-    await syncDpopRegistration({ accessToken, deviceId: authenticatedDeviceId });
     const directory = await getCliDeviceE2eeDirectory({
       controlBaseUrl: relayUrl,
       accessToken,
@@ -1102,6 +1110,26 @@ export async function startDaemon(args) {
     `[daemon] remote share proxy: ${await remoteShareProxyManager.status().then((s) => `${s.state}${s.port ? ` (port ${s.port})` : ""}`)}`,
   );
 
+  let deviceNameSyncInFlight = false;
+  let deviceNameSyncReread = false;
+  const refreshDeviceName = async () => {
+    if (deviceNameSyncInFlight) { deviceNameSyncReread = true; return; }
+    if (shuttingDown || !accountScope) return;
+    deviceNameSyncInFlight = true;
+    try { await syncDeviceName({stateDir, baseUrl:relayUrl, device, accountScope}); }
+    catch (error) { console.warn(`[daemon] device name sync: ${error.message}`); }
+    finally {
+      deviceNameSyncInFlight = false;
+      if (deviceNameSyncReread && !shuttingDown) {
+        deviceNameSyncReread = false;
+        void refreshDeviceName();
+      }
+    }
+  };
+  void refreshDeviceName();
+  deviceNameTimer = setInterval(() => void refreshDeviceName(), 30_000);
+  deviceNameTimer.unref?.();
+
   const configuredRemoteShare = readConfig().remoteShare;
   if (
     configuredRemoteShare?.enabled &&
@@ -1156,6 +1184,10 @@ export async function startDaemon(args) {
         await shutdown("ACCOUNT_CHANGED");
         return;
       }
+      // Enrollment must precede the first Relay handshake: the Relay no
+      // longer accepts an unregistered device's bearer token.
+      if (accountScope) await syncDeviceE2eeIdentity();
+      if (shuttingDown) return;
       const relayOptionsResult = await tryBuildRelayClientOptions({
         stateDir,
         relayUrl,
@@ -1205,6 +1237,10 @@ export async function startDaemon(args) {
               if (!routed) return;
             } else if (deviceE2eeRelay.rejectsPlaintext(payload)) {
               console.error(`[device-e2ee] rejected plaintext ${payload?.type || "message"}`);
+              return;
+            }
+            if (routed.type === "device.name.changed") {
+              if (routed.device_id === effectiveDeviceId && routed.source === "originrouter_cli") void refreshDeviceName();
               return;
             }
             if ([

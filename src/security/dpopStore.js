@@ -50,17 +50,21 @@ export function dpopStorePath(stateDir, { accountScope } = {}) {
   return join(directory, "dpop-key.json");
 }
 
-export function readDpopStore(stateDir, { accountScope } = {}) {
+export function readDpopStore(stateDir, { accountScope, strict = false } = {}) {
   const path = dpopStorePath(stateDir, { accountScope });
-  if (!existsSync(path)) return null;
   let parsed;
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
-  } catch {
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    if (strict) throw Object.assign(new Error("DPoP key store is unreadable"), { code: "dpop_key_unavailable" });
     return null;
   }
-  if (!parsed || typeof parsed !== "object") return null;
-  if (!parsed.key || typeof parsed.key.private_jwk !== "object") return null;
+  if (!parsed || typeof parsed !== "object" || !parsed.key || typeof parsed.key.private_jwk !== "object" ||
+      !parsed.registrations || typeof parsed.registrations !== "object" || Array.isArray(parsed.registrations)) {
+    if (strict) throw Object.assign(new Error("DPoP key store is invalid"), { code: "dpop_key_unavailable" });
+    return null;
+  }
   return {
     version: Number(parsed.version || STORE_VERSION),
     key: parsed.key,
@@ -97,7 +101,7 @@ export function clearDpopStore(stateDir, { accountScope } = {}) {
  * through one of them is the same key to the others.
  */
 export function setDpopRegistration(stateDir, deployment, registration, { accountScope } = {}) {
-  const store = readDpopStore(stateDir, { accountScope }) || {
+  const store = readDpopStore(stateDir, { accountScope, strict: true }) || {
     version: STORE_VERSION,
     key: null,
     registrations: {},
@@ -117,7 +121,7 @@ export function setDpopRegistration(stateDir, deployment, registration, { accoun
  * private half.
  */
 export function forgetDpopRegistration(stateDir, deployment, { accountScope } = {}) {
-  const store = readDpopStore(stateDir, { accountScope });
+  const store = readDpopStore(stateDir, { accountScope, strict: true });
   if (!store || !store.registrations[deployment]) return store;
   const registrations = { ...store.registrations };
   delete registrations[deployment];

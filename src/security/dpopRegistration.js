@@ -41,6 +41,7 @@ import {
   signDeviceE2eeDpopRegistration,
 } from "../crypto/deviceE2eeIdentity.js";
 import { ACCESS_TOKEN_PREFIX } from "../runtime/authContract.js";
+import { isAccountStateDir, readActiveAccountScope } from "../persistence/accounts.js";
 import {
   forgetDpopRegistration,
   readDpopRegistration,
@@ -168,7 +169,8 @@ export function dpopAuthHeaders({
   if (!usesDpopAudience(url)) return bearer;
   const deployment = deploymentFor(url);
   if (!deployment) return bearer;
-  const registration = readDpopRegistration(stateDir, deployment, { accountScope });
+  const store = readDpopStore(stateDir, { accountScope, strict: true });
+  const registration = store?.registrations?.[deployment];
   if (!registration) return bearer;
   // A revoked key is a key this device has given up. It stays revoked until
   // the device registers again, which it does on its own terms — not on
@@ -176,9 +178,8 @@ export function dpopAuthHeaders({
   if (registration.status !== "pending" && registration.status !== "active") {
     return bearer;
   }
-  const store = readDpopStore(stateDir, { accountScope });
   const privateJwk = store?.key?.private_jwk;
-  if (!privateJwk) return bearer;
+  if (!privateJwk) throw Object.assign(new Error("DPoP key is unavailable"), { code: "dpop_key_unavailable" });
   try {
     const publicJwk = store.key.public_jwk || dpopPublicJwk(privateJwk);
     const proof = dpopProof({
@@ -190,7 +191,7 @@ export function dpopAuthHeaders({
     });
     return { Authorization: `${DPOP_SCHEME} ${accessToken}`, DPoP: proof };
   } catch {
-    return bearer;
+    throw Object.assign(new Error("DPoP proof could not be signed"), { code: "dpop_key_unavailable" });
   }
 }
 
@@ -260,7 +261,7 @@ export function dpopRefusalCode(status, headers) {
  * carried them, and registering again would not change them.
  */
 export function isDpopKeyMismatch(code) {
-  return code === "dpop_proof_required" || code === "dpop_key_not_registered";
+  return code === "dpop_key_mismatch" || code === "dpop_key_not_registered";
 }
 
 function collectHeaders(input, init) {
@@ -357,11 +358,27 @@ export function createDpopFetch({ stateDir, fetchFn = null, accountScope = null,
   const options = { stateDir, accountScope, onRefusal };
   const inner = fetchFn || globalThis.fetch;
   const wrapped = async (input, init = {}) => {
+    const dynamicScope = typeof stateDir === "string" && options.accountScope == null && !isAccountStateDir(stateDir);
+    const startingScope = dynamicScope ? readActiveAccountScope(stateDir) : null;
     const rewritten = rewriteForDpop(input, init, options);
-    const response = await inner(
+    let response = await inner(
       rewritten ? rewritten.input : input,
       rewritten ? rewritten.init : init,
     );
+    // A registration can complete while a read is in flight. Retry a
+    // bodyless read only if it was sent without a proof and the same
+    // account now has one; never replay a mutation or a consumed Request.
+    const sameAccount = () => !dynamicScope || readActiveAccountScope(stateDir) === startingScope;
+    const method = String(init?.method || input?.method || "GET").toUpperCase();
+    if (!rewritten && typeof input === "string" && init.body == null &&
+        (method === "GET" || method === "HEAD") && sameAccount() &&
+        dpopRefusalCode(response.status, response.headers) === "dpop_proof_required") {
+      const retry = rewriteForDpop(input, init, options);
+      if (retry && sameAccount()) {
+        response.body?.cancel?.().catch?.(() => {});
+        response = await inner(retry.input, retry.init);
+      }
+    }
     // A refusal that says the key is wrong is answered by putting a key
     // back in place, and the refusal itself is not waited for: the next
     // request is the one that carries the new proof. The refusal is
@@ -372,7 +389,7 @@ export function createDpopFetch({ stateDir, fetchFn = null, accountScope = null,
     if (typeof hook === "function") {
       const url = requestUrl(input);
       const code = dpopRefusalCode(response.status, response.headers);
-      if (code && isDpopKeyMismatch(code) && url && usesDpopAudience(url)) {
+      if (code && isDpopKeyMismatch(code) && url && usesDpopAudience(url) && sameAccount()) {
         Promise.resolve()
           .then(() => hook({ code, url, status: response.status }))
           .catch(() => {});
@@ -498,7 +515,7 @@ export async function ensureDpopRegistered({
   if (!deployment) return { status: "skipped" };
   const send = fetchFn || rawFetch();
 
-  let store = readDpopStore(stateDir, { accountScope });
+  let store = readDpopStore(stateDir, { accountScope, strict: true });
   let localJkt = null;
   if (store?.key?.private_jwk) {
     try {
@@ -519,6 +536,13 @@ export async function ensureDpopRegistered({
   });
   if (status.status === 404) return { status: "unsupported" };
   if (status.ok && status.data?.available === false) return { status: "unavailable" };
+  // Only a definite key disagreement justifies enrollment. A network or
+  // server failure must never be mistaken for a missing registration.
+  if (!status.ok && !(status.status === 401 && [
+    "dpop_key_mismatch", "dpop_key_not_registered", "dpop_proof_required",
+  ].includes(status.code))) {
+    return { status: "refused", code: status.code || `http_${status.status}` };
+  }
   const serverStatus = status.ok ? String(status.data?.status || "none") : null;
   const serverJkt = status.ok && typeof status.data?.jkt === "string" ? status.data.jkt : null;
 
