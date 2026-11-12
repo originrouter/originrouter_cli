@@ -390,10 +390,13 @@ In v2, `replaces_opaque: true` requires both an exact `code.script`
 The runtime applies this replacement boundary to v1 policies as a fail-closed
 compatibility hardening.
 
-## Enforcement modes
+## Enforcement
 
-Policies enforce decisions by default. Observation mode evaluates and audits a
-policy without automatically allowing or denying the request:
+A policy is enforced: the evaluator's decision is the outcome. A rule that
+allows an operation allows it, a rule that denies one denies it, and only an
+`ask` decision forwards the request to the user.
+
+There is no observation mode. A policy that still carries the legacy marker
 
 ```json
 {
@@ -401,8 +404,7 @@ policy without automatically allowing or denying the request:
 }
 ```
 
-The CLI emits `agent.approval_policy.shadow` with display-safe per-layer and
-per-atom results, then forwards the request to normal user approval.
+loads with a validation warning and is enforced like any other policy.
 
 ## Capabilities, simulation, and rollback
 
@@ -448,12 +450,13 @@ cover:
 - unconditional wildcard or process execution rules;
 - declarations that are not constrained by a stable tool, executable, module,
   script path, or digest;
-- declarations that emit too many atoms to review as one auditable unit.
+- declarations that emit too many atoms to review as one auditable unit;
+- a policy that still carries the legacy observation-mode marker.
 
 The impact summary reports enabled and disabled rule counts, declaration count,
-broad rule count, enforcement mode, and the number of registered actions
-covered by allow, ask, and deny rules. These counts describe possible static
-coverage. They do not claim that every condition will match at runtime.
+broad rule count, and the number of registered actions covered by allow, ask,
+and deny rules. These counts describe possible static coverage. They do not
+claim that every condition will match at runtime.
 
 ## Registry source and generation
 

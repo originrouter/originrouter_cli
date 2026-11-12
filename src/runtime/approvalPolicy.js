@@ -200,7 +200,6 @@ function approvalPolicyImpact(policy, rules, declarations) {
       parse_error: policy.defaults?.parse_error || "ask",
       unknown: policy.defaults?.unknown || "ask",
     },
-    enforcement: policy.metadata?.enforcement === "shadow" ? "shadow" : "enforce",
   };
 }
 
@@ -311,9 +310,19 @@ export function validateApprovalPolicy(raw) {
   if (policy.metadata != null && !objectValue(policy.metadata)) {
     errors.push(issue("$.metadata", "metadata must be an object"));
   }
+  // A policy is enforced; there is no observation mode any more. The legacy
+  // "shadow" marker still names a mode that no longer exists, so it is a
+  // warning rather than an error — an old policy has to keep loading, and it
+  // now enforces.
   if (policy.metadata?.enforcement != null
     && !["enforce", "shadow"].includes(policy.metadata.enforcement)) {
-    errors.push(issue("$.metadata.enforcement", "enforcement must be enforce or shadow"));
+    errors.push(issue("$.metadata.enforcement", "enforcement must be enforce"));
+  }
+  if (policy.metadata?.enforcement === "shadow") {
+    warnings.push(issue(
+      "$.metadata.enforcement",
+      "shadow enforcement is no longer supported; this policy is enforced",
+    ));
   }
   const defaults = objectValue(policy.defaults) || {};
   if (policy.defaults != null && !objectValue(policy.defaults)) {

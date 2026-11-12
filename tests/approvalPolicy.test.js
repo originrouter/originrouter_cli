@@ -157,6 +157,30 @@ test("approval policy validation rejects typos and unsafe expression shapes", ()
   assert.ok(invalid.errors.some((item) => item.path === "$.surprise"));
 });
 
+test("the legacy observation-mode marker loads with a warning and is enforced", () => {
+  const legacy = validateApprovalPolicy({
+    version: 2,
+    id: "legacy-policy",
+    metadata: { enforcement: "shadow" },
+    defaults: { unmatched: "ask", parse_error: "ask", unknown: "ask" },
+    rules: [{ id: "allow-read", effect: "allow", actions: ["fs.read"] }],
+  });
+  assert.equal(legacy.valid, true);
+  assert.ok(legacy.warnings.some((item) => item.path === "$.metadata.enforcement"));
+  assert.equal(legacy.errors.length, 0);
+  assert.equal(legacy.impact.enforcement, undefined);
+
+  const unknown = validateApprovalPolicy({
+    version: 2,
+    id: "unknown-enforcement",
+    metadata: { enforcement: "sometimes" },
+    defaults: { unmatched: "ask", parse_error: "ask", unknown: "ask" },
+    rules: [{ id: "allow-read", effect: "allow", actions: ["fs.read"] }],
+  });
+  assert.equal(unknown.valid, false);
+  assert.ok(unknown.errors.some((item) => item.path === "$.metadata.enforcement"));
+});
+
 test("glob and boolean conditions are deterministic", () => {
   assert.equal(matchesApprovalGlob("fs.write", "fs.*"), true);
   assert.equal(matchesApprovalGlob("src/nested/app.js", "src/**"), true);

@@ -546,7 +546,6 @@ export async function resolveWithAutonomy({
   workspaceRoot,
   requestInteraction,
   onAutoResolved,
-  onPolicyObserved,
   aiReviewer,
   aiReviewPolicy = null,
   runtime,
@@ -571,17 +570,6 @@ export async function resolveWithAutonomy({
       workspaceRoot,
       stateDir,
     });
-    const policyDocument = primaryPolicy.policy || primaryPolicy;
-    if (policyDocument.metadata?.enforcement === "shadow") {
-      const summary = policyEvaluationSummary(policyResult);
-      await onPolicyObserved?.({ request, evaluation: summary });
-      const manual = await requestInteraction(request);
-      return {
-        ...manual,
-        policyEvaluation: summary,
-        policyShadow: true,
-      };
-    }
     if (policyResult.effect === "ask") return requestInteraction(request);
     const action = policyResult.effect === "allow" ? "allow" : "deny";
     const summary = policyEvaluationSummary(policyResult);

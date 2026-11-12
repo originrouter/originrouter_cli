@@ -175,7 +175,7 @@ test("resolveWithAutonomy bypasses the pending registry only when allowed", asyn
   assert.equal(autoResolved, 1);
 });
 
-test("workspace policies restrict guarded decisions and shadow policies never auto-resolve", async () => {
+test("workspace policies restrict guarded decisions and a legacy shadow marker is enforced", async () => {
   let requested = 0;
   const workspacePolicy = {
     policy: {
@@ -201,8 +201,9 @@ test("workspace policies restrict guarded decisions and shadow policies never au
   assert.equal(denied.action, "deny");
   assert.equal(requested, 0);
 
-  let observed = 0;
-  const shadow = await resolveWithAutonomy({
+  // The policy that still carries the old observation-mode marker is enforced
+  // like any other: the rule allows the read, so nobody is asked.
+  const legacy = await resolveWithAutonomy({
     request: permission({ tool: "Read", tool_input: { file_path: "README.md" } }),
     profile: "custom",
     workspaceRoot: "/tmp/project",
@@ -212,12 +213,14 @@ test("workspace policies restrict guarded decisions and shadow policies never au
       metadata: { enforcement: "shadow" },
       rules: [{ id: "allow-read", effect: "allow", actions: ["fs.read"] }],
     },
-    requestInteraction: async () => ({ action: "deny", user: true }),
-    onPolicyObserved: async () => { observed += 1; },
+    requestInteraction: async () => {
+      requested += 1;
+      return { action: "deny", user: true };
+    },
   });
-  assert.equal(shadow.action, "deny");
-  assert.equal(shadow.policyShadow, true);
-  assert.equal(observed, 1);
+  assert.equal(legacy.action, "allow");
+  assert.equal(legacy.autoResolved, true);
+  assert.equal(requested, 0);
 });
 
 test("AI review allows routine work but never grants high-risk authority", async () => {

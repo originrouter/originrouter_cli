@@ -1090,13 +1090,6 @@ export async function runClaudeSdkSession(rawArgs) {
       workspaceApprovalPolicy,
       stateDir,
       requestInteraction: (item) => interactions.request(item, signal),
-      onPolicyObserved: ({ request: item, evaluation }) =>
-        sendAgentEvent({
-          type: "agent.approval_policy.shadow",
-          provider: "claude",
-          interactionId: item.interactionId,
-          policyEvaluation: evaluation,
-        }),
       onAutoResolved: ({ request: item, resolved }) =>
         sendAgentEvent({
           type: "agent.interaction.auto_resolved",

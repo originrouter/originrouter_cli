@@ -841,13 +841,6 @@ export async function runLocalAgentSession(agent, rawArgs) {
           isCurrent: () => profileAtRequest === autonomyProfile && reviewPolicyAtRequest === aiReviewPolicy,
           runtime: "claude-pty",
           requestInteraction: (item) => interactions.request(item),
-          onPolicyObserved: ({ request: item, evaluation }) =>
-            sendTransientEvent({
-              type: "agent.approval_policy.shadow",
-              provider: agent,
-              interactionId: item.interactionId,
-              policyEvaluation: evaluation,
-            }),
         })
       : interactions.request(request);
     void resolve
