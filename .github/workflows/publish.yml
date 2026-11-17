@@ -28,6 +28,19 @@ jobs:
       - run: npm ci
       - name: Validate release tag and package metadata
         run: npm run release:check -- --tag "${{ github.event.release.tag_name }}"
+      - name: Isolate the new-surface test batch per file
+        # The combined node --test run hides which file hangs; per-file runs
+        # with a hard ceiling name the culprit instead of timing out silently.
+        run: |
+          for f in relayClientDisconnect relayDispatchContract runtimeSupervisor \
+            runtimeHistoryOrigin runtimeRecoveryStore runtimeLoopDetector \
+            runtimeOutputSampler scheduledTaskRules scheduledTaskStore \
+            scheduledTaskScheduler scheduledTaskCrashProcess scheduledTaskShutdownHttp \
+            sshConnectionManager remoteTargetStore headlessCredentialVault \
+            headlessVaultProcess deviceToolApproval deviceToolService deviceToolMcpIntegration; do
+            echo "=== $f ==="
+            timeout 120 node --test "./tests/$f.test.js" || { echo "TIMEOUT or FAIL: $f"; exit 1; }
+          done
       - name: npm test
         run: npm test
         timeout-minutes: 15

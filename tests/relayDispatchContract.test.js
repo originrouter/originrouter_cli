@@ -76,9 +76,18 @@ function fixture({ control = null } = {}) {
   return { dispatch, sent, store, runtime, sessionManager };
 }
 
-/** Let sessionManager's fire-and-forget browse/trust promises settle. */
-async function settle() {
-  await new Promise((resolve) => setTimeout(resolve, 25));
+/**
+ * Let sessionManager's fire-and-forget browse/trust promises settle. A fixed
+ * sleep loses on a loaded runner: the response lands, just not inside 25ms,
+ * and the read side sees nothing. Poll for the answer instead.
+ */
+async function settle({ until } = {}) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (!until || until()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  if (until && !until()) throw new Error("settle() timed out waiting for a condition");
 }
 
 test("a browse request in the App's shape is answered", async () => {
@@ -93,7 +102,7 @@ test("a browse request in the App's shape is answered", async () => {
     query: "",
     limit: 5,
   });
-  await settle();
+  await settle({ until: () => sent.some((item) => item.type === "agent.workspace.page") });
   const page = sent.find((item) => item.type === "agent.workspace.page");
   assert.ok(page, "the App's browse request must be answered by exactly one owner");
   assert.equal(page.payload.requestId, "browse-1");
@@ -115,7 +124,7 @@ test("a browse request naming another device is still answered, and logged", asy
   } finally {
     console.warn = warn;
   }
-  await settle();
+  await settle({ until: () => sent.some((item) => item.type === "agent.workspace.page") });
   const page = sent.find((item) => item.type === "agent.workspace.page");
   assert.ok(page, "a payload that names a peer must not silence the responder");
   assert.equal(page.payload.requestId, "browse-2");
@@ -128,7 +137,7 @@ test("a browse request naming another device is still answered, and logged", asy
 test("a trust request in the App's shape is answered", async () => {
   const { dispatch, sent } = fixture();
   await dispatch({ type: "agent.workspace.trust", requestId: "trust-1", path: workspace });
-  await settle();
+  await settle({ until: () => sent.some((item) => item.type === "agent.workspace.trust.result") });
   const response = sent.find((item) => item.type === "agent.workspace.trust.result");
   assert.ok(response, "fixing browse must not disturb its sibling type");
   assert.equal(response.payload.requestId, "trust-1");
@@ -204,7 +213,7 @@ test("a history request for an unregistered session is answered through the chai
   });
   const { dispatch } = fixture({ control: router });
   await dispatch({ type: "agent.history.request", sessionId: "claude-new", requestId: "h1" });
-  await settle();
+  await settle({ until: () => routerSent.length === 1 });
   assert.equal(routerSent.length, 1);
   assert.equal(routerSent[0].type, "agent.history.delivery");
   assert.equal(routerSent[0].payload.code, "session_not_registered");
@@ -233,7 +242,7 @@ test("a runtime-task request is answered through the chain", async () => {
     }] },
   });
   await dispatch({ type: "runtime_tasks.request", requestId: "rt-stale", action: "set", body: { baseRevision: 0, cards: [] } });
-  await settle();
+  await settle({ until: () => sent.filter((item) => item.type === "runtime_tasks.result").length === 3 });
   const answers = Object.fromEntries(sent
     .filter((item) => item.type === "runtime_tasks.result")
     .map((item) => [item.payload.requestId, item.payload]));
@@ -258,9 +267,9 @@ test("a scheduled-task request is answered through the encrypted relay dispatch"
     id:"st_a", name:"Build", schedule:{kind:"once",at:"2026-11-03T01:00:00Z"},
     launch:{agentType:"claude",workspaceId:"workspace-a",initialMessage:"test"},
   }}});
-  await settle();
+  await settle({ until: () => sent.some((item) => item.type === "scheduled_tasks.result") });
   await dispatch({type:"scheduled_tasks.request", requestId:"st-list", action:"list"});
-  await settle();
+  await settle({ until: () => sent.filter((item) => item.type === "scheduled_tasks.result").length === 2 });
   const answers = Object.fromEntries(sent.filter((entry) => entry.type === "scheduled_tasks.result").map((entry) => [entry.payload.requestId, entry.payload]));
   assert.equal(answers["st-save"].task.id, "st_a");
   assert.equal(answers["st-list"].tasks[0].launch.initialMessage, "test");
@@ -279,9 +288,9 @@ test("remote environment management is routed and never returns its credential",
     target:{id:"ssh_a",name:"host",host:"example.com",username:"u",hostFingerprint:fingerprint},
     confirmedFingerprint:fingerprint,credential:{kind:"password",password:"private-value"},
   }});
-  await settle();
+  await settle({ until: () => sent.some((item) => item.type === "remote_environments.result") });
   await dispatch({type:"remote_environments.request",requestId:"list",action:"list"});
-  await settle();
+  await settle({ until: () => sent.filter((item) => item.type === "remote_environments.result").length === 2 });
   const answers = sent.filter((item) => item.type === "remote_environments.result");
   assert.equal(answers.length,2);
   assert.equal(answers.find((item) => item.payload.requestId === "list").payload.targets[0].id,"ssh_a");
