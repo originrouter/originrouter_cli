@@ -1,12 +1,22 @@
 import {
   readCodingAuth,
+  sameCredentialSession,
+  withAuthStateLock,
   withCodingAuthLock,
   writeCodingAuth,
 } from "../persistence/codingAuth.js";
 import { accessTokenFor, OAUTH_RESOURCES } from "./authContract.js";
 import { refreshOAuthToken } from "../auth/originrouterAuthClient.js";
+import { accountSelectionRoot, isAccountStateDir } from '../persistence/accounts.js';
 
 const HEADROOM_MS = 60_000;
+
+function assertActiveSession(stateDir, credential) {
+  if (isAccountStateDir(stateDir) &&
+      !sameCredentialSession(readCodingAuth(accountSelectionRoot(stateDir)), credential)) {
+    throw Object.assign(new Error('Account changed during token refresh'), {code: 'account_changed'});
+  }
+}
 
 function assertRefreshSessionValid(credential, nowMs) {
   if (credential.refreshExpiresAt <= nowMs) {
@@ -27,13 +37,17 @@ export async function ensureFreshAccessToken({
 } = {}) {
   const current = readCodingAuth(stateDir);
   if (!current) return null;
+  assertActiveSession(stateDir, current);
   assertRefreshSessionValid(current, nowMs);
   const existing = accessTokenFor(current, resource);
   if (!forceRefresh && existing && nowMs < existing.expiresAt - headroomMs) return current;
 
   return withCodingAuthLock(stateDir, async () => {
     const stored = readCodingAuth(stateDir);
-    if (!stored) return null;
+    if (!sameCredentialSession(stored, current)) {
+      throw Object.assign(new Error('Account changed during token refresh'), {code: 'account_changed'});
+    }
+    assertActiveSession(stateDir, stored);
     assertRefreshSessionValid(stored, Date.now());
     const freshCheck = accessTokenFor(stored, resource);
     if (forceRefresh && staleToken && freshCheck?.token !== staleToken) return stored;
@@ -93,7 +107,14 @@ export async function ensureFreshAccessToken({
         Date.now() + Number(response.refresh_expires_in || 2592000) * 1000,
       accessTokens,
     };
-    writeCodingAuth(stateDir, updated);
+    await withAuthStateLock(stateDir, () => {
+      assertActiveSession(stateDir, stored);
+      const live = readCodingAuth(stateDir);
+      if (!sameCredentialSession(live, stored) || live.refreshToken !== stored.refreshToken) {
+        throw Object.assign(new Error('Account changed during token refresh'), {code: 'account_changed'});
+      }
+      writeCodingAuth(stateDir, updated);
+    });
     return updated;
   });
 }

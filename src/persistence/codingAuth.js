@@ -1,12 +1,9 @@
 import {
   chmodSync,
-  closeSync,
   existsSync,
   mkdirSync,
-  openSync,
   readFileSync,
   renameSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -15,15 +12,16 @@ import { join } from "node:path";
 import { isOAuthCredentialShape, KEY_KIND } from "../runtime/authContract.js";
 import {
   accountStateDir,
+  accountSelectionRoot,
   activateAccount,
   activeAccountStateDir,
   clearActiveAccount,
   isAccountStateDir,
   readActiveAccountScope,
 } from "./accounts.js";
+import { withProcessLock } from "./processLock.js";
 
 const FILE_MODE = 0o600;
-const LOCK_STALE_MS = 30_000;
 
 // These files were installation-root scoped before account directories were
 // introduced. They contain user/account data, unlike device.json, local-api,
@@ -137,7 +135,7 @@ export function writeCodingAuth(stateDir, payload) {
   // credential. This is a no-op for fresh installations and scoped stores.
   migrateLegacyRootAccount(stateDir);
   const scopedStateDir = payload.accountScope
-    ? activateAccount(stateDir, payload.accountScope)
+    ? accountStateDir(stateDir, payload.accountScope)
     : stateDir;
   mkdirSync(scopedStateDir, { recursive: true });
   const path = join(scopedStateDir, "coding-key.json");
@@ -148,6 +146,8 @@ export function writeCodingAuth(stateDir, payload) {
   chmodSync(temporary, FILE_MODE);
   renameSync(temporary, path);
   chmodSync(path, FILE_MODE);
+  // Publish the selector only after its credential is durably visible.
+  if (payload.accountScope) activateAccount(stateDir, payload.accountScope);
 }
 
 export function clearCodingAuth(stateDir) {
@@ -161,36 +161,27 @@ export function clearCodingAuth(stateDir) {
   clearActiveAccount(stateDir);
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+export function sameCredentialSession(left, right) {
+  return Boolean(left && right && left.sessionId === right.sessionId &&
+    left.deviceId === right.deviceId && (left.accountScope ?? null) === (right.accountScope ?? null));
+}
+
+export async function withAuthStateLock(stateDir, fn) {
+  return withProcessLock(join(accountSelectionRoot(stateDir), 'oauth-session-state'), fn,
+    {timeoutCode: 'OAUTH_STATE_LOCK_TIMEOUT'});
+}
+
+export async function clearCodingAuthIfCurrent(stateDir, expected) {
+  return withAuthStateLock(stateDir, () => {
+    const current = readCodingAuth(stateDir);
+    if (expected == null ? current != null : !sameCredentialSession(current, expected)) return false;
+    clearCodingAuth(stateDir);
+    return true;
+  });
 }
 
 export async function withCodingAuthLock(stateDir, fn, { timeoutMs = 10_000 } = {}) {
   const scopedStateDir = activeAccountStateDir(stateDir);
-  mkdirSync(scopedStateDir, { recursive: true });
-  const path = lockPath(scopedStateDir);
-  const deadline = Date.now() + timeoutMs;
-  let fd = null;
-  while (fd == null) {
-    try {
-      fd = openSync(path, "wx", FILE_MODE);
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-      try {
-        if (Date.now() - statSync(path).mtimeMs > LOCK_STALE_MS) unlinkSync(path);
-      } catch {}
-      if (Date.now() >= deadline) {
-        const timeout = new Error("Timed out waiting for OAuth refresh lock");
-        timeout.code = "OAUTH_REFRESH_LOCK_TIMEOUT";
-        throw timeout;
-      }
-      await sleep(100);
-    }
-  }
-  try {
-    return await fn();
-  } finally {
-    try { closeSync(fd); } catch {}
-    try { unlinkSync(path); } catch {}
-  }
+  return withProcessLock(lockPath(scopedStateDir), fn,
+    {timeoutMs, timeoutCode: 'OAUTH_REFRESH_LOCK_TIMEOUT'});
 }

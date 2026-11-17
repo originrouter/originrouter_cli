@@ -14,6 +14,7 @@ import {
   readCodingAuth,
   writeCodingAuth,
 } from "../src/persistence/codingAuth.js";
+import { persistOAuthCredential } from '../src/auth/originrouterLogin.js';
 
 function credential() {
   return {
@@ -106,6 +107,26 @@ test("terminal Surety rejection clears the stored login", () => withState(async 
   });
   assert.equal(result.state, "invalid");
   assert.equal(existsSync(codingAuthPath(stateDir)), false);
+}));
+
+test('a delayed rejection cannot clear a newly signed-in account', () => withState(async (stateDir) => {
+  const old = {...credential(), accountScope:'account-a'};
+  const next = {...credential(), accountScope:'account-b', sessionId:'or_ses_new', refreshToken:'or_rt_new'};
+  writeCodingAuth(stateDir, old);
+  let started;
+  let release;
+  const waiting = new Promise((resolve) => { started = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const pending = inspectStoredLogin({stateDir, fetchFn: async () => {
+    started();
+    await gate;
+    return response(400, {error:'invalid_grant'});
+  }});
+  await waiting;
+  await persistOAuthCredential({stateDir, credential:next});
+  release();
+  await assert.rejects(pending, {code:'account_changed'});
+  assert.equal(readCodingAuth(stateDir).sessionId, next.sessionId);
 }));
 
 test("diagnostic verification preserves an invalid local credential", () => withState(async (stateDir) => {

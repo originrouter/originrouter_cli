@@ -31,9 +31,11 @@ import {
 } from "../security/deviceE2eeDirectoryCache.js";
 import { createDpopFetch, ensureDpopRegistered } from "../security/dpopRegistration.js";
 import {
-  clearCodingAuth,
+  clearCodingAuthIfCurrent,
   readCodingAuth,
+  sameCredentialSession,
 } from "../persistence/codingAuth.js";
+import { accountStateDir, isAccountStateDir } from "../persistence/accounts.js";
 import {
   commitDeviceCandidate,
   createDeviceCandidate,
@@ -50,11 +52,12 @@ import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 import { OAUTH_RESOURCES } from "../runtime/authContract.js";
 import { TelemetryQueue } from "../telemetry/telemetryQueue.js";
 
-function discardPendingTelemetryForSession(stateDir, sessionId) {
+function discardPendingTelemetryForSession(stateDir, sessionId, accountScope = null) {
   if (!sessionId) return;
   let queue;
   try {
-    queue = new TelemetryQueue({ stateDir });
+    const scopedDir = isAccountStateDir(stateDir) ? stateDir : accountStateDir(stateDir, accountScope);
+    queue = new TelemetryQueue({ stateDir: scopedDir });
     queue.dropPendingForAccount(sessionId, "account_logged_out");
   } catch {
     // Logout must still clear credentials when a local telemetry database is
@@ -108,7 +111,9 @@ export async function inspectStoredLogin({
   const stored = readCodingAuth(stateDir);
   if (!stored) {
     // Also removes a malformed credential file that readCodingAuth rejected.
-    clearCodingAuth(stateDir);
+    if (!await clearCodingAuthIfCurrent(stateDir, null)) {
+      throw Object.assign(new Error('Account changed during login inspection'), { code: 'account_changed' });
+    }
     return { state: "missing", credential: null };
   }
   try {
@@ -120,8 +125,10 @@ export async function inspectStoredLogin({
     return { state: "active", credential };
   } catch (error) {
     if (!storedLoginIsInvalid(error)) throw error;
-    discardPendingTelemetryForSession(stateDir, stored.sessionId);
-    clearCodingAuth(stateDir);
+    discardPendingTelemetryForSession(stateDir, stored.sessionId, stored.accountScope);
+    if (!await clearCodingAuthIfCurrent(stateDir, stored)) {
+      throw Object.assign(new Error('Account changed during login inspection'), { code: 'account_changed' });
+    }
     return { state: "invalid", credential: null, error };
   }
 }
@@ -278,7 +285,7 @@ export async function handleLogin(args, {
     if (candidateNeedsCommit) {
       commitDeviceE2eeIdentity(stateDir, enrollmentIdentity, { accountScope: enrollmentScope });
     }
-    persistOAuthCredential({ stateDir, credential });
+    await persistOAuthCredential({ stateDir, credential });
     const e2ee = readDeviceE2eeIdentity(stateDir, { accountScope: credential.accountScope || enrollmentScope });
     const controlFetch = createDpopFetch({stateDir, fetchFn, accountScope: credential.accountScope || enrollmentScope});
     let registered = null;
@@ -372,6 +379,9 @@ export async function handleLogout(args = []) {
     }
     try {
       const fresh = await ensureFreshAccessToken({ stateDir });
+      if (!sameCredentialSession(fresh, stored)) {
+        throw Object.assign(new Error('Account changed during sign-out'), { code: 'account_changed' });
+      }
       const controlBaseUrl =
         process.env.ORIGINROUTER_CONTROL_BASE_URL ||
         DEFAULT_ORIGINROUTER_CONTROL_BASE_URL;
@@ -392,8 +402,11 @@ export async function handleLogout(args = []) {
         accessToken: fresh.accessTokens.control.token,
         signedRemoval: signCurrentDeviceRemoval(identity, { accountEpoch }),
       });
-      discardPendingTelemetryForSession(stateDir, stored.sessionId);
-      clearCodingAuth(stateDir);
+      discardPendingTelemetryForSession(stateDir, stored.sessionId, stored.accountScope);
+      if (!await clearCodingAuthIfCurrent(stateDir, stored)) {
+        console.log('The previous session was removed; a newer login remains active.');
+        return;
+      }
       // --remove-device revokes this account's binding/session only. Keep both
       // the installation-scoped private key and the stable installation device
       // id for a later account login. A separate explicit reset command is
@@ -408,6 +421,9 @@ export async function handleLogout(args = []) {
   let signedOutThroughControl = false;
   try {
     const fresh = await ensureFreshAccessToken({ stateDir });
+    if (!sameCredentialSession(fresh, stored)) {
+      throw Object.assign(new Error('Account changed during sign-out'), { code: 'account_changed' });
+    }
     await signOutCurrentCliDevice({
       controlBaseUrl:
         process.env.ORIGINROUTER_CONTROL_BASE_URL ||
@@ -419,7 +435,8 @@ export async function handleLogout(args = []) {
     console.warn(`logout: device registry update failed (${error.code || "unavailable"})`);
   }
   if (!signedOutThroughControl) {
-    const latestStored = readCodingAuth(stateDir) || stored;
+    const latest = readCodingAuth(stateDir);
+    const latestStored = sameCredentialSession(latest, stored) ? latest : stored;
     try {
       await revokeOAuthToken({
         revocationEndpoint: latestStored.revocationEndpoint,
@@ -429,8 +446,12 @@ export async function handleLogout(args = []) {
       console.warn(`logout: remote revocation failed (${error.code || "unavailable"})`);
     }
   }
-  discardPendingTelemetryForSession(stateDir, stored.sessionId);
-  clearCodingAuth(stateDir);
+  discardPendingTelemetryForSession(stateDir, stored.sessionId, stored.accountScope);
+  const cleared = await clearCodingAuthIfCurrent(stateDir, stored);
+  if (!cleared) {
+    console.log('The previous session was signed out; a newer login remains active.');
+    return;
+  }
   console.log(
     "Logged out. This device remains trusted and this account's local routes are preserved for a later sign-in.",
   );

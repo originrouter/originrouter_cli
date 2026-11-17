@@ -9,7 +9,9 @@ import test from "node:test";
 
 import { readCodingAuth, writeCodingAuth } from "../src/persistence/codingAuth.js";
 import { ensureDeviceE2eeIdentity, readDeviceE2eeIdentity } from "../src/crypto/deviceE2eeIdentity.js";
+import { dpopThumbprint } from "../src/crypto/dpopIdentity.js";
 import { makeOAuthCredential } from "./support/oauthCredential.js";
+import { persistOAuthCredential } from '../src/auth/originrouterLogin.js';
 
 const repo = dirname(dirname(fileURLToPath(import.meta.url)));
 const bin = resolve(repo, "bin", "originrouter.js");
@@ -45,10 +47,27 @@ test("logout device removal signs with the current account epoch and preserves t
   const deviceId = "device-logout-test";
   const requests = [];
   let removal = null;
+  let keyStatus = 'none';
+  let jkt = null;
   const server = http.createServer(async (req, res) => {
     requests.push(req.url);
     res.setHeader("Content-Type", "application/json");
-    if (req.url === "/cli/v1/device-e2ee/status") {
+    if (req.url === '/cli/v1/dpop/status') {
+      res.end(JSON.stringify({data: {available: true, status: keyStatus, jkt}}));
+    } else if (req.url === '/cli/v1/dpop/key') {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      jkt = dpopThumbprint(JSON.parse(Buffer.concat(chunks).toString('utf8')).jwk);
+      keyStatus = 'pending';
+      res.end(JSON.stringify({data: {status: keyStatus, jkt}}));
+    } else if (req.url === '/cli/v1/dpop/proof') {
+      assert.ok(req.headers.dpop);
+      keyStatus = 'active';
+      res.end(JSON.stringify({data: {status: keyStatus, jkt}}));
+    } else if (req.url === '/cli/v1/dpop/session/activate') {
+      assert.ok(req.headers.dpop);
+      res.end(JSON.stringify({data: {status: 'active'}}));
+    } else if (req.url === "/cli/v1/device-e2ee/status") {
       res.end(JSON.stringify({ data: { policy: { epoch: 9 } } }));
     } else if (req.url === "/cli/v1/device-e2ee/self/remove") {
       const chunks = [];
@@ -71,6 +90,10 @@ test("logout device removal signs with the current account epoch and preserves t
     assert.equal(result.code, 0, result.stderr);
     assert.match(result.stdout, /Signed out and removed this device/);
     assert.deepEqual(requests, [
+      '/cli/v1/dpop/status',
+      '/cli/v1/dpop/key',
+      '/cli/v1/dpop/proof',
+      '/cli/v1/dpop/session/activate',
       "/cli/v1/device-e2ee/status",
       "/cli/v1/device-e2ee/self/remove",
     ]);
@@ -81,6 +104,66 @@ test("logout device removal signs with the current account epoch and preserves t
   } finally {
     await new Promise((resolveClose) => server.close(resolveClose));
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a delayed logout cannot clear a newer login in another process', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'originrouter-cli-logout-race-'));
+  const old = makeOAuthCredential({accountScope:'account-a', sessionId:'or_ses_old'});
+  const next = makeOAuthCredential({accountScope:'account-b', sessionId:'or_ses_new', refreshToken:'or_rt_new'});
+  let notify;
+  let resume;
+  const arrived = new Promise((resolve) => { notify = resolve; });
+  const gate = new Promise((resolve) => { resume = resolve; });
+  let keyStatus = 'none';
+  let jkt = null;
+  const server = http.createServer(async (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/cli/v1/dpop/status') {
+      res.end(JSON.stringify({data:{available:true,status:keyStatus,jkt}}));
+    } else if (req.url === '/cli/v1/dpop/key') {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      jkt = dpopThumbprint(JSON.parse(Buffer.concat(chunks)).jwk);
+      keyStatus = 'pending';
+      res.end(JSON.stringify({data:{status:keyStatus,jkt}}));
+    } else if (req.url === '/cli/v1/dpop/proof') {
+      keyStatus = 'active';
+      res.end(JSON.stringify({data:{status:keyStatus,jkt}}));
+    } else if (req.url === '/cli/v1/dpop/session/activate') {
+      res.end(JSON.stringify({data:{status:'active'}}));
+    } else if (req.url === '/cli/v1/devices/self/sign-out') {
+      notify();
+      await gate;
+      res.end(JSON.stringify({data:{signed_out:true}}));
+    } else {
+      res.writeHead(404);
+      res.end('{}');
+    }
+  });
+  try {
+    writeCodingAuth(home, old);
+    ensureDeviceE2eeIdentity(home, {deviceId:old.deviceId, accountScope:old.accountScope});
+    await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    const running = runCli(home, ['logout'], {
+      ORIGINROUTER_CONTROL_BASE_URL:`http://127.0.0.1:${server.address().port}`,
+    });
+    let timer;
+    try {
+      await Promise.race([arrived, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('logout did not arrive')), 5000);
+      })]);
+    } finally { clearTimeout(timer); }
+    await persistOAuthCredential({stateDir:home, credential:next});
+    resume();
+    const result = await running;
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /newer login remains active/);
+    assert.equal(readCodingAuth(home).sessionId, next.sessionId);
+  } finally {
+    resume();
+    await new Promise((resolveClose) => server.close(resolveClose));
+    rmSync(home, {recursive:true, force:true});
   }
 });
 

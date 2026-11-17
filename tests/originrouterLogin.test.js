@@ -298,7 +298,7 @@ test("Device Flow maps denial to a stable client error", async () => {
   );
 });
 
-test("persistOAuthCredential writes the complete OAuth session", () => {
+test("persistOAuthCredential writes the complete OAuth session", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "originrouter-login-persist-"));
   try {
     const credential = {
@@ -319,7 +319,7 @@ test("persistOAuthCredential writes the complete OAuth session", () => {
         }]),
       ),
     };
-    persistOAuthCredential({ stateDir, credential });
+    await persistOAuthCredential({ stateDir, credential });
     assert.equal(readCodingAuth(stateDir).refreshToken, "or_rt_final");
   } finally {
     rmSync(stateDir, { recursive: true, force: true });

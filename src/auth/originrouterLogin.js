@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 
-import { writeCodingAuth } from "../persistence/codingAuth.js";
+import { withAuthStateLock, writeCodingAuth } from "../persistence/codingAuth.js";
 import { KEY_KIND, KEY_SOURCE } from "../runtime/authContract.js";
 import {
   AuthClientError,
@@ -309,8 +309,8 @@ export async function loginWithDeviceFlow({
   throw new AuthClientError({ code: "device_flow_timeout" });
 }
 
-export function persistOAuthCredential({ stateDir, credential }) {
-  writeCodingAuth(stateDir, credential);
+export async function persistOAuthCredential({ stateDir, credential }) {
+  await withAuthStateLock(stateDir, () => writeCodingAuth(stateDir, credential));
   return credential;
 }
 

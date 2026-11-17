@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from 'node:child_process';
+import http from 'node:http';
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +9,100 @@ import test from "node:test";
 import { readCodingAuth, writeCodingAuth } from "../src/persistence/codingAuth.js";
 import { ensureFreshAccessToken } from "../src/runtime/oauthTokenRefresher.js";
 import { makeOAuthCredential } from "./support/oauthCredential.js";
+import { persistOAuthCredential } from "../src/auth/originrouterLogin.js";
+import { accountStateDir } from '../src/persistence/accounts.js';
+
+test('a refresh in another process cannot restore an older account', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'originrouter-refresh-process-'));
+  let notify;
+  let resume;
+  const arrived = new Promise((resolve) => { notify = resolve; });
+  const gate = new Promise((resolve) => { resume = resolve; });
+  const server = http.createServer(async (_req, res) => {
+    notify();
+    await gate;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({access_token:'or_at_old_refreshed', refresh_token:'or_rt_old_rotated',
+      expires_in:600, refresh_expires_in:600}));
+  });
+  let worker;
+  try {
+    await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    const old = expiredCodingCredential({accountScope:'account-a', sessionId:'or_ses_old',
+      tokenEndpoint:`http://127.0.0.1:${server.address().port}/token`});
+    const next = makeOAuthCredential({accountScope:'account-b', sessionId:'or_ses_new', refreshToken:'or_rt_new'});
+    writeCodingAuth(stateDir, old);
+    const moduleUrl = new URL('../src/runtime/oauthTokenRefresher.js', import.meta.url).href;
+    const script = `import {ensureFreshAccessToken} from ${JSON.stringify(moduleUrl)};
+      try { await ensureFreshAccessToken({stateDir:process.argv[1], resource:'originrouter.coding'});
+        console.log('unexpected-success');
+      } catch (error) { console.log(error.code); }`;
+    worker = spawn(process.execPath, ['--input-type=module', '-e', script, stateDir],
+      {stdio:['ignore', 'pipe', 'pipe']});
+    let stdout = '';
+    let stderr = '';
+    worker.stdout.on('data', (chunk) => { stdout += chunk; });
+    worker.stderr.on('data', (chunk) => { stderr += chunk; });
+    const finished = new Promise((resolve) => worker.on('exit', (code) => resolve(code)));
+    let timer;
+    try {
+      await Promise.race([arrived, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('refresh did not arrive')), 5000);
+      })]);
+    } finally { clearTimeout(timer); }
+    await persistOAuthCredential({stateDir, credential:next});
+    resume();
+    assert.equal(await finished, 0, stderr);
+    assert.match(stdout, /account_changed/);
+    assert.equal(readCodingAuth(stateDir).sessionId, next.sessionId);
+    assert.equal(readCodingAuth(stateDir).refreshToken, next.refreshToken);
+  } finally {
+    resume();
+    worker?.kill();
+    await new Promise((resolveClose) => server.close(resolveClose));
+    rmSync(stateDir, {recursive:true, force:true});
+  }
+});
+
+test('a scoped worker cannot refresh its old account after the active account changes', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'originrouter-refresh-scoped-'));
+  try {
+    const old = expiredCodingCredential({accountScope:'account-a', sessionId:'or_ses_old'});
+    const next = makeOAuthCredential({accountScope:'account-b', sessionId:'or_ses_new', refreshToken:'or_rt_new'});
+    writeCodingAuth(stateDir, old);
+    let started;
+    let resume;
+    const arrived = new Promise((resolve) => { started = resolve; });
+    const gate = new Promise((resolve) => { resume = resolve; });
+    const scoped = accountStateDir(stateDir, old.accountScope);
+    const pending = ensureFreshAccessToken({stateDir:scoped, resource:'originrouter.coding', fetchFn:async()=>{
+      started(); await gate;
+      return {ok:true, status:200, json:async()=>({access_token:'or_at_old_fresh',refresh_token:'or_rt_old_rotated'})};
+    }});
+    await arrived;
+    await persistOAuthCredential({stateDir, credential:next});
+    resume();
+    await assert.rejects(pending, {code:'account_changed'});
+    assert.equal(readCodingAuth(stateDir).sessionId, next.sessionId);
+    assert.equal(readCodingAuth(scoped).refreshToken, old.refreshToken);
+  } finally { rmSync(stateDir, {recursive:true, force:true}); }
+});
+
+test('a scoped worker cannot reuse an unexpired token after an account switch', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'originrouter-refresh-scoped-'));
+  try {
+    const old = makeOAuthCredential({accountScope:'account-a', sessionId:'or_ses_old'});
+    const next = makeOAuthCredential({accountScope:'account-b', sessionId:'or_ses_new'});
+    writeCodingAuth(stateDir, old);
+    const scoped = accountStateDir(stateDir, old.accountScope);
+    await persistOAuthCredential({stateDir, credential:next});
+    let calls = 0;
+    await assert.rejects(ensureFreshAccessToken({stateDir:scoped, fetchFn:async()=>{ calls++; }}),
+      {code:'account_changed'});
+    assert.equal(calls, 0);
+    assert.equal(readCodingAuth(stateDir).sessionId, next.sessionId);
+  } finally { rmSync(stateDir, {recursive:true, force:true}); }
+});
 
 function expiredCodingCredential(overrides = {}) {
   return makeOAuthCredential({
@@ -19,6 +115,34 @@ function expiredCodingCredential(overrides = {}) {
       },
       ...(overrides.accessTokens || {}),
     },
+  });
+}
+
+for (const sameAccount of [false, true]) {
+  test(`a delayed refresh cannot overwrite a newer ${sameAccount ? 'session' : 'account'} login`, async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'originrouter-refresh-switch-'));
+    try {
+      const old = expiredCodingCredential({accountScope:'account-a', sessionId:'or_ses_old'});
+      const next = makeOAuthCredential({accountScope:sameAccount ? 'account-a' : 'account-b',
+        sessionId:'or_ses_new', refreshToken:'or_rt_new'});
+      writeCodingAuth(stateDir, old);
+      let started;
+      let release;
+      const waiting = new Promise((resolve) => { started = resolve; });
+      const gate = new Promise((resolve) => { release = resolve; });
+      const pending = ensureFreshAccessToken({stateDir, resource:'originrouter.coding', fetchFn: async () => {
+        started();
+        await gate;
+        return {ok:true, status:200, json:async()=>({access_token:'or_at_old_refreshed',
+          refresh_token:'or_rt_old_rotated', expires_in:600})};
+      }});
+      await waiting;
+      await persistOAuthCredential({stateDir, credential:next});
+      release();
+      await assert.rejects(pending, {code:'account_changed'});
+      assert.equal(readCodingAuth(stateDir).sessionId, 'or_ses_new');
+      assert.equal(readCodingAuth(stateDir).refreshToken, 'or_rt_new');
+    } finally { rmSync(stateDir, {recursive:true, force:true}); }
   });
 }
 
