@@ -85,7 +85,7 @@ async function fixture({settings = undefined} = {}) {
   const manager = new SshConnectionManager({targetProvider:async (id) => id === target.id ? target : null,
     credentialProvider:async () => credential, accountProvider:async () => account, idleMs:100,
     ...(behavior === null ? {} : {settingsProvider:() => behavior})});
-  return {root, target, manager, commands, signals,
+  return {root, target, manager, commands, signals, children,
     get count(){return count;}, get authenticationAttempts(){return authenticationAttempts;}, setAccount(value){account=value;},
     setBehavior(value) { behavior = value; },
     setCredential(value) { credential = value; },
@@ -511,7 +511,7 @@ test('closing a session ends the remote processes it started', async () => {
   const marker = join(f.root, 'killed-marker');
   try {
     const opened = await f.manager.open('agent', 'host-1');
-    const running = f.manager.run('agent', opened.handle, `sleep 0.5; printf alive > '${marker}'`);
+    const running = f.manager.run('agent', opened.handle, `sleep 30; printf alive > '${marker}'`);
     const rejected = assert.rejects(running, {code:'REMOTE_ENV_OUTCOME_UNKNOWN'});
     while (!f.commands.some((command) => command.includes('killed-marker'))) await new Promise((resolve) => setTimeout(resolve, 5));
     await f.manager.close('agent', opened.handle);
@@ -519,7 +519,11 @@ test('closing a session ends the remote processes it started', async () => {
     // The signal request reaches the session's process group, so the command
     // dies instead of finishing its work on the host.
     assert.ok(f.signals.length >= 1, 'the session is closed with a signal request');
-    await new Promise((resolve) => setTimeout(resolve, 700));
+    // A short sleep would make the kill a race against the command's own end;
+    // a long one cannot end on its own, so the dead child is the proof.
+    const deadline = Date.now() + 5000;
+    while (f.children.size && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(f.children.size, 0, 'the remote process group was ended');
     assert.equal(existsSync(marker), false);
   } finally { await f.stop(); }
 });
@@ -557,12 +561,14 @@ test('an Agent ending ends the remote processes it started', async () => {
   const marker = join(f.root, 'owner-detach-marker');
   try {
     const opened = await f.manager.open('agent', 'host-1');
-    const rejected = f.manager.run('agent', opened.handle, `sleep 0.5; printf alive > '${marker}'`);
+    const rejected = f.manager.run('agent', opened.handle, `sleep 30; printf alive > '${marker}'`);
     while (!f.commands.some((command) => command.includes('owner-detach-marker'))) await new Promise((resolve) => setTimeout(resolve, 5));
     f.manager.closeOwner('agent');
     await assert.rejects(rejected, {code:'REMOTE_ENV_OUTCOME_UNKNOWN'});
     assert.ok(f.signals.length >= 1, 'detach sends a signal request, not only a channel close');
-    await new Promise((resolve) => setTimeout(resolve, 700));
+    const deadline = Date.now() + 5000;
+    while (f.children.size && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(f.children.size, 0, 'the remote process group was ended');
     assert.equal(existsSync(marker), false);
   } finally { await f.stop(); }
 });
