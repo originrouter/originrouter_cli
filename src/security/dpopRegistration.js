@@ -41,9 +41,12 @@ import {
   signDeviceE2eeDpopRegistration,
 } from "../crypto/deviceE2eeIdentity.js";
 import { ACCESS_TOKEN_PREFIX } from "../runtime/authContract.js";
+import { accessTokenFor, OAUTH_RESOURCES } from "../runtime/authContract.js";
+import { readCodingAuth } from "../persistence/codingAuth.js";
 import { isAccountStateDir, readActiveAccountScope } from "../persistence/accounts.js";
+import { withProcessLock } from "../persistence/processLock.js";
 import {
-  forgetDpopRegistration,
+  dpopStorePath,
   readDpopRegistration,
   readDpopStore,
   setDpopRegistration,
@@ -78,6 +81,7 @@ const DPOP_ROUTE_PREFIX = "/cli/v1/dpop";
 // server that is down, or a proof the clock refused, would otherwise turn
 // every request into another registration attempt.
 const RECOVERY_COOLDOWN_MS = 15_000;
+const REGISTRATION_REQUEST_TIMEOUT_MS = 15_000;
 
 let ORIGINAL_FETCH = globalThis.fetch;
 
@@ -354,12 +358,22 @@ export function rewriteForDpop(input, init, { stateDir, accountScope = null } = 
  * nothing else. A request it does not recognise goes out byte for byte as
  * it was written.
  */
-export function createDpopFetch({ stateDir, fetchFn = null, accountScope = null, onRefusal = null } = {}) {
-  const options = { stateDir, accountScope, onRefusal };
+export function createDpopFetch({ stateDir, fetchFn = null, accountScope = null, onRefusal = null, prepareSession = null } = {}) {
+  const options = { stateDir, accountScope, onRefusal, prepareSession };
   const inner = fetchFn || globalThis.fetch;
   const wrapped = async (input, init = {}) => {
-    const dynamicScope = typeof stateDir === "string" && options.accountScope == null && !isAccountStateDir(stateDir);
-    const startingScope = dynamicScope ? readActiveAccountScope(stateDir) : null;
+    const currentStateDir = options.stateDir;
+    const dynamicScope = typeof currentStateDir === "string" && options.accountScope == null && !isAccountStateDir(currentStateDir);
+    const startingScope = dynamicScope ? readActiveAccountScope(currentStateDir) : null;
+    const url = requestUrl(input);
+    const authorization = collectHeaders(input, init).authorization || "";
+    const token = /^(?:Bearer|DPoP)\s+(or_at_\S+)$/i.exec(authorization)?.[1];
+    if (options.prepareSession && url && token && usesDpopAudience(url) && !isEnrollmentRequest(url, init?.method || input?.method)) {
+      await options.prepareSession({ stateDir: options.stateDir, accountScope: options.accountScope, url, token });
+      if (dynamicScope && readActiveAccountScope(currentStateDir) !== startingScope) {
+        throw Object.assign(new Error("Account changed before the request was sent"), { code: "account_changed" });
+      }
+    }
     const rewritten = rewriteForDpop(input, init, options);
     let response = await inner(
       rewritten ? rewritten.input : input,
@@ -368,8 +382,24 @@ export function createDpopFetch({ stateDir, fetchFn = null, accountScope = null,
     // A registration can complete while a read is in flight. Retry a
     // bodyless read only if it was sent without a proof and the same
     // account now has one; never replay a mutation or a consumed Request.
-    const sameAccount = () => !dynamicScope || readActiveAccountScope(stateDir) === startingScope;
+    const sameAccount = () => !dynamicScope || readActiveAccountScope(currentStateDir) === startingScope;
     const method = String(init?.method || input?.method || "GET").toUpperCase();
+    // The server emits this challenge before entering a business handler.
+    // Retry only replayable requests with a newly signed proof.
+    const challenge = response?.headers?.get?.('www-authenticate') || '';
+    if (options.prepareSession && response.status === 401 &&
+        challenge.includes('device_session_not_activated') && sameAccount() &&
+        typeof input === 'string' && /^Bearer\s+/i.test(authorization) &&
+        (init.body == null || typeof init.body === 'string')) {
+      await options.prepareSession({stateDir: options.stateDir, accountScope: options.accountScope,
+        url, token, force: true});
+      if (!sameAccount()) throw Object.assign(new Error('Account changed before retry'), {code:'account_changed'});
+      const retry = rewriteForDpop(input, init, options);
+      if (retry) {
+        response.body?.cancel?.().catch?.(() => {});
+        response = await inner(retry.input, retry.init);
+      }
+    }
     if (!rewritten && typeof input === "string" && init.body == null &&
         (method === "GET" || method === "HEAD") && sameAccount() &&
         dpopRefusalCode(response.status, response.headers) === "dpop_proof_required") {
@@ -403,6 +433,61 @@ export function createDpopFetch({ stateDir, fetchFn = null, accountScope = null,
   return wrapped;
 }
 
+function isEnrollmentRequest(url, method = 'GET') {
+  let path;
+  try { path = new URL(url).pathname; } catch { return false; }
+  const verb = String(method || 'GET').toUpperCase();
+  return (verb === 'GET' && path === `${DPOP_ROUTE_PREFIX}/status`) ||
+    (verb === 'POST' && [`${DPOP_ROUTE_PREFIX}/key`, `${DPOP_ROUTE_PREFIX}/proof`,
+      `${DPOP_ROUTE_PREFIX}/session/activate`].includes(path));
+}
+
+/** Prepare one login before its first protected request in this process. */
+export function createDeviceSessionReadiness({ fetchFn, refreshFn = null, ensureFn = ensureDpopRegistered } = {}) {
+  const ready = new Set();
+  const running = new Map();
+  return async ({ stateDir, accountScope = null, url, token, force = false }) => {
+    const credential = readCodingAuth(stateDir);
+    if (!credential) return;
+    const control = accessTokenFor(credential, OAUTH_RESOURCES.CONTROL)?.token;
+    const relay = accessTokenFor(credential, OAUTH_RESOURCES.RELAY)?.token;
+    // A caller may deliberately use an unrelated credential. Do not change
+    // the active installation's state on the strength of that request.
+    if (token !== control && token !== relay) return;
+    const scope = accountScope ?? credential.accountScope ?? null;
+    const binding = [stateDir, scope, credential.sessionId, deploymentFor(url)].join('|');
+    if (ready.has(binding) && !force) return;
+    if (force) ready.delete(binding);
+    const pending = running.get(binding);
+    if (pending) return pending;
+    const operation = (async () => {
+      const refresh = refreshFn ?? (await import('../runtime/oauthTokenRefresher.js')).ensureFreshAccessToken;
+      const current = await refresh({ stateDir, resource: OAUTH_RESOURCES.CONTROL, fetchFn });
+      const live = readCodingAuth(stateDir);
+      if (!current || !live || current.sessionId !== credential.sessionId ||
+          live.sessionId !== credential.sessionId || live.accountScope !== credential.accountScope ||
+          (scope != null && live.accountScope !== scope)) {
+        throw Object.assign(new Error('Account changed during device authentication'), { code: 'account_changed' });
+      }
+      const accessToken = accessTokenFor(current, OAUTH_RESOURCES.CONTROL)?.token;
+      const result = await ensureFn({ stateDir, controlBaseUrl: originOf(url), accessToken,
+        deviceId: current.deviceId, accountScope: scope, fetchFn });
+      const after = readCodingAuth(stateDir);
+      if (!after || after.sessionId !== credential.sessionId || after.accountScope !== credential.accountScope) {
+        throw Object.assign(new Error('Account changed during device authentication'), { code: 'account_changed' });
+      }
+      if (result?.status !== 'active') {
+        throw Object.assign(new Error('Device authentication is not ready'), {
+          code: result?.code || 'dpop_registration_unavailable',
+        });
+      }
+      ready.add(binding);
+    })();
+    running.set(binding, operation);
+    try { await operation; } finally { if (running.get(binding) === operation) running.delete(binding); }
+  };
+}
+
 /**
  * The `fetch` this process started with.
  *
@@ -428,7 +513,8 @@ export function installDpopFetch({ stateDir, fetchFn = null, onRefusal = null } 
     if (onRefusal) current.options.onRefusal = onRefusal;
     return current;
   }
-  const wrapped = createDpopFetch({ stateDir, fetchFn: ORIGINAL_FETCH, onRefusal });
+  const wrapped = createDpopFetch({ stateDir, fetchFn: ORIGINAL_FETCH, onRefusal,
+    prepareSession: createDeviceSessionReadiness({ fetchFn: ORIGINAL_FETCH }) });
   globalThis.fetch = wrapped;
   return wrapped;
 }
@@ -443,6 +529,7 @@ async function dpopRequest({
 }) {
   const response = await send(url, {
     method,
+    signal: AbortSignal.timeout(REGISTRATION_REQUEST_TIMEOUT_MS),
     headers: {
       Accept: "application/json",
       Authorization: `Bearer ${token}`,
@@ -451,8 +538,14 @@ async function dpopRequest({
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
-  let payload = {};
-  try { payload = await response.json(); } catch {}
+  let payload;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    throw Object.assign(new Error('Invalid device authentication response', { cause: error }), {
+      code: 'dpop_invalid_response',
+    });
+  }
   const detail = payload?.detail && typeof payload.detail === "object" ? payload.detail : null;
   return {
     ok: response.ok,
@@ -480,8 +573,10 @@ function proofHeaders({ store, token, method, url }) {
     const publicJwk = store.key.public_jwk || dpopPublicJwk(privateJwk);
     const proof = dpopProof({ privateJwk, publicJwk, accessToken: token, method, url });
     return { Authorization: `${DPOP_SCHEME} ${token}`, DPoP: proof };
-  } catch {
-    return {};
+  } catch (error) {
+    throw Object.assign(new Error('Cannot sign device authentication proof', { cause: error }), {
+      code: 'dpop_key_unavailable',
+    });
   }
 }
 
@@ -493,10 +588,8 @@ function proofHeaders({ store, token, method, url }) {
  * the device's own long-term key signing for it — when there is nothing to
  * prove.
  *
- * Nothing here is allowed to stop the CLI from working. A server that has
- * never heard of these routes, a server that cannot store keys yet, a
- * device with no identity to sign with: each of those leaves the device on
- * bearer tokens, which is where it started.
+ * A caller requiring device authentication must treat a result other than
+ * active as a failure; an unregistered device cannot use protected routes.
  */
 export async function ensureDpopRegistered({
   stateDir,
@@ -507,6 +600,32 @@ export async function ensureDpopRegistered({
   accountScope = null,
   now = new Date(),
 } = {}) {
+  if (!dpopEnabled()) return { status: "disabled" };
+  const base = String(controlBaseUrl || '').replace(/\/+$/, '');
+  if (!base || !accessToken || !deviceId || !deploymentFor(base)) return { status: 'skipped' };
+  const storePath = dpopStorePath(stateDir, { accountScope });
+  const verifyScope = () => {
+    if (dpopStorePath(stateDir, { accountScope }) !== storePath) {
+      throw Object.assign(new Error('Account changed during device authentication'), { code: 'account_changed' });
+    }
+  };
+  return withProcessLock(storePath, async () => {
+    verifyScope();
+    const innerFetch = fetchFn || rawFetch();
+    const guardedFetch = async (...args) => {
+      verifyScope();
+      const response = await innerFetch(...args);
+      verifyScope();
+      return response;
+    };
+    return ensureDpopRegisteredLocked({ stateDir, controlBaseUrl, accessToken,
+      deviceId, fetchFn: guardedFetch, accountScope, now });
+  }, {timeoutCode: 'dpop_registration_lock_timeout'});
+}
+
+async function ensureDpopRegisteredLocked({
+  stateDir, controlBaseUrl, accessToken, deviceId, fetchFn, accountScope, now,
+}) {
   if (!dpopEnabled()) return { status: "disabled" };
   const base = String(controlBaseUrl || "").replace(/\/+$/, "");
   const token = String(accessToken || "");
@@ -543,7 +662,13 @@ export async function ensureDpopRegistered({
   ].includes(status.code))) {
     return { status: "refused", code: status.code || `http_${status.status}` };
   }
-  const serverStatus = status.ok ? String(status.data?.status || "none") : null;
+  if (status.ok && (status.data?.available !== true ||
+      !['none', 'pending', 'active', 'revoked'].includes(status.data?.status) ||
+      (status.data.status !== 'none' &&
+       (typeof status.data.jkt !== 'string' || !status.data.jkt)))) {
+    return { status: 'refused', code: 'dpop_invalid_response' };
+  }
+  const serverStatus = status.ok ? status.data.status : null;
   const serverJkt = status.ok && typeof status.data?.jkt === "string" ? status.data.jkt : null;
 
   if (localJkt && serverJkt === localJkt) {
@@ -554,7 +679,7 @@ export async function ensureDpopRegistered({
         { status: "active", jkt: localJkt, origin: base },
         { accountScope },
       );
-      return { status: "active", jkt: localJkt };
+      return activateDeviceSession({ send, base, token, store, jkt: localJkt });
     }
     if (serverStatus === "pending") {
       setDpopRegistration(
@@ -566,7 +691,8 @@ export async function ensureDpopRegistered({
       const proved = await proveRegistration({
         send, base, token, store, deployment, accountScope, stateDir, jkt: localJkt,
       });
-      return proved;
+      if (proved.status !== "active") return proved;
+      return activateDeviceSession({ send, base, token, store, jkt: localJkt });
     }
   }
 
@@ -617,9 +743,22 @@ export async function ensureDpopRegistered({
     { status: "pending", jkt, origin: base },
     { accountScope },
   );
-  return proveRegistration({
+  const proved = await proveRegistration({
     send, base, token, store, deployment, accountScope, stateDir, jkt,
   });
+  if (proved.status !== "active") return proved;
+  return activateDeviceSession({ send, base, token, store, jkt });
+}
+
+async function activateDeviceSession({ send, base, token, store, jkt }) {
+  const url = `${base}${DPOP_ROUTE_PREFIX}/session/activate`;
+  const result = await dpopRequest({
+    send, url, method: "POST", token,
+    headers: proofHeaders({ store, token, method: "POST", url }),
+  });
+  return result.ok
+    ? { status: "active", jkt }
+    : { status: "refused", code: result.code || `http_${result.status}` };
 }
 
 /**
@@ -672,10 +811,6 @@ export async function recoverDpopRegistration({
   accountScope = null,
 } = {}) {
   const base = String(controlBaseUrl || "").replace(/\/+$/, "");
-  const deployment = deploymentFor(base);
-  if (deployment) {
-    forgetDpopRegistration(stateDir, deployment, { accountScope });
-  }
   return ensureDpopRegistered({
     stateDir,
     controlBaseUrl: base,

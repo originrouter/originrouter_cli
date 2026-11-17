@@ -24,6 +24,7 @@ import {
   createDpopFetch,
   createDpopProofProvider,
   createDpopRecovery,
+  createDeviceSessionReadiness,
   deploymentFor,
   dpopAuthHeaders,
   dpopEnabled,
@@ -43,6 +44,8 @@ import {
 import { ensureDeviceE2eeIdentity } from "../src/crypto/deviceE2eeIdentity.js";
 import { dpopThumbprint, generateDpopKeyPair } from "../src/crypto/dpopIdentity.js";
 import { activateAccount } from "../src/persistence/accounts.js";
+import { readCodingAuth, writeCodingAuth } from '../src/persistence/codingAuth.js';
+import { makeOAuthCredential } from './support/oauthCredential.js';
 
 const CONTROL_BASE = "https://app.easytransnote.com";
 const TOKEN = "or_at_the_cli_token";
@@ -68,6 +71,49 @@ function withDpopSwitch(value, run) {
   }
 }
 
+test('business requests wait for one session activation per login', async () => {
+  const stateDir = makeStateDir();
+  try {
+    const credential = makeOAuthCredential({accountScope:'owner-a'});
+    writeCodingAuth(stateDir, credential);
+    let calls = 0;
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const prepare = createDeviceSessionReadiness({
+      refreshFn: async () => readCodingAuth(stateDir),
+      ensureFn: async () => { calls++; await gate; return {status:'active'}; },
+    });
+    const args = {stateDir, url:`${CONTROL_BASE}/cli/v1/devices`, token:credential.accessTokens.control.token};
+    const pending = [prepare(args), prepare(args), prepare(args)];
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls, 1);
+    release();
+    await Promise.all(pending);
+    await prepare(args);
+    assert.equal(calls, 1);
+    writeCodingAuth(stateDir, {...credential, sessionId:'or_ses_another_session'});
+    await prepare(args);
+    assert.equal(calls, 2);
+  } finally { removeStateDir(stateDir); }
+});
+
+test('a session activation never sends a queued request after an account switch', async () => {
+  const stateDir = makeStateDir();
+  try {
+    const oldCredential = makeOAuthCredential({accountScope:'owner-a'});
+    writeCodingAuth(stateDir, oldCredential);
+    const prepare = createDeviceSessionReadiness({
+      refreshFn: async () => {
+        writeCodingAuth(stateDir, makeOAuthCredential({accountScope:'owner-b', sessionId:'or_ses_session_b'}));
+        return oldCredential;
+      },
+      ensureFn: async () => { throw new Error('must not activate'); },
+    });
+    await assert.rejects(() => prepare({stateDir, url:`${CONTROL_BASE}/cli/v1/devices`,
+      token:oldCredential.accessTokens.control.token}), {code:'account_changed'});
+  } finally { removeStateDir(stateDir); }
+});
+
 /** A device that already holds a key and a registration for one deployment. */
 function registerLocalKey(stateDir, { status = "active" } = {}) {
   const pair = generateDpopKeyPair();
@@ -85,6 +131,50 @@ function registerLocalKey(stateDir, { status = "active" } = {}) {
   return { pair, jkt };
 }
 
+test('a damaged private key fails locally instead of sending an unsigned enrollment request', async () => {
+  const stateDir = makeStateDir();
+  try {
+    writeDpopStore(stateDir, {version: 1, key: {private_jwk: {kty:'invalid'}}, registrations: {}});
+    let requests = 0;
+    await assert.rejects(ensureDpopRegistered({stateDir, controlBaseUrl: CONTROL_BASE,
+      accessToken: TOKEN, deviceId: DEVICE_ID,
+      fetchFn: async () => { requests++; throw new Error('unexpected request'); }}),
+    {code:'dpop_key_unavailable'});
+    assert.equal(requests, 0);
+    assert.equal(readDpopStore(stateDir).key.private_jwk.kty, 'invalid');
+  } finally { removeStateDir(stateDir); }
+});
+
+test('an invalid status response cannot be mistaken for an unregistered device', async () => {
+  const stateDir = makeStateDir();
+  try {
+    let requests = 0;
+    await assert.rejects(ensureDpopRegistered({stateDir, controlBaseUrl: CONTROL_BASE,
+      accessToken: TOKEN, deviceId: DEVICE_ID, fetchFn: async () => {
+        requests++;
+        return {ok: true, status: 200, json: async () => { throw new Error('invalid JSON'); }};
+      }}), {code: 'dpop_invalid_response'});
+    assert.equal(requests, 1);
+    assert.equal(readDpopStore(stateDir), null);
+  } finally { removeStateDir(stateDir); }
+});
+
+test('an incomplete status response cannot trigger a key replacement', async () => {
+  const stateDir = makeStateDir();
+  try {
+    const {jkt} = registerLocalKey(stateDir);
+    let requests = 0;
+    const result = await ensureDpopRegistered({stateDir, controlBaseUrl: CONTROL_BASE,
+      accessToken: TOKEN, deviceId: DEVICE_ID, fetchFn: async () => {
+        requests++;
+        return {ok: true, status: 200, json: async () => ({data: {available: true}})};
+      }});
+    assert.deepEqual(result, {status: 'refused', code: 'dpop_invalid_response'});
+    assert.equal(requests, 1);
+    assert.equal(dpopThumbprint(readDpopStore(stateDir).key.public_jwk), jkt);
+  } finally { removeStateDir(stateDir); }
+});
+
 /**
  * A server that behaves the way the deployed one does.
  *
@@ -97,6 +187,7 @@ function makeFakeServer({
   jkt = null,
   available = true,
   refuseProof = false,
+  refuseActivation = false,
 } = {}) {
   const calls = [];
   const held = { status, jkt };
@@ -145,6 +236,10 @@ function makeFakeServer({
         data: { status: "active", jkt: held.jkt },
       });
     }
+    if (parsed.pathname === "/cli/v1/dpop/session/activate" && method === "POST") {
+      if (refuseActivation) return reply(401, {detail:{code:'device_session_superseded'}});
+      return reply(200, { code: 0, data: { status: "active" } });
+    }
     return reply(404, { detail: { code: "not_found" } });
   };
   return { calls, send, held };
@@ -157,6 +252,19 @@ test("the switch turns the whole thing off and nothing else", () => {
   for (const value of ["off", "0", "false", "no", "disabled", "OFF", " Off "]) {
     assert.equal(dpopEnabled({ ORIGINROUTER_DPOP: value }), false, value);
   }
+});
+
+test('a superseded login never reports device authentication as ready', async () => {
+  const stateDir = makeStateDir();
+  try {
+    const {jkt} = registerLocalKey(stateDir);
+    const server = makeFakeServer({status:'active', jkt, refuseActivation:true});
+    const result = await ensureDpopRegistered({stateDir, controlBaseUrl:CONTROL_BASE,
+      accessToken:TOKEN, deviceId:DEVICE_ID, fetchFn:server.send});
+    assert.deepEqual(result, {status:'refused', code:'device_session_superseded'});
+    const activate = server.calls.find((call) => call.path.endsWith('/session/activate'));
+    assert.ok(activate.headers.DPoP, 'activation proves possession of the device key');
+  } finally { removeStateDir(stateDir); }
 });
 
 test("the public aliases are one deployment and a WebSocket folds onto its origin", () => {
@@ -440,6 +548,7 @@ test("registering walks the four steps and ends up active", async () => {
       "GET /cli/v1/dpop/status",
       "POST /cli/v1/dpop/key",
       "POST /cli/v1/dpop/proof",
+      "POST /cli/v1/dpop/session/activate",
     ]);
 
     // The registration the server took is the key this device signs with,
@@ -483,7 +592,7 @@ test("a key the server already holds is not registered again", async () => {
       fetchFn: server.send,
     });
     assert.equal(result.status, "active");
-    assert.deepEqual(server.calls.map((call) => call.path), ["/cli/v1/dpop/status"]);
+    assert.deepEqual(server.calls.map((call) => call.path), ["/cli/v1/dpop/status", "/cli/v1/dpop/session/activate"]);
     assert.equal(
       readDpopRegistration(stateDir, deploymentFor(CONTROL_BASE)).status,
       "active",
@@ -510,6 +619,7 @@ test("a key the server holds as pending is proved, not registered", async () => 
     assert.deepEqual(server.calls.map((call) => call.path), [
       "/cli/v1/dpop/status",
       "/cli/v1/dpop/proof",
+      "/cli/v1/dpop/session/activate",
     ]);
   } finally {
     removeStateDir(stateDir);
@@ -852,6 +962,7 @@ test("the recovery reads what it needs when it runs, not when it is set up", asy
       "/cli/v1/dpop/status",
       "/cli/v1/dpop/key",
       "/cli/v1/dpop/proof",
+      "/cli/v1/dpop/session/activate",
     ]);
   } finally {
     removeStateDir(stateDir);
