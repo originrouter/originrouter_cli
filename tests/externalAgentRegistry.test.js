@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
+import { AgentCatalog } from "../src/persistence/agentCatalog.js";
 import {
   ExternalAgentRegistry,
   isCollaborationSessionPayload,
@@ -337,6 +341,169 @@ assert.equal(registry.list()[0].status, "stopped");
   const types = tail.events.map((event) => event.type);
   assert.ok(types.includes("session.exited"));
   assert.ok(types.includes("session.error"));
+}
+
+{
+  // An unregister ends the process, not the run. The row stays so the
+  // durable facts it still names — above all the transcript — remain
+  // answerable; what goes is everything only a live process could consume.
+  let clock = 7_000_000;
+  const retained = new ExternalAgentRegistry({ now: () => clock });
+  retained.register({
+    sessionId: "done-1",
+    agent: "claude",
+    transcriptPath: "/tmp/done-1.jsonl",
+  });
+  retained.appendEvent("done-1", { type: "agent.text", text: "bye" });
+  retained.enqueueCommand("done-1", { type: "agent.message", message: "queued" });
+  retained.appendEvent("done-1", {
+    type: "agent.interaction.requested",
+    interactionId: "ask-1",
+    kind: "permission",
+  });
+  assert.equal(retained.unregister("done-1"), true);
+
+  assert.equal(retained.has("done-1"), true, "the run is still known");
+  const stoppedRow = retained.list().find((row) => row.session_id === "done-1");
+  assert.equal(stoppedRow.status, "stopped");
+  assert.equal(stoppedRow.attached, false);
+  assert.equal(stoppedRow.pending_approval_count, 0,
+    "a dead process holds no pending approvals");
+  assert.throws(() => retained.commandsAfter("done-1"), /not active/);
+  assert.throws(() => retained.enqueueCommand("done-1", { type: "agent.message" }),
+    /not active/);
+  // `require` — the read gate — still passes. The transcript file itself is a
+  // filesystem concern, so a missing path must surface as a file error, not
+  // as "this daemon never heard of the session".
+  // `require` — the read gate — still passes. A transcript that is gone
+  // from disk reads as an empty page, not as "this daemon never heard of
+  // the session".
+  assert.equal(retained.history("done-1").messages.length, 0);
+  assert.equal(
+    retained.controlSnapshot("done-1").session.status,
+    "stopped",
+  );
+
+  // Registering the same session id again is the merge path a reconnected
+  // wrapper already uses: the retained row re-attaches, its event tail
+  // survives, and no second session appears.
+  retained.register({ sessionId: "done-1", agent: "claude" });
+  const revived = retained.list().find((row) => row.session_id === "done-1");
+  assert.equal(revived.status, "running");
+  assert.equal(revived.attached, true);
+  assert.equal(
+    retained.list().filter((row) => row.session_id === "done-1").length,
+    1,
+  );
+  assert.equal(
+    retained.eventsAfter(0).events.some((event) => event.text === "bye"),
+    true,
+  );
+}
+
+{
+  // A daemon restart used to blank the registry: every finished session the
+  // App asked about answered `session_not_registered` forever, and every run
+  // the catalog still believed live stayed `running` in the catalog with no
+  // process behind it. The durable half of the registry is rebuilt from the
+  // catalog instead.
+  const home = mkdtempSync(join(tmpdir(), "originrouter-registry-rehydrate-"));
+  try {
+    let clock = Date.parse("2026-11-16T10:00:00Z");
+    const catalog = new AgentCatalog({ stateDir: home });
+    catalog.upsertSession({
+      sessionId: "maybe-live-1",
+      conversationId: "maybe-live-1",
+      runId: "run-live-1",
+      agent: "claude",
+      title: "Still working",
+      deviceId: "device-1",
+      cwd: "/srv/live",
+      status: "running",
+      nativeSessionId: "native-live-1",
+      transcriptPath: "/tmp/native-live-1.jsonl",
+      startedAt: "2026-11-16T09:00:00Z",
+    });
+    catalog.upsertSession({
+      sessionId: "zombie-run-1",
+      conversationId: "zombie-run-1",
+      runId: "run-zombie-1",
+      agent: "claude",
+      title: "Died with the old daemon",
+      deviceId: "device-1",
+      status: "running",
+      startedAt: "2026-11-16T08:00:00Z",
+    });
+    catalog.upsertSession({
+      sessionId: "finished-run-1",
+      conversationId: "finished-conv-1",
+      runId: "run-finished-1",
+      agent: "claude",
+      title: "Done and dusted",
+      deviceId: "device-1",
+      status: "stopped",
+      nativeSessionId: "native-finished-1",
+      transcriptPath: "/tmp/native-finished-1.jsonl",
+      startedAt: "2026-11-16T07:00:00Z",
+      exitedAt: "2026-11-16T07:30:00Z",
+    });
+
+    const restored = new ExternalAgentRegistry({ catalog, now: () => clock });
+    const rows = Object.fromEntries(
+      restored.list().map((row) => [row.session_id, row]),
+    );
+
+    // A run that ended cleanly comes back as it ended: detached, stopped,
+    // still naming its transcript and its conversation.
+    assert.equal(rows["finished-run-1"].status, "stopped");
+    assert.equal(rows["finished-run-1"].attached, false);
+    assert.equal(rows["finished-run-1"].conversation_id, "finished-conv-1");
+    assert.equal(
+      restored.sessionFacts("finished-run-1").attached,
+      false,
+    );
+    assert.equal(
+      restored.history("finished-run-1").messages.length,
+      0,
+      "a transcript gone from disk reads as an empty page",
+    );
+
+    // A run the catalog last saw live gets the stale window: running but not
+    // yet attached. The first wrapper call is the proof of life that
+    // re-attaches it, and commands queued during the gap are drained.
+    assert.equal(rows["maybe-live-1"].status, "running");
+    assert.equal(rows["maybe-live-1"].attached, false);
+    restored.enqueueCommand("maybe-live-1", {
+      type: "agent.message",
+      message: "sent while the daemon was down",
+    });
+    const drained = restored.commandsAfter("maybe-live-1", 0);
+    assert.equal(drained.commands.length, 1);
+    assert.equal(
+      restored.list().find((row) => row.session_id === "maybe-live-1")
+        .attached,
+      true,
+      "the polling wrapper re-attaches its own row",
+    );
+
+    // A run whose process died with the old daemon gets its grace window,
+    // then `expireStale` finishes it — including the catalog row it left
+    // marked `running`.
+    clock += 91_000;
+    assert.equal(
+      restored.list().find((row) => row.session_id === "zombie-run-1")
+        .status,
+      "stopped",
+    );
+    const zombieRun = catalog.getConversation("zombie-run-1").runs
+      .find((run) => run.originrouter_session_id === "zombie-run-1");
+    assert.equal(zombieRun.status, "stopped");
+    assert.ok(zombieRun.exited_at);
+
+    catalog.close();
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 }
 
 console.log("external agent registry tests ok");

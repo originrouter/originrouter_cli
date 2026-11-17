@@ -11,6 +11,19 @@ export { isCollaborationSessionPayload } from "../runtime/agentSessionKind.js";
 const MAX_EVENTS = 500;
 const MAX_COMMANDS = 200;
 const STALE_AFTER_MS = 90_000;
+// A detached row is retained so durable facts — above all the transcript
+// locator — stay answerable after the process is gone. The retention is
+// bounded; beyond it the oldest dead rows are evicted.
+const MAX_DETACHED_SESSIONS = 200;
+// The catalog statuses a live process can still be behind. The presence
+// reconcile uses the same set.
+const LIVE_STATUSES = new Set([
+  "running",
+  "starting",
+  "waiting_approval",
+  "waiting_input",
+  "waiting_device",
+]);
 
 function nowIso() {
   return new Date().toISOString();
@@ -206,6 +219,7 @@ export class ExternalAgentRegistry {
     this.eventStreamId = `local_stream_${randomUUID()}`;
     this.eventCursor = 0;
     this.listeners = new Set();
+    this.rehydrate();
   }
 
   subscribe(listener) {
@@ -216,6 +230,160 @@ export class ExternalAgentRegistry {
 
   has(sessionId) {
     return this.sessions.has(String(sessionId || ""));
+  }
+
+  // The registry holds two kinds of fact with different lifetimes. Attachment
+  // — is the Agent process here? — is volatile and dies with the daemon. The
+  // run's identity — its session id, the conversation it belongs to, where
+  // its transcript lives — is durable and already written to the catalog by
+  // `register`.
+  //
+  // Rebuilding the durable half on boot is what keeps a finished session
+  // answerable: `history()` reads the transcript the row still names, and
+  // `session_not_registered` once again means "this daemon never heard of
+  // the run" instead of "the run ended".
+  //
+  // A run the catalog last saw as `running` is kept `running` for one stale
+  // window: if its wrapper survived the restart it calls home within seconds
+  // (`noteWrapperContact` re-attaches it), and if it did not, `expireStale`
+  // finishes the row and the catalog entry with the same bookkeeping an
+  // unregister would have done. Every other status is dead for certain and
+  // stays dead.
+  rehydrate() {
+    if (!this.catalog?.listRunsForRegistry) return;
+    let rows;
+    try {
+      rows = this.catalog.listRunsForRegistry();
+    } catch (error) {
+      console.error(
+        `[agent-registry] rehydrating from the catalog failed: `
+        + `${error?.message || error}`,
+      );
+      return;
+    }
+    for (const row of rows || []) {
+      const sessionId = safeText(row.originrouter_session_id, 64);
+      if (!sessionId || this.sessions.has(sessionId)) continue;
+      const startedAtMs = Date.parse(row.started_at) || 0;
+      const exitedAtMs = Date.parse(row.exited_at) || 0;
+      const status = safeText(row.status, 32);
+      // Any status that could still describe a live process — the same set
+      // the presence reconcile treats as live — earns the re-attach window.
+      // It lands as `running` because that is the only live status
+      // `expireStale` and `requireActive` understand; the finer waiting
+      // states rebuild themselves from the first event after re-attach.
+      const live = LIVE_STATUSES.has(status);
+      // The field set mirrors `register` minus everything only a live
+      // process provides. Both halves must stay in sync: `project` reads all
+      // of it, and an unlisted field comes back `undefined` on the wire.
+      this.sessions.set(sessionId, {
+        sessionId,
+        sessionKind: isCollaborationSessionPayload({
+          sessionId,
+          runId: row.run_id,
+          startedBy: row.started_by,
+        })
+          ? "collaboration"
+          : "interactive",
+        agent: safeText(row.agent_type, 32) || "unknown",
+        runtime: safeText(row.runtime, 64),
+        supportsRuntimeRecovery: false,
+        supportsDeviceTools: false,
+        title:
+          safeText(row.title, 191)
+          || defaultConversationTitle(row.agent_type || "Agent"),
+        deviceId: safeText(row.device_id, 191),
+        deviceName: safeText(row.device_name, 191),
+        cwd: safeText(row.workspace_path, 1024),
+        pid: Number(row.pid) || null,
+        status: live ? "running" : status || "stopped",
+        conversationId: safeText(row.conversation_id, 96) || sessionId,
+        conversationLabel: safeText(row.conversation_id, 96) || sessionId,
+        nativeSessionId: safeText(row.native_session_id, 191),
+        transcriptPath: safeText(row.transcript_locator, 4096),
+        startedAt: safeText(row.started_at, 64) || nowIso(),
+        // The grace window is what separates "the catalog thinks it is
+        // running" from "it is running": it starts now, and the first
+        // wrapper call re-attaches the row before `expireStale` retires it.
+        lastSeenAtMs: live ? this.now() : exitedAtMs || startedAtMs || this.now(),
+        attached: false,
+        attachedAtMs: startedAtMs || null,
+        detachedAtMs: live ? null : exitedAtMs || startedAtMs || this.now(),
+        events: [],
+        eventIds: new Set(),
+        eventSequence: 0,
+        commands: [],
+        commandSequence: 0,
+        commandStreamId: `local_commands_${randomUUID()}`,
+        pendingInteractions: new Set(),
+        pendingInteractionRequests: new Map(),
+        pendingInteractionKinds: new Map(),
+        mode: "default",
+        modeControl: "unsupported",
+        availableModes: [],
+        model: null,
+        modelProvider: null,
+        modelSource: "device",
+        modelControl: "unsupported",
+        effort: null,
+        effortControl: "unsupported",
+        availableEfforts: [],
+        autonomyRevision: 0,
+        autonomyProfile: "manual",
+        autonomyControl: "unsupported",
+        availableAutonomyProfiles: [],
+        allowedAutonomyScopes: [],
+        availableAutonomyScopes: [],
+        approvalPolicy: null,
+        aiReviewPolicy: null,
+        autonomyStatus: null,
+        controlResults: new Map(),
+        approvalPolicyCapabilities: null,
+        detailProfile: "concise",
+        detailSource: "builtin_default",
+        currentStep: "Stopped",
+        turnState: "idle",
+      });
+    }
+    this.evictDetachedOverflow();
+  }
+
+  // The retained half of the map is bounded. Detached rows are evicted oldest
+  // first; a detached row that is still `running` is in its re-attach window
+  // and is never evicted by retention.
+  evictDetachedOverflow() {
+    const detached = [...this.sessions.values()].filter(
+      (session) => session.attached === false && session.status !== "running",
+    );
+    if (detached.length <= MAX_DETACHED_SESSIONS) return;
+    const evict = detached.length - MAX_DETACHED_SESSIONS;
+    detached.sort(
+      (a, b) =>
+        (Number(a.detachedAtMs) || Number(a.lastSeenAtMs) || 0)
+        - (Number(b.detachedAtMs) || Number(b.lastSeenAtMs) || 0),
+    );
+    for (const session of detached.slice(0, evict)) {
+      this.sessions.delete(session.sessionId);
+    }
+  }
+
+  // Every wrapper endpoint is a live call: a session that asks its daemon
+  // anything proves its process is still here. Attachment is authoritative
+  // presence, so the proof re-attaches a detached row rather than leaving it
+  // to contradict the very call it just answered.
+  noteWrapperContact(sessionId) {
+    const session = this.sessions.get(String(sessionId || ""));
+    if (!session || session.attached !== false) return;
+    session.attached = true;
+    session.attachedAtMs = this.now();
+    session.detachedAtMs = null;
+    session.lastSeenAtMs = this.now();
+    if (session.status !== "running") session.status = "running";
+    this.notify("updated", session.sessionId, {
+      status: "running",
+      attached: true,
+      attachedAt: new Date(session.attachedAtMs).toISOString(),
+    });
   }
 
   isCollaborationSession(sessionId) {
@@ -459,6 +627,7 @@ export class ExternalAgentRegistry {
 
   update(sessionId, payload = {}) {
     const session = this.require(sessionId);
+    this.noteWrapperContact(sessionId);
     const nextConversationId = safeText(payload.conversationId, 96);
     // A run that now holds a different conversation starts over: the events
     // and the pending interactions it collected belong to the conversation it
@@ -555,6 +724,7 @@ export class ExternalAgentRegistry {
 
   heartbeat(sessionId) {
     const session = this.require(sessionId);
+    this.noteWrapperContact(sessionId);
     session.lastSeenAtMs = this.now();
     return this.project(session);
   }
@@ -572,21 +742,40 @@ export class ExternalAgentRegistry {
         exitedAt: new Date(this.now()).toISOString(),
       });
     } catch {}
-    // Keep the session in the registry briefly so the detach notification can
-    // be forwarded before any later lookup fails. It is removed on the next
-    // pass once the projection has been emitted.
+    // The process is gone but the run is not: the row stays so its durable
+    // facts — above all the transcript — remain answerable, exactly as a
+    // rehydrated row does after a daemon restart. What does not stay is
+    // anything only a live process could still consume: the undelivered
+    // commands and the approvals it can no longer resolve. The event tail
+    // survives trimmed to the tail a control snapshot would publish.
+    session.commands = [];
+    session.pendingInteractions.clear();
+    session.pendingInteractionRequests.clear();
+    session.pendingInteractionKinds.clear();
+    if (session.events.length > 100) {
+      session.events = session.events.slice(-100);
+      session.eventIds = new Set(
+        session.events.map((event) => event.eventId).filter(Boolean),
+      );
+    }
     this.notify("unregistered", sessionId, {
       status: session.status,
       attached: false,
       detachedAt: new Date(session.detachedAtMs).toISOString(),
       session: this.project(session),
     });
-    this.sessions.delete(sessionId);
+    this.evictDetachedOverflow();
     return true;
   }
 
   appendEvent(sessionId, event) {
     const session = this.require(sessionId);
+    // Events are deliberately not proof of life: the wrapper replays its
+    // outbox on reconnect, so an arriving event can be stale content from a
+    // dead run, and watchers that distrust events from detached sessions
+    // would see the replay re-attach the row and then trust every event
+    // after it. Attachment is re-established by a direct call — a poll, a
+    // heartbeat, a registration — never by the event stream itself.
     const providedEventId = safeText(event?.eventId, 96);
     if (providedEventId && session.eventIds.has(providedEventId)) {
       return session.eventSequence;
@@ -816,6 +1005,7 @@ export class ExternalAgentRegistry {
 
   commandsAfter(sessionId, after = 0) {
     const session = this.requireActive(sessionId);
+    this.noteWrapperContact(sessionId);
     const commands = session.commands.filter(
       (item) => Number(item.commandSequence || 0) > Number(after || 0),
     );

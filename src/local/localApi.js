@@ -1578,6 +1578,7 @@ async function dispatch(ctx, req, res) {
             return sendError(res, 400, "invalid output observation sequence");
           }
           ctx.externalAgentRegistry.requireActive(sessionId);
+          ctx.externalAgentRegistry.noteWrapperContact(sessionId);
           ctx.externalAgentRegistry.notify("observation", sessionId, { turnId, text: chunk,
             ...(body.sequence == null ? {} : {sequence:body.sequence}) });
           return sendOk(res, { accepted: true });
@@ -1600,6 +1601,7 @@ async function dispatch(ctx, req, res) {
             const event = body.event;
             if (!/^dta_[0-9a-f-]{36}$/i.test(String(event.requestId || "")) || typeof event.accepted !== "boolean") return sendError(res, 400, "invalid device tool approval result");
             ctx.externalAgentRegistry.requireActive(sessionId);
+            ctx.externalAgentRegistry.noteWrapperContact(sessionId);
             ctx.externalAgentRegistry.notify("device_tool_approval_result", sessionId, event);
             return sendOk(res, {accepted:true});
           }
@@ -1611,6 +1613,7 @@ async function dispatch(ctx, req, res) {
               return sendError(res, 400, "invalid interrupt result");
             }
             ctx.externalAgentRegistry.requireActive(sessionId);
+            ctx.externalAgentRegistry.noteWrapperContact(sessionId);
             ctx.externalAgentRegistry.notify("recovery_result", sessionId, event);
             return sendOk(res, { accepted: true });
           }

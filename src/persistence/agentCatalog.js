@@ -1244,6 +1244,28 @@ export class AgentCatalog {
     return rows.map(publicConversation);
   }
 
+  // The registry rebuilds its detached half from these runs when the daemon
+  // restarts. One row per run — not one per conversation — because the App
+  // addresses history and presence by the run's session id, and a resumed
+  // conversation is several runs folded onto one row.
+  listRunsForRegistry({ limit = 200 } = {}) {
+    const params = {
+      limit: Math.max(1, Math.min(MAX_LIMIT, Number(limit) || 200)),
+    };
+    return this.db.prepare(`
+      SELECT r.originrouter_session_id, r.conversation_id, r.run_id,
+             r.device_id, r.device_name, r.runtime, r.provider, r.model,
+             r.started_by, r.pid, r.status, r.started_at, r.exited_at,
+             c.agent_type, c.native_session_id, c.title, c.transcript_locator,
+             w.canonical_path AS workspace_path
+      FROM agent_runs r
+      JOIN agent_conversations c ON c.conversation_id = r.conversation_id
+      LEFT JOIN agent_workspaces w ON w.workspace_id = c.workspace_id
+      ORDER BY r.started_at DESC, r.rowid DESC
+      LIMIT @limit
+    `).all(params);
+  }
+
   listConversationPage({
     collection = "history",
     search = "",

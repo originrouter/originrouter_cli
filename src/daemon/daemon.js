@@ -559,7 +559,13 @@ export async function startDaemon(args) {
   const reconcileAgentPresence = async () => {
     if (!relayConnected) return;
     const attached = new Set(
-      externalAgentRegistry.list().map((item) => item.session_id),
+      externalAgentRegistry
+        .list()
+        // The registry retains a run after its process is gone so its
+        // durable facts stay answerable. Membership is knowledge, not
+        // presence: only a row still attached counts as live.
+        .filter((item) => item.attached !== false)
+        .map((item) => item.session_id),
     );
     try {
       const conversations = agentCatalog

@@ -49,6 +49,12 @@ export const PROTECTED_DEVICE_MESSAGE_TYPES = new Set([
   // The daemon's answer for a session it has not registered: it names the
   // session and is a reply on the same pairwise route as the page.
   "agent.history.delivery",
+  // The daemon's terminal refusal for a command aimed at a dead run. Same
+  // shape as the history answer — a reply on the pairwise route the
+  // command arrived on. Without membership it fell onto the plaintext
+  // fallback, which has no route for a targetless reply, so the App heard
+  // nothing and the refusal existed only in the daemon's logs.
+  "agent.control.delivery",
   "agent.audit.request",
   "agent.audit.page",
   "agent.inquiry.request",

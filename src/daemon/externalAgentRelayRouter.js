@@ -1,5 +1,9 @@
 /** The code the App recognises for "this device does not have the session yet". */
 export const SESSION_NOT_REGISTERED = "session_not_registered";
+// The daemon knows the run but its process is gone. Distinct from
+// `session_not_registered`, which means the daemon never heard of it and may
+// still learn of it; a detached run is terminal for commands.
+export const SESSION_DETACHED = "session_detached";
 
 const DIRECT_APP_EVENT_TYPES = new Set([
   "agent.interaction.requested",
@@ -127,7 +131,46 @@ export class ExternalAgentRelayRouter {
     }
 
     if (!SESSION_COMMAND_TYPES.has(payload.type)) return false;
-    this.registry.enqueueCommand(sessionId, payload);
+    // Commands are for a live process, not for the run the registry still
+    // knows. A retained detached row answers reads — its transcript is a
+    // durable fact — but a command queued onto it has no poller to drain it,
+    // so the App hears the refusal instead of writing into a queue nobody
+    // reads.
+    //
+    // The gate is both halves together. A detached run that is no longer
+    // live is refused outright. A live session holding a pending approval
+    // reads `waiting_approval` while its process is very much alive — the
+    // public status is not the presence fact — and a run in its re-attach
+    // window (`attached === false`, still `running`) queues so a message
+    // sent mid-restart is not dropped.
+    const facts = this.registry.sessionFacts?.(sessionId);
+    if (facts && facts.attached === false && facts.status !== "running") {
+      await this.relayClient.send("agent.control.delivery", withoutUndefined({
+        sessionId,
+        requestId: payload.requestId,
+        accepted: false,
+        retryable: false,
+        code: SESSION_DETACHED,
+        reason: "The session is not running on this device.",
+      }));
+      return true;
+    }
+    try {
+      this.registry.enqueueCommand(sessionId, payload);
+    } catch (error) {
+      if (error?.code !== "SESSION_NOT_ACTIVE") throw error;
+      // The row went stale between the check and the write. The App still
+      // gets a terminal answer rather than the silent drop an uncaught
+      // throw would have produced.
+      await this.relayClient.send("agent.control.delivery", withoutUndefined({
+        sessionId,
+        requestId: payload.requestId,
+        accepted: false,
+        retryable: false,
+        code: SESSION_DETACHED,
+        reason: "The session is not running on this device.",
+      }));
+    }
     return true;
   }
 

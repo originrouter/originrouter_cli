@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import path from "node:path";
 import test from "node:test";
 
 import { canonicalJson } from "../src/crypto/deviceE2eeIdentity.js";
+import { PROTECTED_DEVICE_MESSAGE_TYPES } from "../src/security/deviceE2eeRelayTransport.js";
 import { ExternalAgentRelayRouter } from "../src/daemon/externalAgentRelayRouter.js";
 
 function fixture() {
@@ -601,4 +604,155 @@ test("an unregistered session's other frames still fall through to the session m
   );
   assert.deepEqual(sent, []);
   assert.deepEqual(commands, []);
+});
+
+test("a command for a run whose process is gone gets a terminal answer", async () => {
+  // The registry keeps knowing a session after its process ends so its
+  // transcript stays answerable. A command queued onto that row has no
+  // wrapper to drain it — before the row was deleted outright the command
+  // simply vanished; now the App hears the refusal.
+  const sent = [];
+  const commands = [];
+  const router = new ExternalAgentRelayRouter({
+    registry: {
+      has: () => true,
+      sessionFacts: () => ({ status: "stopped", attached: false }),
+      enqueueCommand: (sessionId, command) => commands.push({ sessionId, command }),
+    },
+    relayClient: {
+      send: async (type, payload) => sent.push({ type, payload }),
+    },
+  });
+  assert.equal(
+    await router.handle({
+      type: "agent.message",
+      sessionId: "dead-1",
+      requestId: "req-dead-1",
+      message: "still there?",
+    }),
+    true,
+  );
+  assert.deepEqual(commands, []);
+  assert.deepEqual(sent, [
+    {
+      type: "agent.control.delivery",
+      payload: {
+        sessionId: "dead-1",
+        requestId: "req-dead-1",
+        accepted: false,
+        retryable: false,
+        code: "session_detached",
+        reason: "The session is not running on this device.",
+      },
+    },
+  ]);
+});
+
+test("a live session holding a pending approval still takes its resolve", async () => {
+  // `waiting_approval` is the public status of a live process waiting on its
+  // user — refusing its `agent.interaction.resolve` because the status is
+  // not literally `running` deadlocks the approval the command exists to
+  // answer. Attachment is the gate; the waiting states are not detachment.
+  const commands = [];
+  const router = new ExternalAgentRelayRouter({
+    registry: {
+      has: () => true,
+      sessionFacts: () => ({ status: "waiting_approval", attached: true }),
+      enqueueCommand: (sessionId, command) => commands.push({ sessionId, command }),
+    },
+    relayClient: {
+      send: async () => {
+        throw new Error("a waiting session is alive; no refusal is owed");
+      },
+    },
+  });
+  assert.equal(
+    await router.handle({
+      type: "agent.interaction.resolve",
+      sessionId: "waiting-1",
+      interactionId: "approval-1",
+      action: "allow",
+    }),
+    true,
+  );
+  assert.equal(commands.length, 1);
+});
+
+test("a run inside its re-attach window still queues commands", async () => {
+  // A daemon restart leaves a live wrapper detached for the seconds it needs
+  // to re-register. Dropping a user's message on that race is worse than
+  // holding it, so a `running` row queues whether or not it has re-attached.
+  const commands = [];
+  const router = new ExternalAgentRelayRouter({
+    registry: {
+      has: () => true,
+      sessionFacts: () => ({ status: "running", attached: false }),
+      enqueueCommand: (sessionId, command) => commands.push({ sessionId, command }),
+    },
+    relayClient: {
+      send: async () => {
+        throw new Error("no delivery is owed while the run is live");
+      },
+    },
+  });
+  assert.equal(
+    await router.handle({
+      type: "agent.message",
+      sessionId: "grace-1",
+      message: "hold this",
+    }),
+    true,
+  );
+  assert.equal(commands.length, 1);
+});
+
+test("a command that went stale between the check and the write still answers", async () => {
+  // `expireStale` can retire a row after `sessionFacts` read it. The enqueue
+  // then throws, and an uncaught throw is exactly the silent drop the
+  // delivery answers instead of.
+  const sent = [];
+  const router = new ExternalAgentRelayRouter({
+    registry: {
+      has: () => true,
+      sessionFacts: () => ({ status: "running", attached: true }),
+      enqueueCommand: () => {
+        const error = new Error("local agent session is not active");
+        error.code = "SESSION_NOT_ACTIVE";
+        throw error;
+      },
+    },
+    relayClient: {
+      send: async (type, payload) => sent.push({ type, payload }),
+    },
+  });
+  assert.equal(
+    await router.handle({ type: "agent.message", sessionId: "stale-1", message: "hi" }),
+    true,
+  );
+  assert.equal(sent[0].payload.code, "session_detached");
+});
+
+test("every *.delivery reply the daemon emits is on the protected route", async () => {
+  // A delivery is a reply: it carries no targetDeviceId and can only ride the
+  // pairwise E2EE session its request arrived on. Miss the protected set and
+  // the message falls onto the plaintext fallback, which has no route for a
+  // targetless reply — the App hears nothing and the refusal exists only in
+  // the daemon's logs. `agent.control.delivery` shipped exactly that way.
+  // The relay does not whitelist types, so nothing but this test can notice.
+  const src = await fs.readdir("src", { recursive: true });
+  const sentTypes = new Set();
+  for (const name of src) {
+    if (!String(name).endsWith(".js")) continue;
+    const text = await fs.readFile(path.join("src", String(name)), "utf8");
+    for (const match of text.matchAll(/\.send(?:Acknowledged)?\("([^"]+\.delivery)"/g)) {
+      sentTypes.add(match[1]);
+    }
+  }
+  assert.ok(sentTypes.size > 0, "the scan found no *.delivery sends — check the pattern");
+  for (const type of sentTypes) {
+    assert.ok(
+      PROTECTED_DEVICE_MESSAGE_TYPES.has(type),
+      `${type} is sent but not protected — it will be dropped as a targetless plaintext reply`,
+    );
+  }
 });
