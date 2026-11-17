@@ -5,7 +5,7 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ## Unreleased
 
-## 0.6.0 - 2026-11-07
+## 0.6.0 - 2026-11-17
 
 ### Added
 
@@ -185,6 +185,14 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
   moment the device's providers changed, and the CLI's own
   `availableSessionModels` — a third derivation of the same rule — is gone
   with it.
+- **An approval policy is enforced; there is no observation mode.** Shadow
+  mode evaluated a policy, recorded what it would have decided, and then
+  asked the user anyway — a decision nobody was bound by. It is gone: the
+  evaluator's decision is the outcome, so allow allows, deny denies, and only
+  "ask" reaches the user. A policy file that still carries the legacy
+  `metadata.enforcement: "shadow"` marker keeps loading and is enforced like
+  any other — the marker now loads as a validation warning, not a mode — and
+  the `agent.approval_policy.shadow` event went with it.
 
 ### Fixed
 
@@ -232,6 +240,41 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
   uploaded again. `docs/agent-conversation-id-alignment.md` says what happened
   and when the same shape appears again (the same conversation used on a
   second device).
+- **A credential write or clear can no longer cross an account switch.** An
+  OAuth refresh, a logout, or a login inspection that stalled mid-flight used
+  to act on whichever account was active when it resumed, so a slow operation
+  started under one account could overwrite or erase a newer login under
+  another. Credential files now sit under a cross-process lock — a SQLite
+  transaction, which the operating system releases when a process dies, so a
+  dead holder no longer leaves a lock its successor has to time out — and
+  every clear and refresh compares the stored session's identity against the
+  one the operation began with. An operation that finds the account changed
+  underneath it answers `account_changed` instead of acting on a session it
+  was never started against, and a logout that lands late leaves the newer
+  login alone.
+- **The device's name is read from the account registry, once a session
+  exists.** Enrollment and the name a device shows used to be decided on their
+  own; a device that had already been named on another account could carry
+  that name into a new login. The account registry is authoritative for a
+  synchronized name: the daemon asks it once the session is up and applies
+  the answer only to the account and session that asked for it — a response
+  that lands after an account switch is dropped — and a name that was
+  synchronized under one account is never proposed as the default for
+  another.
+- **A finished run stays answerable, and a command for a dead run is
+  refused.** Restarting the daemon used to forget every run the registry had
+  ever heard of: history for a completed session answered
+  `session_not_registered` as if the run had never existed, and a command
+  aimed at a dead run was queued into a buffer no process would ever drain —
+  the App got nothing back at all. The registry now rebuilds its runs from
+  the catalogue on boot, so a finished session's transcript stays where
+  `history` can read it. A run the catalogue last saw as live keeps its
+  status for one stale window — a wrapper that survived the restart
+  re-attaches the moment it calls home, and one that does not is finished
+  with the bookkeeping an exit would have done. A command for a run whose
+  process is gone is answered with `session_detached`, a terminal refusal on
+  the protected relay route, so the App hears "not running on this device"
+  instead of silence.
 
 ### Security
 
@@ -247,6 +290,16 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
   logged in since this shipped, an older server that does not have the routes,
   or a server whose migration has not run all keep sending bearer tokens.
   `ORIGINROUTER_DPOP=off` turns the feature off entirely.
+
+  Registration now ends in an activated session, not just a proven key. After
+  the proof the device completes `POST /cli/v1/dpop/session/activate`, and the
+  server answers protected calls only after that step — a login's first
+  protected request used to arrive at a `device_session_not_activated`
+  challenge and fail. The DPoP fetch prepares a session once before a login's
+  first protected request, answers the challenge by activating again and
+  replaying the request once, and concurrent CLI processes run the whole
+  sequence under the same lock that protects the credential store, so two
+  logins share one registration rather than racing two.
 
 ### Upgrade notes
 
