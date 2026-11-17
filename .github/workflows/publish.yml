@@ -28,7 +28,9 @@ jobs:
       - run: npm ci
       - name: Validate release tag and package metadata
         run: npm run release:check -- --tag "${{ github.event.release.tag_name }}"
-      - run: npm test
+      - name: npm test
+        run: npm test
+        timeout-minutes: 15
       - id: package
         run: node -e "const p=require('./package.json'); console.log('name='+p.name); console.log('version='+p.version)" >> "$GITHUB_OUTPUT"
       - id: registry

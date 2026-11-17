@@ -23,7 +23,24 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run release:check
-      - run: npm test
+      - name: Isolate the new-surface test batch per file
+        # These files ship their first Linux run with 0.6.0. A hang inside the
+        # combined node --test run names no file, so each one runs on its own
+        # with a hard ceiling and the batch itself still runs under npm test.
+        if: runner.os == 'Linux'
+        run: |
+          for f in relayClientDisconnect relayDispatchContract runtimeSupervisor \
+            runtimeHistoryOrigin runtimeRecoveryStore runtimeLoopDetector \
+            runtimeOutputSampler scheduledTaskRules scheduledTaskStore \
+            scheduledTaskScheduler scheduledTaskCrashProcess scheduledTaskShutdownHttp \
+            sshConnectionManager remoteTargetStore headlessCredentialVault \
+            headlessVaultProcess deviceToolApproval deviceToolService deviceToolMcpIntegration; do
+            echo "=== $f ==="
+            timeout 120 node --test "./tests/$f.test.js" || { echo "TIMEOUT or FAIL: $f"; exit 1; }
+          done
+      - name: npm test
+        run: npm test
+        timeout-minutes: 15
 
   windows-smoke:
     # Pin Visual Studio 2022 so node-gyp can build native dependencies such
