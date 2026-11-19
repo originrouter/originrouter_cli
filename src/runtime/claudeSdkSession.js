@@ -1252,6 +1252,9 @@ export async function runClaudeSdkSession(rawArgs) {
       message: "Side questions cannot use tools.",
     });
     sideTurnActive = true;
+    // The App's side composer spins on this mark; the SDK's result message
+    // answers agent.task.completed at the other end.
+    await emitSideEvent({ type: "agent.task.started", provider: "claude" });
     let response = "";
     try {
       const sideQuery = query({
@@ -1295,6 +1298,12 @@ export async function runClaudeSdkSession(rawArgs) {
         error: String(error?.message || "side_question_failed").slice(0, 1024),
       });
     } finally {
+      // A query that ends without a result message — a thrown iterator the
+      // catch above already reported aside — still owes the App a terminal
+      // mark, or its streaming entry never closes.
+      if (sideTurnActive) {
+        await emitSideEvent({ type: "agent.task.completed", provider: "claude" });
+      }
       sideTurnActive = false;
     }
   };
@@ -1350,11 +1359,14 @@ export async function runClaudeSdkSession(rawArgs) {
   const handleAgentCommand = async (payload) => {
     const command = normalizeCommandPayload(payload);
     if (command.kind === COMMAND_KIND_SIDE_CLOSE) {
+      // Closing is idempotent: a close that finds no side thread still
+      // achieved the state the reader asked for, so it is not a refusal.
       const { closed } = await closeSide();
       await sendAgentEvent(commandResult(command, {
-        accepted: closed, action: "side_closed",
+        accepted: true,
+        action: closed ? "side_closed" : "side_already_closed",
       }));
-      return closed;
+      return true;
     }
     if (command.kind === COMMAND_KIND_SIDE_MESSAGE) {
       if (!command.text) {
@@ -1492,6 +1504,9 @@ export async function runClaudeSdkSession(rawArgs) {
         mode: currentMode,
         commands: sessionCommands,
         sideOpen,
+        // The badge's word even before the thread exists — the App prints
+        // it on the surface header the moment the reader opens one.
+        sideCapability: "no_tools",
         autonomyProfile,
         autonomy: buildAutonomyStatusEvent({
           provider: "claude",

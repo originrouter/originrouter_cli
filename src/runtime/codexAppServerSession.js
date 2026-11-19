@@ -1294,11 +1294,14 @@ export async function runCodexAppServerSession(rawArgs) {
     const command = normalizeCommandPayload(payload);
     // The side channel uses the same wire type; it is not a slash command.
     if (command.kind === COMMAND_KIND_SIDE_CLOSE) {
+      // Closing is idempotent: a close that finds no side thread still
+      // achieved the state the reader asked for, so it is not a refusal.
       const { closed } = await closeSide();
       await agentEventQueue.enqueue(commandResult(command, {
-        accepted: closed, action: "side_closed",
+        accepted: true,
+        action: closed ? "side_closed" : "side_already_closed",
       }));
-      return closed;
+      return true;
     }
     if (command.kind === COMMAND_KIND_SIDE_MESSAGE) {
       if (!command.text) {
@@ -1420,17 +1423,28 @@ export async function runCodexAppServerSession(rawArgs) {
         return true;
       }
       case "goal": {
+        // The goal record reduces to its objective text; "no goal" and
+        // "just cleared" still answer with a map — a null `data` would be
+        // dropped by the result builder and the reader would see nothing.
+        const goalText = (record) =>
+          typeof record === "string"
+            ? record
+            : record?.objective ?? record?.text ?? null;
         if (!command.args) {
           const goal = await client.getThreadGoal(threadId).catch(() => null);
           await agentEventQueue.enqueue(commandResult(command, {
-            accepted: true, action: "goal", data: goal?.goal || null,
+            accepted: true,
+            action: "goal",
+            data: { goal: goalText(goal?.goal) },
           }));
           return true;
         }
         if (command.args === "clear") {
           await client.clearThreadGoal(threadId);
           await agentEventQueue.enqueue(commandResult(command, {
-            accepted: true, action: "goal_cleared",
+            accepted: true,
+            action: "goal_cleared",
+            data: { goal: null },
           }));
           return true;
         }
@@ -1440,7 +1454,9 @@ export async function runCodexAppServerSession(rawArgs) {
           origin: { type: "user" },
         });
         await agentEventQueue.enqueue(commandResult(command, {
-          accepted: true, action: "goal_set", data: result?.goal || null,
+          accepted: true,
+          action: "goal_set",
+          data: { goal: goalText(result?.goal) ?? command.args },
         }));
         return true;
       }
@@ -1607,7 +1623,10 @@ export async function runCodexAppServerSession(rawArgs) {
         events: recentEvents,
         mode: currentMode,
         commands: sessionCommands,
-        sideThreadId,
+        // The wire fact is the thread's liveness, not its id — the App
+        // answers sideOpen from this and never needs the thread id itself.
+        sideOpen: Boolean(sideThreadId),
+        sideCapability: "read_only_tools",
         autonomyProfile,
         autonomy: buildAutonomyStatusEvent({
           provider: "codex",

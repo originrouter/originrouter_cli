@@ -1655,6 +1655,10 @@ export async function runLocalAgentSession(agent, rawArgs) {
         interactions: interactions.snapshot(),
         events: recentEvents,
         commands: sessionCommands,
+        // Terminal sessions have no side thread to report — but the App
+        // treats the snapshot as authoritative, so the absence must be said
+        // rather than left to a stale true.
+        sideOpen: false,
         mode:
           typeof adapter.modeStatusEvent === "function"
             ? adapter.modeStatusEvent().mode

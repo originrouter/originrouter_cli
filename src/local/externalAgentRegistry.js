@@ -918,6 +918,17 @@ export class ExternalAgentRegistry {
       session.detailSource =
         safeText(event?.detailSource, 32) || session.detailSource;
     }
+    // The side conversation's liveness is a session fact the snapshot must
+    // restate: an App that opens the session after the thread already exists
+    // learns it here, since no event will say so again.
+    if (event?.type === "agent.side.opened") {
+      session.sideOpen = true;
+      session.sideCapability =
+        safeText(event?.capability, 32) || session.sideCapability;
+    }
+    if (event?.type === "agent.side.closed") {
+      session.sideOpen = false;
+    }
     session.turnState = turnStateForEvent(event, session.turnState || "idle");
     session.currentStep = session.turnState === "idle" &&
       (String(event?.type || "").startsWith("agent.interaction.") ||
@@ -1083,6 +1094,12 @@ export class ExternalAgentRegistry {
         session.autonomyStatus,
       // The session's slash-command menu — the App renders exactly this list.
       commands: session.commandMenu || [],
+      // The side conversation's liveness — the App's surface tracks it, and
+      // a snapshot is the only place a late joiner can learn the thread is
+      // already open. `null` never reaches the wire: a session that never
+      // had a side thread still gets the explicit false.
+      sideOpen: session.sideOpen === true,
+      sideCapability: session.sideCapability || null,
       controlResults: [...session.controlResults.values()],
     };
   }
