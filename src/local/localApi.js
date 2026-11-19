@@ -1506,7 +1506,7 @@ async function dispatch(ctx, req, res) {
     }
 
     const localAgentMatch = pathname.match(
-      /^\/agent\/local\/sessions\/([^/]+)\/(update|unregister|events|observation|commands|snapshot|history|audit|message|interrupt|stop|interaction|mode|model|effort|autonomy)$/,
+      /^\/agent\/local\/sessions\/([^/]+)\/(update|unregister|events|observation|commands|snapshot|history|audit|message|command|interrupt|stop|interaction|mode|model|effort|autonomy)$/,
     );
     if (localAgentMatch) {
       const sessionId = decodeURIComponent(localAgentMatch[1]);
@@ -1638,6 +1638,24 @@ async function dispatch(ctx, req, res) {
             sessionId,
             message,
             messageId: body.messageId,
+          });
+          return sendOk(res, {
+            session_id: sessionId,
+            accepted: true,
+            request_id: command.commandId,
+          });
+        }
+        if (action === "command") {
+          // A slash command (or a side-conversation message/close) as the App
+          // composes it. The payload is passed through: the runtime that owns
+          // the session validates it against the menu it published — the
+          // daemon does not second-guess the agents' command tables.
+          const requestId = String(body.requestId || "").slice(0, 128);
+          const command = ctx.externalAgentRegistry.enqueueCommand(sessionId, {
+            type: "agent.command",
+            sessionId,
+            command: body.command,
+            requestId: requestId || undefined,
           });
           return sendOk(res, {
             session_id: sessionId,

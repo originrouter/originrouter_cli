@@ -13,6 +13,7 @@ const DIRECT_APP_EVENT_TYPES = new Set([
 
 const SESSION_COMMAND_TYPES = new Set([
   "agent.message",
+  "agent.command",
   "terminal.input",
   "terminal.resize",
   "terminal.interrupt",

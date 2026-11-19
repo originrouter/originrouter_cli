@@ -1,6 +1,8 @@
 import { RuntimeOutputSampler, claudeStreamPart } from "./runtimeOutputSampler.js";
 import { createAgentPermissionStateTracker } from "./agentPermissionStateTracker.js";
 import process from "node:process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -83,6 +85,7 @@ import {
   modelControlForTransport,
   resolveLaunchModelTarget,
   resolvePricingTarget,
+  seedSessionModelFromDeviceRoute,
   setSessionModel,
   validateSessionModelTarget,
 } from "../proxy/sessionModels.js";
@@ -112,6 +115,21 @@ import {
   readApprovalPolicyReference,
   readWorkspaceApprovalPolicySafe,
 } from "./approvalPolicyStore.js";
+import {
+  AGENT_COMMAND_TYPE,
+  AGENT_SIDE_CLOSED_EVENT,
+  AGENT_SIDE_EVENT,
+  AGENT_SIDE_OPENED_EVENT,
+  buildCommandResultEvent,
+  buildCommandsEvent,
+  claudeSideQuestionPrompt,
+  COMMAND_KIND_SIDE_CLOSE,
+  COMMAND_KIND_SIDE_MESSAGE,
+  commandsForSession,
+  normalizeCommandPayload,
+} from "../agent/slashCommands.js";
+
+const execFileAsync = promisify(execFile);
 
 // Claude Code's own permission modes, kept whole so a status event coming back
 // from the runtime can still be translated into a word. This is a vocabulary,
@@ -574,13 +592,32 @@ export async function runClaudeSdkSession(rawArgs) {
   // stick under the session's `disableAutoMode` pin, so reporting "auto" would
   // show the App a mode the runtime is about to leave on its own.
   let currentMode = floorUnavailablePermissionMode(options.permissionMode || "default") || "default";
-  // The session's model override, if the user pinned one. Null means the
-  // device route is in force.
+  // The session's model is a snapshot pinned at birth, not a pointer at the
+  // device route: a session with none yet — a fresh one, or a stored session
+  // from before sessions carried their own — gets the device's current
+  // default written as its own override here.
   let sessionModel = getSessionModel(stateDir, sessionId);
+  sessionModel ??= seedSessionModelFromDeviceRoute(config, stateDir, sessionId, {
+    agent: "claude",
+    providerResult,
+  });
   // The reasoning effort this session runs on, as the App last named it.
   // Null means nobody has chosen one yet: the run is on whatever the model
   // does by itself, and the device says so as soon as it can tell.
   let sessionEffort = null;
+  // The side conversation's daemon-held state. Claude's side question is a
+  // one-shot forked query, so what a "side conversation" means here is the
+  // open panel plus the question/answer history the next question carries —
+  // the same shape the CLI keeps in `btwHistory`.
+  let sideOpen = false;
+  let sideHistory = [];
+  let sideTurnActive = false;
+  let sideSerial = Promise.resolve();
+  const sessionCommands = commandsForSession({
+    agent: "claude",
+    runtime: "claude-sdk",
+    nativeConfig: options.nativeConfig === true,
+  });
   const invalidScopes = invalidAutonomyScopes(options.autonomyAllowedScopes);
   if (invalidScopes.length) {
     throw new Error(`Unknown unattended scope(s): ${invalidScopes.join(", ")}`);
@@ -1008,12 +1045,17 @@ export async function runClaudeSdkSession(rawArgs) {
     const requestedProvider = String(payload?.provider || "").trim();
     try {
       if (!requested) {
-        // An empty model clears the override and returns the session to the
-        // device route. This is allowed on every transport: clearing is the
-        // safe direction, and it is how an override written while the session
-        // was on route mode is removed after the device moved on.
+        // An empty model resets the session to the device's current default:
+        // the override is dropped and the default pinned again in its place,
+        // so the session keeps a model of its own rather than becoming a
+        // pointer at the route. This is allowed on every transport: clearing
+        // is the safe direction, and it is how an override written while the
+        // session was on route mode is removed after the device moved on.
         clearSessionModel(stateDir, sessionId);
-        sessionModel = null;
+        sessionModel = seedSessionModelFromDeviceRoute(config, stateDir, sessionId, {
+          agent: "claude",
+          providerResult,
+        });
         await reportSessionModel(payload?.requestId || null, { accepted: true });
         // The model the levels were read from is gone, so the levels are
         // read again: the route's model may take a different set.
@@ -1118,6 +1160,10 @@ export async function runClaudeSdkSession(rawArgs) {
     if (stopped) return;
     stopped = true;
     outputSampler.reset();
+    // The side history dies with the session; a queued question must not fork
+    // a session that is going away.
+    sideOpen = false;
+    sideHistory = [];
     deviceToolApproval.close();
     stopHeartbeat();
     abortController.abort();
@@ -1149,6 +1195,287 @@ export async function runClaudeSdkSession(rawArgs) {
     }
   };
 
+  // ---- Side conversation (claude /btw) ----
+  //
+  // The CLI's own semantics, not a thread: a side question is a one-shot SDK
+  // query forked fresh off this session's transcript — `resume` +
+  // `forkSession` — denied every tool, wrapped in the same <system-reminder>
+  // the terminal puts around it. Each follow-up question forks from the *main*
+  // session again; the questions between them live here as `sideHistory`, the
+  // same place the CLI keeps `btwHistory`.
+
+  const emitSideEvent = (event) =>
+    sendAgentEvent({
+      type: AGENT_SIDE_EVENT,
+      provider: "claude",
+      sessionId,
+      event,
+    });
+
+  const openSide = async () => {
+    if (!claudeSessionId) return { opened: false, reason: "session_not_ready" };
+    if (sideOpen) return { opened: true, already: true };
+    sideOpen = true;
+    await sendAgentEvent({
+      type: AGENT_SIDE_OPENED_EVENT,
+      provider: "claude",
+      sessionId,
+      // Honest capability label — Claude's side question is designed
+      // tool-less, and the panel header says so rather than pretending it is
+      // Codex's read-only-tools fork.
+      capability: "no_tools",
+    });
+    return { opened: true };
+  };
+
+  const closeSide = async () => {
+    if (!sideOpen) return { closed: false };
+    sideOpen = false;
+    sideHistory = [];
+    await sendAgentEvent({
+      type: AGENT_SIDE_CLOSED_EVENT,
+      provider: "claude",
+      sessionId,
+    });
+    return { closed: true };
+  };
+
+  const runSideQuestion = async (question) => {
+    const queue = new AsyncMessageQueue();
+    queue.push(toUserMessage(claudeSideQuestionPrompt({
+      question,
+      history: sideHistory,
+    })));
+    queue.close();
+    const denyAllTools = async () => ({
+      behavior: "deny",
+      message: "Side questions cannot use tools.",
+    });
+    sideTurnActive = true;
+    let response = "";
+    try {
+      const sideQuery = query({
+        prompt: queue,
+        options: {
+          cwd,
+          env: { ...process.env, ...providerResult.env },
+          canUseTool: denyAllTools,
+          model,
+          ...(runtimeSettingsOverride?.path
+            ? { settings: runtimeSettingsOverride.path }
+            : {}),
+          resume: claudeSessionId,
+          forkSession: true,
+        },
+      });
+      try {
+        for await (const message of sideQuery) {
+          for (const mapped of mapClaudeSdkMessage(message)) {
+            // The fork's own session id is an implementation detail: the App
+            // knows this stream as the side of the session that spawned it.
+            if (mapped.type === "agent.session_id") continue;
+            if (mapped.type === "agent.text" && mapped.text) {
+              response += mapped.text;
+            }
+            await emitSideEvent(mapped);
+          }
+        }
+      } finally {
+        await sideQuery.return().catch(() => {});
+      }
+      sideHistory.push({
+        question: question.slice(0, 8192),
+        response: response.slice(0, 16384),
+      });
+      if (sideHistory.length > 8) sideHistory.splice(0, sideHistory.length - 8);
+    } catch (error) {
+      await emitSideEvent({
+        type: "agent.task.failed",
+        provider: "claude",
+        error: String(error?.message || "side_question_failed").slice(0, 1024),
+      });
+    } finally {
+      sideTurnActive = false;
+    }
+  };
+
+  // Side questions run one at a time, in the order they arrived — a second
+  // question queued behind the first, exactly like the CLI's single side
+  // panel.
+  const enqueueSideQuestion = (question) => {
+    sideSerial = sideSerial.then(() => runSideQuestion(question)).catch(() => {});
+    return sideSerial;
+  };
+
+  // ---- Slash commands (agent.command) ----
+
+  const commandResult = (command, fields) =>
+    buildCommandResultEvent({
+      sessionId,
+      requestId: command.requestId,
+      command: command.name || command.kind,
+      ...fields,
+    });
+
+  // Commands the CLI resolves itself when they arrive as text: post-text
+  // slash commands. They ride the same queue as any message, and their
+  // outcome comes back through the ordinary event stream
+  // (`local_command_output`, compact boundaries, and so on).
+  const CLAUDE_POST_TEXT_COMMANDS = new Set([
+    "compact", "clear", "init", "review", "security-review", "pr-comments",
+    "recap", "goal", "mcp", "add-dir", "autocompact", "reload-skills",
+    "skill-doctor", "pause-memory",
+  ]);
+
+  const injectCommandText = async (line, requestId) => {
+    await sendAgentEvent({
+      type: "agent.task.started",
+      provider: "claude",
+      id: requestId || `command:${Date.now()}`,
+    });
+    messageQueue.push(toUserMessage(line));
+    await sendAgentEvent({ type: "user.text", provider: "claude", text: line });
+  };
+
+  const claudeGitDiff = async () => {
+    const run = (args) =>
+      execFileAsync("git", args, { cwd, maxBuffer: 4 * 1024 * 1024 })
+        .then(({ stdout }) => stdout)
+        .catch(() => "");
+    const diff = await run(["diff", "HEAD", "--no-color"]);
+    const status = await run(["status", "--porcelain"]);
+    return { diff, status };
+  };
+
+  const handleAgentCommand = async (payload) => {
+    const command = normalizeCommandPayload(payload);
+    if (command.kind === COMMAND_KIND_SIDE_CLOSE) {
+      const { closed } = await closeSide();
+      await sendAgentEvent(commandResult(command, {
+        accepted: closed, action: "side_closed",
+      }));
+      return closed;
+    }
+    if (command.kind === COMMAND_KIND_SIDE_MESSAGE) {
+      if (!command.text) {
+        await sendAgentEvent(commandResult(command, {
+          accepted: false, reason: "empty_message",
+        }));
+        return false;
+      }
+      const opened = await openSide();
+      if (!opened.opened) {
+        await sendAgentEvent(commandResult(command, {
+          accepted: false, reason: opened.reason || "side_open_failed",
+        }));
+        return false;
+      }
+      await emitSideEvent({ type: "user.text", provider: "claude", text: command.text });
+      void enqueueSideQuestion(command.text);
+      await sendAgentEvent(commandResult(command, {
+        accepted: true, action: "side_message",
+      }));
+      return true;
+    }
+
+    switch (command.name) {
+      case "btw":
+      case "side": {
+        const opened = await openSide();
+        if (!opened.opened) {
+          await sendAgentEvent(commandResult(command, {
+            accepted: false, reason: opened.reason || "side_open_failed",
+          }));
+          return false;
+        }
+        await sendAgentEvent(commandResult(command, {
+          accepted: true, action: "side_opened",
+        }));
+        if (command.args) {
+          await emitSideEvent({ type: "user.text", provider: "claude", text: command.args });
+          void enqueueSideQuestion(command.args);
+        }
+        return true;
+      }
+      case "model": {
+        if (options.nativeConfig !== true) {
+          await sendAgentEvent(commandResult(command, {
+            accepted: false, reason: "model_is_gateway_routed",
+          }));
+          return false;
+        }
+        if (!command.args) {
+          await sendAgentEvent(commandResult(command, {
+            accepted: true, action: "model", data: { model: model || null },
+          }));
+          return true;
+        }
+        await queryRef.setModel(command.args);
+        model = command.args;
+        await sendAgentEvent(commandResult(command, { accepted: true }));
+        return true;
+      }
+      case "effort": {
+        if (!command.args) {
+          await reportSessionEffort(command.requestId);
+          await sendAgentEvent(commandResult(command, { accepted: true }));
+          return true;
+        }
+        const applied = await applyEffort({
+          effort: command.args,
+          requestId: command.requestId,
+        });
+        await sendAgentEvent(commandResult(command, { accepted: applied }));
+        return applied;
+      }
+      case "status": {
+        await sendAgentEvent(commandResult(command, {
+          accepted: true,
+          action: "status",
+          data: {
+            nativeSessionId: claudeSessionId,
+            model: model || null,
+            sessionModel: sessionModel || null,
+            mode: currentMode,
+            effort: sessionEffort,
+            transcriptPath,
+          },
+        }));
+        return true;
+      }
+      case "usage": {
+        const usage = queryRef
+          ? await queryRef.getContextUsage().catch((error) => ({
+              error: String(error?.message || "usage_read_failed"),
+            }))
+          : null;
+        await sendAgentEvent(commandResult(command, {
+          accepted: Boolean(usage), action: "usage", data: usage || {},
+        }));
+        return Boolean(usage);
+      }
+      case "diff": {
+        const result = await claudeGitDiff();
+        await sendAgentEvent(commandResult(command, {
+          accepted: true, action: "diff", data: result,
+        }));
+        return true;
+      }
+      default: {
+        if (CLAUDE_POST_TEXT_COMMANDS.has(command.name)) {
+          const line = `/${command.name}${command.args ? ` ${command.args}` : ""}`;
+          await injectCommandText(line, command.requestId);
+          await sendAgentEvent(commandResult(command, { accepted: true }));
+          return true;
+        }
+        await sendAgentEvent(commandResult(command, {
+          accepted: false, reason: "unsupported",
+        }));
+        return false;
+      }
+    }
+  };
+
   const handleRemoteEvent = async (payload) => {
     if (!payload) return false;
     if (payload.type === "agent.device_tool.approval") return deviceToolApproval.start(payload);
@@ -1163,6 +1490,8 @@ export async function runClaudeSdkSession(rawArgs) {
         interactions: interactions.snapshot(),
         events: recentEvents,
         mode: currentMode,
+        commands: sessionCommands,
+        sideOpen,
         autonomyProfile,
         autonomy: buildAutonomyStatusEvent({
           provider: "claude",
@@ -1175,6 +1504,9 @@ export async function runClaudeSdkSession(rawArgs) {
       return true;
     }
     if (payload.sessionId !== sessionId) return false;
+    if (payload.type === AGENT_COMMAND_TYPE) {
+      return handleAgentCommand(payload);
+    }
     if (payload.type === "agent.history.request") {
       let history = { messages: [], nextCursor: null, hasMore: false };
       try {
@@ -1612,6 +1944,7 @@ export async function runClaudeSdkSession(rawArgs) {
       mode: currentMode,
       modeControl: "supported",
       availableModes: CLAUDE_AVAILABLE_MODES,
+      commandMenu: sessionCommands,
       autonomyProfile,
       autonomyControl: "supported",
       allowedAutonomyScopes: autonomyAllowedScopes,
@@ -1631,6 +1964,11 @@ export async function runClaudeSdkSession(rawArgs) {
     }
     await syncCatalog("running");
     await sendAgentEvent({ type: "agent.ready", provider: "claude" });
+    await sendAgentEvent(buildCommandsEvent({
+      sessionId,
+      provider: "claude",
+      commands: sessionCommands,
+    }));
     await reportMode();
     await reportAutonomy();
     await reportDetail();

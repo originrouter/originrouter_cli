@@ -112,6 +112,12 @@ export class CodexAppServerClient {
     this.completedTurnOrder = [];
     this.currentTurnId = null;
     this.turnOpen = false;
+    // Threads run turns concurrently (a side conversation forks its own
+    // thread and turns there while the main thread works). Turn state is
+    // per-thread: `openTurns` maps threadId → turnId, `turnThreads` maps
+    // turnId → threadId for notifications that name only the turn.
+    this.openTurns = new Map();
+    this.turnThreads = new Map();
     this.interruptingTurns = new Set();
     this.rpcTimeoutMs = options.rpcTimeoutMs ?? CODEX_RPC_TIMEOUT_MS;
     this.approvalTimeoutMs = options.approvalTimeoutMs ?? CODEX_APPROVAL_TIMEOUT_MS;
@@ -264,6 +270,8 @@ export class CodexAppServerClient {
     this.completedTurnOrder.length = 0;
     this.turnOpen = false;
     this.currentTurnId = null;
+    this.openTurns.clear();
+    this.turnThreads.clear();
     this.interruptingTurns.clear();
   }
 
@@ -347,6 +355,71 @@ export class CodexAppServerClient {
 
   updateThreadSettings(params = {}) {
     return this.request("thread/settings/update", params);
+  }
+
+  // ---- Slash-command surface RPCs ----
+  //
+  // These back the daemon's slash-command router: the commands the App can
+  // type are resolved here rather than injected into a TUI that may not
+  // exist on this session.
+
+  forkThread(threadId, params = {}) {
+    return this.request("thread/fork", { threadId, ...params });
+  }
+
+  injectItems(threadId, items) {
+    return this.request("thread/inject_items", { threadId, items });
+  }
+
+  unsubscribeThread(threadId) {
+    return this.request("thread/unsubscribe", { threadId });
+  }
+
+  compactThread(threadId) {
+    return this.request("thread/compact/start", { threadId });
+  }
+
+  setThreadName(threadId, name) {
+    return this.request("thread/name/set", { threadId, name });
+  }
+
+  readThread(threadId, params = {}) {
+    return this.request("thread/read", { threadId, ...params });
+  }
+
+  getThreadGoal(threadId) {
+    return this.request("thread/goal/get", { threadId });
+  }
+
+  setThreadGoal(threadId, params = {}) {
+    return this.request("thread/goal/set", { threadId, ...params });
+  }
+
+  clearThreadGoal(threadId) {
+    return this.request("thread/goal/clear", { threadId });
+  }
+
+  listBackgroundTerminals(threadId, params = {}) {
+    return this.request("thread/backgroundTerminals/list", { threadId, ...params });
+  }
+
+  terminateBackgroundTerminal(threadId, processId) {
+    return this.request("thread/backgroundTerminals/terminate", {
+      threadId,
+      processId,
+    });
+  }
+
+  mcpServerStatus(params = {}) {
+    return this.request("mcpServerStatus/list", params);
+  }
+
+  accountUsage(params = {}) {
+    return this.request("account/usage/read", params);
+  }
+
+  gitDiff(cwd) {
+    return this.request("gitDiffToRemote", { cwd });
   }
 
   respond(id, result = {}) {
@@ -447,16 +520,28 @@ export class CodexAppServerClient {
     return method === "item/started" || method === "item/completed";
   }
 
-  closeTurnIfOpen({ turnId, status = "complete", error = null, source }) {
-    // Allow close when we have a turnId even if turnOpen is false (the
+  closeTurnIfOpen({ turnId, threadId = null, status = "complete", error = null, source }) {
+    // Resolve the thread this turn belongs to. A notification may name only
+    // the turn, so open turns are indexed both ways. A turn whose thread the
+    // notification never named sits under a null key — `Map` takes it, so an
+    // unnamed notification still finds it.
+    const resolvedThreadId =
+      threadId
+      ?? (turnId ? this.turnThreads.get(turnId) : undefined)
+      ?? (this.openTurns.size === 1 ? [...this.openTurns.keys()][0] : null);
+    const openTurnId = this.openTurns.get(resolvedThreadId) ?? null;
+    // Allow close when we have a turnId even if no open turn is tracked (the
     // turn/started may have been missed or we attached late). The dedup
     // invariant is preserved by `completedTurnIds`.
-    if (!this.turnOpen && !turnId) return;
+    if (openTurnId == null && !turnId) return;
+    // A close that names no turn adopts the open turn it resolved to, so the
+    // dedup set and the emitted event carry the real id.
+    if (turnId == null) turnId = openTurnId;
     if (turnId && this.completedTurnIds.has(turnId)) {
       // A late duplicate from the previous turn must not clear a newer turn.
       return;
     }
-    if (turnId && this.turnOpen && this.currentTurnId && turnId !== this.currentTurnId) return;
+    if (turnId && openTurnId && turnId !== openTurnId) return;
     if (turnId) {
       this.completedTurnIds.add(turnId);
       this.completedTurnOrder.push(turnId);
@@ -467,12 +552,19 @@ export class CodexAppServerClient {
         this.completedTurnIds.delete(oldest);
       }
     }
-    this.turnOpen = false;
-    this.currentTurnId = null;
+    this.openTurns.delete(resolvedThreadId);
+    if (turnId) this.turnThreads.delete(turnId);
+    // Legacy mirrors: an open turn exists on some thread. Readers that need
+    // the main thread specifically gate on the event's thread_id instead.
+    this.currentTurnId = this.openTurns.size
+      ? [...this.openTurns.values()][0]
+      : null;
+    this.turnOpen = this.openTurns.size > 0;
     const aborted = this.isAbortStatus(status);
     this.eventHandler?.({
       type: aborted ? "turn_aborted" : "task_complete",
       turn_id: turnId,
+      thread_id: resolvedThreadId,
       status,
       error,
       source,
@@ -659,9 +751,14 @@ export class CodexAppServerClient {
 
     if (method === "turn/started") {
       const turnId = this.extractTurnId(params);
+      const threadId = params.threadId || params.thread?.id || null;
+      if (turnId) {
+        this.turnThreads.set(turnId, threadId);
+        this.openTurns.set(threadId, turnId);
+      }
       this.currentTurnId = turnId;
       this.turnOpen = true;
-      this.eventHandler?.({ type: "task_started", turn_id: turnId });
+      this.eventHandler?.({ type: "task_started", turn_id: turnId, thread_id: threadId });
       return;
     }
 
@@ -670,17 +767,31 @@ export class CodexAppServerClient {
       if (turnId) this.interruptingTurns.delete(turnId);
       const status = this.extractTurnStatus(params) || "complete";
       const error = params.turn?.error || params.error || null;
-      this.closeTurnIfOpen({ turnId, status, error, source: "turn/completed" });
+      this.closeTurnIfOpen({
+        turnId,
+        threadId: params.threadId || params.thread?.id || null,
+        status,
+        error,
+        source: "turn/completed",
+      });
       return;
     }
 
     // Stage 8.1: idle fallback. Some Codex flows end without an explicit
     // turn/completed; the thread-level status flip is the alternative signal.
     if (method === "thread/status/changed") {
+      const threadId = params.threadId || params.thread?.id || null;
       const statusType = params.status?.type || params.status;
-      if (statusType === "idle" && this.turnOpen && !this.interruptingTurns.has(this.currentTurnId)) {
+      // An unnamed idle still closes the one open turn, whatever thread key
+      // it sits under; a named idle only closes that thread's turn.
+      const openTurnId = this.openTurns.get(threadId)
+        ?? (threadId == null && this.openTurns.size === 1
+          ? [...this.openTurns.values()][0]
+          : null);
+      if (statusType === "idle" && openTurnId && !this.interruptingTurns.has(openTurnId)) {
         this.closeTurnIfOpen({
-          turnId: this.currentTurnId,
+          turnId: openTurnId,
+          threadId,
           status: "complete",
           error: null,
           source: "thread/status/changed idle",
@@ -691,7 +802,11 @@ export class CodexAppServerClient {
     }
 
     if (method === "thread/tokenUsage/updated" && params.tokenUsage) {
-      this.eventHandler?.({ type: "token_count", ...params.tokenUsage });
+      this.eventHandler?.({
+        type: "token_count",
+        thread_id: params.threadId || null,
+        ...params.tokenUsage,
+      });
       return;
     }
 
@@ -700,6 +815,7 @@ export class CodexAppServerClient {
       this.eventHandler?.({
         type: "exec_command_begin",
         call_id: item.id,
+        thread_id: params.threadId || null,
         command: item.command,
         cwd: item.cwd,
       });
@@ -711,6 +827,7 @@ export class CodexAppServerClient {
       this.eventHandler?.({
         type: "exec_command_end",
         call_id: item.id,
+        thread_id: params.threadId || null,
         command: item.command,
         cwd: item.cwd,
         output: item.aggregatedOutput || "",
@@ -725,6 +842,7 @@ export class CodexAppServerClient {
       this.eventHandler?.({
         type: "patch_apply_begin",
         call_id: item.id,
+        thread_id: params.threadId || null,
         changes: item.changes || {},
       });
       return;
@@ -735,6 +853,7 @@ export class CodexAppServerClient {
       this.eventHandler?.({
         type: "patch_apply_end",
         call_id: item.id,
+        thread_id: params.threadId || null,
         status: item.status,
       });
       return;
@@ -742,10 +861,12 @@ export class CodexAppServerClient {
 
     if (method === "item/completed" && params.item?.type === "agentMessage") {
       const item = params.item;
+      const threadId = params.threadId || null;
       this.eventHandler?.({
         type: "agent_message",
         message: item.text || "",
         item_id: item.id,
+        thread_id: threadId,
         phase: item.phase,
       });
       // Stage 8.1: close the turn on a final-ish agent message. The
@@ -759,7 +880,8 @@ export class CodexAppServerClient {
       const isFinal = (hasFinalPhase && hasText) || completedNoPhase;
       if (isFinal) {
         this.closeTurnIfOpen({
-          turnId: this.currentTurnId,
+          turnId: params.turnId || this.openTurns.get(threadId),
+          threadId,
           status: "complete",
           error: null,
           source: "item/completed agentMessage",

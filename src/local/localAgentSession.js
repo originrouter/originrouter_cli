@@ -50,6 +50,7 @@ import {
   directProvidersForTransport,
   modelControlForTransport,
   resolveLaunchModelTarget,
+  seedSessionModelFromDeviceRoute,
   setSessionModel,
   validateSessionModelTarget,
 } from "../proxy/sessionModels.js";
@@ -117,6 +118,12 @@ import {
   normalizePtyInteraction,
   permissionDecision,
 } from "./agentSessionPrimitives.js";
+import {
+  buildCommandResultEvent,
+  buildCommandsEvent,
+  commandsForSession,
+  normalizeCommandPayload,
+} from "../agent/slashCommands.js";
 
 export {
   buildModeStatusEvent,
@@ -375,9 +382,15 @@ export async function runLocalAgentSession(agent, rawArgs) {
           (autonomyAllowedScopes.length ? "custom" : "manual"),
       )
     : "manual";
-  // The session's model override, if the user pinned one. Null means the
-  // device route is in force.
+  // The session's model is a snapshot pinned at birth, not a pointer at the
+  // device route: a session with none yet — a fresh one, or a stored session
+  // from before sessions carried their own — gets the device's current
+  // default written as its own override here.
   let sessionModel = getSessionModel(stateDir, sessionId);
+  sessionModel ??= seedSessionModelFromDeviceRoute(localConfig, stateDir, sessionId, {
+    agent,
+    providerResult,
+  });
   let approvalPolicy = inheritedPermission
     ? inheritedPermission.approvalPolicy
     : autonomySupported && autonomyProfile === "custom" && options.approvalPolicyReference
@@ -765,11 +778,17 @@ export async function runLocalAgentSession(agent, rawArgs) {
     const requestedProvider = String(payload?.provider || "").trim();
     try {
       if (!requested) {
-        // Clearing is allowed on every transport: it is the safe direction, and
-        // it is how an override written while the session was on route mode is
-        // removed after the device moved on.
+        // Clearing resets the session to the device's current default: the
+        // override is dropped and the default pinned again in its place, so
+        // the session keeps a model of its own. This is allowed on every
+        // transport: clearing is the safe direction, and it is how an override
+        // written while the session was on route mode is removed after the
+        // device moved on.
         clearSessionModel(stateDir, sessionId);
-        sessionModel = null;
+        sessionModel = seedSessionModelFromDeviceRoute(localConfig, stateDir, sessionId, {
+          agent,
+          providerResult,
+        });
         await sendTransientEvent(sessionModelStatus(payload?.requestId || null, { accepted: true }));
         return true;
       }
@@ -1194,6 +1213,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
         sessionId,
         adapter,
         executor,
+        sessionCommands,
       });
       if (applied !== false) {
         await report("agent.event", {
@@ -1215,6 +1235,14 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // adapter's describe() returns `runtime: "codex-app-server"` when
   // the structured app-server path is active, `null` otherwise.
   const runtime = metadata.runtime ?? null;
+  // A terminal session's command list is the injectable subset for its agent;
+  // anything beyond it is refused by the command handler rather than typed
+  // into a TUI that cannot answer with a structured result.
+  const sessionCommands = commandsForSession({
+    agent,
+    runtime: `${agent}-pty`,
+    nativeConfig: useNativeConfig,
+  });
   const fallbackModeList =
     agent === "codex" ? CODEX_AVAILABLE_MODES : CLAUDE_AVAILABLE_MODES;
   const initialModeStatus =
@@ -1378,6 +1406,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
           applyAutonomy,
           applySessionModel,
           applyEffort,
+          sessionCommands,
         });
       }
       if (payload?.type === "agent.message") {
@@ -1399,6 +1428,16 @@ export async function runLocalAgentSession(agent, rawArgs) {
           messageId: payload.messageId || payload.commandId,
           accepted: applied !== false,
         });
+      }
+      if (payload?.type === "agent.command") {
+        const command = normalizeCommandPayload(payload);
+        await localAgentBridge?.sendEvent(buildCommandResultEvent({
+          sessionId,
+          requestId: command.requestId,
+          command: command.name || command.kind,
+          accepted: applied !== false,
+          ...(applied === false ? { reason: "unsupported" } : {}),
+        }));
       }
       return applied;
     },
@@ -1434,6 +1473,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     mode: initialModeStatus.mode,
     modeControl: initialModeStatus.modeControl,
     availableModes: modeList,
+    commandMenu: sessionCommands,
     // The reasoning effort the runtime can put on this session, and the
     // levels it can take. The runtime says both; a runtime without the
     // feature says nothing and the App offers no control.
@@ -1517,6 +1557,13 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // that — including whether this transport can change it — before it can
   // offer a choice.
   void sendTransientEvent(sessionModelStatus());
+  // The session's command list is its own — the App builds the `/` menu from
+  // what the session advertises, never from a cross-agent guess.
+  void sendTransientEvent(buildCommandsEvent({
+    sessionId,
+    provider: agent,
+    commands: sessionCommands,
+  }));
 
   try {
     appendSessionStart({
@@ -1607,6 +1654,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
         requestId: payload.requestId,
         interactions: interactions.snapshot(),
         events: recentEvents,
+        commands: sessionCommands,
         mode:
           typeof adapter.modeStatusEvent === "function"
             ? adapter.modeStatusEvent().mode
@@ -1638,6 +1686,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
       applyAutonomy,
       applySessionModel,
       applyEffort,
+      sessionCommands,
     });
     if (payload?.type === "agent.message") {
       const message = String(payload.message || "").replace(/[\r\n]+$/g, "");
@@ -1656,6 +1705,16 @@ export async function runLocalAgentSession(agent, rawArgs) {
         messageId: payload.messageId,
         accepted: applied !== false,
       });
+    }
+    if (payload?.type === "agent.command") {
+      const command = normalizeCommandPayload(payload);
+      await sendTransientEvent(buildCommandResultEvent({
+        sessionId,
+        requestId: command.requestId,
+        command: command.name || command.kind,
+        accepted: applied !== false,
+        ...(applied === false ? { reason: "unsupported" } : {}),
+      }));
     }
     return applied;
   };

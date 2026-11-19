@@ -482,6 +482,12 @@ export class ExternalAgentRegistry {
         ),
       eventSequence: conversationChanged ? 0 : existing?.eventSequence || 0,
       commands: existing?.commands || [],
+      // The command *menu* the session advertises (slash commands it can
+      // answer for `agent.command`). Kept apart from `commands`, which is the
+      // pending-command queue the session poller drains.
+      commandMenu: Array.isArray(payload?.commandMenu)
+        ? payload.commandMenu.slice(0, 64)
+        : existing?.commandMenu || [],
       commandSequence: existing?.commandSequence || 0,
       commandStreamId: existing?.commandStreamId || `local_commands_${randomUUID()}`,
       pendingInteractions:
@@ -1075,6 +1081,8 @@ export class ExternalAgentRegistry {
       autonomyProfile: session.autonomyProfile,
       autonomy:
         session.autonomyStatus,
+      // The session's slash-command menu — the App renders exactly this list.
+      commands: session.commandMenu || [],
       controlResults: [...session.controlResults.values()],
     };
   }

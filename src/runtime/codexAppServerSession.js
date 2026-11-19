@@ -55,6 +55,7 @@ import {
   modelControlForTransport,
   resolveLaunchModelTarget,
   resolvePricingTarget,
+  seedSessionModelFromDeviceRoute,
   setSessionModel,
   validateSessionModelTarget,
 } from "../proxy/sessionModels.js";
@@ -134,6 +135,21 @@ import {
   loadEffortCatalogue,
   readerEffortLevels,
 } from "./modelEffortCatalog.js";
+import {
+  AGENT_COMMAND_TYPE,
+  AGENT_SIDE_CLOSED_EVENT,
+  AGENT_SIDE_EVENT,
+  AGENT_SIDE_OPENED_EVENT,
+  buildCommandResultEvent,
+  buildCommandsEvent,
+  CODEX_INIT_PROMPT,
+  codexSideBoundaryItem,
+  COMMAND_KIND_SIDE_CLOSE,
+  COMMAND_KIND_SIDE_MESSAGE,
+  commandsForSession,
+  CODEX_SIDE_DEVELOPER_INSTRUCTIONS,
+  normalizeCommandPayload,
+} from "../agent/slashCommands.js";
 
 export {
   buildCodexCollaborationMode,
@@ -340,9 +356,25 @@ export async function runCodexAppServerSession(rawArgs) {
   let transcriptPath = null;
   let currentTurnId = null;
   let currentMode = "default";
-  // The session's model override, if the user pinned one. Null means the
-  // device route is in force.
+  // The side conversation's thread, when one is open. One side per parent,
+  // exactly as the TUI holds it; events that arrive with this thread id are
+  // routed to the side stream instead of the main transcript.
+  let sideThreadId = null;
+  let sideTurnId = null;
+  const sessionCommands = commandsForSession({
+    agent: "codex",
+    runtime: "codex-app-server",
+    nativeConfig: options.nativeConfig === true,
+  });
+  // The session's model is a snapshot pinned at birth, not a pointer at the
+  // device route: a session with none yet — a fresh one, or a stored session
+  // from before sessions carried their own — gets the device's current
+  // default written as its own override here.
   let sessionModel = getSessionModel(stateDir, sessionId);
+  sessionModel ??= seedSessionModelFromDeviceRoute(config, stateDir, sessionId, {
+    agent: "codex",
+    providerResult,
+  });
   // The reasoning effort this session runs on, as the App last named it.
   // Null means nobody has chosen one yet: the thread is on the model's own
   // default, and the device says so as soon as it can tell.
@@ -724,11 +756,17 @@ export async function runCodexAppServerSession(rawArgs) {
     const requestedProvider = String(payload?.provider || "").trim();
     try {
       if (!requested) {
-        // Clearing is allowed on every transport: it is the safe direction, and
-        // it is how an override written while the session was on route mode is
-        // removed after the device moved on.
+        // Clearing resets the session to the device's current default: the
+        // override is dropped and the default pinned again in its place, so
+        // the session keeps a model of its own. This is allowed on every
+        // transport: clearing is the safe direction, and it is how an override
+        // written while the session was on route mode is removed after the
+        // device moved on.
         clearSessionModel(stateDir, sessionId);
-        sessionModel = null;
+        sessionModel = seedSessionModelFromDeviceRoute(config, stateDir, sessionId, {
+          agent: "codex",
+          providerResult,
+        });
         await reportSessionModel(payload?.requestId || null, { accepted: true });
         // The session is back on the device route, so its levels are the
         // route's model's levels now.
@@ -1085,6 +1123,13 @@ export async function runCodexAppServerSession(rawArgs) {
     // The app-server transport is initialized before the managed thread and
     // OriginRouter session exist. Emit one ready event only after thread/start.
     if (rawEvent.type === "codex.initialized") return;
+    // A side conversation is a forked thread of this session. Everything that
+    // arrives tagged with its thread id (or the turn running on it) belongs to
+    // the side stream, not the main transcript.
+    if (isSideEvent(rawEvent)) {
+      handleSideEvent(rawEvent);
+      return;
+    }
     // Codex names the thread itself, a turn or two in, and announces it.
     // This is the conversation's real title, and it is the one the App shows.
     if (rawEvent.type === "codex.notification" && rawEvent.method === "thread/name/updated") {
@@ -1125,6 +1170,326 @@ export async function runCodexAppServerSession(rawArgs) {
       }));
     }
   });
+
+  // ---- Side conversation (codex /side, /btw) ----
+  //
+  // The TUI's `side.rs`, mapped onto one thread of this session: fork the
+  // parent thread as ephemeral, pin the side developer instructions on it,
+  // inject the boundary prompt so the model knows inherited history is
+  // reference-only, and run its turns under the same permission pin. One side
+  // per session — opening a second focuses the one that exists, and closing
+  // discards it.
+
+  const isSideEvent = (event) => {
+    if (!sideThreadId) return false;
+    const eventThread = event?.thread_id || event?.params?.threadId;
+    if (eventThread === sideThreadId) return true;
+    const eventTurn = event?.turn_id || event?.params?.turnId;
+    return sideTurnId != null && eventTurn != null && eventTurn === sideTurnId;
+  };
+
+  const emitSideEvent = (event) =>
+    agentEventQueue.enqueue({
+      type: AGENT_SIDE_EVENT,
+      provider: "codex",
+      sessionId,
+      sideThreadId,
+      event,
+    });
+
+  const handleSideEvent = (rawEvent) => {
+    if (rawEvent.type === "task_started") {
+      sideTurnId = rawEvent.turn_id || sideTurnId;
+    } else if (rawEvent.type === "task_complete" || rawEvent.type === "turn_aborted") {
+      if (!rawEvent.turn_id || rawEvent.turn_id === sideTurnId) sideTurnId = null;
+    }
+    // The text stream of the side thread is streamed like the main one's:
+    // deltas ride as text.delta so the panel can paint as it arrives, the
+    // completed message closes it out.
+    if (rawEvent.type === "codex.notification"
+      && rawEvent.method === "item/agentMessage/delta") {
+      const delta = codexStreamDelta(rawEvent, sideTurnId, sideThreadId);
+      if (delta != null) {
+        emitSideEvent({ type: "agent.text.delta", provider: "codex", text: delta });
+      }
+      return;
+    }
+    for (const event of mapCodexAppServerEvent(rawEvent)) {
+      emitSideEvent(event);
+    }
+  };
+
+  const startSideTurn = async (text) => {
+    const result = await client.startTurn(withCodexTurnPermission({
+      threadId: sideThreadId,
+      input: textInput(text),
+      collaborationMode: buildCodexCollaborationMode(currentMode, model, sessionEffort),
+    }));
+    sideTurnId = result?.turn?.id || sideTurnId;
+    emitSideEvent({ type: "user.text", provider: "codex", text });
+  };
+
+  const openSide = async () => {
+    if (sideThreadId) return { opened: true, already: true };
+    if (!threadId) return { opened: false, reason: "thread_not_ready" };
+    // The fork is ephemeral and reads the parent's whole history; the
+    // response's turn payload is not needed (`excludeTurns` only skips
+    // hydrating the reply, never the inherited context).
+    const fork = await client.forkThread(threadId, withCodexThreadPermission({
+      ephemeral: true,
+      excludeTurns: true,
+      developerInstructions: CODEX_SIDE_DEVELOPER_INSTRUCTIONS,
+    }));
+    const forkedId = fork?.thread?.id;
+    if (!forkedId) return { opened: false, reason: "fork_failed" };
+    sideThreadId = forkedId;
+    sideTurnId = null;
+    try {
+      await client.injectItems(sideThreadId, [codexSideBoundaryItem()]);
+    } catch (error) {
+      await client.unsubscribeThread(sideThreadId).catch(() => {});
+      sideThreadId = null;
+      throw error;
+    }
+    await agentEventQueue.enqueue({
+      type: AGENT_SIDE_OPENED_EVENT,
+      provider: "codex",
+      sessionId,
+      sideThreadId,
+      // Honest capability label — the App prints this on the panel header.
+      capability: "read_only_tools",
+    });
+    return { opened: true };
+  };
+
+  const closeSide = async () => {
+    if (!sideThreadId) return { closed: false };
+    const closing = sideThreadId;
+    if (sideTurnId) {
+      await client.interruptTurn(closing, sideTurnId).catch(() => {});
+    }
+    await client.unsubscribeThread(closing).catch(() => {});
+    sideThreadId = null;
+    sideTurnId = null;
+    await agentEventQueue.enqueue({
+      type: AGENT_SIDE_CLOSED_EVENT,
+      provider: "codex",
+      sessionId,
+      sideThreadId: closing,
+    });
+    return { closed: true };
+  };
+
+  // ---- Slash commands (agent.command) ----
+
+  const commandResult = (command, fields) =>
+    buildCommandResultEvent({
+      sessionId,
+      requestId: command.requestId,
+      command: command.name || command.kind,
+      ...fields,
+    });
+
+  const handleAgentCommand = async (payload) => {
+    const command = normalizeCommandPayload(payload);
+    // The side channel uses the same wire type; it is not a slash command.
+    if (command.kind === COMMAND_KIND_SIDE_CLOSE) {
+      const { closed } = await closeSide();
+      await agentEventQueue.enqueue(commandResult(command, {
+        accepted: closed, action: "side_closed",
+      }));
+      return closed;
+    }
+    if (command.kind === COMMAND_KIND_SIDE_MESSAGE) {
+      if (!command.text) {
+        await agentEventQueue.enqueue(commandResult(command, {
+          accepted: false, reason: "empty_message",
+        }));
+        return false;
+      }
+      const opened = await openSide();
+      if (!opened.opened) {
+        await agentEventQueue.enqueue(commandResult(command, {
+          accepted: false, reason: opened.reason || "side_open_failed",
+        }));
+        return false;
+      }
+      await startSideTurn(command.text);
+      await agentEventQueue.enqueue(commandResult(command, {
+        accepted: true, action: "side_message",
+      }));
+      return true;
+    }
+
+    switch (command.name) {
+      case "side":
+      case "btw": {
+        try {
+          const opened = await openSide();
+          if (!opened.opened) {
+            await agentEventQueue.enqueue(commandResult(command, {
+              accepted: false, reason: opened.reason || "side_open_failed",
+            }));
+            return false;
+          }
+          await agentEventQueue.enqueue(commandResult(command, {
+            accepted: true, action: "side_opened",
+          }));
+          if (command.args) await startSideTurn(command.args);
+          return true;
+        } catch (error) {
+          await agentEventQueue.enqueue(commandResult(command, {
+            accepted: false, reason: String(error?.message || "side_open_failed").slice(0, 512),
+          }));
+          return false;
+        }
+      }
+      case "compact": {
+        if (currentTurnId) {
+          await agentEventQueue.enqueue(commandResult(command, {
+            accepted: false, reason: "turn_in_progress",
+          }));
+          return false;
+        }
+        await client.compactThread(threadId);
+        await agentEventQueue.enqueue(commandResult(command, { accepted: true }));
+        return true;
+      }
+      case "init": {
+        const accepted = await sendMessage(CODEX_INIT_PROMPT, null, "command");
+        await agentEventQueue.enqueue(commandResult(command, { accepted }));
+        return accepted;
+      }
+      case "review": {
+        const target = command.args
+          ? { type: "custom", instructions: command.args }
+          : { type: "uncommittedChanges" };
+        const result = await client.request("review/start", {
+          threadId,
+          target,
+          delivery: "inline",
+        });
+        await agentEventQueue.enqueue(commandResult(command, {
+          accepted: Boolean(result?.turn?.id || result),
+        }));
+        return true;
+      }
+      case "status": {
+        const thread = threadId
+          ? await client.readThread(threadId).catch(() => null)
+          : null;
+        await agentEventQueue.enqueue(commandResult(command, {
+          accepted: true,
+          action: "status",
+          data: {
+            threadId,
+            model,
+            mode: currentMode,
+            effort: sessionEffort,
+            turnInProgress: Boolean(currentTurnId),
+            thread: thread?.thread || null,
+          },
+        }));
+        return true;
+      }
+      case "usage": {
+        const usage = await client.accountUsage().catch((error) => ({
+          error: String(error?.message || "usage_read_failed"),
+        }));
+        await agentEventQueue.enqueue(commandResult(command, {
+          accepted: true, action: "usage", data: usage,
+        }));
+        return true;
+      }
+      case "diff": {
+        const result = await client.gitDiff(cwd);
+        await agentEventQueue.enqueue(commandResult(command, {
+          accepted: true,
+          action: "diff",
+          data: { sha: result?.sha || null, diff: String(result?.diff || "") },
+        }));
+        return true;
+      }
+      case "mcp": {
+        const servers = await client.mcpServerStatus().catch((error) => ({
+          error: String(error?.message || "mcp_status_failed"),
+        }));
+        await agentEventQueue.enqueue(commandResult(command, {
+          accepted: true, action: "mcp", data: servers,
+        }));
+        return true;
+      }
+      case "goal": {
+        if (!command.args) {
+          const goal = await client.getThreadGoal(threadId).catch(() => null);
+          await agentEventQueue.enqueue(commandResult(command, {
+            accepted: true, action: "goal", data: goal?.goal || null,
+          }));
+          return true;
+        }
+        if (command.args === "clear") {
+          await client.clearThreadGoal(threadId);
+          await agentEventQueue.enqueue(commandResult(command, {
+            accepted: true, action: "goal_cleared",
+          }));
+          return true;
+        }
+        const result = await client.setThreadGoal(threadId, {
+          objective: command.args,
+          status: "active",
+          origin: { type: "user" },
+        });
+        await agentEventQueue.enqueue(commandResult(command, {
+          accepted: true, action: "goal_set", data: result?.goal || null,
+        }));
+        return true;
+      }
+      case "rename": {
+        if (!command.args || !threadId) {
+          await agentEventQueue.enqueue(commandResult(command, {
+            accepted: false, reason: "missing_name",
+          }));
+          return false;
+        }
+        await client.setThreadName(threadId, command.args);
+        if (setAgentTitle(command.args)) void publishAgentTitle();
+        await agentEventQueue.enqueue(commandResult(command, { accepted: true }));
+        return true;
+      }
+      case "ps": {
+        const page = await client.listBackgroundTerminals(threadId).catch(() => null);
+        await agentEventQueue.enqueue(commandResult(command, {
+          accepted: true,
+          action: "terminals",
+          data: { terminals: page?.data || [] },
+        }));
+        return true;
+      }
+      case "stop": {
+        const page = await client.listBackgroundTerminals(threadId).catch(() => null);
+        const terminals = page?.data || [];
+        let terminated = 0;
+        for (const terminal of terminals) {
+          const result = await client
+            .terminateBackgroundTerminal(threadId, terminal.processId)
+            .catch(() => null);
+          if (result?.terminated) terminated += 1;
+        }
+        await agentEventQueue.enqueue(commandResult(command, {
+          accepted: true,
+          action: "terminals_stopped",
+          data: { terminated, total: terminals.length },
+        }));
+        return true;
+      }
+      default: {
+        await agentEventQueue.enqueue(commandResult(command, {
+          accepted: false, reason: "unsupported",
+        }));
+        return false;
+      }
+    }
+  };
 
   const sendMessage = async (message, messageId = null, origin = null) => {
     const text = String(message || "").trim();
@@ -1194,6 +1559,16 @@ export async function runCodexAppServerSession(rawArgs) {
       signal ? "stopped" : code === 0 ? "completed" : "failed",
     );
     localAgentBridge = null;
+    // The side thread is ephemeral: its turns are interrupted and the thread
+    // is unsubscribed here, so nothing of it is left running after the session.
+    if (sideThreadId) {
+      const closing = sideThreadId;
+      sideThreadId = null;
+      if (sideTurnId)
+        await client.interruptTurn(closing, sideTurnId).catch(() => {});
+      sideTurnId = null;
+      await client.unsubscribeThread(closing).catch(() => {});
+    }
     if (currentTurnId && threadId)
       await client.interruptTurn(threadId, currentTurnId).catch(() => {});
     client.disconnect();
@@ -1231,6 +1606,8 @@ export async function runCodexAppServerSession(rawArgs) {
         interactions: interactions.snapshot(),
         events: recentEvents,
         mode: currentMode,
+        commands: sessionCommands,
+        sideThreadId,
         autonomyProfile,
         autonomy: buildAutonomyStatusEvent({
           provider: "codex",
@@ -1242,6 +1619,9 @@ export async function runCodexAppServerSession(rawArgs) {
       return true;
     }
     if (payload.sessionId !== sessionId) return false;
+    if (payload.type === AGENT_COMMAND_TYPE) {
+      return handleAgentCommand(payload);
+    }
     if (payload.type === "agent.history.request") {
       await refreshTranscriptPath();
       const history = readCodexConversationHistory(transcriptPath, {
@@ -1534,6 +1914,7 @@ export async function runCodexAppServerSession(rawArgs) {
       mode: currentMode,
       modeControl: "supported",
       availableModes: CODEX_MODES,
+      commandMenu: sessionCommands,
       autonomyProfile,
       autonomyControl: "supported",
       allowedAutonomyScopes: autonomyAllowedScopes,
@@ -1560,6 +1941,13 @@ export async function runCodexAppServerSession(rawArgs) {
       status: "running",
     });
     await sendAgentEvent({ type: "agent.ready", provider: "codex" });
+    // The session's command list is its own, built when the session came up.
+    // Late joiners get the same list again in the interactions snapshot.
+    await sendAgentEvent(buildCommandsEvent({
+      sessionId,
+      provider: "codex",
+      commands: sessionCommands,
+    }));
     await reportMode();
     await reportAutonomy();
     await reportDetail();

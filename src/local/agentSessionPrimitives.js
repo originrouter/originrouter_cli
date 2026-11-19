@@ -2,6 +2,11 @@ import {
   displaySafeToolInput,
   toolInputContainsSecret,
 } from "../runtime/displaySafeToolInput.js";
+import {
+  AGENT_COMMAND_TYPE,
+  COMMAND_KIND_SLASH,
+  normalizeCommandPayload,
+} from "../agent/slashCommands.js";
 
 const CLAUDE_AVAILABLE_MODES = Object.freeze([
   "default",
@@ -50,6 +55,27 @@ export function handleRemoteEvent(payload, ctx) {
     const message = String(payload.message || "").replace(/[\r\n]+$/g, "");
     if (!message) return false;
     return submitRemoteMessage(ctx.executor, message);
+  }
+  if (payload.type === AGENT_COMMAND_TYPE) {
+    // Terminal sessions take commands the same way they take messages: the
+    // TUI resolves the line itself. Only slash commands the session's own
+    // menu named are injected — side-conversation kinds and anything the
+    // table did not offer get a negative result instead of a stray keystroke.
+    const command = normalizeCommandPayload(payload);
+    if (command.kind !== COMMAND_KIND_SLASH) return false;
+    const offered = Array.isArray(ctx.sessionCommands)
+      ? ctx.sessionCommands
+      : [];
+    const entry = offered.find(
+      (item) =>
+        item.name === command.name ||
+        (Array.isArray(item.aliases) && item.aliases.includes(command.name)),
+    );
+    if (!entry || entry.route === "app") return false;
+    return submitRemoteMessage(
+      ctx.executor,
+      `/${command.name}${command.args ? ` ${command.args}` : ""}`,
+    );
   }
   if (payload.type === "terminal.input") {
     ctx.executor.write(payload.data || "");
