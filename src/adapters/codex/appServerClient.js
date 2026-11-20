@@ -1,6 +1,7 @@
 import { createInterface } from "node:readline";
 import { runCapture } from "../../utils/detect.js";
 import { spawnCommand } from "../../utils/spawn.js";
+import { inheritSystemProxyEnv } from "../../utils/systemProxy.js";
 import { mapDecisionToWire as mapDecisionToWireImpl } from "./decisionMapping.js";
 
 // Stage 8.0A: gate Codex app-server support on semver, matching happy's
@@ -167,7 +168,7 @@ export class CodexAppServerClient {
     // Stage 8.1: build a fresh childEnv so we never mutate process.env.
     // The RUST_LOG filter suppresses noisy codex_core::rollout::list logs
     // unless the user has set their own value.
-    const childEnv = { ...env, RUST_LOG: env.RUST_LOG || CODEX_ROLLOUT_RUST_LOG };
+    const childEnv = inheritSystemProxyEnv({ ...env, RUST_LOG: env.RUST_LOG || CODEX_ROLLOUT_RUST_LOG });
     // Stage 8.4: increment processEpoch at the top of connect() so all
     // listeners registered below share the same epoch and are atomically
     // invalidated if connect() is called again. disconnect() must not

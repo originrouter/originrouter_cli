@@ -4,7 +4,7 @@ import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
 

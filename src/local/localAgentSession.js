@@ -1,5 +1,7 @@
 import { createAgentPermissionStateTracker } from "../runtime/agentPermissionStateTracker.js";
+import { agyTranscriptPath } from '../adapters/agy/history.js';
 import process from "node:process";
+import { inheritSystemProxyEnv } from "../utils/systemProxy.js";
 import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import {
@@ -12,6 +14,8 @@ import {
   updateAgentActivitySnapshot,
 } from "../agent/bridgeReporter.js";
 import { createAdapter } from "../adapters/createAdapter.js";
+import { RuntimeOutputSampler } from '../runtime/runtimeOutputSampler.js';
+import { createDeviceToolApprovalHandler } from '../runtime/deviceToolApproval.js';
 import {
   defaultConversationTitle,
   looksLikePlaceholderTitle,
@@ -139,7 +143,7 @@ function writeLocal(data) {
   process.stdout.write(data);
 }
 
-export async function runLocalAgentSession(agent, rawArgs) {
+export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedRuntime = null } = {}) {
   const stateDir = ensureStateDir();
   const relayAccount = captureRelayAccountContext(stateDir);
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
@@ -216,7 +220,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
       `[originrouter] ${relayModeDescription(relayPlan)}; local and LAN control remain available.\n`,
     );
   }
-  const useNativeConfig = options.nativeConfig === true;
+  const useNativeConfig = agent === 'agy' || options.nativeConfig === true;
   if (useNativeConfig && options.provider) {
     throw new Error(
       "--provider cannot be combined with --native-config",
@@ -228,8 +232,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
     args: passthrough,
     cwd,
     nativeConfig: useNativeConfig,
+    runtime: requestedRuntime,
   });
-  const executor = createExecutor(
+  const executor = typeof adapter.createExecutor === 'function' ? adapter.createExecutor() : createExecutor(
     normalizeExecutor(options.executor || DEFAULT_EXECUTOR),
   );
   const localConfig = readConfig();
@@ -326,7 +331,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
       }
     }
   }
-  const baseEnv = { ...process.env, ...providerEnv };
+  const baseEnv = inheritSystemProxyEnv({ ...process.env, ...providerEnv });
   let exited = false;
   let finalizing = false;
   let shutdownRequested = false;
@@ -352,7 +357,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     conversationId = resolved;
     return true;
   };
-  const autonomySupported = agent === "claude";
+  const autonomySupported = agent === "claude" || agent === 'agy';
   const invalidScopes = invalidAutonomyScopes(options.autonomyAllowedScopes);
   if (invalidScopes.length) {
     throw new Error(`Unknown unattended scope(s): ${invalidScopes.join(", ")}`);
@@ -386,8 +391,8 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // device route: a session with none yet — a fresh one, or a stored session
   // from before sessions carried their own — gets the device's current
   // default written as its own override here.
-  let sessionModel = getSessionModel(stateDir, sessionId);
-  sessionModel ??= seedSessionModelFromDeviceRoute(localConfig, stateDir, sessionId, {
+  let sessionModel = useNativeConfig ? null : getSessionModel(stateDir, sessionId);
+  if (!useNativeConfig) sessionModel ??= seedSessionModelFromDeviceRoute(localConfig, stateDir, sessionId, {
     agent,
     providerResult,
   });
@@ -585,6 +590,20 @@ export async function runLocalAgentSession(agent, rawArgs) {
     return runtimeReporter.report(type, extra);
   };
   const recentEvents = [];
+  let observationSequence = 0;
+  let observationTail = Promise.resolve();
+  let pendingObservations = 0;
+  const observeOutput = (turnId, text) => {
+    if (!text) return;
+    const sequence = ++observationSequence;
+    if (pendingObservations >= 8) return;
+    pendingObservations += 1;
+    observationTail = observationTail.then(() => localAgentBridge?.sendObservation(turnId, text, sequence)).catch(() => false)
+      .finally(() => { pendingObservations -= 1; });
+  };
+  const acpOutputSampler = requestedRuntime === 'agy-acp' ? new RuntimeOutputSampler({
+    onChunk: observeOutput, onGap: () => { observationSequence += 1; },
+  }) : null;
   let controlReady = false;
   const activitySnapshot = {
     summary: "",
@@ -670,7 +689,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
   const autonomyStatus = (requestId = null, { accepted = null, reason = null } = {}) =>
     buildAutonomyStatusEvent({
       provider: agent,
-      runtime: agent === "claude" ? "claude-pty" : "codex-pty",
+      runtime: requestedRuntime || `${agent}-pty`,
       profile: autonomyProfile,
       autonomyRevision: permissionState.capture({
         profile: autonomyProfile, allowedScopes: autonomyAllowedScopes,
@@ -719,14 +738,16 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // Per-session model selection. The terminal agent keeps asking the proxy
   // for the route alias; the compatibility gateway substitutes the concrete
   // model this session pinned.
-  const sessionModelStatus = (requestId = null, { accepted = null, reason = null } = {}) => ({
+  const sessionModelStatus = (requestId = null, { accepted = null, reason = null } = {}) =>
+    useNativeConfig && typeof adapter.modelStatusEvent === 'function'
+      ? adapter.modelStatusEvent({ requestId, accepted, reason }) : ({
     type: "agent.model.status",
     provider: agent,
-    runtime: "claude-pty",
+    runtime: `${agent}-pty`,
     sessionId,
     model: sessionModel?.model || null,
     modelProvider: sessionModel?.provider || null,
-    source: sessionModel ? "session" : "device",
+    source: useNativeConfig ? 'native' : sessionModel ? "session" : "device",
     // Three transports have a place to rewrite the request's model — route
     // mode's compatibility gateway, the cloud's per-session auth proxy, the
     // remote device's relay proxy. The others show what the session runs on
@@ -751,7 +772,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     return {
       type: "agent.effort.status",
       provider: agent,
-      runtime: "claude-pty",
+      runtime: `${agent}-pty`,
       sessionId,
       effort: null,
       effortControl: "unsupported",
@@ -774,6 +795,11 @@ export async function runLocalAgentSession(agent, rawArgs) {
     return false;
   };
   const applySessionModel = async (payload) => {
+    if (useNativeConfig && typeof adapter.setModel === 'function') return adapter.setModel(payload);
+    if (useNativeConfig) {
+      await sendTransientEvent(sessionModelStatus(payload?.requestId || null, { accepted: false, reason: 'model_control_unsupported' }));
+      return false;
+    }
     const requested = String(payload?.model || "").trim();
     const requestedProvider = String(payload?.provider || "").trim();
     try {
@@ -840,6 +866,21 @@ export async function runLocalAgentSession(agent, rawArgs) {
     }
   };
   const registeredInteractions = new Set();
+  const deviceToolApproval = requestedRuntime === 'agy-acp' ? createDeviceToolApprovalHandler({
+    sessionId, provider: agent, runtime: requestedRuntime,
+    revision: () => permissionState.revision,
+    sendResult: event => localAgentBridge?.sendDeviceToolApprovalResult(event) || Promise.resolve(false),
+    markApplied: resolved => interactions.markResult(resolved.interactionId, 'applied', { responseId: resolved.responseId }),
+    requestInteraction: (request, signal) => {
+      const profile = autonomyProfile, policy = aiReviewPolicy;
+      return resolveWithAutonomy({ request, profile, allowedScopes: autonomyAllowedScopes,
+        approvalPolicy, workspaceApprovalPolicy, workspaceRoot: cwd, stateDir,
+        aiReviewer: aiApprovalReviewer, aiReviewPolicy: policy, runtime: requestedRuntime,
+        isCurrent: () => profile === autonomyProfile && policy === aiReviewPolicy,
+        requestInteraction: item => interactions.request(item, signal),
+      });
+    },
+  }) : null;
   const registerInteraction = (event) => {
     const request = normalizePtyInteraction(event, sessionId);
     if (registeredInteractions.has(request.interactionId)) return;
@@ -858,7 +899,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
           aiReviewer: aiApprovalReviewer,
           aiReviewPolicy,
           isCurrent: () => profileAtRequest === autonomyProfile && reviewPolicyAtRequest === aiReviewPolicy,
-          runtime: "claude-pty",
+          runtime: requestedRuntime || `${agent}-pty`,
           requestInteraction: (item) => interactions.request(item),
         })
       : interactions.request(request);
@@ -964,6 +1005,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
           };
         }
         if (event.type === "agent.permission.request.detected") continue;
+        if (event.type === 'agent.commands' && Array.isArray(adapter.commands)) {
+          sessionCommands.splice(0, sessionCommands.length, ...adapter.commands);
+        }
         if (event.type === "agent.interaction.requested") {
           registerInteraction(event);
           continue;
@@ -980,7 +1024,18 @@ export async function runLocalAgentSession(agent, rawArgs) {
             registeredInteractions.delete(interactionId);
           }
         }
+        if (acpOutputSampler && ['agent.task.complete', 'agent.task.aborted', 'agent.task.failed'].includes(event.type)) {
+          observeOutput(event.supervisorTurnId, acpOutputSampler.flush(event.supervisorTurnId));
+          acpOutputSampler.reset();
+          await observationTail;
+        }
         await sendTransientEvent(displayEvent);
+        if (acpOutputSampler) {
+          if (event.type === 'agent.task.started') acpOutputSampler.reset(event.supervisorTurnId);
+          if (event.type === 'agent.text.delta') {
+            for (const chunk of acpOutputSampler.add(event.supervisorTurnId, event.text)) observeOutput(event.supervisorTurnId, chunk);
+          }
+        }
         if (event.type === "agent.session.start") {
           await sendTransientEvent(autonomyStatus());
         }
@@ -992,6 +1047,8 @@ export async function runLocalAgentSession(agent, rawArgs) {
   const terminalOutputPump = createTerminalOutputPump({ write: writeLocal });
 
   const cleanup = () => {
+    deviceToolApproval?.close();
+    acpOutputSampler?.reset();
     stopSessionHeartbeat();
     stopSessionHeartbeat = () => {};
     stopApprovalPolling();
@@ -1036,6 +1093,16 @@ export async function runLocalAgentSession(agent, rawArgs) {
     if (signalFallbackTimer) {
       clearTimeout(signalFallbackTimer);
       signalFallbackTimer = null;
+    }
+    // Official agy already persisted its transcript. Detach its control
+    // channel before cloud reporting can spend the process-exit budget;
+    // otherwise the App can retain an attached row for a dead ACP process.
+    if (agent === 'agy' && localAgentBridge) {
+      const bridge = localAgentBridge;
+      await bridge.sendEvent({ type: 'session.exited', provider: agent,
+        runtime: requestedRuntime || 'agy-pty', sessionId, code: code ?? null, signal: signal ?? null });
+      await bridge.close(signal ? 'stopped' : code === 0 ? 'completed' : 'failed');
+      localAgentBridge = null;
     }
     // Publish the terminal conversation status FIRST, before the cleanup
     // chain below.
@@ -1159,6 +1226,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
       excludePids: agentChildPid ? [agentChildPid] : [],
     });
     const target = resolveHandoverTarget({
+      ...(agent === 'agy' ? { transcriptPathFor: agyTranscriptPath } : {}),
       fromNativeSessionId,
       toNativeSessionId,
       transcriptPath: switchInfo.transcriptPath,
@@ -1195,14 +1263,30 @@ export async function runLocalAgentSession(agent, rawArgs) {
     });
   };
 
+  const reportStartupFailure = async (error) => {
+    if (agent === 'agy') {
+      const startupBridge = new LocalAgentBridgeClient({ stateDir, sessionId, onCommand: async () => false });
+      try {
+        await startupBridge.start({ sessionId, conversationId, runId: options.runId || sessionId,
+          agent, runtime: requestedRuntime || `${agent}-pty`, cwd, nativeConfig: true, title: sessionTitle(), deviceId: effectiveDeviceId, workspaceTrusted: true });
+        const authenticationRequired = /auth|login|sign.?in|no available model/i.test(error.message);
+        await startupBridge.sendEvent({ type: 'agent.adapter.status', provider: 'agy',
+          state: authenticationRequired ? 'authentication_required' : 'startup_failed', message: error.message });
+        await startupBridge.sendEvent({ type: 'session.error', provider: 'agy', message: error.message });
+      } finally { await startupBridge.close('failed'); cleanup(); }
+    }
+  };
+  if (agent === 'agy' && requestedResumeId) {
+    const claim = claimConversation(requestedResumeId);
+    if (!claim.ok) throw new Error(conversationAlreadyOpenMessage({ holder: claim.holder }));
+  }
   if (typeof adapter.beforeStart === "function") {
-    await adapter.beforeStart({
-      cwd,
-      env: baseEnv,
-      sessionId,
-      relayClient,
-      send,
-    });
+    try {
+      await adapter.beforeStart({ cwd, env: baseEnv, sessionId, stateDir, relayClient, send });
+    } catch (error) {
+      await reportStartupFailure(error);
+      throw error;
+    }
   }
 
   stopApprovalPolling = startApprovalDecisionPolling({
@@ -1240,12 +1324,12 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // into a TUI that cannot answer with a structured result.
   const sessionCommands = commandsForSession({
     agent,
-    runtime: `${agent}-pty`,
+    runtime: runtime || `${agent}-pty`,
     nativeConfig: useNativeConfig,
   });
   const fallbackModeList =
     agent === "codex" ? CODEX_AVAILABLE_MODES : CLAUDE_AVAILABLE_MODES;
-  const initialModeStatus =
+  let initialModeStatus =
     typeof adapter.modeStatusEvent === "function"
       ? adapter.modeStatusEvent()
       : buildModeStatusEvent({
@@ -1254,7 +1338,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
           runtime,
           availableModes: fallbackModeList,
         });
-  const modeList = initialModeStatus.availableModes;
+  let modeList = initialModeStatus.availableModes;
   syncCatalog = (status) => {
     // The agent may have named the conversation since the last sync. Reading
     // it here means every sync carries the newest name, however often it
@@ -1328,7 +1412,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
       process.exitCode = code ?? (signal ? 1 : 0);
       Promise.race([
         finalizeSession({ code, signal }),
-        new Promise((resolve) => setTimeout(resolve, 1500)),
+        new Promise((resolve) => setTimeout(resolve, agent === 'agy' ? 4500 : 1500)),
       ]).finally(() => process.exit(process.exitCode || 0));
     },
     onError: (error) => {
@@ -1347,8 +1431,15 @@ export async function runLocalAgentSession(agent, rawArgs) {
       });
       console.error(error.message);
     },
+  }).catch(async (error) => {
+    await reportStartupFailure(error);
+    throw error;
   });
   agentChildPid = started.pid ?? null;
+  if (runtime === 'agy-acp') {
+    initialModeStatus = adapter.modeStatusEvent();
+    modeList = initialModeStatus.availableModes;
+  }
 
   send("session.started", {
     command: launch.command,
@@ -1391,6 +1482,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
       }
     },
     onCommand: async (payload) => {
+      if (payload?.type === 'agent.device_tool.approval') return deviceToolApproval?.start(payload) ?? false;
+      if (payload?.type === 'agent.device_tool.cancel') return deviceToolApproval?.cancel(payload.requestId) ?? false;
+      if (['terminal.interrupt', 'session.stop'].includes(payload?.type)) deviceToolApproval?.close();
       let applied;
       let agentCommandCtx = null;
       if (payload?.type === "agent.interaction.resolve") {
@@ -1418,7 +1512,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
       }
       if (payload?.type === "agent.message") {
         const message = String(payload.message || "").replace(/[\r\n]+$/g, "");
-        if (applied !== false && message) {
+        if (agent !== 'agy' && applied !== false && message) {
           await sendTransientEvent({
             type: "user.text",
             provider: agent,
@@ -1434,7 +1528,12 @@ export async function runLocalAgentSession(agent, rawArgs) {
           type: "agent.message.result",
           messageId: payload.messageId || payload.commandId,
           accepted: applied !== false,
+          ...(agent === 'agy' && applied === false ? { reason: 'Antigravity is not ready for this input.', rejectedMessage: String(payload.message || '') } : {}),
         });
+      }
+      if (payload?.type === 'agent.supervisor.interrupt') {
+        await localAgentBridge?.sendEvent({ type: 'agent.recovery.interrupt_result', requestId: payload.requestId,
+          turnId: payload.turnId, accepted: applied === true });
       }
       if (payload?.type === "agent.command") {
         const command = normalizeCommandPayload(payload);
@@ -1452,6 +1551,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     },
   });
   relayViaDaemon = await localAgentBridge.start({
+    nativeConfig: useNativeConfig,
     sessionId,
     conversationId,
     runId: options.runId || sessionId,
@@ -1474,6 +1574,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     pid: started.pid,
     startedAt: sessionStartedAt,
     runtime,
+    ...(runtime === 'agy-acp' ? { supportsDeviceTools: true, supportsRuntimeRecovery: true } : {}),
     provider: resolvedProvider?.name,
     model: resolvedProvider?.model,
     permissionProfile: autonomyProfile,
@@ -1520,6 +1621,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
   // names the conversation and not the attempt.
   adoptResolvedConversation();
   controlReady = true;
+  await adapter.onRegistered?.();
   void syncCatalog("running");
   stopSessionHeartbeat = startAgentSessionHeartbeat({
     sessionId,
@@ -1613,6 +1715,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
   }
   process.stdin.resume();
   process.stdin.on("data", (data) => {
+    adapter.onTerminalInput?.(data.toString('utf8'));
     executor.write(data.toString("utf8"));
   });
 
@@ -1704,7 +1807,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     const applied = await handleRemoteEvent(payload, commandCtx);
     if (payload?.type === "agent.message") {
       const message = String(payload.message || "").replace(/[\r\n]+$/g, "");
-      if (applied !== false && message) {
+      if (agent !== 'agy' && applied !== false && message) {
         await sendTransientEvent({
           type: "user.text",
           provider: agent,
@@ -1718,6 +1821,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
       await send("agent.message.result", {
         messageId: payload.messageId,
         accepted: applied !== false,
+        ...(agent === 'agy' && applied === false ? { reason: 'Antigravity is not ready for this input.', rejectedMessage: String(payload.message || '') } : {}),
       });
     }
     if (payload?.type === "agent.command") {

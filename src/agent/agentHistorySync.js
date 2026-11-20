@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { readCodexConversationHistory } from "../adapters/codex/jsonlScanner.js";
 import { readClaudeConversationHistory } from "../runtime/claudeConversationHistory.js";
+import { readAgyConversationHistory } from '../adapters/agy/history.js';
 import { redactDisplayText, redactDisplayValue } from "../security/displayRedaction.js";
 import { reportAgentHistoryChunk, reportAgentHistoryManifest } from "./bridgeReporter.js";
 import { accountSelectionRoot } from "../persistence/accounts.js";
@@ -78,7 +79,7 @@ function readCompleteHistory(agentType, transcriptPath) {
     ? readClaudeConversationHistory
     : agentType === "codex"
       ? readCodexConversationHistory
-      : null;
+      : agentType === 'agy' ? readAgyConversationHistory : null;
   if (!reader || !transcriptPath) return [];
   const pages = [];
   let cursor = null;
@@ -196,7 +197,7 @@ export async function syncAgentHistoryBodies({
       if (rotating) catalog.setMeta?.(ROTATION_META_KEY, conversation.conversation_id);
     };
     const transcriptPath = catalog.getConversationTranscriptLocator(conversation.conversation_id);
-    if (!transcriptPath || !conversation.device_id || !["claude", "codex"].includes(conversation.agent_type)) {
+    if (!transcriptPath || !conversation.device_id || !["claude", "codex", "agy"].includes(conversation.agent_type)) {
       skipped += 1;
       checkpointRotation();
       continue;

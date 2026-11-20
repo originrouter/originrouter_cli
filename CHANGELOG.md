@@ -5,6 +5,26 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 
 ## Unreleased
 
+### Added
+
+- Optional official Antigravity installation (`setup --with-agy`), a native
+  `originrouter agy` TUI with Hooks/control/history, and App-created or resumed
+  sessions through official ACP. Authentication and quota remain with agy.
+- Native model catalogs and model/effort control for explicit
+  `--native-config` Claude SDK and Codex app-server sessions. Gateway sessions
+  retain their existing model alias and route ownership.
+- Per-launch network proxy discovery with environment precedence and static
+  system proxy fallback, including installer download subprocesses.
+- Antigravity ACP steering, native command menus, question forms, image/text
+  context, usage, device-tools MCP and acknowledged runtime recovery through
+  existing App/device control paths. Unsupported native controls stay disabled.
+
+### Fixed
+
+- Preserve native configuration when reopening recorded native conversations;
+  report authentication/startup errors and detach ended Antigravity sessions
+  before cloud reporting can delay their local presence update.
+
 ## 0.6.0 - 2026-11-17
 
 ### Added

@@ -123,6 +123,16 @@ function claudePtyCommands({ nativeConfig = false } = {}) {
 // session actually runs on, not the agent name: "codex-app-server",
 // "claude-sdk", "codex-pty"/"native-pty", "claude-pty"/"native-pty".
 export function commandsForSession({ agent, runtime, nativeConfig = false } = {}) {
+  if (agent === 'agy') {
+    const local = [
+      cmd({ name: 'rename', description: 'Rename this session', argumentHint: '<name>', availableDuringTask: true, route: 'app' }),
+      cmd({ name: 'export', description: 'Export the conversation', availableDuringTask: true, route: 'app' }),
+      cmd({ name: 'quit', aliases: ['exit'], description: 'End this session', availableDuringTask: true, route: 'app' }),
+    ];
+    if (runtime === 'agy-acp') return local;
+    return ['goal', 'plan', 'grill-me', 'browser', 'learn', 'agy-customizations', 'antigravity-guide'].map(name =>
+      cmd({ name, description: '', argumentHint: '[task]', availableDuringTask: false, route: 'inject' })).concat(local);
+  }
   if (agent === "codex") {
     return runtime === "codex-app-server"
       ? codexAppServerCommands()

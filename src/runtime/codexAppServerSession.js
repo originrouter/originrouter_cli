@@ -1,3 +1,4 @@
+import { NativeModelControl } from './nativeModelControl.js';
 import { RuntimeOutputSampler, codexStreamDelta } from "./runtimeOutputSampler.js";
 import { createAgentPermissionStateTracker } from "./agentPermissionStateTracker.js";
 import process from "node:process";
@@ -170,6 +171,7 @@ export async function runCodexAppServerSession(rawArgs) {
   const relayAccount = captureRelayAccountContext(stateDir);
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
   const options = extractOptions(rawArgs);
+  if (options.nativeConfig && options.provider) throw new Error("--provider cannot be combined with --native-config");
   const collaborationWorker = isCollaborationSessionPayload({
     ...options, sessionId: options.session,
   });
@@ -220,7 +222,7 @@ export async function runCodexAppServerSession(rawArgs) {
   });
   let remoteCodingProxyManager = null;
   let remoteCodingStatus = staticProxyStatusFn(NOOP_REMOTE_CODING_SNAPSHOT);
-  if (willRouteRemoteCoding(config, "codex")) {
+  if (options.nativeConfig !== true && willRouteRemoteCoding(config, "codex")) {
     remoteCodingProxyManager = new RemoteCodingProxyManager({
       stateDir,
       relayUrl,
@@ -236,7 +238,7 @@ export async function runCodexAppServerSession(rawArgs) {
       await snapshotRemoteCodingStatus(remoteCodingProxyManager),
     );
   }
-  let providerResult = await buildAgentProviderEnv("codex", config, {
+  let providerResult = options.nativeConfig === true ? { env: {}, provider: null, source: "native-config" } : await buildAgentProviderEnv("codex", config, {
     provider: options.provider,
     // Same contract as the Claude runtime: the credential names the session so
     // the compatibility gateway can apply this session's model override.
@@ -247,12 +249,12 @@ export async function runCodexAppServerSession(rawArgs) {
   // Which levels a model supports. The catalogue is where that is said, and
   // it is asked for before the proxy starts, because the proxy is what tells
   // Codex which levels its models have.
-  const effortCatalogue = await loadEffortCatalogue({ stateDir });
+  const effortCatalogue = options.nativeConfig === true ? [] : await loadEffortCatalogue({ stateDir });
   let originrouterCodingProxy = null;
   let localAgentBridge = null;
   let relayViaDaemon = false;
   let emitGatewayResponseIds = null;
-  ({ providerResult, proxy: originrouterCodingProxy } =
+  if (options.nativeConfig !== true) ({ providerResult, proxy: originrouterCodingProxy } =
     await protectOriginrouterCodingEnv("codex", providerResult, {
       stateDir,
       runId: options.runId,
@@ -356,6 +358,19 @@ export async function runCodexAppServerSession(rawArgs) {
   let transcriptPath = null;
   let currentTurnId = null;
   let currentMode = "default";
+  const nativeControl = new NativeModelControl({
+    enabled: options.nativeConfig, provider: 'codex', runtime: 'codex-app-server', current: () => model,
+    load: async () => (await client.request('model/list', {limit: 100})).data.map(item => ({
+      id: item.model || item.id, displayName: item.displayName,
+      efforts: (item.supportedReasoningEfforts || []).map(level => typeof level === 'string' ? level : level.reasoningEffort || level.effort),
+    })),
+    apply: async value => {
+      if (!threadId) throw new Error('native_session_not_ready');
+      await client.updateThreadSettings(withCodexTurnPermission({ threadId, model: value,
+        collaborationMode: buildCodexCollaborationMode(currentMode, value, null) }));
+      model = value;
+    },
+  });
   // The side conversation's thread, when one is open. One side per parent,
   // exactly as the TUI holds it; events that arrive with this thread id are
   // routed to the side stream instead of the main transcript.
@@ -370,8 +385,8 @@ export async function runCodexAppServerSession(rawArgs) {
   // device route: a session with none yet — a fresh one, or a stored session
   // from before sessions carried their own — gets the device's current
   // default written as its own override here.
-  let sessionModel = getSessionModel(stateDir, sessionId);
-  sessionModel ??= seedSessionModelFromDeviceRoute(config, stateDir, sessionId, {
+  let sessionModel = options.nativeConfig === true ? null : getSessionModel(stateDir, sessionId);
+  if (options.nativeConfig !== true) sessionModel ??= seedSessionModelFromDeviceRoute(config, stateDir, sessionId, {
     agent: "codex",
     providerResult,
   });
@@ -404,6 +419,7 @@ export async function runCodexAppServerSession(rawArgs) {
   // runtime's whole vocabulary: a level the model cannot take is a row that
   // fails when it is tapped, and the App does not offer rows that fail.
   const sessionEffortLevels = () => {
+    if (options.nativeConfig === true) return nativeControl.efforts();
     const modelId = sessionEffortModelId();
     const declared = readerEffortLevels(config, modelId, providerResult.provider?.name);
     if (declared?.length) return declared;
@@ -734,7 +750,9 @@ export async function runCodexAppServerSession(rawArgs) {
   // alias; the compatibility gateway substitutes the concrete model this
   // session pinned, so a change lands on the next turn with no restart.
   const reportSessionModel = (requestId = null, { accepted = null, reason = null } = {}) =>
-    sendAgentEvent({
+    options.nativeConfig === true
+      ? sendAgentEvent(nativeControl.status({sessionId, requestId, accepted, reason}))
+      : sendAgentEvent({
       type: "agent.model.status",
       provider: "codex",
       runtime: "codex-app-server",
@@ -752,6 +770,12 @@ export async function runCodexAppServerSession(rawArgs) {
       reason,
     });
   const applySessionModel = async (payload) => {
+    if (options.nativeConfig === true) {
+      const result = await nativeControl.set(payload);
+      await reportSessionModel(payload?.requestId || null, result);
+      if (result.accepted) await reconcileEffortWithModel();
+      return result.accepted;
+    }
     const requested = String(payload?.model || "").trim();
     const requestedProvider = String(payload?.provider || "").trim();
     try {
@@ -1802,7 +1826,7 @@ export async function runCodexAppServerSession(rawArgs) {
         ...(String(options.runId || "").startsWith("acr_") ? codexAgentGatewayConfigArgs(sessionId, {stateDir}) : []),
         ...codexAgentGatewayConfigArgs(sessionId, {deviceTools:true,stateDir}),
       ],
-      modelProvider: (providerResult.env.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL)
+      modelProvider: options.nativeConfig !== true && (providerResult.env.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL)
         ? {
             id: "originrouter_proxy",
             name: "OriginRouter Route",
@@ -1908,6 +1932,7 @@ export async function runCodexAppServerSession(rawArgs) {
       },
     });
     relayViaDaemon = await localAgentBridge.start({
+      nativeConfig: options.nativeConfig === true,
       sessionId,
       sessionKind: collaborationWorker ? "collaboration" : "interactive",
       conversationId: options.conversationId || sessionId,
@@ -1974,6 +1999,7 @@ export async function runCodexAppServerSession(rawArgs) {
     // has touched yet still answers on the device route, and the App needs
     // to hear that — including whether this transport can change it — before
     // it can offer a choice.
+    await nativeControl.refresh();
     await reportSessionModel();
     // And the effort it runs on. A session nobody has put on a level yet is
     // on the model's own default, and saying so is what lets the App offer

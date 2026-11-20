@@ -4,6 +4,32 @@ import test from "node:test";
 import { LocalAgentBridgeClient } from "../src/local/localAgentBridgeClient.js";
 import { ExternalAgentRegistry } from "../src/local/externalAgentRegistry.js";
 
+test('agy native menus, content capabilities and usage survive daemon restart', async () => {
+  const originalFetch = globalThis.fetch;
+  let registry = new ExternalAgentRegistry();
+  const registrations = [];
+  const client = new LocalAgentBridgeClient({ stateDir: '/tmp/originrouter-agy-capability-reconnect', sessionId: 'agy-reconnect',
+    onCommand() {}, endpointProvider: () => ({ baseUrl: 'http://127.0.0.1:7437', token: 'test' }) });
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body || '{}');
+    if (url.endsWith('/register')) { registrations.push(body); registry.register(body); }
+    if (url.endsWith('/events')) registry.appendEvent('agy-reconnect', body.event);
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+  try {
+    client.sessionMetadata = { sessionId: 'agy-reconnect', agent: 'agy', runtime: 'agy-acp', commandMenu: [] };
+    await client.connect();
+    for (const event of [{ type: 'agent.commands', commands: [{ name: 'compact' }] },
+      { type: 'agent.capabilities', promptCapabilities: { image: true, embeddedContext: true } },
+      { type: 'agent.usage', provider: 'agy', contextUsedTokens: 42, contextWindowTokens: 1000, amountMicros: null }]) await client.sendEvent(event);
+    registry = new ExternalAgentRegistry(); client.setEndpoint(null); await client.connect();
+    while (client.flushingEvents) await new Promise(resolve => setTimeout(resolve, 1));
+    const snapshot = registry.controlSnapshot('agy-reconnect');
+    assert.equal(snapshot.commands[0].name, 'compact'); assert.equal(snapshot.promptCapabilities.image, true); assert.equal(snapshot.usage.contextUsedTokens, 42);
+    assert.equal(registrations.at(-1).commandMenu[0].name, 'compact');
+  } finally { await client.close(); globalThis.fetch = originalFetch; }
+});
+
 test("automatic title provenance survives bridge reconnection", async () => {
   const registrations = [];
   const originalFetch = globalThis.fetch;

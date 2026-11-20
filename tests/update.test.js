@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -230,6 +230,23 @@ try {
     reason: "daemon_activity_unknown",
   });
 
+  // A state file truncated by a crash mid-write used to escape readJson as a
+  // raw JSON.parse error and kill `originrouter update` outright. Regenerable
+  // state must read as absent instead, and the corrupt file is kept under a
+  // quarantined name rather than silently discarded.
+  const corruptDir = join(root, "corrupt-daemon-state");
+  mkdirSync(corruptDir, { recursive: true });
+  writeFileSync(join(corruptDir, "daemon.state.json"), "{\"pid\": 1234, '");
+  const corruptActivity = await inspectUpdateActivity({ stateDir: corruptDir });
+  assert.deepEqual(corruptActivity, {
+    daemon_running: false,
+    active: false,
+    reason: null,
+  });
+  const corruptLeftovers = readdirSync(corruptDir)
+    .filter((entry) => entry.startsWith("daemon.state.json.corrupt-"));
+  assert.equal(corruptLeftovers.length, 1, "the unreadable state is preserved, not lost");
+
   for (const running of [false, true]) {
     const refreshDir = join(root, `refresh-${running}`);
     writeUpdateState(refreshDir, { latest_version: "9.9.9" });
@@ -380,6 +397,48 @@ try {
     (error) => error.code === "UPDATE_TIMEOUT" && error.termination_confirmed === true,
   );
   assert.deepEqual(timeoutSignals, ["SIGTERM", "SIGKILL"]);
+
+  // npm itself prints nothing during a global install, so the command reads
+  // as hung for minutes on a slow network. runInstaller draws its own status:
+  // a heartbeat line on a non-TTY stderr, a spinner line it erases on a TTY.
+  const heartbeatWrites = [];
+  const heartbeatStream = { isTTY: false, write: (chunk) => heartbeatWrites.push(chunk) };
+  await runInstaller("npm", ["install"], {
+    progressLabel: "Installing test package with npm",
+    progressStream: heartbeatStream,
+    progressHeartbeatMs: 5,
+    spawnFn: () => {
+      const child = new EventEmitter();
+      setTimeout(() => child.emit("exit", 0, null), 20);
+      return child;
+    },
+  });
+  assert.ok(
+    heartbeatWrites.some((chunk) => /Installing test package with npm.*elapsed/.test(chunk)),
+    `a non-TTY run must announce it is still alive; got ${JSON.stringify(heartbeatWrites)}`,
+  );
+
+  const ttyWrites = [];
+  const ttyStream = { isTTY: true, write: (chunk) => ttyWrites.push(chunk) };
+  await runInstaller("npm", ["install"], {
+    progressLabel: "Installing test package with npm",
+    progressStream: ttyStream,
+    progressTickMs: 2,
+    spawnFn: () => {
+      const child = new EventEmitter();
+      setTimeout(() => child.emit("exit", 0, null), 20);
+      return child;
+    },
+  });
+  assert.ok(
+    ttyWrites.some((chunk) => /Installing test package with npm/.test(chunk)),
+    "the spinner must actually paint while the installer runs",
+  );
+  assert.equal(
+    ttyWrites[ttyWrites.length - 1],
+    "\r\x1b[K",
+    "the spinner line is erased when the installer exits — no residue",
+  );
 } finally {
   rmSync(root, { recursive: true, force: true });
 }

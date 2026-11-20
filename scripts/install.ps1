@@ -2,6 +2,7 @@ param(
     [string]$Release = $(if ($env:ORIGINROUTER_RELEASE) { $env:ORIGINROUTER_RELEASE } else { "latest" }),
     [switch]$Yes,
     [switch]$NoProxy,
+    [switch]$WithAgy,
     [switch]$DryRun
 )
 
@@ -15,31 +16,73 @@ if ($Release -notmatch '^(latest|\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$') {
     exit 1
 }
 
-# Inherit the system proxy so npm (which ignores Windows proxy settings) can
-# reach the registry behind local proxies such as Clash. The .NET HttpClient
-# picks up the system proxy on its own; ORIGINROUTER_PROXY overrides, -NoProxy skips.
-function Get-SystemProxy {
-    if ($NoProxy) { return $null }
-    if ($env:ORIGINROUTER_PROXY) { return $env:ORIGINROUTER_PROXY }
-    if ($env:HTTPS_PROXY) { return $null }  # already set in the environment; keep it
+# Environment proxies win. -NoProxy controls the optional LiteLLM runtime;
+# ORIGINROUTER_NO_PROXY=1 independently disables OS network-proxy discovery.
+function Initialize-InstallerProxyEnvironment {
+    if ($env:HTTP_PROXY -or $env:HTTPS_PROXY -or $env:ALL_PROXY) { return }
+    if ($env:ORIGINROUTER_NO_PROXY -eq '1') { return }
+    if ($env:ORIGINROUTER_PROXY) {
+        if ($env:ORIGINROUTER_PROXY -match '^https?://') {
+            $env:HTTP_PROXY = $env:ORIGINROUTER_PROXY
+            $env:HTTPS_PROXY = $env:ORIGINROUTER_PROXY
+        } elseif ($env:ORIGINROUTER_PROXY -match '^socks(5h?)?://') {
+            $env:ALL_PROXY = $env:ORIGINROUTER_PROXY
+        } else { throw 'ORIGINROUTER_PROXY requires a complete supported proxy URL.' }
+        return
+    }
     try {
         $settings = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-        if (-not $settings.ProxyEnable) { return $null }
+        if (-not $settings.ProxyEnable) { return }
         $server = $settings.ProxyServer
-        if (-not $server) { return $null }
-        if ($server -notmatch "=") { return "http://$server" }
-        foreach ($part in $server.Split(";")) {
-            if ($part -match "^https?=(.+)$") { return "http://$($Matches[1])" }
+        if (-not $server) { return }
+        if ($server -notmatch '=') {
+            $url = if ($server -match '://') { $server } else { "http://$server" }
+            $env:HTTP_PROXY = $env:HTTPS_PROXY = $url
+        } else {
+            foreach ($part in $server.Split(';')) {
+                if ($part.Trim() -match '^(http|https|socks)=(.+)$') {
+                    $kind = $Matches[1]
+                    $value = $Matches[2]
+                    $scheme = if ($kind -eq 'socks') { 'socks5h' } else { 'http' }
+                    $url = if ($value -match '://') { $value } else { "${scheme}://$value" }
+                    $key = if ($kind -eq 'socks') { 'ALL_PROXY' } else { "${kind}_proxy" }
+                    [Environment]::SetEnvironmentVariable($key, $url, 'Process')
+                }
+            }
         }
+        $bypass = @('localhost', '127.0.0.1', '::1')
+        if ($env:NO_PROXY) { $bypass += $env:NO_PROXY.Split(',') }
+        if ($settings.PSObject.Properties['ProxyOverride'] -and $settings.ProxyOverride) {
+            $bypass += @($settings.ProxyOverride.Split(';') | Where-Object { $_ -and $_ -ne '<local>' } | ForEach-Object { $_ -replace '^\*\.', '.' })
+        }
+        $env:NO_PROXY = ($bypass | Select-Object -Unique) -join ','
     } catch { }
-    return $null
 }
 
-$systemProxy = Get-SystemProxy
-if ($systemProxy) {
-    Write-Host "==> Using proxy $systemProxy"
-    $env:HTTP_PROXY = $systemProxy
-    $env:HTTPS_PROXY = $systemProxy
+$installerPreviousProxyEnvironment = @{}
+foreach ($proxyKey in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')) {
+    $installerPreviousProxyEnvironment[$proxyKey] = [Environment]::GetEnvironmentVariable($proxyKey, 'Process')
+}
+$installerPreviousWebProxy = [System.Net.WebRequest]::DefaultWebProxy
+try {
+Initialize-InstallerProxyEnvironment
+
+# Windows PowerShell 5.1 web requests do not consistently consume proxy env
+# variables. Bridge HTTP(S) proxy settings into this installer's .NET client.
+# npm and all child processes receive the same environment values.
+$installerHttpProxy = if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } else { $env:HTTP_PROXY }
+if ($installerHttpProxy -and $installerHttpProxy -match '^https?://') {
+    $installerProxyUri = [Uri]$installerHttpProxy
+    $installerWebProxy = [System.Net.WebProxy]::new($installerProxyUri)
+    $installerWebProxy.BypassList = @('^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(/|$)')
+    if ($installerProxyUri.UserInfo) {
+        $proxyCredentialParts = $installerProxyUri.UserInfo.Split([char[]]':', 2)
+        $proxyUsername = [Uri]::UnescapeDataString($proxyCredentialParts[0])
+        $proxyPassword = if ($proxyCredentialParts.Length -gt 1) { [Uri]::UnescapeDataString($proxyCredentialParts[1]) } else { '' }
+        $installerWebProxy.Credentials = [System.Net.NetworkCredential]::new($proxyUsername, $proxyPassword)
+    }
+    if ($env:NO_PROXY -eq '*') { $installerWebProxy = $null }
+    [System.Net.WebRequest]::DefaultWebProxy = $installerWebProxy
 }
 
 function Stop-WithNodeGuidance([string]$Message) {
@@ -410,6 +453,7 @@ try {
     $setupArgs = @()
     if ($Yes) { $setupArgs += "--yes" }
     if ($NoProxy) { $setupArgs += "--no-proxy" }
+    if ($WithAgy) { $setupArgs += "--with-agy" }
     if ($DryRun) { $setupArgs += "--dry-run" }
 
     if ($DryRun) {
@@ -452,11 +496,23 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "OriginRouter setup did not complete successfully. Run the same installer command again to resume." }
     }
     Write-Host "==> Verifying the installation"
-    & $cliPath setup --verify
+    $verifyArgs = @('setup', '--verify')
+    if ($WithAgy) { $verifyArgs += '--with-agy' }
+    if ($NoProxy) { $verifyArgs += '--no-proxy' }
+    & $cliPath @verifyArgs
     if ($LASTEXITCODE -ne 0) { throw "OriginRouter verification failed. Run the same installer command again to resume." }
     Write-Host "==> OriginRouter installation complete"
 }
 finally {
     $mutex.ReleaseMutex()
     $mutex.Dispose()
+}
+}
+finally {
+    # irm | iex executes inside the caller's PowerShell. Restore its state
+    # after our children have finished rather than leaving stale OS settings.
+    foreach ($proxyKey in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')) {
+        [Environment]::SetEnvironmentVariable($proxyKey, $installerPreviousProxyEnvironment[$proxyKey], 'Process')
+    }
+    [System.Net.WebRequest]::DefaultWebProxy = $installerPreviousWebProxy
 }

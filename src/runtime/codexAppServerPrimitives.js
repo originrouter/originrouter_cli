@@ -235,7 +235,8 @@ function extractOptions(args) {
       options[key] = args[index + 1];
       index += 1;
     };
-    if (arg === "--originrouter-relay") take("relay");
+    if (arg === '--native-config') options.nativeConfig = true;
+    else if (arg === "--originrouter-relay") take("relay");
     else if (arg === "--originrouter-relay-mode") take("relayMode");
     else if (arg === "--originrouter-device") take("device");
     else if (arg === "--originrouter-session") take("session");

@@ -1,0 +1,224 @@
+{
+  "date": "2026-11-20",
+  "platform": "macOS ARM64",
+  "agyVersion": "1.5.13",
+  "entry": "source originrouter agy inside PtyExecutor; test-only authenticated loopback controller",
+  "productionAppRelayTested": false,
+  "cases": [
+    {
+      "case": "observe",
+      "elapsedSeconds": 8.23,
+      "sameProcessAndConversation": true,
+      "hookEvents": [
+        "PreInvocation",
+        "PreToolUse",
+        "PostToolUse",
+        "PostInvocation",
+        "PreInvocation",
+        "PostInvocation",
+        "Stop"
+      ],
+      "tools": [
+        "read_file"
+      ],
+      "toolResults": [
+        {
+          "status": "DONE",
+          "error": "",
+          "containsReadMarker": true
+        }
+      ],
+      "assistantResponses": [
+        "ORIGINROUTER_NATIVE_FILE_MARKER"
+      ]
+    },
+    {
+      "case": "deny",
+      "elapsedSeconds": 8.9,
+      "sameProcessAndConversation": true,
+      "hookEvents": [
+        "PreInvocation",
+        "PreToolUse",
+        "PostInvocation",
+        "PreInvocation",
+        "PostInvocation",
+        "Stop"
+      ],
+      "tools": [
+        "read_file"
+      ],
+      "toolResults": [
+        {
+          "status": "ERROR",
+          "error": "tool call denied by pre-tool hook: OriginRouter isolated Hook probe",
+          "containsReadMarker": false
+        }
+      ],
+      "assistantResponses": [
+        "ORIGINROUTER_DENIED"
+      ]
+    },
+    {
+      "case": "timeout",
+      "elapsedSeconds": 12.56,
+      "sameProcessAndConversation": true,
+      "hookEvents": [
+        "PreInvocation",
+        "PreToolUse",
+        "PostInvocation",
+        "PreInvocation",
+        "PostInvocation",
+        "Stop"
+      ],
+      "tools": [
+        "read_file"
+      ],
+      "toolResults": [
+        {
+          "status": "ERROR",
+          "error": "JSON hook \"jsonhook__originrouter-native-probe_PreToolUse_0_0\" failed: command failed: signal: killed, stderr: ",
+          "containsReadMarker": false
+        }
+      ],
+      "assistantResponses": [
+        "ORIGINROUTER_DENIED"
+      ]
+    },
+    {
+      "case": "crash",
+      "elapsedSeconds": 7.43,
+      "sameProcessAndConversation": true,
+      "hookEvents": [
+        "PreInvocation",
+        "PostInvocation",
+        "PreInvocation",
+        "PostInvocation",
+        "Stop"
+      ],
+      "tools": [
+        "read_file"
+      ],
+      "toolResults": [
+        {
+          "status": "ERROR",
+          "error": "JSON hook \"jsonhook__originrouter-native-probe_PreToolUse_0_0\" failed: command failed: exit status 7, stderr: ",
+          "containsReadMarker": false
+        }
+      ],
+      "assistantResponses": [
+        "ORIGINROUTER_DENIED"
+      ]
+    },
+    {
+      "case": "malformed",
+      "elapsedSeconds": 7.42,
+      "sameProcessAndConversation": true,
+      "hookEvents": [
+        "PreInvocation",
+        "PostInvocation",
+        "PreInvocation",
+        "PostInvocation",
+        "Stop"
+      ],
+      "tools": [
+        "read_file"
+      ],
+      "toolResults": [
+        {
+          "status": "ERROR",
+          "error": "failed to unmarshal result from hook jsonhook__originrouter-native-probe_PreToolUse_0_0 via protojson: invalid hook json: proto: syntax error (line 1:1): invalid value invalid",
+          "containsReadMarker": false
+        }
+      ],
+      "assistantResponses": [
+        "ORIGINROUTER_DENIED"
+      ]
+    },
+    {
+      "case": "remote-deny",
+      "elapsedSeconds": 10.29,
+      "sameProcessAndConversation": true,
+      "hookEvents": [
+        "PreInvocation",
+        "PreToolUse",
+        "PostInvocation",
+        "PreInvocation",
+        "PostInvocation",
+        "Stop"
+      ],
+      "tools": [
+        "read_file"
+      ],
+      "toolResults": [
+        {
+          "status": "ERROR",
+          "error": "tool call denied by pre-tool hook: OriginRouter isolated remote decision",
+          "containsReadMarker": false
+        }
+      ],
+      "assistantResponses": [
+        "ORIGINROUTER_DENIED"
+      ]
+    },
+    {
+      "case": "remote-allow",
+      "elapsedSeconds": 7.54,
+      "sameProcessAndConversation": true,
+      "hookEvents": [
+        "PreInvocation",
+        "PreToolUse",
+        "PostToolUse",
+        "PostInvocation",
+        "PreInvocation",
+        "PostInvocation",
+        "Stop"
+      ],
+      "tools": [
+        "read_file"
+      ],
+      "toolResults": [
+        {
+          "status": "DONE",
+          "error": "",
+          "containsReadMarker": true
+        }
+      ],
+      "assistantResponses": [
+        "ORIGINROUTER_NATIVE_FILE_MARKER"
+      ]
+    }
+  ],
+  "forceAsk": {
+    "nativePermissionMenuDisplayed": true,
+    "nativeUserDenialRecorded": true,
+    "permissionRequestHookExists": false
+  },
+  "interruption": {
+    "nativeUiConfirmed": true,
+    "processRetained": true,
+    "stopHookObserved": false,
+    "followupAssistantResponse": "ORIGINROUTER_AFTER_INTERRUPT_OK",
+    "multilineMessagePreserved": true,
+    "pendingHookClosedAfterInterruptMs": 3,
+    "lateApprovalRejectedByProbeController": 409
+  },
+  "stop": {
+    "nativeExit": {
+      "code": 0,
+      "signal": 9
+    },
+    "observedForegroundTaskTerminated": true,
+    "completionMarkerAbsentAfter18Seconds": true
+  },
+  "nativePickers": {
+    "modelMenuOpened": true,
+    "effortMenuOpened": true,
+    "selectionChanged": false,
+    "globalModelDefaultPreserved": true
+  },
+  "remainingLiveChecks": {
+    "resumeAfterStop": "blocked: official agy requires sign-in",
+    "nativeDenyRuleVsHookAutoApprove": "blocked: official agy requires sign-in"
+  },
+  "evidenceConversationId": "457ce0b8-f296-42af-844c-65df04322b2c"
+}

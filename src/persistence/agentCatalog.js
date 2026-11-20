@@ -216,6 +216,7 @@ export class AgentCatalog {
       this.db.prepare("PRAGMA table_info(agent_runs)").all()
         .map((column) => column.name),
     );
+    if (!runColumns.has('native_config')) this.db.exec('ALTER TABLE agent_runs ADD COLUMN native_config INTEGER NOT NULL DEFAULT 0');
     if (!runColumns.has("device_name")) {
       // Local history only stored `device_id`, so a directly connected App had
       // no device to show next to the workspace path even though the CLI knows
@@ -911,13 +912,14 @@ export class AgentCatalog {
         INSERT INTO agent_runs(
           run_id, conversation_id, originrouter_session_id, device_id, device_name,
           runtime, provider, model, permission_profile, started_by, pid, status,
-          started_at, exited_at, exit_code, exit_signal
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          started_at, exited_at, exit_code, exit_signal, native_config
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(originrouter_session_id) DO UPDATE SET
           conversation_id = excluded.conversation_id,
           device_id = CASE WHEN excluded.device_id <> '' THEN excluded.device_id ELSE agent_runs.device_id END,
           device_name = CASE WHEN excluded.device_name <> '' THEN excluded.device_name ELSE agent_runs.device_name END,
           runtime = CASE WHEN excluded.runtime <> '' THEN excluded.runtime ELSE agent_runs.runtime END,
+          native_config = MAX(agent_runs.native_config, excluded.native_config),
           provider = CASE WHEN excluded.provider <> '' THEN excluded.provider ELSE agent_runs.provider END,
           model = CASE WHEN excluded.model <> '' THEN excluded.model ELSE agent_runs.model END,
           permission_profile = CASE WHEN excluded.permission_profile <> '' THEN excluded.permission_profile ELSE agent_runs.permission_profile END,
@@ -944,6 +946,7 @@ export class AgentCatalog {
         payload.exitedAt ? iso(payload.exitedAt) : null,
         Number.isFinite(Number(payload.exitCode)) ? Number(payload.exitCode) : null,
         safeText(payload.exitSignal, 32),
+        payload.nativeConfig === true || agent === 'agy' ? 1 : 0,
       );
     });
     write();
@@ -1213,7 +1216,7 @@ export class AgentCatalog {
     const rows = this.db.prepare(`
       SELECT c.*, w.display_name AS workspace_name,
              w.canonical_path AS workspace_path, w.repo_root,
-             r.device_id, r.device_name, r.runtime, r.provider, r.model,
+             r.device_id, r.device_name, r.runtime, r.provider, r.model, r.native_config,
              r.permission_profile, r.status, r.started_at, r.exited_at,
              -- The session this conversation's current run belongs to. The
              -- run knows the session id it was started under, and the
@@ -1254,7 +1257,7 @@ export class AgentCatalog {
     };
     return this.db.prepare(`
       SELECT r.originrouter_session_id, r.conversation_id, r.run_id,
-             r.device_id, r.device_name, r.runtime, r.provider, r.model,
+             r.device_id, r.device_name, r.runtime, r.provider, r.model, r.native_config,
              r.started_by, r.pid, r.status, r.started_at, r.exited_at,
              c.agent_type, c.native_session_id, c.title, c.transcript_locator,
              w.canonical_path AS workspace_path
@@ -1353,7 +1356,7 @@ export class AgentCatalog {
     const rows = this.db.prepare(`
       SELECT c.*, w.display_name AS workspace_name,
              w.canonical_path AS workspace_path, w.repo_root,
-             r.device_id, r.device_name, r.runtime, r.provider, r.model,
+             r.device_id, r.device_name, r.runtime, r.provider, r.model, r.native_config,
              r.permission_profile, r.status, r.started_at, r.exited_at,
              -- The session this conversation's current run belongs to. The
              -- run knows the session id it was started under, and the
@@ -1437,7 +1440,7 @@ export class AgentCatalog {
       ...conversation,
       runs: this.db.prepare(`
         SELECT run_id, originrouter_session_id, device_id, device_name, runtime,
-               provider, model, permission_profile, started_by, pid, status,
+               provider, model, permission_profile, started_by, pid, status, native_config,
                started_at, exited_at, exit_code, exit_signal
         FROM agent_runs WHERE conversation_id = ?
         ORDER BY started_at DESC, rowid DESC

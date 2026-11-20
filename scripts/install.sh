@@ -10,7 +10,7 @@ LOCK_DIR="${HOME}/.originrouter/install.lock.d"
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--release VERSION] [--yes] [--no-proxy] [--dry-run]
+Usage: install.sh [--release VERSION] [--yes] [--no-proxy] [--with-agy] [--dry-run]
 
 Installs OriginRouter CLI from npm, then completes first-run setup and
 installation verification. Node.js 22 or later and npm are required.
@@ -27,8 +27,10 @@ while [[ $# -gt 0 ]]; do
     --yes)
       SETUP_ARGS+=("$1")
       ;;
+    --with-agy)
+      SETUP_ARGS+=("$1")
+      ;;
     --no-proxy|--noproxy)
-      NO_PROXY=true
       SETUP_ARGS+=("$1")
       ;;
     --dry-run)
@@ -62,37 +64,74 @@ fi
 NODE_MIN_MAJOR=22
 NODESOURCE_MAJOR=22
 
-# Inherit the system proxy (macOS settings or ORIGINROUTER_PROXY) so curl and
-# npm work behind local proxies such as Clash or Surge. Environment variables
-# are passed through to child processes as-is.
-resolve_system_proxy() {
-  if [[ -n "${ORIGINROUTER_PROXY:-}" ]]; then
-    printf '%s\n' "$ORIGINROUTER_PROXY"
-    return
-  fi
-  if [[ -n "${HTTPS_PROXY:-}${https_proxy:-}${HTTP_PROXY:-}${http_proxy:-}" ]]; then
-    return 1  # already set in the environment; keep it
-  fi
-  if [[ "$(uname -s)" == "Darwin" ]] && command -v scutil >/dev/null 2>&1; then
-    local proxy_info proxy port
-    proxy_info="$(scutil --proxy 2>/dev/null || true)"
-    if [[ "$(awk '/^HTTPSEnable/ {print $3}' <<<"$proxy_info")" == "1" ]]; then
-      proxy="$(awk '/^HTTPSProxy/ {print $3}' <<<"$proxy_info")"
-      port="$(awk '/^HTTPSPort/ {print $3}' <<<"$proxy_info")"
-      if [[ -n "$proxy" && -n "$port" ]]; then
-        printf 'http://%s:%s\n' "$proxy" "$port"
-        return
-      fi
-    fi
-  fi
-  return 1
+# Bootstrap before Node is available. Keep this policy aligned with
+# src/utils/systemProxy.js: environment first, OS static settings second.
+# --no-proxy skips LiteLLM; ORIGINROUTER_NO_PROXY=1 skips network detection.
+bootstrap_proxy_pair() {
+  local kind="$1" value="$2"
+  export "${kind}_proxy=$value" "$(echo "$kind" | tr '[:lower:]' '[:upper:]')_PROXY=$value"
 }
 
-if [[ "${NO_PROXY:-false}" != true ]] && SYSTEM_PROXY="$(resolve_system_proxy)" && [[ -n "$SYSTEM_PROXY" ]]; then
-  echo "==> Using proxy $SYSTEM_PROXY"
-  export HTTP_PROXY="$SYSTEM_PROXY" HTTPS_PROXY="$SYSTEM_PROXY"
-  export http_proxy="$SYSTEM_PROXY" https_proxy="$SYSTEM_PROXY"
-fi
+bootstrap_proxy_host() {
+  local kind="$1" host="$2" port="$3" scheme=http
+  [[ -n "$host" && "$port" =~ ^[0-9]+$ ]] || return 0
+  [[ "$port" -gt 0 && "$port" -le 65535 ]] || return 0
+  [[ "$host" != *:* || "$host" == \[* ]] || host="[$host]"
+  [[ "$kind" != all ]] || scheme=socks5h
+  bootstrap_proxy_pair "$kind" "$scheme://$host:$port"
+}
+
+bootstrap_proxy_environment() {
+  if [[ -z "${http_proxy:-}${HTTP_PROXY:-}${https_proxy:-}${HTTPS_PROXY:-}${all_proxy:-}${ALL_PROXY:-}" && "${ORIGINROUTER_NO_PROXY:-0}" != 1 ]]; then
+    if [[ -n "${ORIGINROUTER_PROXY:-}" ]]; then
+      case "$ORIGINROUTER_PROXY" in
+        http://*|https://*) bootstrap_proxy_pair http "$ORIGINROUTER_PROXY"; bootstrap_proxy_pair https "$ORIGINROUTER_PROXY" ;;
+        socks://*|socks5://*|socks5h://*) bootstrap_proxy_pair all "$ORIGINROUTER_PROXY" ;;
+        *) echo "ORIGINROUTER_PROXY requires a complete supported proxy URL." >&2; return 1 ;;
+      esac
+    elif [[ "$(uname -s)" == Darwin ]] && command -v scutil >/dev/null 2>&1; then
+      local proxy_info prefix kind enabled host port
+      proxy_info="$(scutil --proxy 2>/dev/null || true)"
+      for prefix in HTTP HTTPS SOCKS; do
+        case "$prefix" in HTTP) kind=http ;; HTTPS) kind=https ;; SOCKS) kind=all ;; esac
+        enabled="$(awk -v key="${prefix}Enable" '$1==key && $2==":" {print $3}' <<<"$proxy_info")"
+        [[ "$enabled" == 1 ]] || continue
+        host="$(awk -v key="${prefix}Proxy" '$1==key && $2==":" {print $3}' <<<"$proxy_info")"
+        port="$(awk -v key="${prefix}Port" '$1==key && $2==":" {print $3}' <<<"$proxy_info")"
+        bootstrap_proxy_host "$kind" "$host" "$port"
+      done
+    elif [[ "$(uname -s)" == Linux ]] && [[ "${XDG_CURRENT_DESKTOP:-}" != *KDE* ]] && command -v gsettings >/dev/null 2>&1; then
+      local proxy_info mode protocol host port
+      proxy_info="$(gsettings list-recursively org.gnome.system.proxy 2>/dev/null || true)"
+      mode="$(awk '$1=="org.gnome.system.proxy" && $2=="mode" {gsub(/\047/,"",$3);print $3}' <<<"$proxy_info")"
+      if [[ "$mode" == manual ]]; then
+        for protocol in http https socks; do
+          host="$(awk -v schema="org.gnome.system.proxy.$protocol" '$1==schema && $2=="host" {gsub(/\047/,"",$3);print $3}' <<<"$proxy_info")"
+          port="$(awk -v schema="org.gnome.system.proxy.$protocol" '$1==schema && $2=="port" {print $3}' <<<"$proxy_info")"
+          [[ "$protocol" != socks ]] || protocol=all
+          bootstrap_proxy_host "$protocol" "$host" "$port"
+        done
+      fi
+    fi
+    if [[ -n "${http_proxy:-}${https_proxy:-}${all_proxy:-}" ]]; then
+      local bypass="${no_proxy:-${NO_PROXY:-}}"
+      export no_proxy="${bypass:+$bypass,}localhost,127.0.0.1,::1"
+      export NO_PROXY="$no_proxy"
+      echo "==> Using proxy settings for the installer and its child processes"
+    fi
+  fi
+  # Preserve explicitly supplied values, including different per-scheme URLs.
+  [[ -n "${http_proxy:-}" || -z "${HTTP_PROXY:-}" ]] || export http_proxy="$HTTP_PROXY"
+  [[ -n "${HTTP_PROXY:-}" || -z "${http_proxy:-}" ]] || export HTTP_PROXY="$http_proxy"
+  [[ -n "${https_proxy:-}" || -z "${HTTPS_PROXY:-}" ]] || export https_proxy="$HTTPS_PROXY"
+  [[ -n "${HTTPS_PROXY:-}" || -z "${https_proxy:-}" ]] || export HTTPS_PROXY="$https_proxy"
+  [[ -n "${all_proxy:-}" || -z "${ALL_PROXY:-}" ]] || export all_proxy="$ALL_PROXY"
+  [[ -n "${ALL_PROXY:-}" || -z "${all_proxy:-}" ]] || export ALL_PROXY="$all_proxy"
+  [[ -n "${no_proxy:-}" || -z "${NO_PROXY:-}" ]] || export no_proxy="$NO_PROXY"
+  [[ -n "${NO_PROXY:-}" || -z "${no_proxy:-}" ]] || export NO_PROXY="$no_proxy"
+}
+
+bootstrap_proxy_environment
 
 # Privilege helper: on a root session run directly; otherwise require sudo.
 priv_prefix() {

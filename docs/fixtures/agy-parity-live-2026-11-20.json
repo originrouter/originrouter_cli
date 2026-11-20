@@ -1,0 +1,230 @@
+{
+  "date": "2026-11-20",
+  "agyVersion": "1.5.13",
+  "platform": "macOS ARM64",
+  "usesOfficialSavedAccount": true,
+  "googleCredentialsRead": false,
+  "productionMobileRelayTested": false,
+  "checks": [
+    {
+      "runtimeGroup": "acp",
+      "check": "app-launch-native-catalog",
+      "passed": true,
+      "model": "gemini-3.8-flash",
+      "models": 4
+    },
+    {
+      "runtimeGroup": "acp",
+      "check": "app-prompt-real-response",
+      "passed": true
+    },
+    {
+      "runtimeGroup": "acp",
+      "check": "native-model-set",
+      "passed": true,
+      "model": "claude-sonnet-4-6",
+      "efforts": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "runtimeGroup": "acp",
+      "check": "native-effort-set",
+      "passed": true,
+      "effort": "low"
+    },
+    {
+      "runtimeGroup": "acp",
+      "check": "app-real-tool",
+      "passed": true,
+      "nativePolicyAllowed": true
+    },
+    {
+      "runtimeGroup": "acp",
+      "check": "native-command-and-content-capability-snapshot",
+      "passed": true,
+      "commands": [
+        "goal",
+        "compact",
+        "schedule",
+        "browser",
+        "plan",
+        "grill-me",
+        "learn",
+        "agy-customizations",
+        "antigravity-guide",
+        "run-workflow",
+        "swarm",
+        "rename",
+        "export",
+        "quit"
+      ]
+    },
+    {
+      "runtimeGroup": "acp",
+      "check": "real-originrouter-device-mcp-through-existing-approval",
+      "passed": true
+    },
+    {
+      "runtimeGroup": "acp",
+      "check": "real-form-answer-via-local-app-control",
+      "passed": true
+    },
+    {
+      "runtimeGroup": "acp",
+      "check": "real-embedded-context-via-local-app-control",
+      "passed": true
+    },
+    {
+      "runtimeGroup": "acp",
+      "check": "context-usage-without-fabricated-quota-or-price",
+      "passed": true
+    },
+    {
+      "runtimeGroup": "acp",
+      "check": "app-stop",
+      "passed": true
+    },
+    {
+      "runtimeGroup": "acp",
+      "check": "app-resume-same-native-history",
+      "passed": true
+    },
+    {
+      "runtimeGroup": "acp",
+      "check": "app-resume-real-response",
+      "passed": true
+    },
+    {
+      "runtimeGroup": "native-tui",
+      "check": "native-TUI-registered-message",
+      "passed": true
+    },
+    {
+      "runtimeGroup": "native-tui",
+      "check": "native-TUI-App-Hook-approval",
+      "passed": true
+    },
+    {
+      "runtimeGroup": "native-tui",
+      "check": "native-deny-beats-Hook-autoapprove",
+      "passed": true
+    },
+    {
+      "runtimeGroup": "native-tui",
+      "check": "native-TUI-stop",
+      "passed": true
+    },
+    {
+      "runtimeGroup": "native-tui",
+      "check": "native-TUI-resume-same-history",
+      "passed": true
+    },
+    {
+      "runtimeGroup": "claude-codex-native",
+      "agent": "claude",
+      "check": "native-catalog-without-inference",
+      "passed": true,
+      "models": 5,
+      "model": null
+    },
+    {
+      "runtimeGroup": "claude-codex-native",
+      "agent": "claude",
+      "check": "native-model-control-ack",
+      "passed": true,
+      "model": "sonnet",
+      "efforts": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "runtimeGroup": "claude-codex-native",
+      "agent": "claude",
+      "check": "native-effort-control-ack",
+      "passed": true,
+      "effort": "low"
+    },
+    {
+      "runtimeGroup": "claude-codex-native",
+      "agent": "codex",
+      "check": "native-catalog-without-inference",
+      "passed": true,
+      "models": 11,
+      "model": "gpt-6.1-sol"
+    },
+    {
+      "runtimeGroup": "claude-codex-native",
+      "agent": "codex",
+      "check": "native-model-control-ack",
+      "passed": true,
+      "model": "gpt-6.2-sol",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ]
+    },
+    {
+      "runtimeGroup": "claude-codex-native",
+      "agent": "codex",
+      "check": "native-effort-control-ack",
+      "passed": true,
+      "effort": "low"
+    },
+    {
+      "check": "real-acp-steering",
+      "passed": true,
+      "detail": "second prompt changed a running task; only one task start/end"
+    },
+    {
+      "check": "real-acp-cancel-ack",
+      "passed": true,
+      "detail": "cancelled prompt response before recovery acknowledgement"
+    },
+    {
+      "check": "real-image-input",
+      "passed": true,
+      "image": "generated 32x32 red PNG",
+      "answer": "Red"
+    },
+    {
+      "check": "real-native-compact",
+      "passed": true,
+      "detail": "prompt /compact completed without error"
+    },
+    {
+      "check": "native-fork-probe",
+      "supported": false,
+      "rpcCode": -32601,
+      "message": "Method not found: session/fork"
+    }
+  ],
+  "validation": {
+    "cliFullSuite": "passed",
+    "appExpanded": {
+      "passed": 1478,
+      "skipped": 5,
+      "existingFailures": [
+        "agent_audit_chain_test empty-search copy",
+        "session_restore_test duplicate 最新对话 finder"
+      ]
+    },
+    "appFocused": "passed",
+    "backendPassed": 18
+  },
+  "limits": [
+    "Windows/Linux runtime acceptance pending",
+    "physical mobile/public relay acceptance pending",
+    "no live quota exhaustion or manufactured model loop",
+    "native TUI structured model/effort/forms/attachments remain unavailable",
+    "OriginRouter multi-agent and scheduled agy launches deferred"
+  ]
+}

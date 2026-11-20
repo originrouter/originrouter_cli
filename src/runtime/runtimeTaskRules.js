@@ -20,7 +20,7 @@ export const RUNTIME_TASK_ERROR_CLASSES = Object.freeze([
 ]);
 
 const RETRYABLE = new Set(["overloaded", "rate_limited", "server_error", "network"]);
-const AGENTS = new Set(["claude", "codex"]);
+const AGENTS = new Set(["claude", "codex", "agy"]);
 // Which checkpoints a built-in rule can be true at. A card that pairs a rule
 // with a checkpoint where it can never hold is a mistake the editor should
 // hear about, not a card that silently never fires.
@@ -72,7 +72,7 @@ export function normalizeRuntimeTaskCard(input, { aiJudgeAvailable = false } = {
 
   const scopeInput = input.scope && typeof input.scope === "object" ? input.scope : {};
   const agents = Array.isArray(scopeInput.agents) ? [...new Set(scopeInput.agents.map((a) => text(a, 16)))] : [];
-  if (agents.some((agent) => !AGENTS.has(agent))) throw invalid("scope.agents may only name claude or codex");
+  if (agents.some((agent) => !AGENTS.has(agent))) throw invalid("scope.agents may only name claude, codex or agy");
   const workspaces = Array.isArray(scopeInput.workspaces)
     ? [...new Set(scopeInput.workspaces.map((w) => text(w, 1024)).filter(Boolean))]
     : [];

@@ -102,6 +102,56 @@ function classifyUpdateFailure(error) {
   return "install_failed";
 }
 
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+// npm dropped its own progress UI years ago: a global install of this
+// package can sit silently for minutes on a slow network, which reads as a
+// hung command. While the installer runs we draw a moving status line —
+// a spinner plus elapsed time on a TTY, a periodic heartbeat otherwise.
+// Everything goes to stderr, never stdout: `update install --json` must
+// keep stdout parseable by a caller.
+function startInstallProgress(label, {
+  stream = process.stderr,
+  tickMs = 150,
+  heartbeatMs = 20_000,
+  now = () => Date.now(),
+} = {}) {
+  const noop = { stop() {} };
+  if (!label || !stream) return noop;
+  const startedAt = now();
+  const elapsed = () => `${Math.max(0, Math.round((now() - startedAt) / 1000))}s`;
+  let stopped = false;
+  if (stream.isTTY) {
+    let frame = 0;
+    const paint = () => {
+      stream.write(`\r${SPINNER_FRAMES[frame % SPINNER_FRAMES.length]} ${label}… ${elapsed()}\x1b[K`);
+      frame += 1;
+    };
+    paint();
+    const timer = setInterval(paint, tickMs);
+    timer.unref?.();
+    return {
+      stop() {
+        if (stopped) return;
+        stopped = true;
+        clearInterval(timer);
+        stream.write("\r\x1b[K");
+      },
+    };
+  }
+  const timer = setInterval(() => {
+    stream.write(`${label}… still running, ${elapsed()} elapsed\n`);
+  }, heartbeatMs);
+  timer.unref?.();
+  return {
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+}
+
 function signalInstaller(child, signal) {
   if (process.platform === "win32" && Number.isInteger(child?.pid) && child.pid > 0) {
     const args = ["/pid", String(child.pid), "/T"];
@@ -136,6 +186,10 @@ export function runInstaller(command, args, {
   forceKillWaitMs = 2_000,
   onSpawn = () => {},
   env = process.env,
+  progressLabel = null,
+  progressStream = process.stderr,
+  progressTickMs,
+  progressHeartbeatMs,
 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawnFn(command, args, {
@@ -146,6 +200,11 @@ export function runInstaller(command, args, {
       env: { ...env, npm_config_yes: "true" },
     });
     onSpawn(child);
+    const progress = startInstallProgress(progressLabel, {
+      stream: progressStream,
+      ...(progressTickMs != null ? { tickMs: progressTickMs } : {}),
+      ...(progressHeartbeatMs != null ? { heartbeatMs: progressHeartbeatMs } : {}),
+    });
     let stderrTail = "";
     child.stderr?.on?.("data", (chunk) => {
       const text = String(chunk);
@@ -156,6 +215,7 @@ export function runInstaller(command, args, {
     let timingOut = false;
     const exitWaiters = new Set();
     const markExited = () => {
+      progress.stop();
       exited = true;
       for (const waiter of exitWaiters) waiter();
       exitWaiters.clear();
@@ -184,6 +244,7 @@ export function runInstaller(command, args, {
       error.code = "UPDATE_TIMEOUT";
       error.termination_confirmed = exited;
       error.keep_update_lock = !exited;
+      progress.stop();
       reject(error);
     }, timeoutMs);
     child.once("error", (error) => {
@@ -325,6 +386,7 @@ export async function installLatestVersion({
       killGraceMs: installerKillGraceMs,
       forceKillWaitMs: installerForceKillWaitMs,
       onSpawn: (child) => lock.setInstallerPid(child?.pid),
+      progressLabel: `Installing @originrouter/cli@${checked.latest_version} with ${installContext.command}`,
     });
     const installedVersion = readInstalledVersionFn(installContext);
     if (!parseSemver(installedVersion) || compareSemver(installedVersion, checked.latest_version) < 0) {

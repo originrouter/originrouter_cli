@@ -84,7 +84,7 @@ export const COMMAND_CATALOG = [
     ],
   }),
   leaf("setup", "Install agent runtimes, local Proxy, and configure this device", {
-    options: ["--no-proxy", "--noproxy", "--proxy", "--yes", "--dry-run", "--verify"],
+    options: ["--no-proxy", "--noproxy", "--proxy", "--with-agy", "--yes", "--dry-run", "--verify"],
   }),
   leaf("sessions", "Inspect local agent sessions", { options: ["--json"] }),
   leaf("devices", "Inspect devices authorized for this account", { options: ["--json"] }),
@@ -406,6 +406,12 @@ export const COMMAND_CATALOG = [
     valuesFor: { "--relay-mode": ["auto", "cloud", "local", "custom"] },
   }),
   leaf("daemon-port", "Print the running daemon's Local API URL"),
+  leaf("agy", "Start native Antigravity CLI with automatic proxy environment", {
+    options: ["--native-config"],
+    passthrough: true,
+  }),
+  leaf('agy-acp', 'Run a managed Antigravity ACP session', { hidden: true, options: AGENT_WRAPPER_OPTIONS, passthrough: true }),
+  leaf('agy-hooks', 'Manage OriginRouter Antigravity Hooks', { children: [leaf('install', 'Install Hooks'), leaf('uninstall', 'Remove only OriginRouter Hooks')] }),
   leaf("claude", "Start the native Claude Code TUI with remote control", {
     options: AGENT_WRAPPER_OPTIONS,
     passthrough: true,
@@ -446,6 +452,9 @@ export const COMMAND_CATALOG = [
 //
 // Values are source files, relative to the repo root.
 export const SUBSYSTEM_MODULE = Object.freeze({
+  agy: "src/index.js",
+  'agy-acp': 'src/index.js',
+  'agy-hooks': 'src/index.js',
   agent: "src/index.js",
   "agent-mcp-server": "src/index.js",
   auth: "src/commands/auth.js",

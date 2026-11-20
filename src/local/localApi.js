@@ -55,6 +55,7 @@ import {
   setAgentDetailDefault,
 } from "../runtime/agentDetailProfile.js";
 import { ExternalAgentRegistry } from "./externalAgentRegistry.js";
+import { agyPromptContent } from '../adapters/agy/acpContent.js';
 import { LocalAuditStore } from "../persistence/localAuditStore.js";
 import { ProxyRequestStore } from "../persistence/proxyRequestStore.js";
 import { buildAuditEvidenceBundle } from "../inquiry/auditEvidenceAdapter.js";
@@ -1632,12 +1633,15 @@ async function dispatch(ctx, req, res) {
         }
         if (action === "message") {
           const message = String(body.message || "").trim();
-          if (!message || message.length > 8192) return sendError(res, 400, "invalid agent message");
+          if ((!message && !body.content?.length) || message.length > 8192) return sendError(res, 400, "invalid agent message");
+          if (body.content != null && (ctx.externalAgentRegistry.sessionFacts(sessionId)?.runtime !== 'agy-acp' ||
+              !agyPromptContent(message, body.content, { image: true, embeddedContext: true }))) return sendError(res, 400, 'unsupported agent content');
           const command = ctx.externalAgentRegistry.enqueueCommand(sessionId, {
             type: "agent.message",
             sessionId,
             message,
             messageId: body.messageId,
+            ...(body.content != null ? { content: body.content } : {}),
           });
           return sendOk(res, {
             session_id: sessionId,

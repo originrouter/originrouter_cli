@@ -2,7 +2,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync,
 import { execFileSync } from "node:child_process";
 import { isIP } from "node:net";
 import { homedir, hostname, platform } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { VERSION } from "../constants.js";
 import { migrateLegacyConfig } from "../config/migration.js";
@@ -38,9 +38,30 @@ export function ensureStateDir() {
 // command path and a repeated warning would bury real output.
 let warnedAboutStateDirAcl = false;
 
+// Everything readJson serves — daemon.state.json, proxy state, config — is
+// regenerable state, so a truncated write (crash mid-write, power loss; the
+// rename in atomicWriteJson orders metadata but does not flush data on every
+// filesystem) must degrade to "no state" rather than kill the whole command
+// with a raw JSON.parse error. The corrupt file is moved aside rather than
+// deleted: it stays available for forensics, and quarantining bounds the
+// warning to one read instead of one per command.
+function quarantineCorruptJson(path) {
+  const backup = `${path}.corrupt-${Date.now()}`;
+  try { renameSync(path, backup); } catch { /* reading on matters more than keeping it */ }
+  process.stderr.write(
+    `Warning: ${path} was not valid JSON; moved to ${basename(backup)} and treated as absent.\n`,
+  );
+  return null;
+}
+
 function readJson(path) {
   if (!existsSync(path)) return null;
-  return JSON.parse(readFileSync(path, "utf8"));
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    return quarantineCorruptJson(path);
+  }
 }
 
 function atomicWriteJson(path, value, { mode = null } = {}) {

@@ -98,6 +98,9 @@ export function buildCollaborationCapabilities({
       route_slots: [...(ROUTE_DEFS[runtime]?.slots || [])],
     };
   });
+  // Runtime discovery is separate from gateway routes and collaboration.
+  const agyRuntime = { id: 'agy', available: Boolean(findExecutable('agy', env)), executable: findExecutable('agy', env),
+    route_slots: [], native_config: true, supports_collaboration: false, supports_scheduled_tasks: false };
   const workspaceSummary = workspaceCapabilityCounts({ trusted_workspaces: workspaces });
   return {
     schema_version: 1,
@@ -112,6 +115,7 @@ export function buildCollaborationCapabilities({
       default_workspace_path: process.cwd(),
     },
     runtimes,
+    agent_runtimes: [...runtimes, agyRuntime],
     providers,
     models: providers.flatMap((provider) => provider.models.map((model) => ({
       provider: provider.name,

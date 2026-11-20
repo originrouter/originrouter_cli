@@ -47,15 +47,15 @@ export function rewriteResumeArgv(argv, nativeSessionId) {
   const kept = [];
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (arg === "--resume") {
+    if (arg === "--resume" || arg === '--conversation') {
       // The value belongs to the flag; drop both.
       index += 1;
       continue;
     }
-    if (arg.startsWith("--resume=")) continue;
+    if (arg.startsWith("--resume=") || arg.startsWith('--conversation=')) continue;
     kept.push(arg);
   }
-  const resume = nativeSessionId ? ["--resume", String(nativeSessionId)] : [];
+  const resume = nativeSessionId ? [kept[0] === 'agy' ? '--conversation' : '--resume', String(nativeSessionId)] : [];
   return [kept[0] ?? "claude", ...resume, ...kept.slice(1)];
 }
 
@@ -68,11 +68,11 @@ export function parseResumeArgv(args) {
   const list = Array.isArray(args) ? args.map((arg) => String(arg)) : [];
   for (let index = 0; index < list.length; index += 1) {
     const arg = list[index];
-    if (arg.startsWith("--resume=")) {
-      const value = arg.slice("--resume=".length).trim();
+    if (arg.startsWith("--resume=") || arg.startsWith('--conversation=')) {
+      const value = arg.slice(arg.indexOf('=') + 1).trim();
       return value || null;
     }
-    if (arg === "--resume") {
+    if (arg === "--resume" || arg === '--conversation') {
       const next = list[index + 1];
       if (!next || next.startsWith("-")) return null;
       return next.trim() || null;

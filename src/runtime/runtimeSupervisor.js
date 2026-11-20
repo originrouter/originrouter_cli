@@ -598,7 +598,7 @@ export class RuntimeSupervisor {
   // enqueueing, then wait for the wrapper's matching acceptance receipt.
   startDelivery(sessionId, state, card, snapshot, via, progress, facts) {
     if (state.recovery || !facts.supportsRuntimeRecovery
-      || !["claude-sdk", "codex-app-server"].includes(facts.runtime)) {
+      || !["claude-sdk", "codex-app-server", "agy-acp"].includes(facts.runtime)) {
       this.emit(sessionId, "agent.supervisor.escalated", card, snapshot, {
         reason:"needs_user", code:"RUNTIME_CONFIRMATION_UNAVAILABLE", summary:"This runtime cannot confirm an automatic continuation",
       });
@@ -633,7 +633,7 @@ export class RuntimeSupervisor {
   // before the command is enqueued; an uncertain outcome stays blocked.
   startRecovery(sessionId, state, card, snapshot, via, progress, facts) {
     if (state.recovery || !state.turnToken || !facts.supportsRuntimeRecovery
-      || !["claude-sdk", "codex-app-server"].includes(facts.runtime)) {
+      || !["claude-sdk", "codex-app-server", "agy-acp"].includes(facts.runtime)) {
       this.emit(sessionId, "agent.supervisor.escalated", card, snapshot, {
         reason: "needs_user", code: "RUNTIME_CONFIRMATION_UNAVAILABLE", summary: "This runtime cannot confirm an automatic recovery",
       });
@@ -936,7 +936,7 @@ export class RuntimeSupervisor {
         this.store.appendLog({
           ...event,
           sessionId,
-          ...(["claude", "codex"].includes(snapshot.agent) ? { agent: snapshot.agent } : {}),
+          ...(["claude", "codex", "agy"].includes(snapshot.agent) ? { agent: snapshot.agent } : {}),
           createdAt: new Date(this.now()).toISOString(),
         });
       } catch (error) {

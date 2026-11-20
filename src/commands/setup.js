@@ -4,6 +4,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { platform } from "node:os";
 import os from "node:os";
 import path from "node:path";
+import { inheritSystemProxyEnv } from "../utils/systemProxy.js";
 import {
   detectCliAvailability,
   runCapture,
@@ -28,6 +29,17 @@ const NPM_INSTALLER_ENV = Object.freeze({
 });
 
 export const AGENT_INSTALLERS = Object.freeze({
+  agy: {
+    label: "Antigravity CLI (optional)",
+    optional: true,
+    checks: ["agy", "--version"],
+    darwin: { kind: "shell", command: "curl -fsSL https://antigravity.google/cli/install.sh | bash", display: "curl -fsSL https://antigravity.google/cli/install.sh | bash" },
+    linux: { kind: "shell", command: "curl -fsSL https://antigravity.google/cli/install.sh | bash", display: "curl -fsSL https://antigravity.google/cli/install.sh | bash" },
+    win32: {
+      kind: "powershell", display: "irm https://antigravity.google/cli/install.ps1 | iex",
+      args: ["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; $p=if($env:HTTPS_PROXY){$env:HTTPS_PROXY}else{$env:HTTP_PROXY}; if($p -match '^https?://'){[Net.WebRequest]::DefaultWebProxy=[Net.WebProxy]::new($p)}; irm https://antigravity.google/cli/install.ps1 | iex"],
+    },
+  },
   claude: {
     label: "Claude Code",
     checks: ["claude", "--version"],
@@ -59,14 +71,14 @@ async function runInstaller(installer) {
   // `curl | bash` exits with the LAST command's status: if curl fails (403,
   // DNS, …) the receiving bash gets empty input and still exits 0, silently
   // swallowing the failure. pipefail propagates curl's status instead.
-  return runProcess("bash", ["-lc", `set -o pipefail; ${installer.command}`], { env });
+  return runProcess("bash", ["-c", `set -o pipefail; ${installer.command}`], { env });
 }
 
 export function installerEnvironment(installer, baseEnv = process.env) {
-  return {
+  return inheritSystemProxyEnv({
     ...baseEnv,
     ...(installer.env || {}),
-  };
+  });
 }
 
 function runProcess(command, args, { env = process.env } = {}) {
@@ -99,6 +111,7 @@ export async function refreshAgentPath({ env = process.env, platformName = proce
     candidates.push(path.join(home, ".npm-global", "bin"));
   }
   if (platformName === "win32" && env.APPDATA) candidates.push(path.join(env.APPDATA, "npm"));
+  if (platformName === "win32" && env.LOCALAPPDATA) candidates.push(path.join(env.LOCALAPPDATA, "agy", "bin"));
 
   const existing = String(env.PATH || "").split(separator).filter(Boolean);
   const merged = [...candidates, ...existing].filter((value, index, values) => values.indexOf(value) === index);
@@ -132,7 +145,7 @@ async function installProxyRuntime(pythonCommand) {
   }
 }
 
-export async function verifySetupEnvironment({ includeProxy = true } = {}) {
+export async function verifySetupEnvironment({ includeProxy = true, includeAgy = false } = {}) {
   await refreshAgentPath();
   const stateDir = ensureStateDir();
   const serviceInstalled = isServiceInstalled();
@@ -154,6 +167,11 @@ export async function verifySetupEnvironment({ includeProxy = true } = {}) {
     { name: "Codex", ok: codex.available && codexAppServer.ok, detail: !codex.available ? "not available on PATH" : codexAppServer.ok ? (codex.version || "installed") : "app-server is unavailable" },
     { name: "Background service", ok: serviceInstalled && serviceReady, detail: !serviceInstalled ? "not installed" : serviceReady ? "installed and running" : "installed but not ready" },
   ];
+  if (includeAgy) {
+    const agy = await detectCliAvailability("agy");
+    const acp = agy.available ? await runCapture("agy", ["acp", "--help"], { timeoutMs: 4000 }) : { ok: false };
+    checks.push({ name: "Antigravity CLI", ok: agy.available && acp.ok, detail: !agy.available ? "not available on PATH" : !acp.ok ? "ACP is unavailable; update agy" : agy.version });
+  }
   if (includeProxy) {
     checks.splice(2, 0,
       { name: "Managed Python", ok: python.available, detail: python.available ? `${python.version} at ${python.path}` : "not installed" },
@@ -188,6 +206,7 @@ export async function handleSetupCommand(args = []) {
   // backwards-compatible explicit alias, and offer --no-proxy for the rare
   // case where a user does not need local Provider routing.
   const skipProxy = flags.has("--no-proxy") || flags.has("--noproxy");
+  let includeAgy = flags.has("--with-agy");
   if (!nonInteractive && (!input.isTTY || !output.isTTY)) {
     throw new Error("`originrouter setup` requires an interactive terminal. Re-run it in a terminal, or use `--yes`.");
   }
@@ -195,14 +214,15 @@ export async function handleSetupCommand(args = []) {
   const currentPlatform = platform();
   await refreshAgentPath();
   if (verifyOnly) {
-    printSetupVerification(await verifySetupEnvironment({ includeProxy: !skipProxy }));
+    printSetupVerification(await verifySetupEnvironment({ includeProxy: !skipProxy, includeAgy }));
     return;
   }
 
-  const [claude, codex, managedPython] = await Promise.all([
+  const [claude, codex, managedPython, agy] = await Promise.all([
     detectCliAvailability("claude"),
     detectCliAvailability("codex"),
     managedPythonStatus(ensureStateDir()),
+    detectCliAvailability("agy"),
   ]);
   const missing = [
     ["claude", claude],
@@ -217,9 +237,14 @@ export async function handleSetupCommand(args = []) {
     console.log(`  ${codex.available ? "✓" : "✗"} Codex${codex.version ? ` (${codex.version})` : ""}`);
     console.log(`  ${managedPython.available ? "✓" : skipProxy ? "○" : "✗"} Managed Python ${managedPython.available ? managedPython.version : skipProxy ? "not needed (--no-proxy)" : `${MANAGED_PYTHON_VERSION} will be installed`}`);
     console.log("");
+    console.log(`  ${agy.available ? "✓" : "○"} Antigravity CLI (optional)${agy.version ? ` (${agy.version})` : ""}`);
+    if (!includeAgy && !agy.available && !nonInteractive) {
+      includeAgy = await ask(rl, "Install optional Antigravity CLI using Google's official installer? Requires access to Google's download and sign-in services.", false);
+    }
+    if (includeAgy && !agy.available) missing.push("agy");
 
     const installAgents = missing.length > 0
-      ? (nonInteractive || await ask(rl, `Install missing required runtimes (${missing.map((agent) => AGENT_INSTALLERS[agent].label).join(" and ")})?`, true))
+      ? (nonInteractive || await ask(rl, `Install selected missing runtimes (${missing.map((agent) => AGENT_INSTALLERS[agent].label).join(" and ")})?`, true))
       : false;
     const installService = nonInteractive || await ask(rl, "Install and start the OriginRouter background service?", true);
     const installProxy = !skipProxy;
@@ -239,7 +264,7 @@ export async function handleSetupCommand(args = []) {
     }
     if (plan.length === 0) {
       console.log("Everything selected is already installed.\n");
-      if (!dryRun) printSetupVerification(await verifySetupEnvironment({ includeProxy: !skipProxy }));
+      if (!dryRun) printSetupVerification(await verifySetupEnvironment({ includeProxy: !skipProxy, includeAgy }));
       return;
     }
 
@@ -369,7 +394,7 @@ export async function handleSetupCommand(args = []) {
     if (dryRun) {
       console.log("\nDry run complete. No installation or service changes were made.\n");
     } else {
-      printSetupVerification(await verifySetupEnvironment({ includeProxy: !skipProxy }));
+      printSetupVerification(await verifySetupEnvironment({ includeProxy: !skipProxy, includeAgy }));
     }
   } finally {
     rl?.close();

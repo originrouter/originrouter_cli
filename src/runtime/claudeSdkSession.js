@@ -1,3 +1,4 @@
+import { NativeModelControl } from './nativeModelControl.js';
 import { RuntimeOutputSampler, claudeStreamPart } from "./runtimeOutputSampler.js";
 import { createAgentPermissionStateTracker } from "./agentPermissionStateTracker.js";
 import process from "node:process";
@@ -67,6 +68,7 @@ import {
   resolveWithAutonomy,
 } from "./agentAutonomyPolicy.js";
 import { AsyncMessageQueue } from "./asyncMessageQueue.js";
+import { inheritSystemProxyEnv } from "../utils/systemProxy.js";
 import {
   claudeEffortSettings,
   CLAUDE_EFFORT_LEVELS,
@@ -255,7 +257,8 @@ function extractOriginRouterOptions(args) {
       options[key] = args[index + 1];
       index += 1;
     };
-    if (arg === "--originrouter-relay") take("relay");
+    if (arg === '--native-config') options.nativeConfig = true;
+    else if (arg === "--originrouter-relay") take("relay");
     else if (arg === "--originrouter-relay-mode") take("relayMode");
     else if (arg === "--originrouter-device") take("device");
     else if (arg === "--originrouter-session") take("session");
@@ -399,6 +402,7 @@ export async function runClaudeSdkSession(rawArgs) {
   const relayAccount = captureRelayAccountContext(stateDir);
   const aiApprovalReviewer = new AiApprovalReviewer({ stateDir });
   const options = extractOriginRouterOptions(rawArgs);
+  if (options.nativeConfig && options.provider) throw new Error("--provider cannot be combined with --native-config");
   const collaborationWorker = isCollaborationSessionPayload({
     ...options, sessionId: options.session,
   });
@@ -440,7 +444,7 @@ export async function runClaudeSdkSession(rawArgs) {
     config,
     launchOverride: options.detailProfile,
   });
-  let providerResult = await buildAgentProviderEnv("claude", config, {
+  let providerResult = options.nativeConfig === true ? { env: {}, provider: null, source: "native-config" } : await buildAgentProviderEnv("claude", config, {
     provider: options.provider,
     // The session id rides along as the route credential so the compatibility
     // gateway can resolve this session's model override without the agent
@@ -496,7 +500,7 @@ export async function runClaudeSdkSession(rawArgs) {
       effectiveOptions = { ...options, model: undefined };
     }
   }
-  ({ providerResult, proxy: originrouterCodingProxy } =
+  if (options.nativeConfig !== true) ({ providerResult, proxy: originrouterCodingProxy } =
     await protectOriginrouterCodingEnv("claude", providerResult, {
       stateDir,
       runId: options.runId,
@@ -564,6 +568,12 @@ export async function runClaudeSdkSession(rawArgs) {
     }),
   });
   let queryRef = null;
+  const nativeControl = new NativeModelControl({
+    enabled: options.nativeConfig, provider: 'claude', runtime: 'claude-sdk', current: () => model,
+    load: async () => (await queryRef.supportedModels()).map(item => ({ id: item.value, displayName: item.displayName,
+      resolvedModel: item.resolvedModel, efforts: (item.supportedEffortLevels || []).filter(level => CLAUDE_EFFORT_LEVELS.includes(level)) })),
+    apply: async value => { await queryRef.setModel(value); model = value; },
+  });
   let claudeSessionId =
     typeof options.resume === "string" ? options.resume : null;
   let transcriptPath = claudeTranscriptPathForSession(cwd, claudeSessionId);
@@ -596,8 +606,8 @@ export async function runClaudeSdkSession(rawArgs) {
   // device route: a session with none yet — a fresh one, or a stored session
   // from before sessions carried their own — gets the device's current
   // default written as its own override here.
-  let sessionModel = getSessionModel(stateDir, sessionId);
-  sessionModel ??= seedSessionModelFromDeviceRoute(config, stateDir, sessionId, {
+  let sessionModel = options.nativeConfig === true ? null : getSessionModel(stateDir, sessionId);
+  if (options.nativeConfig !== true) sessionModel ??= seedSessionModelFromDeviceRoute(config, stateDir, sessionId, {
     agent: "claude",
     providerResult,
   });
@@ -900,6 +910,7 @@ export async function runClaudeSdkSession(rawArgs) {
     providerResult.provider?.model ||
     "";
   const sessionEffortLevels = async () => {
+    if (options.nativeConfig === true) return nativeControl.efforts();
     const modelId = sessionEffortModelId();
     // The reader's own words come first: a model they brought with them is
     // a model the cloud's catalogue says nothing about, and they wrote down
@@ -1020,7 +1031,9 @@ export async function runClaudeSdkSession(rawArgs) {
   // gateway substitutes the concrete model this session pinned. That is why
   // this takes effect on the next turn instead of restarting anything.
   const reportSessionModel = (requestId = null, { accepted = null, reason = null } = {}) =>
-    sendAgentEvent({
+    options.nativeConfig === true
+      ? sendAgentEvent(nativeControl.status({sessionId, requestId, accepted, reason}))
+      : sendAgentEvent({
       type: "agent.model.status",
       provider: "claude",
       runtime: "claude-sdk",
@@ -1041,6 +1054,12 @@ export async function runClaudeSdkSession(rawArgs) {
       reason,
     });
   const applySessionModel = async (payload) => {
+    if (options.nativeConfig === true) {
+      const result = await nativeControl.set(payload);
+      await reportSessionModel(payload?.requestId || null, result);
+      if (result.accepted) await reconcileEffortWithModel();
+      return result.accepted;
+    }
     const requested = String(payload?.model || "").trim();
     const requestedProvider = String(payload?.provider || "").trim();
     try {
@@ -1261,7 +1280,8 @@ export async function runClaudeSdkSession(rawArgs) {
         prompt: queue,
         options: {
           cwd,
-          env: { ...process.env, ...providerResult.env },
+          env: inheritSystemProxyEnv({ ...process.env, ...providerResult.env }),
+          ...(options.nativeConfig === true ? { settingSources: ['user', 'project', 'local'] } : {}),
           canUseTool: denyAllTools,
           model,
           ...(runtimeSettingsOverride?.path
@@ -1422,10 +1442,9 @@ export async function runClaudeSdkSession(rawArgs) {
           }));
           return true;
         }
-        await queryRef.setModel(command.args);
-        model = command.args;
-        await sendAgentEvent(commandResult(command, { accepted: true }));
-        return true;
+        const accepted = await applySessionModel({ model: command.args, requestId: command.requestId });
+        await sendAgentEvent(commandResult(command, { accepted, ...(accepted ? {} : { reason: 'native_model_change_failed' }) }));
+        return accepted;
       }
       case "effort": {
         if (!command.args) {
@@ -1858,7 +1877,8 @@ export async function runClaudeSdkSession(rawArgs) {
       prompt: messageQueue,
       options: {
         cwd,
-        env: { ...process.env, ...providerResult.env },
+        env: inheritSystemProxyEnv({ ...process.env, ...providerResult.env }),
+        ...(options.nativeConfig === true ? { settingSources: ['user', 'project', 'local'] } : {}),
         abortController,
         canUseTool,
         onElicitation,
@@ -1935,6 +1955,7 @@ export async function runClaudeSdkSession(rawArgs) {
       },
     });
     relayViaDaemon = await localAgentBridge.start({
+      nativeConfig: options.nativeConfig === true,
       sessionId,
       sessionKind: collaborationWorker ? "collaboration" : "interactive",
       conversationId: options.conversationId || sessionId,
@@ -1991,6 +2012,7 @@ export async function runClaudeSdkSession(rawArgs) {
     // has touched yet still answers on the device route, and the App needs
     // to hear that — including whether this transport can change it — before
     // it can offer a choice.
+    await nativeControl.refresh();
     await reportSessionModel();
     // And the effort it runs on. A session nobody has put on a level yet is
     // on the model's own default, and saying so is what lets the App offer
@@ -2027,6 +2049,7 @@ export async function runClaudeSdkSession(rawArgs) {
         if (event.type === "agent.session_id" && event.sessionId) {
           claudeSessionId = event.sessionId;
           model = model || event.model;
+          if (options.nativeConfig === true) await reportSessionModel();
           transcriptPath = claudeTranscriptPathForSession(cwd, claudeSessionId);
           await localAgentBridge?.update({
             nativeSessionId: claudeSessionId,

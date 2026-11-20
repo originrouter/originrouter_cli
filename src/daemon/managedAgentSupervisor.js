@@ -17,7 +17,7 @@ import {
   requireRemoteWorkspacePathPreflight,
 } from "../runtime/unattendedWorkspaceReadiness.js";
 
-const AGENTS = new Set(["claude", "codex"]);
+const AGENTS = new Set(["claude", "codex", "agy"]);
 const PERMISSION_PROFILES = new Set([
   "manual",
   "guarded",
@@ -111,6 +111,9 @@ export class ManagedAgentSupervisor {
     if (!AGENTS.has(agent)) {
       throw launchError("UNSUPPORTED_AGENT", `Unsupported Agent: ${agent || "unknown"}`);
     }
+    if (agent === 'agy' && isCollaborationSessionPayload(payload)) throw launchError('UNSUPPORTED_AGENT', 'Antigravity collaboration is not supported.');
+    let nativeConfig = agent === 'agy' || payload.nativeConfig === true || payload.native_config === true;
+    if (nativeConfig && payload.provider) throw launchError('INVALID_PROVIDER', 'Native sessions cannot select an OriginRouter model provider.');
     const deviceBudget = this.agentBudgetStore?.status("device");
     const agentBudget = this.agentBudgetStore?.status("agent", agent);
     if (deviceBudget?.blocked || agentBudget?.blocked) {
@@ -270,9 +273,11 @@ export class ManagedAgentSupervisor {
         );
       }
       conversationId = resumeConversationId;
+      nativeConfig ||= resumeConversation.runs?.[0]?.native_config === 1;
+      if (nativeConfig && payload.provider) throw launchError('INVALID_PROVIDER', 'Native sessions cannot select an OriginRouter model provider.');
     }
 
-    const command = agent === "claude" ? "claude-sdk" : "codex-app-server";
+    const command = { claude: 'claude-sdk', codex: 'codex-app-server', agy: 'agy-acp' }[agent];
     const args = [
       this.binPath,
       command,
@@ -291,6 +296,7 @@ export class ManagedAgentSupervisor {
       "--originrouter-workspace",
       workspace.workspace_id,
     ];
+    if (nativeConfig) args.push('--native-config');
     const taskId = safeText(payload.taskId || payload.task_id, 195);
     if (taskId) args.push("--originrouter-task", taskId);
     const startedBy = nativeSessionId
@@ -372,7 +378,8 @@ export class ManagedAgentSupervisor {
       workspaceTrusted: true,
       cwd: workspace.canonical_path,
       pid: child.pid,
-      runtime: agent === "claude" ? "claude-sdk" : "codex-app-server",
+      runtime: command,
+      nativeConfig,
       provider,
       model,
       permissionProfile,

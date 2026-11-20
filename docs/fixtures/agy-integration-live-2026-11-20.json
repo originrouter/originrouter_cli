@@ -1,0 +1,71 @@
+{
+  "date": "2026-11-20",
+  "platform": "macOS ARM64",
+  "agyVersion": "1.5.13",
+  "transport": "existing local API and LocalAgentBridgeClient, isolated daemon state",
+  "officialAuthAndModelRequests": "official agy only",
+  "checks": [
+    {
+      "path": "App-created ACP",
+      "checks": [
+        "native catalog",
+        "real message response",
+        "model set acknowledged",
+        "effort set acknowledged",
+        "permission request and approval",
+        "real file read",
+        "stop",
+        "resume same native session and history",
+        "real response after resume"
+      ],
+      "passed": true
+    },
+    {
+      "path": "originrouter agy native TUI",
+      "checks": [
+        "existing registry registration",
+        "real message via local API",
+        "Hook approval via local API",
+        "native deny blocks Hook auto_approve",
+        "stop",
+        "resume same native session and history",
+        "real response after resume"
+      ],
+      "passed": true
+    },
+    {
+      "path": "Claude SDK native-config",
+      "checks": [
+        "official model catalog",
+        "setModel acknowledgement",
+        "native effort setting acknowledgement"
+      ],
+      "inferenceTested": false,
+      "passed": true
+    },
+    {
+      "path": "Codex app-server native-config",
+      "checks": [
+        "official model catalog",
+        "thread settings model update",
+        "native effort setting acknowledgement"
+      ],
+      "inferenceTested": false,
+      "passed": true
+    }
+  ],
+  "notTestedLive": [
+    "Windows",
+    "Linux",
+    "physical mobile App over production public relay",
+    "actual agy reinstall on an already-installed device"
+  ],
+  "originalNativeTuiHookEvidence": "agy-native-validation-1.5.13.json",
+  "globalAgyModelDefaultUnchanged": true,
+  "finalAcpRun": "passed all live steps through source scripts/test-agy-live.mjs --live",
+  "regressionChecks": {
+    "cli": "npm test passed; later focused agy/setup/control checks passed",
+    "server": "18 relevant tests passed",
+    "app": "1408 passed, 5 skipped, 2 unrelated UI assertion failures in expanded workspace suite; focused integration tests passed"
+  }
+}

@@ -128,6 +128,7 @@ import {
 } from "./commands/routeSources.js";
 import { runClaudeSdkSession } from "./runtime/claudeSdkSession.js";
 import { runCodexAppServerSession } from "./runtime/codexAppServerSession.js";
+import { runAgyNativeSession } from "./runtime/agyNativeSession.js";
 import { runAgentGatewayMcpServer } from "./mcp/agentGatewayServer.js";
 import {
   detectClaudeAgentSdkAvailability,
@@ -142,9 +143,14 @@ import {
 } from "./runtime/agentDetailProfile.js";
 import { printHelp, printSummaryHelp } from "./commands/help.js";
 import { spawnCommand } from "./utils/spawn.js";
+import { inheritSystemProxyEnv } from "./utils/systemProxy.js";
 
 
 export function resolveAgentCommand(command, args = []) {
+  if (command === "agy-acp") return { agent: 'agy', runtime: 'agy-acp', args: args.slice() };
+  if (command === "agy") {
+    return { agent: "agy", runtime: "agy-native", args: args.slice() };
+  }
   if (command === "claude") {
     return {
       agent: "claude",
@@ -183,7 +189,7 @@ function runCommand(command, args) {
   // cmd.exe — CreateProcess alone cannot run them.
   const child = spawnCommand(command, args, {
     cwd: process.cwd(),
-    env: process.env,
+    env: inheritSystemProxyEnv(process.env),
     stdio: "inherit",
   });
 
@@ -1628,7 +1634,22 @@ export async function main(argv) {
     return;
   }
 
+  if (command === "agy-hooks") {
+    if (!["install", "uninstall"].includes(args[0])) throw new Error('Use originrouter agy-hooks install|uninstall');
+    const { configureAgyHooks } = await import('./adapters/agy/hookSettings.js');
+    const result = await configureAgyHooks({ remove: args[0] === "uninstall" });
+    console.log(`${result.changed ? 'Updated' : 'Unchanged'}: ${result.path}`);
+    return;
+  }
   const agentCommand = resolveAgentCommand(command, args);
+  if (agentCommand?.runtime === 'agy-acp') {
+    await runLocalAgentSession('agy', [...agentCommand.args, '--native-config'], { runtime: 'agy-acp' });
+    return;
+  }
+  if (agentCommand?.runtime === "agy-native") {
+    await runAgyNativeSession(agentCommand.args);
+    return;
+  }
   if (agentCommand?.runtime === "claude-sdk") {
     await runClaudeSdkSession(agentCommand.args);
     return;

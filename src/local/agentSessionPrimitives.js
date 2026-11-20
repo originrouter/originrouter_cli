@@ -53,7 +53,10 @@ export function handleRemoteEvent(payload, ctx) {
 
   if (payload.type === "agent.message") {
     const message = String(payload.message || "").replace(/[\r\n]+$/g, "");
-    if (!message) return false;
+    if (!message && !payload.content?.length) return false;
+    if (payload.content != null && ctx.adapter?.describe?.().runtime !== 'agy-acp') return false;
+    if (typeof ctx.adapter?.submitRemoteMessage === 'function') return ctx.adapter.submitRemoteMessage(ctx.executor, message,
+      { ...payload, messageId: payload.messageId || payload.commandId });
     return submitRemoteMessage(ctx.executor, message);
   }
   if (payload.type === AGENT_COMMAND_TYPE) {
@@ -61,6 +64,7 @@ export function handleRemoteEvent(payload, ctx) {
     // TUI resolves the line itself. Only slash commands the session's own
     // menu named are injected — side-conversation kinds and anything the
     // table did not offer get a negative result instead of a stray keystroke.
+    //
     // Every refusal names its reason on `ctx.commandRefusal` so the caller
     // can fold it into the `agent.command.result` it emits: "unsupported"
     // used to be the only word, which told the reader a busy session did not
@@ -102,6 +106,7 @@ export function handleRemoteEvent(payload, ctx) {
     });
   }
   if (payload.type === "terminal.input") {
+    if (ctx.adapter?.supportsRawTerminal === false) return false;
     ctx.executor.write(payload.data || "");
     return true;
   }
@@ -109,7 +114,11 @@ export function handleRemoteEvent(payload, ctx) {
     ctx.executor.resize(payload.cols, payload.rows);
   }
   if (payload.type === "terminal.interrupt") {
+    ctx.adapter.onInterrupt?.();
     ctx.executor.interrupt();
+  }
+  if (payload.type === 'agent.supervisor.interrupt') {
+    return ctx.adapter?.interruptForRecovery?.(payload.turnId) ?? false;
   }
   if (payload.type === "agent.permission.resolve") {
     if (typeof ctx.adapter.resolvePermission === "function") {
@@ -288,6 +297,10 @@ export function extractOriginRouterOptions(args) {
       options.runId = args[index + 1];
       index += 1;
       continue;
+    }
+    if (['--originrouter-workspace', '--originrouter-task', '--originrouter-session-kind', '--originrouter-telemetry-owner'].includes(arg)) {
+      const key = { '--originrouter-workspace': 'workspaceId', '--originrouter-task': 'taskId', '--originrouter-session-kind': 'sessionKind', '--originrouter-telemetry-owner': 'telemetryOwner' }[arg];
+      options[key] = args[++index]; continue;
     }
     // The title is ours, not the agent's: the agent names the conversation
     // itself, and this is only the name the launcher already knows.

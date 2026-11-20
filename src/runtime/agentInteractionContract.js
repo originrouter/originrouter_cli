@@ -46,6 +46,7 @@ export const INTERACTION_ACTIONS = Object.freeze({
 // The values are stable so a rename in 9.0+ breaks the test instead
 // of silently shipping.
 export const INTERACTION_SOURCES = Object.freeze({
+  ACP: "acp",
   HOOK: "hook", // Claude PTY PermissionRequest hook (default)
   JSONL: "jsonl", // reserved for future Claude JSONL scanner
   APP_SERVER: "app-server", // Codex app-server approvals

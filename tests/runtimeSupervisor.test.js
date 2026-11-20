@@ -58,7 +58,7 @@ function card(overrides = {}) {
 function fixture(t, cards = [card()], { agent = "claude", cwd = "/srv/app", autoAck = true } = {}) {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_800_000_000_000 });
   const registry = new ExternalAgentRegistry();
-  registry.register({ sessionId: SESSION, agent, cwd, runtime:agent === "codex" ? "codex-app-server" : "claude-sdk", supportsRuntimeRecovery:true });
+  registry.register({ sessionId: SESSION, agent, cwd, runtime:agent === "agy" ? "agy-acp" : agent === "codex" ? "codex-app-server" : "claude-sdk", supportsRuntimeRecovery:true });
   const store = new RuntimeTaskStore({ stateDir: mkdtempSync(join(tmpdir(), "originrouter-rt-")) });
   store.setCards({ cards });
   const supervisor = new RuntimeSupervisor({ registry, store, settleMs: 1000, log: { error() {} } }).start();
@@ -86,6 +86,22 @@ function fixture(t, cards = [card()], { agent = "claude", cwd = "/srv/app", auto
 }
 
 const overloaded = { type: "agent.task.aborted", provider: "claude", status: "error", reason: "overloaded" };
+
+test("agy ACP continues only after matching receipt and keeps user-stop protection", async (t) => {
+  const f = fixture(t, [card({scope:{agents:["agy"]}})], {agent:"agy", autoAck:false});
+  f.event({type:"agent.task.started",supervisorTurnId:"agy-turn"});
+  f.event(overloaded);
+  await f.advance(31_000);
+  assert.equal(f.sent().length,1);
+  assert.equal(f.supervisorEvents().some(item => item.type === "agent.supervisor.acted"),false);
+  f.event({type:"agent.message.result",messageId:f.sent()[0].messageId,accepted:true});
+  await f.advance(500);
+  assert.ok(f.store.log().some(item => item.agent === "agy" && item.type === "agent.supervisor.acted"));
+  f.registry.enqueueCommand(SESSION,{type:"terminal.interrupt"});
+  f.event(overloaded);
+  await f.advance(300_000);
+  assert.equal(f.sent().length,1);
+});
 
 test("an overloaded turn is continued after the backoff, and says so", async (t) => {
   const f = fixture(t);
@@ -855,12 +871,12 @@ test("a delayed loop verdict cannot act while approval is pending", async (t) =>
   assert.equal(f.escalations.length, 0);
 });
 
-function recoveryFixture(t, judge = async () => ({ verdict: "act", confidence: 0.99 })) {
+function recoveryFixture(t, judge = async () => ({ verdict: "act", confidence: 0.99 }), runtime = "codex-app-server") {
   return aiFixture(t, judge, {
     checkpoints: ["loop"],
     action: { kind: "interrupt_and_continue", message: "请继续" },
     limits: { maxFires: 2, cooldownSeconds: 0 },
-  }, { runtime: "codex-app-server", supportsRuntimeRecovery: true });
+  }, { runtime, agent: runtime === "agy-acp" ? "agy" : "codex", supportsRuntimeRecovery: true });
 }
 
 async function triggerRecovery(f) {
@@ -870,9 +886,9 @@ async function triggerRecovery(f) {
   return f.registry.commandsAfter(SESSION, 0).commands.find((command) => command.type === "agent.supervisor.interrupt");
 }
 
-for (const ackFirst of [true, false]) {
-  test(`recovery waits for matching acknowledgement and aborted turn (ack first: ${ackFirst})`, async (t) => {
-    const f = recoveryFixture(t);
+for (const runtime of ["codex-app-server", "agy-acp"]) for (const ackFirst of [true, false]) {
+  test(`${runtime} recovery waits for matching acknowledgement and aborted turn (ack first: ${ackFirst})`, async (t) => {
+    const f = recoveryFixture(t, undefined, runtime);
     const interrupt = await triggerRecovery(f);
     assert.ok(interrupt);
     assert.equal(f.store.recoveryFor(SESSION).pending, true);

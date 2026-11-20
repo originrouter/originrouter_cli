@@ -23,6 +23,9 @@ assert.equal(resolveAgentCommand("claude-sdk", []).runtime, "claude-sdk");
 assert.equal(resolveAgentCommand("codex-terminal", []).runtime, "codex-app-server");
 assert.equal(resolveAgentCommand("codex-app-server", []).runtime, "codex-app-server");
 assert.equal(resolveAgentCommand("status", []), null);
+assert.deepEqual(resolveAgentCommand("agy", ["--conversation=test"]), {
+  agent: "agy", runtime: "agy-native", args: ["--conversation=test"],
+});
 
 assert.deepEqual(
   extractOriginRouterOptions([

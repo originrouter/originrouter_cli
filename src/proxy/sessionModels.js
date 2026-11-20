@@ -1,11 +1,16 @@
 // Per-session model overrides.
 //
-// The device-level route (config.routes) stays the default: when a session has
-// no override, the agent asks the proxy for its alias and the proxy resolves it
-// through the rendered route YAML. A session override does not touch routes, the
-// proxy process, or the agent's own model string — it only tells the
-// compatibility gateway which concrete upstream model to substitute when it sees
-// that session's credential on a request.
+// A session's model is a snapshot, not a pointer: at launch the device's
+// current default is resolved once and pinned here as the session's own
+// override (seedSessionModelFromDeviceRoute), so a route the device moves to
+// later changes only sessions started after it. The device-level route
+// (config.routes) remains the resolution floor: when a session has no
+// override — one whose default could not be pinned, or one started before
+// this — the agent asks the proxy for its alias and the proxy resolves it
+// through the rendered route YAML. A session override does not touch routes,
+// the proxy process, or the agent's own model string — it only tells the
+// compatibility gateway which concrete upstream model to substitute when it
+// sees that session's credential on a request.
 //
 // Why the credential and not a header: Claude Code and Codex already send a
 // credential on every request, and the CLI already pins that credential through
@@ -21,8 +26,9 @@ import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 
 import { activeAccountStateDir } from "../persistence/accounts.js";
+import { defaultModelForSlot } from "../config/deviceDefaults.js";
 import { enabledProviderModelEntries } from "../config/providerModels.js";
-import { routeProviderForRead } from "../config/routes.js";
+import { fallbackModelsFor, routeProviderForRead } from "../config/routes.js";
 
 export const SESSION_MODELS_SCHEMA = "originrouter-session-models-v1";
 
@@ -322,6 +328,67 @@ export function clearSessionModel(stateDir, sessionId) {
   if (!document.sessions[id]) return document;
   delete document.sessions[id];
   return writeSessionModels(stateDir, document);
+}
+
+/**
+ * Give a session a model of its own by pinning the device's current default.
+ *
+ * A session is born on the device route's model — as a *snapshot*, not a
+ * pointer. The default is resolved once at launch and written as the session's
+ * own override, so a route the device moves to later changes only the sessions
+ * started after it, never a running or stored one. A stored session that never
+ * got a model — one started before sessions carried their own — is pinned on
+ * its next start, the same way a new session is.
+ *
+ * The absent override still resolves to the device route — a session whose
+ * default cannot be pinned, or a session-models file from before this, runs on
+ * exactly what it ran on before.
+ *
+ * Only a transport with a model-rewrite point takes a seed: there the gateway
+ * resolves the entry, so the pinned model is what the session runs on. On the
+ * others the override could never take effect, and writing one would leave a
+ * session that claims a model it does not run on.
+ *
+ * Returns `{ provider, model }` shaped like a session-models entry, or null
+ * when the session already has a model of its own, the transport cannot
+ * rewrite, or the default cannot be named.
+ */
+export function seedSessionModelFromDeviceRoute(
+  config,
+  stateDir,
+  sessionId,
+  { agent, providerResult } = {},
+) {
+  const id = String(sessionId || "").trim();
+  if (!id || !agent) return null;
+  if (getSessionModel(stateDir, id)) return null;
+  if (modelControlForTransport(providerResult?.source) !== "supported") {
+    return null;
+  }
+  const provider = providerResult?.provider || null;
+  const resolved =
+    fallbackModelsFor(agent, providerResult).main ||
+    // The bundled default answers only for the cloud, for the same reason the
+    // gateway's own chain stops there: a remote or LiteLLM route serves its
+    // own models, and naming a cloud one would claim a model the route cannot
+    // answer.
+    ((!provider?.type || provider.type === "originrouter")
+      ? defaultModelForSlot(agent, "main")
+      : null);
+  if (!resolved) return null;
+  const target = resolveLaunchModelTarget(config, {
+    agent,
+    model: resolved,
+    provider: providerResult?.routes?.main?.provider || "",
+    allowedProviders: directProvidersForTransport(providerResult),
+  });
+  if (!target.ok) return null;
+  setSessionModel(stateDir, id, {
+    agent,
+    provider: target.provider,
+    model: target.model,
+  });
+  return { provider: target.provider, model: target.model };
 }
 
 /**

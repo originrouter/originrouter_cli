@@ -4,6 +4,7 @@ import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
 
 import { readClaudeConversationHistory } from "../runtime/claudeConversationHistory.js";
 import { readCodexConversationHistory } from "../adapters/codex/jsonlScanner.js";
+import { readAgyConversationHistory } from '../adapters/agy/history.js';
 import { isCollaborationSessionPayload } from "../runtime/agentSessionKind.js";
 
 export { isCollaborationSessionPayload } from "../runtime/agentSessionKind.js";
@@ -321,9 +322,9 @@ export class ExternalAgentRegistry {
         mode: "default",
         modeControl: "unsupported",
         availableModes: [],
-        model: null,
+        model: row.native_config === 1 || row.agent_type === 'agy' ? row.model || null : null,
         modelProvider: null,
-        modelSource: "device",
+        modelSource: row.native_config === 1 || row.agent_type === 'agy' ? 'native' : 'device',
         modelControl: "unsupported",
         effort: null,
         effortControl: "unsupported",
@@ -486,8 +487,10 @@ export class ExternalAgentRegistry {
       // answer for `agent.command`). Kept apart from `commands`, which is the
       // pending-command queue the session poller drains.
       commandMenu: Array.isArray(payload?.commandMenu)
-        ? payload.commandMenu.slice(0, 64)
+        ? payload.commandMenu.slice(0, 128)
         : existing?.commandMenu || [],
+      promptCapabilities: existing?.promptCapabilities || {},
+      usage: existing?.usage || null,
       commandSequence: existing?.commandSequence || 0,
       commandStreamId: existing?.commandStreamId || `local_commands_${randomUUID()}`,
       pendingInteractions:
@@ -523,8 +526,9 @@ export class ExternalAgentRegistry {
       // what the field meant.
       model: existing?.model ?? null,
       modelProvider: existing?.modelProvider ?? null,
-      modelSource: existing?.modelSource || "device",
+      modelSource: existing?.modelSource || (payload.nativeConfig === true || payload.agent === 'agy' ? 'native' : 'device'),
       modelControl: existing?.modelControl || "unsupported",
+      availableModels: existing?.availableModels || [],
       // The session's own reasoning effort. Null means the runtime has not
       // said yet — the runtime owns the vocabulary, so the App renders the
       // level list it publishes rather than a list of its own.
@@ -787,6 +791,11 @@ export class ExternalAgentRegistry {
       return session.eventSequence;
     }
     session.eventSequence += 1;
+    if (event?.type === 'agent.capabilities') {
+      session.promptCapabilities = { image: event.promptCapabilities?.image === true, embeddedContext: event.promptCapabilities?.embeddedContext === true };
+    }
+    if (event?.type === 'agent.commands' && Array.isArray(event.commands)) session.commandMenu = event.commands.slice(0, 128);
+    if (event?.type === 'agent.usage') session.usage = { ...event };
     this.eventCursor += 1;
     session.lastSeenAtMs = this.now();
     const storedEvent = {
@@ -847,6 +856,7 @@ export class ExternalAgentRegistry {
         : session.availableModes;
     }
     if (event?.type === "agent.model.status") {
+      if (Array.isArray(event.availableModels)) session.availableModels = event.availableModels.slice(0, 256);
       // The model is a fact about the session, and it can be cleared: an
       // empty model means the session is back on the device route, so the
       // value is assigned rather than kept when it is blank.
@@ -1031,6 +1041,9 @@ export class ExternalAgentRegistry {
 
   history(sessionId, options) {
     const session = this.require(sessionId);
+    if (session.agent === 'agy') return { ...readAgyConversationHistory(session.transcriptPath, options),
+      conversationId: session.conversationId, nativeSessionId: session.nativeSessionId,
+      detailProfile: session.detailProfile, detailSource: session.detailSource };
     if (session.agent === "claude") {
       return {
         ...(this.runtimeTaskStore?.annotateHistory(sessionId, readClaudeConversationHistory(session.transcriptPath, options))
@@ -1084,6 +1097,7 @@ export class ExternalAgentRegistry {
       modelProvider: session.modelProvider,
       modelSource: session.modelSource,
       modelControl: session.modelControl,
+      ...(session.modelSource === 'native' ? { availableModels: session.availableModels || [] } : {}),
       // The session's own reasoning effort, and the levels the runtime
       // published for it.
       effort: session.effort,
@@ -1094,6 +1108,8 @@ export class ExternalAgentRegistry {
         session.autonomyStatus,
       // The session's slash-command menu — the App renders exactly this list.
       commands: session.commandMenu || [],
+      promptCapabilities: session.promptCapabilities || {},
+      ...(session.usage ? { usage: session.usage } : {}),
       // The side conversation's liveness — the App's surface tracks it, and
       // a snapshot is the only place a late joiner can learn the thread is
       // already open. `null` never reaches the wire: a session that never

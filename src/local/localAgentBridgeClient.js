@@ -197,7 +197,8 @@ export class LocalAgentBridgeClient {
 
   async sendEvent(event) {
     if (this.closed) return false;
-    if (["agent.autonomy.status", "agent.mode.status", "agent.detail.status", "agent.model.status", "agent.effort.status"].includes(event?.type)) {
+    if (["agent.autonomy.status", "agent.mode.status", "agent.detail.status", "agent.model.status", "agent.effort.status", "agent.commands", "agent.capabilities"].includes(event?.type)
+        || (event?.type === 'agent.usage' && event.provider === 'agy')) {
       // The runtime outlives the daemon. Reconnect must rehydrate current
       // configuration even when its original telemetry was delivered.
       //
@@ -207,6 +208,7 @@ export class LocalAgentBridgeClient {
       // Without the replay a session the reader had pinned silently fell back
       // to the device route on the daemon's next start.
       this.latestStatusEvents.set(event.type, event);
+      if (event.type === 'agent.commands') this.sessionMetadata = { ...this.sessionMetadata, commandMenu: event.commands || [] };
       if (event.type === "agent.autonomy.status") {
         this.sessionMetadata = { ...this.sessionMetadata,
           autonomyProfile: event.autonomyProfile,
