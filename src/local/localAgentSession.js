@@ -1392,6 +1392,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
     },
     onCommand: async (payload) => {
       let applied;
+      let agentCommandCtx = null;
       if (payload?.type === "agent.interaction.resolve") {
         try {
           applied = interactions.resolve(payload).accepted;
@@ -1399,7 +1400,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
           applied = false;
         }
       } else {
-        applied = await handleRemoteEvent(payload, {
+        const commandCtx = {
           sessionId,
           adapter,
           executor,
@@ -1407,7 +1408,13 @@ export async function runLocalAgentSession(agent, rawArgs) {
           applySessionModel,
           applyEffort,
           sessionCommands,
-        });
+        };
+        applied = await handleRemoteEvent(payload, commandCtx);
+        if (payload?.type === "agent.command") {
+          // Fold the primitives' own refusal word into the result emitted
+          // below — a busy terminal says turn_in_progress, not unsupported.
+          agentCommandCtx = commandCtx;
+        }
       }
       if (payload?.type === "agent.message") {
         const message = String(payload.message || "").replace(/[\r\n]+$/g, "");
@@ -1436,7 +1443,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
           requestId: command.requestId,
           command: command.name || command.kind,
           accepted: applied !== false,
-          ...(applied === false ? { reason: "unsupported" } : {}),
+          ...(applied === false
+            ? { reason: agentCommandCtx?.commandRefusal || "unsupported" }
+            : {}),
         }));
       }
       return applied;
@@ -1683,7 +1692,7 @@ export async function runLocalAgentSession(agent, rawArgs) {
         return false;
       }
     }
-    const applied = await handleRemoteEvent(payload, {
+    const commandCtx = {
       sessionId,
       adapter,
       executor,
@@ -1691,7 +1700,8 @@ export async function runLocalAgentSession(agent, rawArgs) {
       applySessionModel,
       applyEffort,
       sessionCommands,
-    });
+    };
+    const applied = await handleRemoteEvent(payload, commandCtx);
     if (payload?.type === "agent.message") {
       const message = String(payload.message || "").replace(/[\r\n]+$/g, "");
       if (applied !== false && message) {
@@ -1717,7 +1727,9 @@ export async function runLocalAgentSession(agent, rawArgs) {
         requestId: command.requestId,
         command: command.name || command.kind,
         accepted: applied !== false,
-        ...(applied === false ? { reason: "unsupported" } : {}),
+        ...(applied === false
+          ? { reason: commandCtx.commandRefusal || "unsupported" }
+          : {}),
       }));
     }
     return applied;

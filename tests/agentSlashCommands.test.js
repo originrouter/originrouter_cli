@@ -123,6 +123,81 @@ const names = (list) => list.map((entry) => entry.name);
   assert.equal(submitted.length, 2);
 }
 
+// ---- Every refusal names why on ctx.commandRefusal ----
+
+{
+  // The managed claude menu is the one that gates on busy: compact/clear
+  // carry availableDuringTask:false there, while the PTY tables mark every
+  // inject true — a terminal's TUI manages its own busy state.
+  const claudeMenu = commandsForSession({ agent: "claude", runtime: "claude-sdk" });
+  const send = (ctx, command) =>
+    handleRemoteEvent({ type: AGENT_COMMAND_TYPE, sessionId: "s1", command }, ctx);
+
+  // A busy terminal refuses commands that cannot run mid-turn — and the
+  // result says turn_in_progress, not the old blanket "unsupported" that
+  // read as "this session does not know the command".
+  const busyCtx = {
+    sessionId: "s1",
+    adapter: { busy: true, submitRemoteMessage: async () => true },
+    executor: { write() {} },
+    sessionCommands: claudeMenu,
+  };
+  assert.equal(await send(busyCtx, { name: "compact" }), false);
+  assert.equal(busyCtx.commandRefusal, "turn_in_progress");
+
+  // Commands the table marked availableDuringTask still go through.
+  const injected = [];
+  const midTurnCtx = {
+    sessionId: "s1",
+    adapter: {
+      busy: true,
+      submitRemoteMessage: async (_exec, line) => { injected.push(line); return true; },
+    },
+    executor: { write() {} },
+    sessionCommands: claudeMenu,
+  };
+  assert.equal(await send(midTurnCtx, { name: "status" }), true);
+  assert.equal(injected[0], "/status");
+  assert.equal(midTurnCtx.commandRefusal, null);
+
+  // An inject the terminal itself declined is its own word.
+  const refusedCtx = {
+    sessionId: "s1",
+    adapter: { busy: false, submitRemoteMessage: async () => false },
+    executor: { write() {} },
+    sessionCommands: claudeMenu,
+  };
+  assert.equal(await send(refusedCtx, { name: "compact" }), false);
+  assert.equal(refusedCtx.commandRefusal, "inject_failed");
+
+  // The executor-level path names the same failure.
+  const execRefusedCtx = {
+    sessionId: "s1",
+    adapter: {},
+    executor: { write() {}, submitMessage: async () => false },
+    sessionCommands: claudeMenu,
+  };
+  assert.equal(await send(execRefusedCtx, { name: "compact" }), false);
+  assert.equal(execRefusedCtx.commandRefusal, "inject_failed");
+
+  // Unknown and App-routed names still say unsupported.
+  const plainCtx = {
+    sessionId: "s1",
+    adapter: {},
+    executor: { write() {}, submitMessage: async () => true },
+    sessionCommands: claudeMenu,
+  };
+  assert.equal(await send(plainCtx, { name: "frobnicate" }), false);
+  assert.equal(plainCtx.commandRefusal, "unsupported");
+  assert.equal(await send(plainCtx, { name: "quit" }), false);
+  assert.equal(plainCtx.commandRefusal, "unsupported");
+  assert.equal(
+    await send(plainCtx, { kind: COMMAND_KIND_SIDE_MESSAGE, text: "hi" }),
+    false,
+  );
+  assert.equal(plainCtx.commandRefusal, "unsupported");
+}
+
 // ---- Side payloads carry the agents' own semantics ----
 
 {

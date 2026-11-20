@@ -61,9 +61,17 @@ export function handleRemoteEvent(payload, ctx) {
     // TUI resolves the line itself. Only slash commands the session's own
     // menu named are injected — side-conversation kinds and anything the
     // table did not offer get a negative result instead of a stray keystroke.
+    // Every refusal names its reason on `ctx.commandRefusal` so the caller
+    // can fold it into the `agent.command.result` it emits: "unsupported"
+    // used to be the only word, which told the reader a busy session did not
+    // know the command at all.
     const command = normalizeCommandPayload(payload);
-    if (command.kind !== COMMAND_KIND_SLASH) return false;
-    const offered = Array.isArray(ctx.sessionCommands)
+    ctx.commandRefusal = null;
+    if (command.kind !== COMMAND_KIND_SLASH) {
+      ctx.commandRefusal = "unsupported";
+      return false;
+    }
+    const offered = Array.isArray(ctx.adapter?.commands) ? ctx.adapter.commands : Array.isArray(ctx.sessionCommands)
       ? ctx.sessionCommands
       : [];
     const entry = offered.find(
@@ -71,11 +79,27 @@ export function handleRemoteEvent(payload, ctx) {
         item.name === command.name ||
         (Array.isArray(item.aliases) && item.aliases.includes(command.name)),
     );
-    if (!entry || entry.route === "app") return false;
-    return submitRemoteMessage(
-      ctx.executor,
-      `/${command.name}${command.args ? ` ${command.args}` : ""}`,
-    );
+    if (!entry || entry.route === "app") {
+      ctx.commandRefusal = "unsupported";
+      return false;
+    }
+    const line = `/${command.name}${command.args ? ` ${command.args}` : ""}`;
+    if (typeof ctx.adapter?.submitRemoteMessage === 'function') {
+      if (ctx.adapter.busy && !entry.availableDuringTask) {
+        ctx.commandRefusal = "turn_in_progress";
+        return false;
+      }
+      return Promise.resolve(
+        ctx.adapter.submitRemoteMessage(ctx.executor, line),
+      ).then((accepted) => {
+        if (accepted === false) ctx.commandRefusal = "inject_failed";
+        return accepted;
+      });
+    }
+    return submitRemoteMessage(ctx.executor, line).then((accepted) => {
+      if (accepted === false) ctx.commandRefusal = "inject_failed";
+      return accepted;
+    });
   }
   if (payload.type === "terminal.input") {
     ctx.executor.write(payload.data || "");
@@ -146,8 +170,7 @@ export function handleRemoteEvent(payload, ctx) {
 
 async function submitRemoteMessage(executor, message) {
   if (typeof executor?.submitMessage === "function") {
-    await executor.submitMessage(message);
-    return true;
+    return (await executor.submitMessage(message)) !== false;
   }
   executor.write(message);
   await new Promise((resolve) => setTimeout(resolve, 30));
