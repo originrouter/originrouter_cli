@@ -7,14 +7,24 @@ apply to the active process.
 
 | CLI command | Conversation mirror | Tool/activity mirror | Blocking controls | Mode control | History source |
 | --- | --- | --- | --- | --- | --- |
-| `originrouter claude` | Yes | Yes | PermissionRequest, AskUserQuestion, ExitPlanMode, MCP form/URL | Display only | Claude transcript JSONL |
+| `originrouter claude` | Yes | Yes | PermissionRequest, AskUserQuestion, ExitPlanMode, MCP form/URL | Native confirmed control when observed | Claude transcript JSONL |
 | `originrouter claude-terminal` | Yes | Yes | Tool permissions, questions, plan approval, MCP form/URL | Yes | Claude transcript JSONL |
-| `originrouter codex` | Yes | Yes | Terminal input and interrupt only | Display only | Codex rollout JSONL |
+| `originrouter codex` | Yes | Yes | Official TUI and App share command/file/permission approvals and questions on compatible launches | Display only | Codex rollout JSONL |
 | `originrouter codex-terminal` | Yes | Yes | Command/file/permission approval, user input, MCP form/URL | Yes | Live app-server events |
 
+
+Terminal `originrouter agy` and App-created agy share `agy-pty`: native TUI,
+startup Hooks, transcript and a controlled PTY. Model/effort/mode changes restart
+and resume the exact native conversation when fully idle. Questions, local/App
+approvals, validated image-file references, text attachments and device MCP are
+integrated. Generic native forms/URL panels and automatic interrupt-and-continue
+are not advertised. Recorded ACP sessions retain their structured ACP runtime.
+See [the current agy matrix](antigravity-feature-parity.md) and the three launch
+comparisons in the READMEs. `--native-config` selects model configuration, not
+TUI versus managed transport; Claude/Codex gateway model ownership is unchanged.
+
 Unattended execution is supported by managed Claude, native Claude through
-its Hook channel, and managed Codex. Native Codex reports the control as
-unsupported because its running TUI cannot be attached to Codex app-server.
+its Hook channel, and managed Codex. Native Codex uses Codex's own approval policy and supports manual answers from either device.
 See [agent-autonomy.md](./agent-autonomy.md) for the guarded/full decision
 boundary.
 
@@ -25,13 +35,23 @@ contract covering OriginRouter-routed versus native configuration mode,
 Claude/Codex resume syntax, session identifier boundaries, and App control
 limitations.
 
-## Native Codex limitation
+## Native Codex terminal control
 
-`codex app-server` cannot attach to an already-running native Codex TUI
-thread. Starting a second app-server process beside the TUI therefore does not
-provide approvals for that TUI. OriginRouter uses the TUI's local rollout
-JSONL for semantic mirroring and history, and reserves structured approval
-control for the managed `codex-terminal` runtime.
+On compatible interactive launches, `originrouter codex` opens the official TUI
+against a per-session, authenticated loopback bridge to one local Codex app-server.
+The first answer from the terminal or App completes the original request.
+The App can open a session while it is waiting and recover the pending card.
+The rollout for the TUI's own thread supplies history and activity.
+
+Run `node scripts/test-codex-native-live.mjs` to exercise the installed official
+TUI with an isolated daemon and a scripted local model endpoint. Pass
+`--native-config` to exercise a stable local provider and resume a saved thread.
+
+Older Codex versions without authenticated `--remote`, explicit remote endpoints,
+local-only launch options (including `--worktree`, `--add-dir`, `--profile`,
+and `--no-daemon`), and noninteractive Codex subcommands use the existing native
+launch path. These launches keep terminal input and interrupt; approvals stay in Codex.
+Use `originrouter codex-terminal` for OriginRouter-managed unattended approval policies.
 
 Both Codex runtimes still mirror non-blocking state. Native Codex reads the
 rollout JSONL for messages, reasoning summaries, tools, web search, plan/goal

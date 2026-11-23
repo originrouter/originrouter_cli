@@ -52,9 +52,13 @@ export function handleRemoteEvent(payload, ctx) {
   if (!payload || payload.sessionId !== ctx.sessionId) return;
 
   if (payload.type === "agent.message") {
-    const message = String(payload.message || "").replace(/[\r\n]+$/g, "");
+    if (ctx.adapter?.hasBlockingInput?.()) return false;
+    const message = String(payload.message || "").replace(/\r\n/g, '\n').replace(/[\r\n]+$/g, "");
     if (!message && !payload.content?.length) return false;
-    if (payload.content != null && ctx.adapter?.describe?.().runtime !== 'agy-acp') return false;
+    // Chat text is not a terminal-control channel. Structured ACP accepts
+    // literal text; raw terminal input continues through its explicit path.
+    if (ctx.adapter?.supportsRawTerminal !== false && /[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(message)) return false;
+    if (payload.content != null && !['agy-acp', 'agy-pty'].includes(ctx.adapter?.describe?.().runtime)) return false;
     if (typeof ctx.adapter?.submitRemoteMessage === 'function') return ctx.adapter.submitRemoteMessage(ctx.executor, message,
       { ...payload, messageId: payload.messageId || payload.commandId });
     return submitRemoteMessage(ctx.executor, message);
@@ -69,6 +73,10 @@ export function handleRemoteEvent(payload, ctx) {
     // can fold it into the `agent.command.result` it emits: "unsupported"
     // used to be the only word, which told the reader a busy session did not
     // know the command at all.
+    if (ctx.adapter?.hasBlockingInput?.()) {
+      ctx.commandRefusal = "interaction_pending";
+      return false;
+    }
     const command = normalizeCommandPayload(payload);
     ctx.commandRefusal = null;
     if (command.kind !== COMMAND_KIND_SLASH) {
@@ -88,13 +96,16 @@ export function handleRemoteEvent(payload, ctx) {
       return false;
     }
     const line = `/${command.name}${command.args ? ` ${command.args}` : ""}`;
+    if (ctx.adapter?.supportsRawTerminal !== false && /[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(line)) {
+      ctx.commandRefusal = 'invalid_terminal_text'; return false;
+    }
     if (typeof ctx.adapter?.submitRemoteMessage === 'function') {
       if (ctx.adapter.busy && !entry.availableDuringTask) {
         ctx.commandRefusal = "turn_in_progress";
         return false;
       }
       return Promise.resolve(
-        ctx.adapter.submitRemoteMessage(ctx.executor, line),
+        ctx.adapter.submitRemoteMessage(ctx.executor, line, { isCommand: true, requestId: command.requestId }),
       ).then((accepted) => {
         if (accepted === false) ctx.commandRefusal = "inject_failed";
         return accepted;
@@ -107,6 +118,7 @@ export function handleRemoteEvent(payload, ctx) {
   }
   if (payload.type === "terminal.input") {
     if (ctx.adapter?.supportsRawTerminal === false) return false;
+    if (ctx.adapter?.handleTerminalInput?.(payload.data || '', ctx.executor) === true) return true;
     ctx.executor.write(payload.data || "");
     return true;
   }

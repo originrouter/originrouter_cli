@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync, existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 export const AGY_HOOK_KEY = 'originrouter-cli-v1';
 export function agyHookBlock(script = fileURLToPath(new URL('../../../scripts/agy-session-hook-forwarder.cjs', import.meta.url))) {
   const quote = value => process.platform === 'win32' ? `"${value.replaceAll('"', '')}"` : `'${value.replaceAll("'", "'\\''")}'`;
-  const handler = { type: 'command', command: `${quote(process.execPath)} ${quote(script)}`, timeout: 3605 };
+  const handler = { type: 'command', command: `${quote(process.execPath)} ${quote(script)}`, timeout: 300 };
   const block = Object.fromEntries(['SessionStart', 'PreInvocation', 'PostInvocation', 'Stop'].map(name => [name, [handler]]));
   for (const name of ['PreToolUse', 'PostToolUse']) block[name] = [{ matcher: '*', hooks: [handler] }];
   return block;
@@ -30,8 +30,12 @@ export async function configureAgyHooks({ home = homedir(), remove = false } = {
         if (Number.isInteger(owner.pid) && owner.pid > 0) {
           try { process.kill(owner.pid, 0); }
           catch (probe) { if (probe.code === 'ESRCH') rmSync(lock, { recursive: true, force: true }); }
-        }
-      } catch { /* A live installer may still be writing the owner file. */ }
+        } else throw new Error('invalid_lock_owner');
+      } catch {
+        // A crash between mkdir and owner.json must not block every later launch.
+        // A fresh incomplete lock may still belong to a live concurrent installer.
+        try { if (Date.now() - statSync(lock).mtimeMs > 60000) rmSync(lock, { recursive: true, force: true }); } catch {}
+      }
       await new Promise(resolve => setTimeout(resolve, 50));
     }
   }

@@ -63,7 +63,8 @@ test("clean CLI entry propagates OS proxy to the actual agy child", { skip: !["d
     } catch (error) {
       assert.equal(error.status, 7);
       const result = JSON.parse(error.stdout.trim());
-      assert.deepEqual(result.args, ["--conversation=test"]);
+      assert.deepEqual(result.args.slice(0, 2), ['--conversation=test', '--add-dir']);
+      assert.ok(result.args[2].startsWith(join(environment.ORIGINROUTER_HOME, 'agy-attachments')));
       assert.equal(result.http, "http://127.0.0.1:7890");
       assert.equal(result.https, result.http);
       assert.equal(result.upper, result.https);

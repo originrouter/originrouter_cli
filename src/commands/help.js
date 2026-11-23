@@ -172,6 +172,7 @@ Other:
   originrouter run -- <command> [args...]
   originrouter agy [args...]                      Start native Antigravity CLI with automatic proxy environment
   originrouter agy-hooks install|uninstall        Manage OriginRouter Hooks; preserves other Antigravity Hooks
+  originrouter agy-integration install|uninstall  Manage OriginRouter Hooks and device MCP; preserves user entries
   originrouter claude [args...]                   Start native Claude Code TUI with remote control
   originrouter codex [args...]                    Start native Codex TUI with remote control
   originrouter claude-terminal [args...]          Start managed Claude Agent SDK session

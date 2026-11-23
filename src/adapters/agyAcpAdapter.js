@@ -10,6 +10,7 @@ import { buildInteractionRequest, INTERACTION_KINDS } from '../runtime/agentInte
 import { agentGatewayMcpConfig } from '../mcp/agentGatewayConfig.js';
 import { agyCommands, agyPromptContent, agyToolContent } from './agy/acpContent.js';
 import { supportedAgyForm, validAgyFormValues } from './agy/acpForms.js';
+import { displaySafeToolInput } from '../runtime/displaySafeToolInput.js';
 
 function optionsFor(config) {
   return (config?.options || []).flatMap(option => option.options ? optionsFor(option) : [option]);
@@ -46,6 +47,7 @@ export class AgyAcpAdapter extends AgyAdapter {
     const options = config ? optionsFor(config).map(item => ({ id: item.value, displayName: item.name || item.value }))
       : (this.models?.availableModels || []).map(item => ({ id: item.modelId, displayName: item.name || item.modelId }));
     return { ...super.modelStatusEvent(), model: this.model, availableModels: options.map(item => ({ ...item, provider: '', providerName: 'Antigravity' })),
+      changeStrategy: 'native_config',
       modelControl: config && options.length && !this.authenticationRequired ? 'supported' : 'unsupported',
       ...(this.authenticationRequired ? { availableModels: [] } : {}), ...extra };
   }
@@ -53,6 +55,7 @@ export class AgyAcpAdapter extends AgyAdapter {
     const config = this.effortConfig();
     const levels = optionsFor(config).map(item => item.value);
     return { ...super.effortStatusEvent(), effort: config?.currentValue || null,
+      changeStrategy: 'native_config',
       availableEfforts: this.authenticationRequired ? [] : levels, effortControl: levels.length && !this.authenticationRequired ? 'supported' : 'unsupported', ...extra };
   }
   async setOption(payload, config, value, status) {
@@ -192,7 +195,7 @@ export class AgyAcpAdapter extends AgyAdapter {
       case 'tool_call':
         if (this.toolCalls.has(update.toolCallId)) break;
         this.toolCalls.set(update.toolCallId, { ...update, ended: false });
-        this.pendingEvents.push({ type: 'agent.tool_call.start', provider: 'agy', callId: update.toolCallId, tool: update.title || update.kind, input: update.rawInput || {} }); break;
+        this.pendingEvents.push({ type: 'agent.tool_call.start', provider: 'agy', callId: update.toolCallId, tool: update.title || update.kind, input: displaySafeToolInput(update.rawInput) }); break;
       case 'tool_call_update': {
         const tool = { ...this.toolCalls.get(update.toolCallId), ...update };
         this.toolCalls.set(update.toolCallId, tool);
@@ -272,5 +275,5 @@ export class AgyAcpAdapter extends AgyAdapter {
   }
   scanStructuredEvents() { return this.pendingEvents.splice(0); }
   async onRegistered() { if (this.initialMessage) { const message = this.initialMessage; this.initialMessage = null; await this.submitRemoteMessage(null, message); } }
-  cleanup() { this.ready = false; this.cancelInteractions('session_ended'); this.client.close(); }
+  cleanup() { this.ready = false; this.screen?.dispose(); this.cancelInteractions('session_ended'); this.client.close(); }
 }

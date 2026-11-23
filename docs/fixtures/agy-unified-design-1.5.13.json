@@ -1,0 +1,102 @@
+{
+  "date": "2026-11-20",
+  "platform": "macOS arm64",
+  "agyVersion": "1.5.13",
+  "scope": "Design research only; no production runtime mapping changes",
+  "singleChoice": {
+    "step": 6,
+    "tool": "ask_question",
+    "questions": [
+      {
+        "is_multi_select": false,
+        "options": [
+          "(Recommended) ALPHA2",
+          "BETA2"
+        ],
+        "question": "Choose marker?"
+      }
+    ],
+    "sameToolId": true,
+    "postError": "",
+    "nativeResult": "A1: BETA2"
+  },
+  "multiChoice": {
+    "step": 10,
+    "tool": "ask_question",
+    "questions": [
+      {
+        "is_multi_select": true,
+        "options": [
+          "(Recommended) RED_MARK",
+          "GREEN_MARK",
+          "BLUE_MARK"
+        ],
+        "question": "Choose colors?"
+      }
+    ],
+    "sameToolId": true,
+    "postError": "",
+    "nativeResult": "A1: GREEN_MARK, BLUE_MARK"
+  },
+  "approvalOrdering": {
+    "configuredTimeoutSeconds": 300,
+    "heldMs": 10002,
+    "nativePanelDuringHook": false,
+    "nativePanelAfterForceAsk": true
+  },
+  "settingsHooks": {
+    "exitCode": 1,
+    "error": "--settings: unknown setting \"hooks\""
+  },
+  "settingsPersistence": {
+    "temporaryFileUsed": true,
+    "effortHighToLowInTui": true,
+    "saveAttemptTarget": "official global settings.json",
+    "globalSaveDeniedBySandbox": true,
+    "globalFileHashUnchangedInNarrowGuardLab": true,
+    "temporarySettingsContent": {
+      "altScreenMode": "never"
+    },
+    "notAFullyWritableProfile": true
+  },
+  "exactResume": {
+    "sameNativeConversation": true,
+    "oldPid": 11803,
+    "newPid": 14205,
+    "oldActualModel": "gemini-3.8-flash-medium",
+    "newActualModel": "gemini-3.8-flash-low",
+    "rememberedAnswer": "BETA2",
+    "physicalPtyReplaced": true
+  },
+  "zeroTimeout": {
+    "configuredTimeoutSeconds": 0,
+    "actualPreToolWaitMs": 2002,
+    "postToolSuccess": true,
+    "result": "1: DESIGN_LAB_READ_MARKER",
+    "doesNotProveUnlimitedWait": true
+  },
+  "imageFileReference": {
+    "nativeTool": "read_file",
+    "step": 34,
+    "mediaMime": "image/png",
+    "reply": "Left: Red\nRight: Blue",
+    "appUploadPipelineNotYetImplemented": true
+  },
+  "excludedExperiment": {
+    "epoch": 3,
+    "reason": "Initial sandbox denied native brain/history writes; discarded and repeated with writable native storage"
+  },
+  "sideEffects": {
+    "officialCliSavedTemporaryWorkspaceTrust": true,
+    "originalModelDefault": "Gemini 3.8 Flash (High)",
+    "finalModelDefault": "Gemini 3.8 Flash (High)",
+    "noSettingsBackupRestore": true
+  },
+  "notAccepted": [
+    "Other operating systems",
+    "Full 300-second human wait",
+    "Generic MCP elicitation responder in native TUI",
+    "Deployed phone/relay integration",
+    "Production unified startup mapping"
+  ]
+}

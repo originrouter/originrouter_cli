@@ -796,6 +796,7 @@ export class ExternalAgentRegistry {
     }
     if (event?.type === 'agent.commands' && Array.isArray(event.commands)) session.commandMenu = event.commands.slice(0, 128);
     if (event?.type === 'agent.usage') session.usage = { ...event };
+    if (event?.type === 'agent.model.status') session.modelChangeStrategy = safeText(event.changeStrategy, 64);
     this.eventCursor += 1;
     session.lastSeenAtMs = this.now();
     const storedEvent = {
@@ -854,6 +855,10 @@ export class ExternalAgentRegistry {
       session.availableModes = Array.isArray(event?.availableModes)
         ? event.availableModes.slice(0, 16)
         : session.availableModes;
+      if (event.requestId) {
+        session.controlResults.set(event.requestId, event);
+        while (session.controlResults.size > 32) session.controlResults.delete(session.controlResults.keys().next().value);
+      }
     }
     if (event?.type === "agent.model.status") {
       if (Array.isArray(event.availableModels)) session.availableModels = event.availableModels.slice(0, 256);
@@ -866,6 +871,10 @@ export class ExternalAgentRegistry {
         safeText(event?.source, 16) || session.modelSource || "device";
       session.modelControl =
         safeText(event?.modelControl, 16) || session.modelControl;
+      if (event.requestId) {
+        session.controlResults.set(event.requestId, event);
+        while (session.controlResults.size > 32) session.controlResults.delete(session.controlResults.keys().next().value);
+      }
     }
     if (event?.type === "agent.effort.status") {
       // The runtime publishes the levels it can actually run. An empty
@@ -1097,6 +1106,7 @@ export class ExternalAgentRegistry {
       modelProvider: session.modelProvider,
       modelSource: session.modelSource,
       modelControl: session.modelControl,
+      changeStrategy: session.modelChangeStrategy || '',
       ...(session.modelSource === 'native' ? { availableModels: session.availableModels || [] } : {}),
       // The session's own reasoning effort, and the levels the runtime
       // published for it.

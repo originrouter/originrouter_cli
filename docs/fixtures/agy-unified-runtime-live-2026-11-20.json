@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-11-20",
+  "scope": "Source implementation acceptance; not a published release or deployed service",
+  "environment": {
+    "platform": "macOS",
+    "architecture": "arm64",
+    "officialAgyVersion": "1.5.13",
+    "account": "Official user login and quota, handled only by agy",
+    "transport": "Isolated native processes controlled through the OriginRouter local API and Hooks"
+  },
+  "runtime": {
+    "terminalDefault": "agy-pty",
+    "appNewDefault": "agy-pty",
+    "recordedAcpResume": "agy-acp",
+    "startupSourceSelectsProtocol": false,
+    "modelChangeStrategy": "Wait for full idle, stop old child, resume the exact native conversation with session flags, observe configuration acknowledgement",
+    "remoteModelSettersWriteDefaultSettings": false,
+    "googleCredentialAccessOrProviderInjection": false,
+    "claudeCodexGatewayRoutingChanged": false
+  },
+  "liveAcceptance": {
+    "latestReproducibleCommand": "node scripts/test-agy-live.mjs --live --parity --model gemini-3.8-flash-low",
+    "latestReproducibleExitCode": 0,
+    "checks": [
+      { "name": "App background startup, native model catalog and initial message", "passed": true },
+      { "name": "Real model response and tool execution through native Hooks", "passed": true },
+      { "name": "Model restart with accepted request acknowledgement", "passed": true },
+      { "name": "Effort restart and observed native configuration", "passed": true },
+      { "name": "Native command and content capability snapshot", "passed": true },
+      { "name": "Native question answer through App local control", "passed": true },
+      { "name": "Embedded text context", "passed": true },
+      { "name": "Actual token usage without fabricated price or quota", "passed": true },
+      { "name": "Stop, exact native history resume and real post-resume response", "passed": true }
+    ],
+    "supplementaryIsolatedChecks": [
+      { "name": "Native multi-select question driver", "passed": true },
+      { "name": "Native single-choice Write-in answer", "passed": true },
+      { "name": "Local OriginRouter approval prompt and keyboard decision", "passed": true },
+      { "name": "Execution mode restart with native acknowledgement", "passed": true },
+      { "name": "PNG upload, native reading and correct image recognition", "passed": true },
+      { "name": "Busy message queue and repeated message-ID deduplication", "passed": true },
+      { "name": "App text attachment and Hook approval", "passed": true },
+      { "name": "App resume retains the recorded native runtime", "passed": true },
+      { "name": "Session-bound originrouter_native_device MCP with native and device approvals", "passed": true, "approvalCount": 2 },
+      { "name": "Daemon restart re-registers the existing wrapper and same native conversation", "passed": true }
+    ]
+  },
+  "regression": {
+    "cli": { "command": "npm test", "exitCode": 0 },
+    "agyFocused": { "command": "npm run test:agy", "passed": 44, "failed": 0, "skipped": 0 },
+    "appFocused": {
+      "tests": [
+        "native_session_model_test.dart",
+        "session_model_options_test.dart",
+        "agent_interaction_lifecycle_test.dart",
+        "agy_elicitation_form_test.dart"
+      ],
+      "passed": 35,
+      "failed": 0,
+      "scope": "Targeted App regression; not a complete App suite"
+    },
+    "appAnalysis": { "modifiedFilesAnalyzed": 5, "issues": 0 },
+    "additionalCoverage": [
+      "Retained ACP resume and native/ACP MCP namespace separation",
+      "User MCP configuration preservation and inactive bare-agy tools",
+      "Exact question result acknowledgement, including rejection of prefix-only matches",
+      "Unsent versus uncertain queue recovery",
+      "Live native child writer lock after wrapper loss",
+      "Attachment validation and private file boundaries",
+      "Proxy fallback and gateway/native model control separation"
+    ]
+  },
+  "configurationObservation": {
+    "officialDefaultModelUnchanged": true,
+    "alternateProviderConfigured": false,
+    "ownedHooksAndNativeMcpInstalled": true,
+    "nativeMcpName": "originrouter_native_device",
+    "oldOwnedConflictingMcpEntryPresent": false,
+    "userConfigurationEntriesPreserved": true
+  },
+  "limits": {
+    "notAcceptedByTheseChecks": [
+      "Windows or Linux native process execution",
+      "A physical phone through the deployed public relay",
+      "Arbitrary future agy versions",
+      "A complete 300-second human approval wait"
+    ],
+    "notAdvertised": [
+      "Generic native MCP forms or URL authorization responders",
+      "Mixed custom multi-select answers",
+      "Automatic interrupt-and-continue recovery without a formal native cancellation acknowledgement",
+      "Independent terminal attach/detach client",
+      "General native background-task or fork control"
+    ],
+    "deferred": ["OriginRouter multi-agent agy launches", "OriginRouter scheduled agy launches"],
+    "versionGate": "Native menu and content drivers are enabled only for tested agy 1.5.13; other versions retain basic native operation"
+  },
+  "privacy": "Aggregate results only. No raw terminal output, account identifiers, credentials, conversation IDs or private filesystem paths are included."
+}

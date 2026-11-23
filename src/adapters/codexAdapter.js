@@ -1,3 +1,4 @@
+import { startCodexNativeBridge } from "./codex/nativeBridge.js";
 import { TerminalAdapter } from "./terminalAdapter.js";
 import {
   buildCodexModelProviderConfigArgs,
@@ -65,7 +66,7 @@ export class CodexAdapter extends TerminalAdapter {
       // Stage 8.4: gate structuredSources on the app-server path so the
       // relay doesn't claim "codex-app-server" is one of the sources
       // when we fell back to terminal-only.
-      structuredSources: this.appServerAvailable
+      structuredSources: this.nativeBridge || this.appServerAvailable
         ? ["codex-app-server", "codex-jsonl", "terminal-output"]
         : ["codex-jsonl", "terminal-output"],
       // Stage 8.4: top-level runtime tag. `"codex-app-server"` when
@@ -81,6 +82,7 @@ export class CodexAdapter extends TerminalAdapter {
     // app-server runtime applies has to hold here: a session launched with one
     // of these flags has no approval path back to OriginRouter, and there is no
     // later point at which that can be restored.
+    if (this.nativeBridge) return this.nativeBridge.launch;
     assertNoCodexBypassFlag(this.args);
     let args = this.args.slice();
     if (this.nativeConfig) {
@@ -114,22 +116,39 @@ export class CodexAdapter extends TerminalAdapter {
 
   handleOutput(data) {
     const events = [];
+    if (this.nativeBridge) return events;
     if (data.includes("approval") || data.includes("permission")) {
       events.push({ type: "agent.possible_permission", provider: "codex", text: data });
     }
     return events;
   }
 
-  async beforeStart({ sessionId, cwd, env }) {
+  async beforeStart({ sessionId, cwd, env, interactions }) {
     // Stage 8.9: capture sessionId for dual-emit. The Codex event
     // mapper never sees sessionId; the adapter enriches here.
     this.sessionId = sessionId ?? null;
     this.cwd = cwd || this.cwd;
     this.startedAt = Date.now();
     this.scanner = new CodexJsonlScanner({ cwd: this.cwd, startedAt: this.startedAt });
-    // Stage 8.9: skip the system probe when the caller passed an
-    // explicit appServerAvailable override (test seam). The
-    // production default still probes via isCodexAppServerAvailable.
+    if (interactions && this.appServerAvailable === null) {
+      this.nativeBridge = await startCodexNativeBridge({
+        launch: this.buildLaunch(), sessionId, cwd: this.cwd, env, interactions,
+        onThread: thread => {
+          if (thread.ephemeral || thread.parentThreadId || !thread.id) return;
+          if (this.nativeThread?.id !== thread.id) {
+            this.previousThread = this.nativeThread;
+            this.scanner = new CodexJsonlScanner({ cwd: this.cwd, startedAt: this.startedAt });
+          }
+          this.nativeThread = thread;
+          this.scanner.transcriptPath = thread.path || null;
+          this.pendingEvents.push({
+            type: "agent.session.start", provider: "codex", sessionId: thread.id,
+            cwd: thread.cwd, transcriptPath: thread.path,
+          });
+        },
+      });
+      if (this.nativeBridge) return true;
+    }
     if (this.appServerAvailable === null) {
       this.appServerAvailable = false;
     }
@@ -139,7 +158,7 @@ export class CodexAdapter extends TerminalAdapter {
         provider: "codex",
         appServerAvailable: false,
         state: "native_tui_limited",
-        message: "Native Codex TUI uses local JSONL mirroring. Structured approvals require the managed Codex mode.",
+        message: "This launch uses native Codex terminal input and JSONL mirroring. Answer approvals in the terminal.",
       });
       return false;
     }
@@ -204,9 +223,16 @@ export class CodexAdapter extends TerminalAdapter {
     });
   }
 
+  onRegistered() {
+    this.nativeBridge?.onRegistered();
+  }
+
   scanStructuredEvents() {
-    const scanned = this.scanner.scan();
-    if (this.scanner.transcriptPath && !this._reportedTranscriptPath) {
+    if (this.nativeBridge && !this.nativeThread?.path) return this.pendingEvents.splice(0);
+    const scanned = this.nativeBridge
+      ? this.scanner.scan().filter(event => event.type !== "agent.session.start")
+      : this.scanner.scan();
+    if (!this.nativeBridge && this.scanner.transcriptPath && !this._reportedTranscriptPath) {
       this._reportedTranscriptPath = true;
       scanned.unshift({
         type: "agent.session.start",
@@ -219,6 +245,10 @@ export class CodexAdapter extends TerminalAdapter {
     return [...this.pendingEvents.splice(0), ...scanned];
   }
 
+  transcriptForThread(id) {
+    return [this.nativeThread, this.previousThread].find(thread => thread?.id === id)?.path || null;
+  }
+
   getTranscriptPath() {
     return this.scanner.transcriptPath || null;
   }
@@ -227,7 +257,13 @@ export class CodexAdapter extends TerminalAdapter {
     return readCodexConversationHistory(this.getTranscriptPath(), options);
   }
 
-  resolvePermission({ callId, interactionId, decision, reason, decisionSource }) {
+  hasBlockingInput() {
+    return this.nativeBridge?.hasPendingInput() || false;
+  }
+
+  resolvePermission(payload) {
+    if (this.nativeBridge) return this.nativeBridge.resolvePermission(payload);
+    const { callId, interactionId, decision, reason, decisionSource } = payload;
     // Stage 8.9: accept interactionId as an alias for callId so the
     // new agent.interaction.resolve envelope (which carries
     // interactionId) flows through the same pendingApprovals map.
@@ -258,6 +294,7 @@ export class CodexAdapter extends TerminalAdapter {
   }
 
   cleanup() {
+    this.nativeBridge?.close();
     for (const [callId, pending] of this.pendingApprovals) {
       pending.resolve("denied");
       this.pendingEvents.push({

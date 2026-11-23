@@ -13,7 +13,7 @@ export function createAdapter({ agent, command, args = [], cwd, nativeConfig = f
   if (agent === "codex" || command === "codex") {
     return new CodexAdapter({
       args,
-      appServerAvailable: false,
+      cwd,
       nativeConfig,
     });
   }

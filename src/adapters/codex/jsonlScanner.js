@@ -48,11 +48,16 @@ export function mapCodexJsonLine(line, lineIndex = 0) {
     }];
   }
   if (raw.type === "event_msg") {
-    if (payload.type === "user_message") {
-      return [{ ...base, type: "user.text", text: String(payload.message || "").trim(), eventId: eventId(raw, lineIndex, "user") }];
+    // Current rollouts store visible messages as completed items. Reading generic
+    // response_item messages would also publish injected environment instructions.
+    const item = payload.type === "item_completed" ? payload.item : null;
+    const itemText = () => (Array.isArray(item?.content) ? item.content : [])
+      .filter(part => part?.type === "text" || part?.type === "Text").map(part => part.text).join("\n");
+    if (payload.type === "user_message" || item?.type === "UserMessage") {
+      return [{ ...base, type: "user.text", text: String(item ? itemText() : payload.message || "").trim(), eventId: eventId(raw, lineIndex, "user") }];
     }
-    if (payload.type === "agent_message") {
-      return mapCodexAssistantText(payload.message).map((event) => ({
+    if (payload.type === "agent_message" || item?.type === "AgentMessage") {
+      return mapCodexAssistantText(item ? itemText() : payload.message).map((event) => ({
         ...base,
         ...event,
         eventId: eventId(raw, lineIndex, event.type === "agent.thinking" ? "thinking" : "assistant"),

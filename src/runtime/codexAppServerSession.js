@@ -1,4 +1,5 @@
 import { NativeModelControl } from './nativeModelControl.js';
+import { CodexTurnState } from '../adapters/codex/turnState.js';
 import { RuntimeOutputSampler, codexStreamDelta } from "./runtimeOutputSampler.js";
 import { createAgentPermissionStateTracker } from "./agentPermissionStateTracker.js";
 import process from "node:process";
@@ -77,11 +78,7 @@ import { LocalAgentBridgeClient } from "../local/localAgentBridgeClient.js";
 import { createTelemetryPipeline } from "../telemetry/index.js";
 import { codexAgentGatewayConfigArgs } from "../mcp/agentGatewayConfig.js";
 import { createDeviceToolApprovalHandler } from "./deviceToolApproval.js";
-import {
-  buildInteractionRequest,
-  INTERACTION_KINDS,
-  INTERACTION_SOURCES,
-} from "./agentInteractionContract.js";
+import { codexInteraction } from "./codexInteraction.js";
 import {
   buildAutonomyStatusEvent,
   invalidAutonomyScopes,
@@ -92,10 +89,6 @@ import {
 import { protectOriginrouterCodingEnv } from "./originrouterCodingAuthProxy.js";
 import { PendingInteractionRegistry } from "./pendingInteractionRegistry.js";
 import { isCollaborationSessionPayload } from "./agentSessionKind.js";
-import {
-  displaySafeToolInput,
-  toolInputContainsSecret,
-} from "./displaySafeToolInput.js";
 import {
   AGENT_DETAIL_PROFILES,
   resolveAgentDetailProfile,
@@ -113,14 +106,8 @@ import {
   CODEX_MODES,
   assertNoCodexBypassFlag,
   codexApprovalExpiresAt,
-  codexCommandApprovalDecision,
-  codexCommandApprovalPresentation,
-  codexQuestionResponse,
-  codexQuestions,
   createSerialAgentEventQueue,
-  decisionFor,
   buildCodexCollaborationMode,
-  containsSecretSchema,
   extractOptions,
   gatewayResponseIdsFromTurnResult,
   requestInteractionId,
@@ -357,6 +344,7 @@ export async function runCodexAppServerSession(rawArgs) {
   let threadId = null;
   let transcriptPath = null;
   let currentTurnId = null;
+  const nativeTurnState = new CodexTurnState();
   let currentMode = "default";
   const nativeControl = new NativeModelControl({
     enabled: options.nativeConfig, provider: 'codex', runtime: 'codex-app-server', current: () => model,
@@ -930,194 +918,20 @@ export async function runCodexAppServerSession(rawArgs) {
   });
 
   client.onServerRequest(async ({ id, method, params }) => {
-    const interactionId = requestInteractionId(method, params, id);
-    if (method === "item/tool/requestUserInput") {
+    const interaction = codexInteraction(method, params, {
+      sessionId, runtime: "codex-app-server", interactionId: requestInteractionId(method, params, id),
+      expiresAt: codexApprovalExpiresAt(),
+    });
+    if (interaction) {
       let resolved;
       try {
-        resolved = await requestRemoteInteraction(
-          buildInteractionRequest({
-            provider: "codex",
-            runtime: "codex-app-server",
-            sessionId,
-            interactionId,
-            source: INTERACTION_SOURCES.APP_SERVER,
-            kind: INTERACTION_KINDS.QUESTIONS,
-            title: "Codex needs input",
-            prompt: "Answer the questions to continue.",
-            payload: codexQuestions(params),
-            containsSecret: (params.questions || []).some(
-              (question) => question?.isSecret,
-            ),
-            expiresAt: params.autoResolutionMs
-              ? Math.ceil((Date.now() + params.autoResolutionMs) / 1000)
-              : codexApprovalExpiresAt(),
-          }),
-        );
-      } catch {
-        return { answers: {} };
+        resolved = await requestRemoteInteraction(interaction.request);
+      } catch (error) {
+        if (method === "item/tool/requestUserInput") return { answers: {} };
+        throw error;
       }
       await markInteractionApplied(resolved);
-      if (resolved.action !== "submit" && resolved.action !== "allow")
-        return { answers: {} };
-      return codexQuestionResponse(params, resolved.response);
-    }
-
-    if (method === "mcpServer/elicitation/request") {
-      const isUrl = params.mode === "url";
-      const resolved = await requestRemoteInteraction(
-        buildInteractionRequest({
-          provider: "codex",
-          runtime: "codex-app-server",
-          sessionId,
-          interactionId,
-          source: INTERACTION_SOURCES.APP_SERVER,
-          kind: isUrl ? INTERACTION_KINDS.URL : INTERACTION_KINDS.FORM,
-          title: params.serverName || "MCP request",
-          prompt: params.message || "The MCP server needs input.",
-          payload: isUrl
-            ? { url: params.url || "", server_name: params.serverName || "" }
-            : {
-                schema: params.requestedSchema || {},
-                server_name: params.serverName || "",
-              },
-          containsSecret: containsSecretSchema(params.requestedSchema),
-          expiresAt: codexApprovalExpiresAt(),
-        }),
-      );
-      await markInteractionApplied(resolved);
-      if (resolved.action === "submit" || resolved.action === "allow") {
-        return {
-          action: "accept",
-          content: resolved.response?.values || resolved.response || {},
-          _meta: null,
-        };
-      }
-      return {
-        action: resolved.action === "cancel" ? "cancel" : "decline",
-        content: null,
-        _meta: null,
-      };
-    }
-
-    if (
-      [
-        "item/commandExecution/requestApproval",
-        "item/fileChange/requestApproval",
-        "execCommandApproval",
-        "applyPatchApproval",
-      ].includes(method)
-    ) {
-      const tool =
-        method.includes("fileChange") || method.includes("Patch")
-          ? "file_change"
-          : "command";
-      const commandPresentation =
-        tool === "command" && !method.startsWith("execCommand")
-          ? codexCommandApprovalPresentation(params)
-          : { remember_allowed: true };
-      const resolved = await requestRemoteInteraction(
-        buildInteractionRequest({
-          provider: "codex",
-          runtime: "codex-app-server",
-          sessionId,
-          interactionId,
-          source: INTERACTION_SOURCES.APP_SERVER,
-          kind: INTERACTION_KINDS.PERMISSION,
-          title:
-            tool === "command"
-              ? "Run this command?"
-              : "Apply these file changes?",
-          prompt: params.reason || "Review this action before continuing.",
-          payload: {
-            tool,
-            command:
-              typeof params.command === "string"
-                ? params.command.slice(0, 2048)
-                : "",
-            cwd: String(params.cwd || "").slice(0, 1024),
-            file_changes:
-              tool === "file_change"
-                ? displaySafeToolInput(
-                    params.fileChanges || params.changes || {},
-                    { maxEncodedLength: 32_768 },
-                  )
-                : undefined,
-            additional_permissions:
-              tool === "command"
-                ? displaySafeToolInput(params.additionalPermissions || {})
-                : undefined,
-            network_approval_context:
-              tool === "command"
-                ? displaySafeToolInput(params.networkApprovalContext || {})
-                : undefined,
-            ...commandPresentation,
-          },
-          containsSecret: toolInputContainsSecret(params),
-          expiresAt: codexApprovalExpiresAt(),
-        }),
-      );
-      await markInteractionApplied(resolved);
-      const legacy =
-        method === "execCommandApproval" || method === "applyPatchApproval";
-      let decision =
-        tool === "command" && !legacy
-          ? codexCommandApprovalDecision(params, resolved)
-          : decisionFor(
-              resolved.action,
-              Boolean(resolved.response?.remember_for_session),
-            );
-      if (legacy) {
-        decision = {
-          accept: "approved",
-          acceptForSession: "approved_for_session",
-          decline: "denied",
-          cancel: "abort",
-        }[decision];
-      }
-      return { decision };
-    }
-
-    if (method === "item/permissions/requestApproval") {
-      const resolved = await requestRemoteInteraction(
-        buildInteractionRequest({
-          provider: "codex",
-          runtime: "codex-app-server",
-          sessionId,
-          interactionId,
-          source: INTERACTION_SOURCES.APP_SERVER,
-          kind: INTERACTION_KINDS.PERMISSION,
-          title: "Grant additional permissions?",
-          prompt:
-            params.reason || "Codex requested additional sandbox permissions.",
-          payload: {
-            tool: "permissions",
-            cwd: String(params.cwd || "").slice(0, 1024),
-            requested: displaySafeToolInput(params.permissions || {}),
-            remember_allowed: true,
-          },
-          containsSecret: toolInputContainsSecret(params.permissions),
-          expiresAt: codexApprovalExpiresAt(),
-        }),
-      );
-      await markInteractionApplied(resolved);
-      const allowed =
-        resolved.action === "allow" || resolved.action === "submit";
-      return {
-        permissions: allowed
-          ? {
-              ...(params.permissions?.network
-                ? { network: params.permissions.network }
-                : {}),
-              ...(params.permissions?.fileSystem
-                ? { fileSystem: params.permissions.fileSystem }
-                : {}),
-            }
-          : {},
-        scope:
-          allowed && resolved.response?.remember_for_session
-            ? "session"
-            : "turn",
-      };
+      return interaction.reply(resolved);
     }
 
     // Dynamic tools execute in the app-server client, not in the Codex
@@ -1164,8 +978,12 @@ export async function runCodexAppServerSession(rawArgs) {
       }
       return;
     }
+    if (['task_started', 'task_complete', 'turn_aborted'].includes(rawEvent.type)) {
+      const observed = nativeTurnState.observe(rawEvent, currentTurnId, threadId);
+      if (!observed.accepted) return;
+      if (rawEvent.type === 'task_started') currentTurnId = observed.currentTurnId;
+    }
     if (rawEvent.type === "task_started") {
-      currentTurnId = rawEvent.turn_id || currentTurnId;
       outputSampler.reset(currentTurnId);
     }
     if (rawEvent.type === "codex.notification" && rawEvent.method === "item/agentMessage/delta") {
@@ -1571,7 +1389,7 @@ export async function runCodexAppServerSession(rawArgs) {
       // rather than on the thread's older one.
       collaborationMode: buildCodexCollaborationMode(currentMode, model, sessionEffort),
     }));
-    currentTurnId = result?.turn?.id || currentTurnId;
+    currentTurnId = nativeTurnState.acknowledgeStart(result?.turn?.id, currentTurnId);
     const gatewayResponseIds = gatewayResponseIdsFromTurnResult(result);
     if (gatewayResponseIds.length) {
       await sendAgentEvent({

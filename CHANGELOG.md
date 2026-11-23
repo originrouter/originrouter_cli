@@ -8,8 +8,9 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 ### Added
 
 - Optional official Antigravity installation (`setup --with-agy`), a native
-  `originrouter agy` TUI with Hooks/control/history, and App-created or resumed
-  sessions through official ACP. Authentication and quota remain with agy.
+  `originrouter agy` TUI with Hooks/control/history. Terminal and App-created
+  sessions share this native PTY runtime; recorded ACP conversations retain ACP.
+  Authentication and quota remain with agy.
 - Native model catalogs and model/effort control for explicit
   `--native-config` Claude SDK and Codex app-server sessions. Gateway sessions
   retain their existing model alias and route ownership.
@@ -19,7 +20,18 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
   context, usage, device-tools MCP and acknowledged runtime recovery through
   existing App/device control paths. Unsupported native controls stay disabled.
 
+- Shared native agy question/choice/write-in control, local and App approvals,
+  private image-file references and text attachments, session-bound device MCP,
+  durable message intents, and observed model/effort/mode changes through exact
+  conversation restart. Unsupported native panels and automatic recovery remain
+  disabled. The App explains restart-based changes; both READMEs compare all
+  three agents' launch methods.
+
 ### Fixed
+
+- Preserve the current terminal size and conversation ownership across native
+  agy child replacement; retain a live child lock after its wrapper dies and
+  never automatically replay a message whose delivery is uncertain.
 
 - Preserve native configuration when reopening recorded native conversations;
   report authentication/startup errors and detach ended Antigravity sessions

@@ -73,6 +73,7 @@ export class PtyExecutor {
     this.terminal = null;
     this._exited = false;
     this._stopTimer = null;
+    this._inputGeneration = 0;
     // SIGTERM→SIGKILL escalation window. Injected so unit tests can use a
     // short window (mirrors CodexAppServerClient.forceKillMs).
     this.forceKillMs = forceKillMs;
@@ -92,6 +93,7 @@ export class PtyExecutor {
   }) {
     // The exit flag starts fresh for a (re)started session.
     this._exited = false;
+    this._inputGeneration += 1;
     if (this._stopTimer) { clearTimeout(this._stopTimer); this._stopTimer = null; }
 
     let pty;
@@ -125,6 +127,7 @@ export class PtyExecutor {
     this.terminal.onData((data) => onOutput(data));
     this.terminal.onExit((event) => {
       this._exited = true;
+      this._inputGeneration += 1;
       if (this._stopTimer) { clearTimeout(this._stopTimer); this._stopTimer = null; }
       onExit?.({ code: event.exitCode, signal: event.signal });
     });
@@ -141,11 +144,15 @@ export class PtyExecutor {
   }
 
   async submitMessage(data) {
-    this.write(String(data || ""));
+    const terminal = this.terminal, generation = this._inputGeneration;
+    if (!terminal || this._exited) return false;
+    terminal.write(String(data || ""));
     // Claude/Codex distinguish a standalone Enter key from a newline that is
     // part of a pasted input chunk. Keep them as separate PTY writes.
     await new Promise((resolve) => setTimeout(resolve, 30));
-    this.write("\r");
+    if (this._exited || this.terminal !== terminal || this._inputGeneration !== generation) return false;
+    terminal.write("\r");
+    return true;
   }
 
   resize(cols, rows) {
@@ -153,10 +160,12 @@ export class PtyExecutor {
   }
 
   interrupt() {
+    this._inputGeneration += 1;
     this.write("\x03");
   }
 
   stop() {
+    this._inputGeneration += 1;
     const terminal = this.terminal;
     const pid = terminal?.pid;
     if (!terminal || !Number.isInteger(pid) || pid <= 0) return;

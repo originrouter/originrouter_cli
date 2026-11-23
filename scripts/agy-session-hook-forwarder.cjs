@@ -30,6 +30,6 @@ process.stdin.on('end', () => {
     response.on('end', () => process.stdout.write(response.statusCode === 200 ? result : '{"decision":"deny","reason":"OriginRouter control unavailable"}'));
   });
   request.on('error', () => process.stdout.write('{"decision":"deny","reason":"OriginRouter control disconnected"}'));
-  request.setTimeout(3600000, () => request.destroy());
+  request.setTimeout(290000, () => request.destroy());
   request.end(input);
 });

@@ -1634,11 +1634,16 @@ export async function main(argv) {
     return;
   }
 
-  if (command === "agy-hooks") {
-    if (!["install", "uninstall"].includes(args[0])) throw new Error('Use originrouter agy-hooks install|uninstall');
+  if (command === "agy-hooks" || command === "agy-integration") {
+    if (!["install", "uninstall"].includes(args[0])) throw new Error(`Use originrouter ${command} install|uninstall`);
     const { configureAgyHooks } = await import('./adapters/agy/hookSettings.js');
     const result = await configureAgyHooks({ remove: args[0] === "uninstall" });
     console.log(`${result.changed ? 'Updated' : 'Unchanged'}: ${result.path}`);
+    if (command === "agy-integration") {
+      const { configureAgyDeviceMcp } = await import('./adapters/agy/mcpSettings.js');
+      const mcp = await configureAgyDeviceMcp({ remove: args[0] === 'uninstall' });
+      console.log(`OriginRouter MCP integration: ${mcp.path}`);
+    }
     return;
   }
   const agentCommand = resolveAgentCommand(command, args);

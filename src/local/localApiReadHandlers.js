@@ -19,6 +19,10 @@ export async function handleLocalStatus(ctx) {
       pid: ctx.pid,
       version: ctx.version,
       deviceId: ctx.deviceId,
+      // The account-facing name alongside the id: a client that launches
+      // sessions against this daemon labels the target with the same name
+      // the relay surfaces show, falling back to the id when unset.
+      deviceName: ctx.deviceName || "",
       startedAt,
       uptimeSeconds,
       port: ctx.localApiPort,

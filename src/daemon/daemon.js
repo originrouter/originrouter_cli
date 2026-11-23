@@ -21,6 +21,7 @@ import {
   readApiToken,
 } from "../persistence/authToken.js";
 import {
+  defaultDeviceDisplayName,
   ensureDevice,
   ensureStateDir,
   readConfig,
@@ -616,6 +617,16 @@ export async function startDaemon(args) {
     version: VERSION,
     relayUrl,
     deviceId: () => effectiveDeviceId,
+    // The name the account sees everywhere else, live from the device state
+    // so a server-side rename reaches /local/status without a restart. The
+    // account-scope check mirrors syncDeviceName's proposal rule: a name
+    // that was synchronized under another account is not this account's
+    // name, so the same local default is shown until this account's sync
+    // writes its own.
+    deviceName: () =>
+      (device.displayNameAccountScope && device.displayNameAccountScope !== accountScope
+        ? defaultDeviceDisplayName()
+        : device.displayName) || device.host || effectiveDeviceId,
     relayConnected: () => relayConnected,
     relayAuthState: () => relayAuthState,
     relayAuthError: () => relayAuthError,

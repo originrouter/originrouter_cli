@@ -57,6 +57,15 @@ assert.deepEqual(
 );
 
 const settingsEvent = mapCodexJsonLine(JSON.stringify(lines[0]), 0)[0];
+for (const [itemType, expectedType] of [["UserMessage", "user.text"], ["AgentMessage", "agent.text"]]) {
+  const events = mapCodexJsonLine(JSON.stringify({
+    type: "event_msg", payload: { type: "item_completed", item: { type: itemType, content: [{ type: "text", text: "visible" }] } },
+  }), 0);
+  assert.deepEqual(events.map(({ type, text }) => [type, text]), [[expectedType, "visible"]]);
+}
+assert.deepEqual(mapCodexJsonLine(JSON.stringify({
+  type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "internal environment" }] },
+}), 0), []);
 assert.equal(settingsEvent.activity, "settings_applied");
 assert.equal(settingsEvent.metadata.model, "gpt-5.5");
 assert.equal(settingsEvent.metadata.permission_profile, "managed");

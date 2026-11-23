@@ -4,6 +4,7 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureStateDir } from "../persistence/state.js";
 import { isCollaborationSessionPayload } from "../runtime/agentSessionKind.js";
+import { agyManagedCommand } from '../adapters/agy/nativeLaunch.js';
 import {
   deployApprovalPolicyBundle,
   readApprovalPolicy,
@@ -277,7 +278,8 @@ export class ManagedAgentSupervisor {
       if (nativeConfig && payload.provider) throw launchError('INVALID_PROVIDER', 'Native sessions cannot select an OriginRouter model provider.');
     }
 
-    const command = { claude: 'claude-sdk', codex: 'codex-app-server', agy: 'agy-acp' }[agent];
+    const command = agent === 'agy' ? agyManagedCommand(resumeConversation)
+      : { claude: 'claude-sdk', codex: 'codex-app-server' }[agent];
     const args = [
       this.binPath,
       command,
@@ -315,7 +317,7 @@ export class ManagedAgentSupervisor {
     const model = safeText(payload.model, 191);
     if (provider) args.push("--provider", provider);
     if (model) args.push("--model", model);
-    if (initialMessage) args.push("--prompt", initialMessage);
+    if (initialMessage) args.push(command === 'agy' ? '--prompt-interactive' : '--prompt', initialMessage);
     const title = safeText(payload.title, 256) || resumeConversation?.title || `${agent} session`;
     if (title) args.push("--originrouter-title", title);
     if (nativeSessionId) args.push("--resume", nativeSessionId);
@@ -336,6 +338,7 @@ export class ManagedAgentSupervisor {
       env: {
         ...process.env,
         ORIGINROUTER_MANAGED_AGENT: "1",
+        ...(command === 'agy' ? { ORIGINROUTER_AGY_TRUSTED_CWD: workspace.canonical_path } : {}),
         ORIGINROUTER_PERMISSION_CONVERSATION_ID: savedPermission ? savedConversationId : "",
         ...(aiReviewPolicy
           ? {

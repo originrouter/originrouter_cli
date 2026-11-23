@@ -1,22 +1,29 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, basename, dirname } from 'node:path';
+import { displaySafeToolInput } from '../../runtime/displaySafeToolInput.js';
 
 export function agyTranscriptPath(sessionId, home = homedir()) {
   if (!/^[a-zA-Z0-9_-]{1,191}$/.test(String(sessionId || ''))) return null;
   return join(home, '.gemini', 'antigravity-cli', 'brain', sessionId, '.system_generated', 'logs', 'transcript.jsonl');
 }
 
-export function agyTranscriptItems(text, { includeToolStarts = true } = {}) {
+export function agyTranscriptRows(text) {
   const rows = new Map();
   for (const line of text.split('\n')) {
     let row;
     try { row = JSON.parse(line); } catch { continue; }
     if (Number.isInteger(row.step_index)) rows.set(row.step_index, row);
   }
+  return rows;
+}
+
+export function agyTranscriptItems(text, { includeToolStarts = true, toolIdsByStep = new Map() } = {}) {
+  const rows = agyTranscriptRows(text);
   const items = [], tools = [];
   let sampledTokens = 0;
   for (const row of [...rows.values()].sort((a, b) => a.step_index - b.step_index)) {
+    if (row.status && !['DONE', 'ERROR'].includes(row.status)) continue;
     const base = { id: `agy-step-${row.step_index}`, sequence: row.step_index,
       createdAt: row.created_at, timestamp: row.created_at };
     const eventItem = (suffix, event) => items.push({ ...base, id: `${base.id}${suffix}`, role: 'event', event });
@@ -28,10 +35,10 @@ export function agyTranscriptItems(text, { includeToolStarts = true } = {}) {
       if (typeof row.thinking === 'string' && row.thinking) eventItem(':thinking', { type: 'agent.thinking', provider: 'agy', text: row.thinking.slice(0, 64000) });
       if (row.content) items.push({ ...base, role: 'assistant', text: String(row.content), model: row.model });
       for (const [index, tool] of (Array.isArray(row.tool_calls) ? row.tool_calls : []).entries()) {
-        const callId = `${base.id}:tool-${index}`;
+        const callId = tool.id || `${base.id}:tool-${index}`;
         tools.push(callId);
         if (includeToolStarts) eventItem(`:tool-${index}`, { type: 'agent.tool_call.start', provider: 'agy', callId,
-          tool: tool.name || 'Tool', input: tool.args || {} });
+          tool: tool.name || 'Tool', input: displaySafeToolInput(tool.args) });
       }
       if (Number.isFinite(row.input_tokens) || Number.isFinite(row.output_tokens)) {
         const count = value => Math.max(0, Number(value) || 0);
@@ -41,7 +48,9 @@ export function agyTranscriptItems(text, { includeToolStarts = true } = {}) {
           tokenUsage: { inputTokens, outputTokens, cacheReadInputTokens: count(row.cache_read_tokens) }, amountMicros: null, costSource: 'unsupported' });
       }
     } else if (row.type === 'GENERIC') {
-      eventItem('', { type: 'agent.tool_call.end', provider: 'agy', callId: tools.shift() || base.id,
+      const fallbackId = tools.shift();
+      if (row.status && !['DONE', 'ERROR'].includes(row.status)) continue;
+      eventItem('', { type: 'agent.tool_call.end', provider: 'agy', callId: toolIdsByStep.get(row.step_index) || fallbackId || base.id,
         content: String(row.content || '').slice(0, 64000), isError: row.status === 'ERROR',
         ...(row.error ? { error: String(row.error) } : {}) });
     }

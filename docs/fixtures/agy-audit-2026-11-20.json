@@ -1,0 +1,142 @@
+{
+  "date": "2026-11-20",
+  "scope": "Unpublished working source; App integration restored and relevant regression accepted",
+  "environment": {
+    "platform": "macOS",
+    "architecture": "arm64",
+    "officialAgyVersion": "1.5.13"
+  },
+  "architecture": {
+    "terminalAndAppDefault": "agy-pty",
+    "recordedAcpPreserved": true,
+    "googleCredentialStoresRead": false,
+    "modelGatewayInjected": false,
+    "claudeCodexDispatchChanged": false
+  },
+  "faultInjection": {
+    "file": "tests/agyAudit.test.js",
+    "cases": 18,
+    "checks": [
+      "Interrupted delivery remains uncertain and is not automatically replayed",
+      "PTY submission exceptions do not strand the queue",
+      "Duplicate delivery acknowledgement survives modal changes",
+      "Text, UTF-8 and combined attachment size limits",
+      "Stop during child replacement reports one session exit",
+      "Replacement spawn failure reports a failed session",
+      "Old PTY errors do not contaminate the replacement",
+      "Interrupt between paste and Enter cancels the delayed Enter",
+      "Chat and attachment text cannot inject terminal controls",
+      "Exact resume removes latest-conversation selectors",
+      "Tool input credential fields are redacted and approvals marked sensitive",
+      "Failed approval callbacks immediately clear pending state",
+      "Chinese Hook payload survives a split UTF-8 HTTP character",
+      "Unknown versions revoke unverified controls",
+      "Configuration waits for full idle and no local draft",
+      "Stale incomplete Hook/MCP installer locks recover",
+      "Native execution-mode acknowledgement survives in a late snapshot",
+      "Interrupted native question answering cancels all remaining remote keystrokes"
+    ]
+  },
+  "regression": {
+    "cliFull": {
+      "command": "npm test",
+      "exitCode": 0
+    },
+    "agentControl": {
+      "command": "npm run test:agent-control",
+      "exitCode": 0
+    },
+    "transport": {
+      "tests": [
+        "relayClientE2eeAck.test.js",
+        "relayEndpointSelector.test.js",
+        "agentInteractionTimeout.test.js"
+      ],
+      "exitCode": 0
+    },
+    "serverSimulation": {
+      "passed": 52,
+      "failed": 0,
+      "sourceChanged": false,
+      "deployedServiceTested": false
+    },
+    "app": {
+      "earlierExpandedRun": {
+        "passed": 359,
+        "failed": 0
+      },
+      "preBaselineChangeDataAndFormRun": {
+        "passed": 20,
+        "failed": 0
+      },
+      "currentAcceptance": "Restored App integration and current audit fixes confirmed",
+      "completeAppSuiteClaimed": false,
+      "restoredMainRun": {
+        "passed": 361,
+        "failed": 0
+      },
+      "restoredAdditionalRun": {
+        "passed": 74,
+        "failed": 0
+      },
+      "totalRelevantTests": 435,
+      "analysis": {
+        "files": 9,
+        "errors": 0,
+        "warnings": 0,
+        "styleInfo": 17
+      }
+    },
+    "agyFocused": {
+      "command": "npm run test:agy",
+      "passed": 62,
+      "failed": 0
+    },
+    "packaging": {
+      "command": "npm pack --dry-run --json",
+      "exitCode": 0,
+      "files": 312,
+      "missingRequiredFiles": []
+    }
+  },
+  "nativeLive": {
+    "coreCommand": "node scripts/test-agy-live.mjs --live --parity --model gemini-3.8-flash-low",
+    "coreExitCode": 0,
+    "coreChecksPassed": 13,
+    "manualProxyVariablesInParent": false,
+    "systemProxyFallbackObserved": true,
+    "supplementary": {
+      "command": "node scripts/test-agy-live.mjs --live --audit --audit-only --model gemini-3.8-flash-low",
+      "exitCode": 0,
+      "multiChoiceWithNativeToolResult": true,
+      "writeInWithExactNativeToolResult": true,
+      "executionModeRestartAndRestoration": true,
+      "busyQueueAndNativeDedup": true,
+      "stopAndExactResume": true
+    },
+    "previousPngAndDaemonReconnectEvidence": "agy-unified-runtime-live-2026-11-20.json",
+    "finalNativeRegression": {
+      "command": "node scripts/test-agy-live.mjs --live --audit --audit-only --model gemini-3.8-flash-low",
+      "exitCode": 0,
+      "checksPassed": 9,
+      "interruptedQuestionKeystrokesCoveredByFaultSimulation": true
+    }
+  },
+  "configuration": {
+    "observedDefaultModelUnchanged": true,
+    "officialTrustAcceptanceCanUpdateTrustedWorkspaces": true,
+    "wholeSettingsFileHashUnchangedClaimed": false,
+    "onlyThisAuditTemporaryTrustEntriesRemoved": 6
+  },
+  "limits": [
+    "435 relevant App tests accepted; complete App test suite not claimed",
+    "No Windows or Linux native execution in this audit",
+    "No physical phone over the deployed public relay",
+    "No full 300-second human approval wait",
+    "No extra live Claude/Codex account task",
+    "Transcript history is bounded to 32 MiB",
+    "Confirmed and uncertain message-ID persistence retains the latest 128 entries per list",
+    "Future versions, arbitrary native panels and unsupported native controls are not accepted by these checks"
+  ],
+  "privacy": "Aggregate evidence only; no account identifiers, native conversation IDs, bearer tokens, raw terminals or private filesystem paths."
+}

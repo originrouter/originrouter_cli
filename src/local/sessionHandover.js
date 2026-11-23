@@ -44,6 +44,28 @@ export function originrouterBinPath() {
 // changed.
 export function rewriteResumeArgv(argv, nativeSessionId) {
   const args = Array.isArray(argv) ? argv.map((arg) => String(arg)) : [];
+  if (args[0] === "codex") {
+    // A replacement must never replay the original prompt or image, and the
+    // previous run's OriginRouter identity must not reclaim the new thread.
+    const kept = ["codex"];
+    const runFlags = ["--originrouter-session", "--originrouter-run", "--originrouter-conversation", "--originrouter-title"];
+    const optionsWithValue = ["--provider", "-c", "--config", "-m", "--model", "-C", "--cd",
+      "-a", "--ask-for-approval", "-s", "--sandbox", "--enable", "--disable"];
+    for (let index = 1; index < args.length; index++) {
+      const arg = args[index];
+      if (arg === "--") break;
+      const key = arg.split("=")[0];
+      if (["-i", "--image", ...runFlags].includes(key)) {
+        if (key === arg) index++;
+      } else if (["--native-config", "--originrouter-auto-approve", "--strict-config", "--search", "--no-alt-screen"].includes(key)) {
+        kept.push(arg);
+      } else if (optionsWithValue.includes(key) || key.startsWith("--originrouter-")) {
+        kept.push(arg);
+        if (key === arg && index + 1 < args.length) kept.push(args[++index]);
+      }
+    }
+    return nativeSessionId ? [...kept, "resume", String(nativeSessionId)] : kept;
+  }
   const kept = [];
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];

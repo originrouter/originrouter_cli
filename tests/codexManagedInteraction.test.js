@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { resolve } from "node:path";
+import { codexBridgeArgs } from "../src/adapters/codex/nativeBridge.js";
 
 import {
   codexCommandApprovalDecision,
@@ -6,6 +8,16 @@ import {
   codexQuestions,
   codexQuestionResponse,
 } from "../src/runtime/codexAppServerSession.js";
+
+const cwd = process.cwd();
+const project = resolve(cwd, "project");
+assert.deepEqual(codexBridgeArgs(["--cd=project", "-c", "x=1", "--config=y=2", "resume", "--last"], cwd), {
+  serverCwd: project, config: ["-c", "x=1", "--config", "y=2"],
+  tui: ["--cd", project, "-c", "x=1", "--config", "y=2", "resume", "--last"],
+});
+for (const args of [["--worktree"], ["exec", "run"], ["--remote", "ws://localhost"], ["--unknown-option"]]) {
+  assert.equal(codexBridgeArgs(args, cwd), null);
+}
 
 const params = {
   questions: [

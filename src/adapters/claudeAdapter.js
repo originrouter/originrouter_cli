@@ -17,6 +17,7 @@ import {
 import { readClaudeConversationHistory } from "../runtime/claudeConversationHistory.js";
 import { CLAUDE_PTY_EFFORT_LEVELS } from "../runtime/agentEffort.js";
 import { readConfig } from "../persistence/state.js";
+import { TerminalResponseFilter } from '../utils/terminalResponses.js';
 
 const CLAUDE_NATIVE_MODES = Object.freeze([
   { id: "default", label: "Default" },
@@ -193,14 +194,20 @@ function effortAppliedFromTerminalText(value) {
 // only)"). The badge comes first because it is the one that is always
 // drawn.
 function effortLandedFromTerminalText(value) {
-  return effortAppliedFromTerminalText(value) || effortBadgeFromTerminalText(value) || null;
+  const text = squashTerminalText(value);
+  let latest = null, at = -1;
+  for (const match of text.matchAll(/([a-z]+)[·:•]\/effort|seteffortlevelto(low|medium|high|xhigh|max)/g)) {
+    const level = match[2] || match[1];
+    if (CLAUDE_EFFORT_LEVELS.includes(level) && match.index > at) { latest = level; at = match.index; }
+  }
+  return latest;
 }
 
 // The slider's own footer: "←/→ to adjust · Enter to confirm · s for this
 // session only". It is what says the slider opened.
 function effortSliderFromTerminalText(value) {
   const text = squashTerminalText(value);
-  return /toadjust|forthissessiononly/.test(text) ? true : null;
+  return /toadjust/.test(text) && /confirm|forthissessiononly/.test(text) ? true : null;
 }
 
 // The levels the slider offers, read from the line it draws them on:
@@ -584,7 +591,7 @@ export class ClaudeAdapter extends TerminalAdapter {
     if (this.taskActive || this.pendingInteractionInputs.size > 0) {
       return fail("mode_change_busy");
     }
-    if (this.modeChangeWaiter) return fail("mode_change_in_progress");
+    if (this.disposed || this.nativeControlActive || this.modeChangeWaiter) return fail("mode_change_in_progress");
     if (requested === this.currentMode) {
       this.pendingEvents.push(
         this.modeStatusEvent({ accepted: true, requestId }),
@@ -592,23 +599,54 @@ export class ClaudeAdapter extends TerminalAdapter {
       return true;
     }
 
-    const visited = new Set([this.currentMode]);
-    for (let step = 0; step < this.modeChangeMaxSteps; step += 1) {
-      const previousMode = this.currentMode;
-      const observedMode = this.waitForModeChange(previousMode);
-      executor.write(CLAUDE_SHIFT_TAB);
-      const nextMode = await observedMode;
-      if (!nextMode) return fail("mode_change_not_confirmed");
-      if (nextMode === requested) {
-        this.pendingEvents.push(
-          this.modeStatusEvent({ accepted: true, requestId }),
-        );
-        return true;
+    this.nativeControlActive = true;
+    const epoch = this.nativeControlEpoch || 0;
+    try {
+      const visited = new Set([this.currentMode]);
+      for (let step = 0; step < this.modeChangeMaxSteps; step += 1) {
+        const previousMode = this.currentMode;
+        const observedMode = this.waitForModeChange(previousMode);
+        executor.write(CLAUDE_SHIFT_TAB);
+        const nextMode = await observedMode;
+        if (this.disposed || epoch !== (this.nativeControlEpoch || 0)) return fail('mode_change_interrupted');
+        if (!nextMode) return fail("mode_change_not_confirmed");
+        if (nextMode === requested) {
+          this.pendingEvents.push(
+            this.modeStatusEvent({ accepted: true, requestId }),
+          );
+          return true;
+        }
+        if (visited.has(nextMode)) return fail("mode_not_reachable");
+        visited.add(nextMode);
       }
-      if (visited.has(nextMode)) return fail("mode_not_reachable");
-      visited.add(nextMode);
+      return fail("mode_not_reachable");
+    } finally { this.nativeControlActive = false; }
+  }
+
+  async submitRemoteMessage(executor, message) {
+    if (this.disposed || this.nativeControlActive) return false;
+    if (typeof executor?.submitMessage === 'function') return (await executor.submitMessage(message)) !== false;
+    executor.write(message);
+    await delay(30);
+    if (this.disposed || this.nativeControlActive) return false;
+    executor.write('\r'); return true;
+  }
+
+  handleTerminalInput(data, executor) {
+    if (!this.nativeControlActive) { this.terminalResponses = null; return false; }
+    if (data.includes('\x03')) { this.onInterrupt(); executor.interrupt(); return true; }
+    const replies = (this.terminalResponses ||= new TerminalResponseFilter()).push(data);
+    if (replies) executor.write(replies);
+    return true;
+  }
+
+  onInterrupt() {
+    this.nativeControlEpoch = (this.nativeControlEpoch || 0) + 1;
+    if (this.modeOutputTimer) { clearTimeout(this.modeOutputTimer); this.modeOutputTimer = null; }
+    for (const name of ['modeChangeWaiter', 'effortWaiter']) {
+      const waiter = this[name];
+      if (waiter) { clearTimeout(waiter.timer); this[name] = null; waiter.resolve(null); }
     }
-    return fail("mode_not_reachable");
   }
 
   // The levels this session's terminal can put on a running turn.
@@ -666,7 +704,7 @@ export class ClaudeAdapter extends TerminalAdapter {
         this.pendingEvents.push(this.effortStatusEvent());
       }
     }
-    const applied = effortAppliedFromTerminalText(squashed);
+    const applied = effortLandedFromTerminalText(squashed);
     if (applied && applied !== this.currentEffort) {
       this.currentEffort = applied;
       this.pendingEvents.push(this.effortStatusEvent());
@@ -708,7 +746,7 @@ export class ClaudeAdapter extends TerminalAdapter {
     if (this.taskActive || this.pendingInteractionInputs.size > 0) {
       return fail("effort_change_busy");
     }
-    if (this.effortWaiter) return fail("effort_change_in_progress");
+    if (this.disposed || this.nativeControlActive || this.effortWaiter) return fail("effort_change_in_progress");
     if (requested === this.currentEffort) {
       this.pendingEvents.push(
         this.effortStatusEvent({ accepted: true, requestId }),
@@ -716,44 +754,54 @@ export class ClaudeAdapter extends TerminalAdapter {
       return true;
     }
 
-    // Open the slider.
-    const slider = this.waitForEffortText(effortSliderFromTerminalText);
-    executor.write("/effort\r");
-    if (!(await slider)) return fail("effort_change_not_confirmed");
+    this.nativeControlActive = true;
+    const epoch = this.nativeControlEpoch || 0;
+    const active = () => !this.disposed && epoch === (this.nativeControlEpoch || 0);
+    try {
+      // Open the slider. Old confirmation lines are not evidence of this menu.
+      this.effortOutputBuffer = '';
+      const slider = this.waitForEffortText(effortSliderFromTerminalText);
+      executor.write("/effort\r");
+      if (!(await slider)) return fail("effort_change_not_confirmed");
+      if (!active()) return fail('effort_change_interrupted');
 
-    // The slider's own levels are the ones this model takes: a model that
-    // cannot take a level does not have it in its slider. They are read
-    // from the line the slider drew, and the published list is narrowed to
-    // them, so the App stops offering a row that cannot be applied.
-    const sliderLevels = effortLevelsFromTerminalText(this.effortOutputBuffer);
-    if (sliderLevels.length > 1) {
-      this.effortLevels = sliderLevels;
-      this.pendingEvents.push(this.effortStatusEvent());
-    }
-    const wanted = this.effortLevels.indexOf(requested);
-    if (wanted < 0) return fail("effort_level_unsupported");
+      // The slider's own levels are the ones this model takes: a model that
+      // cannot take a level does not have it in its slider. They are read
+      // from the line the slider drew, and the published list is narrowed to
+      // them, so the App stops offering a row that cannot be applied.
+      const sliderLevels = effortLevelsFromTerminalText(this.effortOutputBuffer);
+      if (sliderLevels.length > 1) {
+        this.effortLevels = sliderLevels;
+        this.pendingEvents.push(this.effortStatusEvent());
+      }
+      const wanted = this.effortLevels.indexOf(requested);
+      if (wanted < 0) return fail("effort_level_unsupported");
 
-    // The slider opens on the level the session is already on. Walking it
-    // to the far left first makes the walk to the wanted level a fixed
-    // number of steps, whatever the session started on.
-    executor.write(CLAUDE_EFFORT_LEFT.repeat(this.effortLevels.length));
-    await delay(EFFORT_KEY_SETTLE_MS);
-    executor.write(CLAUDE_EFFORT_RIGHT.repeat(wanted));
-    await delay(EFFORT_KEY_SETTLE_MS);
+      // The slider opens on the level the session is already on. Walking it
+      // to the far left first makes the walk to the wanted level a fixed
+      // number of steps, whatever the session started on.
+      executor.write(CLAUDE_EFFORT_LEFT.repeat(this.effortLevels.length));
+      await delay(EFFORT_KEY_SETTLE_MS);
+      if (!active()) return fail('effort_change_interrupted');
+      executor.write(CLAUDE_EFFORT_RIGHT.repeat(wanted));
+      await delay(EFFORT_KEY_SETTLE_MS);
+      if (!active()) return fail('effort_change_interrupted');
 
-    // `s` applies the level to this session only. `Enter` would apply it
-    // as the default for new sessions as well, which writes the reader's
-    // own settings file — not this session's business.
-    this.effortOutputBuffer = "";
-    const applied = this.waitForEffortText(effortLandedFromTerminalText);
-    executor.write("s");
-    const level = await applied;
-    if (!level || level !== requested) return fail("effort_change_not_confirmed");
-    this.currentEffort = level;
-    this.pendingEvents.push(
-      this.effortStatusEvent({ accepted: true, requestId }),
-    );
-    return true;
+      // `s` applies the level to this session only. `Enter` would apply it
+      // as the default for new sessions as well, which writes the reader's
+      // own settings file — not this session's business.
+      this.effortOutputBuffer = "";
+      const applied = this.waitForEffortText(effortLandedFromTerminalText);
+      executor.write("s");
+      const level = await applied;
+      if (!active()) return fail('effort_change_interrupted');
+      if (!level || level !== requested) return fail("effort_change_not_confirmed");
+      this.currentEffort = level;
+      this.pendingEvents.push(
+        this.effortStatusEvent({ accepted: true, requestId }),
+      );
+      return true;
+    } finally { this.nativeControlActive = false; }
   }
 
   questionPayload(input) {
@@ -1141,6 +1189,9 @@ export class ClaudeAdapter extends TerminalAdapter {
   }
 
   cleanup() {
+    this.disposed = true;
+    this.sessionReady = false;
+    this.nativeControlEpoch = (this.nativeControlEpoch || 0) + 1;
     if (this.modeOutputTimer) {
       clearTimeout(this.modeOutputTimer);
       this.modeOutputTimer = null;
@@ -1149,6 +1200,11 @@ export class ClaudeAdapter extends TerminalAdapter {
       clearTimeout(this.modeChangeWaiter.timer);
       this.modeChangeWaiter.resolve(null);
       this.modeChangeWaiter = null;
+    }
+    if (this.effortWaiter) {
+      clearTimeout(this.effortWaiter.timer);
+      this.effortWaiter.resolve(null);
+      this.effortWaiter = null;
     }
     this.hookServer?.stop();
     cleanupClaudeHookSettings(this.hookSettingsPath);

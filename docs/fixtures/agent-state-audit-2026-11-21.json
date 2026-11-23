@@ -1,0 +1,142 @@
+{
+  "date": "2026-11-21",
+  "scope": "Native control and state inference audit of unpublished source",
+  "environment": {
+    "platform": "macOS",
+    "architecture": "arm64",
+    "agyVersion": "1.5.13"
+  },
+  "architecture": {
+    "nativeConfigurationAndGatewayOwnershipChanged": false,
+    "runtimeLaunchDispatchChanged": false,
+    "googleCredentialsRead": false,
+    "userRunningSessionsTerminated": false
+  },
+  "verification": {
+    "cliFull": {
+      "command": "npm test",
+      "exitCode": 0
+    },
+    "agentControl": {
+      "command": "npm run test:agent-control",
+      "exitCode": 0
+    },
+    "stateFaults": {
+      "command": "npm run test:state-audit",
+      "passed": 24,
+      "failed": 0
+    },
+    "appRelated": {
+      "passed": 36,
+      "failed": 0,
+      "completeSuite": false
+    },
+    "nativeLive": {
+      "command": "node scripts/test-agy-live.mjs --live --parity --audit --model gemini-3.8-flash-low",
+      "exitCode": 0,
+      "checks": [
+        {
+          "name": "app-launch-native-catalog",
+          "passed": true
+        },
+        {
+          "name": "app-prompt-real-response",
+          "passed": true
+        },
+        {
+          "name": "native-model-set",
+          "passed": true
+        },
+        {
+          "name": "native-effort-set",
+          "passed": true
+        },
+        {
+          "name": "app-real-tool",
+          "passed": true
+        },
+        {
+          "name": "native-command-and-content-capability-snapshot",
+          "passed": true
+        },
+        {
+          "name": "real-originrouter-device-mcp-through-existing-approval",
+          "passed": true
+        },
+        {
+          "name": "real-form-answer-via-local-app-control",
+          "passed": true
+        },
+        {
+          "name": "real-embedded-context-via-local-app-control",
+          "passed": true
+        },
+        {
+          "name": "context-usage-without-fabricated-quota-or-price",
+          "passed": true
+        },
+        {
+          "name": "audit-native-multi-select-with-tool-result",
+          "passed": true
+        },
+        {
+          "name": "audit-native-write-in-with-exact-tool-result",
+          "passed": true
+        },
+        {
+          "name": "audit-mode-restart-and-restoration",
+          "passed": true
+        },
+        {
+          "name": "audit-busy-queue-native-receipt-and-dedup",
+          "passed": true
+        },
+        {
+          "name": "app-stop",
+          "passed": true
+        },
+        {
+          "name": "app-resume-same-native-history",
+          "passed": true
+        },
+        {
+          "name": "app-resume-real-response",
+          "passed": true
+        }
+      ]
+    },
+    "terminalLive": {
+      "command": "node scripts/test-agy-terminal-input-live.mjs --live",
+      "exitCode": 0,
+      "checks": [
+        {
+          "name": "terminal-source wrapper accepts App input after terminal protocol replies",
+          "passed": true
+        },
+        {
+          "name": "real terminal draft blocks remote input without overwriting or submitting it",
+          "passed": true
+        },
+        {
+          "name": "clearing native draft restores App input without restart",
+          "passed": true
+        }
+      ],
+      "automaticTerminalReplies": 3
+    },
+    "claudeNativeControls": "Captured native-output fixtures, cancellation and concurrency simulation; no new official account task",
+    "codexManagedLifecycle": "Actual JSON-RPC client with simulated turn lifecycle notifications preceding RPC response"
+  },
+  "cleanup": {
+    "removedOnlyThisRunTemporaryNativeTrustEntries": 1,
+    "observedDefaultModel": "Gemini 3.8 Flash (High)"
+  },
+  "limits": [
+    "No live Claude/Codex account tasks in this audit",
+    "No Windows/Linux native process acceptance",
+    "No physical phone over deployed public Relay",
+    "Arbitrary native TUI drafts/menus and future versions are not fully accepted by these checks",
+    "Running sessions load source at startup; existing processes do not automatically receive all fixes"
+  ],
+  "privacy": "Aggregate only; no native session IDs, account identifiers, credentials, private paths or raw terminal text"
+}

@@ -149,11 +149,16 @@ export function readDevice() {
   const path = join(ensureStateDir(), "device.json");
   const existing = readJson(path);
   if (!existing?.deviceId) return existing;
-  if (existing.displayNameSynced === true && typeof existing.displayName === "string" && existing.displayName.trim()) return existing;
+  if (existing.displayNameSynced === true && typeof existing.displayName === "string"
+      && existing.displayName.trim() && existing.displayName !== existing.deviceId) return existing;
   const rawDisplayName = String(existing.displayName || "").trim();
   const legacyHost = normalizedDeviceName(existing.host);
   const legacyAutomaticName = !rawDisplayName
     || rawDisplayName === "OriginRouter CLI"
+    // An id cached as the name is a placeholder, not a name: a daemon that
+    // once synchronized before any real name existed would otherwise
+    // propose its own id forever.
+    || rawDisplayName === existing.deviceId
     || (/^[^@]+@.+$/.test(rawDisplayName)
       && (!legacyHost || rawDisplayName.endsWith(`@${legacyHost}`)
         || isIP(rawDisplayName.slice(rawDisplayName.lastIndexOf("@") + 1))));

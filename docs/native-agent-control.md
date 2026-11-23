@@ -86,6 +86,13 @@ originrouter codex --native-config resume <session-id-or-name>
 originrouter codex --native-config resume --last
 ```
 
+Codex 0.170.0 records the model provider ID on the thread. OriginRouter's
+routed configuration generates a provider ID per process, so reopening a
+routed thread in a new process can report “Model provider unavailable”.
+Joining the running terminal from the App keeps the same provider. A thread
+created with a stable provider in native configuration can also be resumed
+with that same configuration.
+
 All native resume arguments are passed to the installed agent unchanged after
 OriginRouter-specific flags are removed.
 
@@ -106,10 +113,12 @@ OriginRouter wrapper session ID.
 | Native command | Conversation/history | App message and interrupt | Structured approvals | Unattended execution |
 | --- | --- | --- | --- | --- |
 | `originrouter claude` | Yes | Yes | Yes, through Claude Hooks | Yes |
-| `originrouter codex` | Yes | Yes | No, native Codex cannot attach its blocking approval channel | No |
+| `originrouter codex` | Yes | Yes | Yes, for compatible official TUI launches | No |
 
-Use `originrouter codex-terminal` when structured Codex approvals and
-unattended approval handling are required. Managed sessions intentionally do
+Compatible Codex terminals share manual approvals and questions with the App.
+See [the capability matrix](agent-control-capability-matrix.md#native-codex-terminal-control)
+for compatibility and fallback behavior. Use `originrouter codex-terminal` for
+OriginRouter-managed unattended approvals. Managed sessions intentionally do
 not support `--native-config`; they require an explicit provider
 environment.
 

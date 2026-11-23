@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
 
-export async function startAgyHookServer({ onEvent, onPermission, onCancel, timeoutMs = 300000 }) {
+export async function startAgyHookServer({ onEvent, onPermission, onCancel, delegateTool = () => false, timeoutMs = 285000 }) {
   const token = randomBytes(32).toString('hex');
   const pending = new Map();
   let closed = false;
@@ -18,16 +18,23 @@ export async function startAgyHookServer({ onEvent, onPermission, onCancel, time
   };
   const server = http.createServer(async (request, response) => {
     if (request.method !== 'POST' || request.url !== '/hook' || request.headers.authorization !== `Bearer ${token}`) return respond(response, {}, 401);
-    let body = '';
+    let size = 0, permissionId;
+    const chunks = [];
     try {
-      for await (const chunk of request) { body += chunk; if (body.length > 1024 * 1024) return respond(response, {}, 413); }
-      const payload = JSON.parse(body);
+      for await (const chunk of request) {
+        size += chunk.length;
+        if (size > 1024 * 1024) return respond(response, {}, 413);
+        chunks.push(chunk);
+      }
+      const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       await onEvent(payload);
       if (payload.hookEventName !== 'PreToolUse') return respond(response, {});
+      if (delegateTool(payload)) return respond(response, { decision: 'allow' });
       const id = `${payload.conversationId}:${payload.toolCall?.id || `step-${payload.stepIdx}`}`;
       if (pending.has(id)) return respond(response, { decision: 'deny', reason: 'Duplicate native permission request' });
       const entry = { response, timer: null };
       pending.set(id, entry);
+      permissionId = id;
       entry.timer = setTimeout(() => {
         if (finish(id, 'deny', 'OriginRouter approval expired')) onCancel(id, 'approval_timeout');
       }, Math.min(3600000, Math.max(1000, timeoutMs || 300000)));
@@ -38,7 +45,8 @@ export async function startAgyHookServer({ onEvent, onPermission, onCancel, time
       });
       await onPermission(payload, id);
     } catch {
-      respond(response, { decision: 'deny', reason: 'OriginRouter could not process this Hook' });
+      if (permissionId && finish(permissionId, 'deny', 'OriginRouter could not process this Hook')) onCancel(permissionId, 'approval_callback_failed');
+      else respond(response, { decision: 'deny', reason: 'OriginRouter could not process this Hook' });
     }
   });
   server.requestTimeout = 0;

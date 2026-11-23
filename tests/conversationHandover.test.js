@@ -49,6 +49,11 @@ assert.deepEqual(
   "a conversation with no transcript of its own cannot be resumed",
 );
 
+assert.deepEqual(rewriteResumeArgv([
+  "codex", "--native-config", "--originrouter-session", "old-run", "--model", "gpt-5.4",
+  "resume", "old-thread", "original prompt",
+], "new-thread"), ["codex", "--native-config", "--model", "gpt-5.4", "resume", "new-thread"]);
+
 // --- where the handover lands --------------------------------------------
 
 const emptyTranscript = (path) => 0;

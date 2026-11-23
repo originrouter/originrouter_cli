@@ -24,6 +24,8 @@ import {
   readFileSync,
   unlinkSync,
   writeSync,
+  writeFileSync,
+  renameSync,
 } from "node:fs";
 import { join } from "node:path";
 
@@ -53,6 +55,8 @@ function readHolder(path) {
         ? Number(record.startedAt)
         : null,
       acquiredAt: Number(record.acquiredAt) || null,
+      ...(Number.isInteger(record.childPid) && record.childPid > 0
+        ? { childPid: record.childPid, childStartedAt: record.childStartedAt } : {}),
     };
   } catch {
     return null;
@@ -83,7 +87,8 @@ export function acquireThreadLock(nativeSessionId, {
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
       const holder = readHolder(path);
-      if (holder && isAlive(holder.pid, holder.startedAt, { now })) {
+      if (holder && (isAlive(holder.pid, holder.startedAt, { now })
+          || (holder.childPid && isAlive(holder.childPid, holder.childStartedAt, { now })))) {
         return { ok: false, path, holder };
       }
       // The owner is gone. Reclaim the lock and try once more.
@@ -111,10 +116,11 @@ export function acquireThreadLock(nativeSessionId, {
 
 // Give the lock back. The file is only removed when it still names us: a
 // lock that has been reclaimed by somebody else belongs to them now.
-export function releaseThreadLock(lock, { pid = process.pid } = {}) {
+export function releaseThreadLock(lock, { pid = process.pid, isAlive = isSameLiveProcess } = {}) {
   if (!lock?.path) return false;
   const holder = readHolder(lock.path);
   if (holder && holder.pid !== pid) return false;
+  if (holder?.childPid && isAlive(holder.childPid, holder.childStartedAt)) return false;
   try {
     unlinkSync(lock.path);
     return true;
@@ -126,11 +132,22 @@ export function releaseThreadLock(lock, { pid = process.pid } = {}) {
 // Release the lock when the process goes away, however it goes away. A
 // `SIGKILL`ed run leaves the file behind, and the next run's liveness check
 // is what reclaims it.
-export function releaseThreadLockOnExit(lock, { pid = process.pid } = {}) {
+export function releaseThreadLockOnExit(lock, { pid = process.pid, isAlive = isSameLiveProcess } = {}) {
   if (!lock?.path) return () => {};
   const release = () => {
-    releaseThreadLock(lock, { pid });
+    releaseThreadLock(lock, { pid, isAlive });
   };
   process.once("exit", release);
   return release;
+}
+
+// Optional child identity, used by agy. Other agents retain the existing lock contract.
+export function setThreadLockChild(lock, childPid, childStartedAt, { pid = process.pid } = {}) {
+  if (!lock?.path || !Number.isInteger(childPid) || childPid <= 0) return false;
+  const holder = readHolder(lock.path);
+  if (!holder || holder.pid !== pid) return false;
+  const temporary = `${lock.path}.${pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify({ ...holder, childPid, childStartedAt }), { mode: 0o600 });
+  renameSync(temporary, lock.path);
+  return true;
 }

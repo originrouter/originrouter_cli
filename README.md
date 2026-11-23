@@ -59,6 +59,98 @@ session control, and remote follow-up.
 The App is optional. Local commands, tools, and workspace access always run on
 the CLI device.
 
+## Launch methods and App controls
+
+Following a terminal session from the App keeps control of its original process. Creating a
+session from the App starts a process on the selected device. Features in an official local
+UI are not automatically remote App controls. The online session reports its actual capabilities;
+unsupported controls remain disabled. This is the integration matrix for this source version.
+
+`--native-config` selects native login/model configuration, not TUI versus SDK transport.
+Claude/Codex gateway sessions retain their routing model while the gateway selects the actual
+model. Only native configuration uses official model catalogs and native setters. agy always
+uses the user's official Google login and quota, without OriginRouter model-provider injection.
+
+### Claude Code
+
+| Capability | Terminal `originrouter claude`, followed from App | App-created Claude |
+| --- | --- | --- |
+| Runtime and local UI | Official TUI + PTY + startup Hooks | Claude SDK; no native TUI |
+| Messages, history, tools and activity | PTY input and native transcript | SDK input and events |
+| Tool approvals, questions and plans | PermissionRequest, AskUserQuestion and ExitPlanMode Hooks | SDK approvals, questions and plan confirmation |
+| MCP forms / URL interactions | Public Elicitation Hooks | Public SDK elicitation callbacks; private product dialogs remain local |
+| App model selection with native config | No native TUI setter; disabled | Official catalog and acknowledged changes |
+| App reasoning effort | Session-only control when the native slider is recognized | Runtime-reported levels |
+| App permission mode | Recognized native mode controls with confirmation | SDK controls for runtime-reported modes |
+| In-flight input / side conversations | Subject to native input/modal state; no structured side channel | Integrated SDK messaging and `/btw` side conversations |
+| App `/` commands | Curated injection; native panels do not become structured App controls | Integrated SDK / app-server commands and results |
+| App image/file content blocks | Not exposed by this integration | Not exposed by this integration |
+| OriginRouter device tools / automatic recovery | Full managed capabilities not exposed | Session-bound device tools and runtime supervision |
+| Interrupt, stop and conversation resume | Supported through the native process | Supported through the SDK/session lifecycle |
+
+### Codex
+
+| Capability | Terminal `originrouter codex`, followed from App | App-created Codex |
+| --- | --- | --- |
+| Runtime and local UI | Official TUI + PTY | Official app-server; no native TUI |
+| Messages, history, tools and activity | PTY input and rollout logs | Structured requests and events |
+| Structured App approvals / questions / MCP forms | No blocking control channel for this TUI; answer locally | Public app-server approval, input and elicitation interfaces |
+| App native model / reasoning selection | No native TUI setters; disabled | Official model catalog, configuration and confirmation |
+| App execution mode / autonomy | Structured native TUI controls unavailable | Runtime-reported modes and policy controls |
+| Plans, compaction and usage mirroring | Events exposed in native logs | Official app-server events and results |
+| Side conversations / background terminals | Native local features; structured App controls unavailable | Integrated fork side conversations and background terminal commands |
+| App `/` commands | Curated injection; native panels do not become structured App controls | Integrated SDK / app-server commands and results |
+| App image/file content blocks | Not exposed by this integration | Not exposed by this integration |
+| OriginRouter device tools / automatic recovery | Full managed capabilities not exposed | Session-bound device tools and runtime supervision |
+| Interrupt, stop and conversation resume | Supported through the native process | Supported through app-server/session lifecycle |
+
+To select a managed runtime explicitly from a terminal, use `originrouter claude-terminal` or
+`originrouter codex-terminal`; these do not provide the official native TUI either. Following
+an existing native session from the App never changes its runtime.
+
+### Antigravity CLI (agy)
+
+Terminal `originrouter agy` and App-created agy now use the **same official native TUI + PTY +
+Hooks runtime**. A terminal launch attaches local input/output; an App launch uses a background
+virtual terminal. This changes the visible window, not the agent's control capabilities.
+Following an existing session never starts another ACP process for it.
+
+| Capability | Both native launch methods |
+| --- | --- |
+| Messages, history, queue, interrupt, stop and exact resume | Supported; modal state and local drafts are protected |
+| Tool approvals | Shared local OriginRouter prompt and App interaction; native deny rules remain effective |
+| Native questions | Structured single/multiple choice and single-choice write-in answers, confirmed by native results |
+| Model / reasoning / execution mode | Supported native catalogs and observed settings; changes wait for idle, restart the child and resume the exact conversation. Reasoning choices require account-advertised model variants |
+| App text/image attachments | UTF-8 text context; validated PNG/JPEG uploaded as private session files and read by native agy. Subject to model support |
+| OriginRouter device-tools MCP | Session-bound MCP and device approval; native and device approval may be separate steps |
+| Commands and usage | Curated prompt skills and `/compact`; actual transcript token counts, without a fabricated quota balance |
+| Generic MCP forms / URL authorization | No general native responder exposed; unsupported panels remain local |
+| Automatic interrupt-and-continue recovery | Not advertised on native TUI; no formal ACP cancellation acknowledgment is assumed |
+| Background-task management / fork | No general structured App control is advertised |
+
+Menu drivers are enabled for the tested official **agy 1.5.13**. Other versions retain the native
+process and basic control; unverified structured controls stay disabled. Existing recorded
+`agy-acp` conversations retain ACP when resumed; explicit `originrouter agy-acp` is available
+for integration use. That mode has structured forms, direct content blocks and ACP cancellation,
+and has no native TUI. It is not selected automatically by App startup.
+
+agy integration registers independent, environment-gated entries in the official global Hook
+and MCP files while preserving user entries. Bare agy does not contact the OriginRouter broker
+and the inactive MCP entry exposes no tools. Remove only these entries with:
+
+```sh
+originrouter agy-integration uninstall
+```
+
+Starting another controlled agy session reinstalls the integration. Optional official installation
+uses `originrouter setup --with-agy`; agy is not an npm dependency. Proxy variables take precedence,
+then static system proxy settings are used for this process and its children; shell profiles are
+not modified. PAC/TUN and network availability remain environment-specific.
+
+Version, platform, login and account permissions can limit features. Multi-agent/scheduled agy
+launches remain outside this integration. See the [integration notes](docs/antigravity-integration.md)
+and [validation matrix](docs/antigravity-feature-parity.md) for evidence and limits.
+
 ## Install
 
 ### Recommended: official installer

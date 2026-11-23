@@ -1,0 +1,3 @@
+// Controller for the isolated agy design lab; never print its bearer token.
+import fs from 'node:fs';
+const [root,endpoint='status',body='{}']=process.argv.slice(2);const c=JSON.parse(fs.readFileSync(root+'/controller.json'));const r=await fetch(c.url+'/'+endpoint,{method:'POST',headers:{authorization:'Bearer '+c.token,'content-type':'application/json'},body});const data=await r.json();if(data.screen)data.screen=data.screen.slice(-2300);if(data.events)data.events=data.events.map(x=>({event:x.hookEventName,id:x.conversationId,step:x.stepIdx,tool:x.toolCall,model:x.modelName,error:x.error}));console.log(JSON.stringify(data,null,2).replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,'[account]'));

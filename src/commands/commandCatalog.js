@@ -412,6 +412,7 @@ export const COMMAND_CATALOG = [
   }),
   leaf('agy-acp', 'Run a managed Antigravity ACP session', { hidden: true, options: AGENT_WRAPPER_OPTIONS, passthrough: true }),
   leaf('agy-hooks', 'Manage OriginRouter Antigravity Hooks', { children: [leaf('install', 'Install Hooks'), leaf('uninstall', 'Remove only OriginRouter Hooks')] }),
+  leaf('agy-integration', 'Manage OriginRouter Antigravity Hooks and device MCP', { children: [leaf('install', 'Install integration'), leaf('uninstall', 'Remove only OriginRouter integration')] }),
   leaf("claude", "Start the native Claude Code TUI with remote control", {
     options: AGENT_WRAPPER_OPTIONS,
     passthrough: true,
@@ -455,6 +456,7 @@ export const SUBSYSTEM_MODULE = Object.freeze({
   agy: "src/index.js",
   'agy-acp': 'src/index.js',
   'agy-hooks': 'src/index.js',
+  'agy-integration': 'src/index.js',
   agent: "src/index.js",
   "agent-mcp-server": "src/index.js",
   auth: "src/commands/auth.js",

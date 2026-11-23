@@ -361,6 +361,11 @@ export async function startLocalApi(ctx, { port = 0, apiTokenPath: apiTokenPathO
         ? ctx.deviceId()
         : (ctx.deviceId || "local-dev");
     },
+    get deviceName() {
+      return typeof ctx.deviceName === "function"
+        ? ctx.deviceName()
+        : (ctx.deviceName || "");
+    },
     // Stage 6: token file path. The dispatch reads the file on every request
     // (not snapshotted) so a `token rotate` takes effect without a restart.
     // Priority: ctx.apiTokenPath > startLocalApi({ apiTokenPath }) > env
@@ -1634,7 +1639,7 @@ async function dispatch(ctx, req, res) {
         if (action === "message") {
           const message = String(body.message || "").trim();
           if ((!message && !body.content?.length) || message.length > 8192) return sendError(res, 400, "invalid agent message");
-          if (body.content != null && (ctx.externalAgentRegistry.sessionFacts(sessionId)?.runtime !== 'agy-acp' ||
+          if (body.content != null && (!['agy-acp', 'agy-pty'].includes(ctx.externalAgentRegistry.sessionFacts(sessionId)?.runtime) ||
               !agyPromptContent(message, body.content, { image: true, embeddedContext: true }))) return sendError(res, 400, 'unsupported agent content');
           const command = ctx.externalAgentRegistry.enqueueCommand(sessionId, {
             type: "agent.message",

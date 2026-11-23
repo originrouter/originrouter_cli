@@ -49,8 +49,10 @@ The native entry inherits the resolved network environment and preserves
 official agy flags. `--native-config` is implicit; spelling it explicitly is
 also accepted and consumed by OriginRouter. `--provider` is rejected.
 
-Interactive runs now register the native PTY session and use official Hooks plus transcripts for App control. App-created/resumed sessions use the separate official ACP runtime. See [Antigravity integration](antigravity-integration.md).
-Those require their own runtime adapter and end-to-end verification. A
+Interactive terminal runs and App-created native sessions share the same PTY,
+official Hooks and transcript controller. Recorded ACP sessions retain their
+ACP runtime, also available explicitly as `originrouter agy-acp`.
+See [Antigravity integration](antigravity-integration.md). A
 successful `--version` verifies startup, not login or a model request.
 
 ## Compatibility boundaries

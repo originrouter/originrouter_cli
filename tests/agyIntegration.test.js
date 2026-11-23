@@ -138,7 +138,7 @@ test('App launch and resume retain runtime ownership without changing gateway de
       assert.equal(launches.at(-1).includes('--native-config'), agent === 'agy' || native);
       assert.equal(launches.at(-1).includes('--provider'), false);
     }
-    assert.equal(launches[0][1], 'agy-acp');
+    assert.equal(launches[0][1], 'agy');
     catalog.updateSession('agy-session', { nativeSessionId: 'native-agy', transcriptPath: join(root, 'transcript') });
     catalog.finishSession('agy-session', { status: 'completed' });
     await supervisor.start({ launchId: 'agy-resume-launch', sessionId: 'agy-resumed-session', agentType: 'agy',
@@ -146,6 +146,14 @@ test('App launch and resume retain runtime ownership without changing gateway de
     assert.ok(launches.at(-1).includes('native-agy'));
     const run = catalog.getConversation('agy-conversation').runs.find(run => run.originrouter_session_id === 'agy-resumed-session');
     assert.equal(run.native_config, 1);
+    catalog.upsertSession({ sessionId: 'recorded-acp', conversationId: 'recorded-acp-conversation', runId: 'recorded-acp-run',
+      agent: 'agy', deviceId: 'test-device', cwd: root, workspaceId: workspace.workspace_id, runtime: 'agy-acp',
+      nativeConfig: true, nativeSessionId: 'old-native-acp', status: 'running' });
+    catalog.finishSession('recorded-acp', { status: 'completed' });
+    await supervisor.start({ launchId: 'legacy-resume', sessionId: 'legacy-resumed', agentType: 'agy', workspaceId: workspace.workspace_id,
+      resumeConversationId: 'recorded-acp-conversation', nativeSessionId: 'old-native-acp', initialMessage: 'Continue.' });
+    assert.equal(launches.at(-1)[1], 'agy-acp');
+    assert.ok(launches.at(-1).includes('--prompt'));
     await assert.rejects(supervisor.start({ launchId: 'bad-provider', sessionId: 'bad-provider', agentType: 'agy', provider: 'gateway', workspaceId: workspace.workspace_id }), { code: 'INVALID_PROVIDER' });
     await assert.rejects(supervisor.start({ launchId: 'collab-agy', sessionId: 'collab-agy', agentType: 'agy', workspaceId: workspace.workspace_id }), { code: 'UNSUPPORTED_AGENT' });
   } finally { catalog.close(); rmSync(root, { recursive: true, force: true }); }
@@ -155,16 +163,19 @@ test('native TUI refuses chat input while a modal or local draft owns the termin
   const adapter = new AgyAdapter();
   let text;
   const executor = { submitMessage: async value => { text = value; } };
+  adapter.executor = executor;
   adapter.handleOutput('Select login method:');
   assert.equal(await adapter.submitRemoteMessage(executor, 'hello'), false);
-  adapter.handleOutput('? for shortcuts');
+  adapter.handleOutput('\x1b[2J\x1b[H>\r\n────────────\r\n? for shortcuts');
   assert.equal(await adapter.submitRemoteMessage(executor, 'hello'), true);
   assert.equal(text, 'hello');
+  clearTimeout(adapter.inFlightMessage?.timer); adapter.inFlightMessage = null;
   adapter.onTerminalInput('local draft');
   assert.equal(await adapter.submitRemoteMessage(executor, 'remote'), false);
-  adapter.onTerminalInput('\r'); adapter.handleOutput('? for shortcuts');
-  adapter.handleOutput('Switch Model');
+  adapter.onTerminalInput('\r'); adapter.handleOutput('\x1b[2J\x1b[H>\r\n────────────\r\n? for shortcuts');
+  adapter.handleOutput('\x1b[2J\x1b[HSwitch Model');
   assert.equal(await adapter.submitRemoteMessage(executor, 'remote'), false);
+  adapter.cleanup();
 });
 
 test('account-only runtime refuses alternate provider selection without modifying user settings', () => {

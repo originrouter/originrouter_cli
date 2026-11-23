@@ -92,8 +92,8 @@ interactive even if every scope is selected.
   automatic only in full mode.
 - `item/tool/requestUserInput` questions and MCP elicitation remain
   interactive.
-- Native Codex TUI mirroring cannot attach to Codex app-server's blocking
-  approval channel. It reports `autonomyControl=unsupported`; use
+- The native Codex TUI shares manual approvals on compatible launches and
+  retains its native permission policy. It reports `autonomyControl=unsupported`; use
   `originrouter codex-terminal` when unattended approval control is required.
 
 ## Wire events

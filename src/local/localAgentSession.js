@@ -105,7 +105,9 @@ import { findLiveClaudeSession } from "./claudeLiveSessions.js";
 import {
   acquireThreadLock,
   releaseThreadLockOnExit,
+  setThreadLockChild,
 } from "./threadLock.js";
+import { processStartEpochMs, agyProcessAlive } from '../adapters/agy/processIdentity.js';
 import {
   parseResumeArgv,
   readHandoffNote,
@@ -414,7 +416,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     (options.autonomyProfile || (options.autonomyAllowedScopes || []).length)
   ) {
     process.stderr.write(
-      "warning: native Codex cannot expose structured approval requests; " +
+      "warning: native Codex uses its native approval policy; " +
         "unattended settings are ignored. Use `originrouter codex-terminal`.\n",
     );
   }
@@ -485,16 +487,18 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     const id = String(nativeId || "").trim();
     if (!id) return { ok: true };
     if (lockedNativeSessionId === id) return { ok: true };
-    const lock = acquireThreadLock(id);
+    const lock = acquireThreadLock(id, agent === 'agy'
+      ? { startedAt: processStartEpochMs(process.pid) ?? Date.now(), isAlive: agyProcessAlive } : {});
     if (!lock.ok) {
       return {
         ok: false,
-        holder: { originrouter: true, pid: lock.holder?.pid ?? null },
+        holder: { originrouter: true, pid: lock.holder?.childPid || lock.holder?.pid || null },
       };
     }
-    releaseThreadLockOnExit(lock);
+    releaseThreadLockOnExit(lock, agent === 'agy' ? { isAlive: agyProcessAlive } : {});
     threadLock = lock;
     lockedNativeSessionId = id;
+    if (agent === 'agy' && agentChildPid) setThreadLockChild(lock, agentChildPid, processStartEpochMs(agentChildPid));
     return { ok: true };
   };
   // Check that the conversation the agent just joined is ours to write to.
@@ -658,6 +662,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
   };
   const interactions = new PendingInteractionRegistry({
     onRequested: async (request) => {
+      adapter.onInteractionRegistered?.(request);
       await Promise.all([
         send("agent.interaction.requested", request),
         report("agent.event", { event: request }),
@@ -703,7 +708,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       accepted,
       reason: reason || (autonomySupported
         ? null
-        : "Native Codex does not expose its blocking approval channel. Use originrouter codex-terminal."),
+        : "Native Codex uses its native approval policy. Use originrouter codex-terminal."),
     });
   const detailStatus = () => ({
     type: "agent.detail.status",
@@ -866,7 +871,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     }
   };
   const registeredInteractions = new Set();
-  const deviceToolApproval = requestedRuntime === 'agy-acp' ? createDeviceToolApprovalHandler({
+  const deviceToolApproval = agent === 'agy' ? createDeviceToolApprovalHandler({
     sessionId, provider: agent, runtime: requestedRuntime,
     revision: () => permissionState.revision,
     sendResult: event => localAgentBridge?.sendDeviceToolApprovalResult(event) || Promise.resolve(false),
@@ -905,7 +910,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       : interactions.request(request);
     void resolve
       .then(async (resolved) => {
-        const applied = adapter.resolvePermission({
+        const applied = await adapter.resolvePermission({
           callId: resolved.interactionId,
           interactionId: resolved.interactionId,
           decision: permissionDecision(resolved),
@@ -952,6 +957,11 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       if (typeof adapter.scanStructuredEvents !== "function") return;
       for (const event of adapter.scanStructuredEvents()) {
         let displayEvent = event;
+        if (event.type === 'agent.process.started' || event.type === 'agent.process.restarted') {
+          agentChildPid = event.pid;
+          if (agent === 'agy' && threadLock) setThreadLockChild(threadLock, event.pid, processStartEpochMs(event.pid));
+          await localAgentBridge?.update({ pid: event.pid });
+        }
         if (event.type === "agent.session.start") {
           const nextNativeSessionId = String(event.sessionId || "").slice(0, 191);
           // `conversationId` deliberately does NOT follow the native session id.
@@ -1227,6 +1237,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     });
     const target = resolveHandoverTarget({
       ...(agent === 'agy' ? { transcriptPathFor: agyTranscriptPath } : {}),
+      ...(adapter.nativeBridge ? { transcriptPathFor: id => adapter.transcriptForThread(id) } : {}),
       fromNativeSessionId,
       toNativeSessionId,
       transcriptPath: switchInfo.transcriptPath,
@@ -1282,8 +1293,11 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
   }
   if (typeof adapter.beforeStart === "function") {
     try {
-      await adapter.beforeStart({ cwd, env: baseEnv, sessionId, stateDir, relayClient, send });
+      await adapter.beforeStart({ cwd, env: baseEnv, sessionId, conversationId, stateDir, relayClient, send,
+        interactions, resolveInteraction: payload => interactions.resolve(payload),
+        writeLocal, localTerminalAttached: process.stdin.isTTY === true });
     } catch (error) {
+      if (agent === "codex") cleanup();
       await reportStartupFailure(error);
       throw error;
     }
@@ -1432,6 +1446,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       console.error(error.message);
     },
   }).catch(async (error) => {
+    if (agent === "codex") cleanup();
     await reportStartupFailure(error);
     throw error;
   });
@@ -1528,7 +1543,10 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
           type: "agent.message.result",
           messageId: payload.messageId || payload.commandId,
           accepted: applied !== false,
-          ...(agent === 'agy' && applied === false ? { reason: 'Antigravity is not ready for this input.', rejectedMessage: String(payload.message || '') } : {}),
+          ...(adapter.describe().runtime === 'agy-pty' && applied !== false ? { deliveryState: 'queued' } : {}),
+          ...(agent === 'agy' && applied === false ? { reason: adapter.describe().runtime === 'agy-pty'
+            ? adapter.messageRefusalReason(payload.messageId || payload.commandId) : 'Antigravity is not ready for this input.',
+            rejectedMessage: String(payload.message || '') } : {}),
         });
       }
       if (payload?.type === 'agent.supervisor.interrupt') {
@@ -1574,6 +1592,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     pid: started.pid,
     startedAt: sessionStartedAt,
     runtime,
+    ...(agent === 'agy' && adapter.supportsDeviceTools ? { supportsDeviceTools: true } : {}),
     ...(runtime === 'agy-acp' ? { supportsDeviceTools: true, supportsRuntimeRecovery: true } : {}),
     provider: resolvedProvider?.name,
     model: resolvedProvider?.model,
@@ -1715,6 +1734,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
   }
   process.stdin.resume();
   process.stdin.on("data", (data) => {
+    if (adapter.handleTerminalInput?.(data.toString('utf8'), executor) === true) return;
     adapter.onTerminalInput?.(data.toString('utf8'));
     executor.write(data.toString("utf8"));
   });
@@ -1821,7 +1841,10 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       await send("agent.message.result", {
         messageId: payload.messageId,
         accepted: applied !== false,
-        ...(agent === 'agy' && applied === false ? { reason: 'Antigravity is not ready for this input.', rejectedMessage: String(payload.message || '') } : {}),
+        ...(adapter.describe().runtime === 'agy-pty' && applied !== false ? { deliveryState: 'queued' } : {}),
+        ...(agent === 'agy' && applied === false ? { reason: adapter.describe().runtime === 'agy-pty'
+          ? adapter.messageRefusalReason(payload.messageId || payload.commandId) : 'Antigravity is not ready for this input.',
+          rejectedMessage: String(payload.message || '') } : {}),
       });
     }
     if (payload?.type === "agent.command") {

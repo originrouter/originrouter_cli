@@ -130,7 +130,7 @@ export function commandsForSession({ agent, runtime, nativeConfig = false } = {}
       cmd({ name: 'quit', aliases: ['exit'], description: 'End this session', availableDuringTask: true, route: 'app' }),
     ];
     if (runtime === 'agy-acp') return local;
-    return ['goal', 'plan', 'grill-me', 'browser', 'learn', 'agy-customizations', 'antigravity-guide'].map(name =>
+    return ['compact', 'goal', 'plan', 'grill-me', 'browser', 'learn', 'agy-customizations', 'antigravity-guide'].map(name =>
       cmd({ name, description: '', argumentHint: '[task]', availableDuringTask: false, route: 'inject' })).concat(local);
   }
   if (agent === "codex") {
