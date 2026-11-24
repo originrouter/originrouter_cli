@@ -90,7 +90,14 @@ export class AgyAdapter extends TerminalAdapter {
     }
     this.transcriptPath = agyTranscriptPath(this.nativeSessionId);
     if (this.transcriptPath && existsSync(this.transcriptPath) && statSync(this.transcriptPath).size <= 32 * 1024 * 1024) {
-      for (const item of agyTranscriptItems(readFileSync(this.transcriptPath, 'utf8'))) this.seen.set(`${this.nativeSessionId}:${item.id}`, JSON.stringify(item));
+      // Seed `seen` with the same shapes the live scan emits: a tool-call end
+      // carries a different callId under `includeToolStarts` (history renders
+      // pair FIFO with `agy-step-*` starts; live ends pair on `step-N`), so a
+      // seed taken in history mode would let every recorded end re-emit as a
+      // fresh live event on the first scan after a restart.
+      for (const item of agyTranscriptItems(readFileSync(this.transcriptPath, 'utf8'), { includeToolStarts: false })) {
+        this.seen.set(`${this.nativeSessionId}:${item.id}`, JSON.stringify(item));
+      }
     }
     this.resetScreen();
   }

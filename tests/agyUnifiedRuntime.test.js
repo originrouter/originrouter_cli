@@ -124,6 +124,33 @@ test('running transcript rows are not final tool results and ends key on the ste
   assert.equal(start.event.callId, 'agy-step-3:tool-0'); assert.equal(end.event.callId, 'agy-step-3:tool-0');
 });
 
+test('a resumed adapter re-emits nothing, then ends carry the deterministic step id', () => {
+  const root = fixture();
+  try {
+    const rows = [
+      { step_index: 1, type: 'USER_INPUT', content: '<USER_REQUEST>go</USER_REQUEST>' },
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', args: {} }] },
+      { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'data' },
+    ];
+    const a = new AgyAdapter({ args: ['--conversation', 'native'], cwd: root });
+    a.transcriptPath = join(root, 'transcript.jsonl');
+    writeFileSync(a.transcriptPath, rows.map(JSON.stringify).join('\n'));
+    a.nativeSessionId = 'native';
+    // The constructor seed ran before the transcript existed (the daemon sets
+    // transcriptPath from the launch args at spawn time), so seed `seen` the
+    // same way the constructor does.
+    for (const item of agyTranscriptItems(readFileSync(a.transcriptPath, 'utf8'), { includeToolStarts: false })) {
+      a.seen.set(`${a.nativeSessionId}:${item.id}`, JSON.stringify(item));
+    }
+    assert.deepEqual(a.scanStructuredEvents(), [], 'a resume must re-emit nothing');
+    writeFileSync(a.transcriptPath, [...rows, { step_index: 4, type: 'GENERIC', status: 'DONE', content: 'more' }].map(JSON.stringify).join('\n'));
+    const ends = a.scanStructuredEvents().filter(e => e.type === 'agent.tool_call.end');
+    assert.equal(ends.length, 1);
+    assert.equal(ends[0].callId, 'step-4');
+    a.cleanup();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('effort changes use only account-advertised model variants', () => {
   const models = parseAgyModels('flash-low\tGemini Flash (Low)\nflash-high\tGemini Flash (High)\nother\tOther Model\nPlease login');
   assert.deepEqual(agyEffortVariants(models, 'flash-low'), [{ effort: 'low', model: 'flash-low' }, { effort: 'high', model: 'flash-high' }]);
