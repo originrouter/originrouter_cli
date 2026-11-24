@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import xterm from '@xterm/headless';
 import { AgyAdapter } from '../src/adapters/agyAdapter.js';
 
 const editor = draft => `\x1b[2J\x1b[H────────────────────\r\n> ${draft}\r\n────────────────────\r\n? for shortcuts   auto · Gemini Flash · high`;
@@ -84,5 +85,54 @@ test('message rejection reports the actual cause instead of an opaque not-ready 
     assert.equal(await a.submitRemoteMessage({}, 'remote', { messageId: 'login' }), false);
     assert.equal(a.messageRefusalReason('login'), 'native_needs_login');
     assert.equal(a.messageRefusalReason('draft'), 'native_local_draft');
+  } finally { a.cleanup(); }
+});
+
+test('localNotice uses VT100 DECSC/DECRC and never shifts agy relative cursor on Apple Terminal', async () => {
+  const a = new AgyAdapter();
+  try {
+    a.resetScreen(80, 8);
+    const seq = a.localNotice('[OriginRouter approval] read_file — y: allow once, n: deny; also available in App.');
+    assert.ok(seq.startsWith('\x1b7\x1b[8;1H\x1b[2K\x1b[0m'));
+    assert.ok(seq.endsWith('\x1b8'));
+    assert.equal(seq.includes('\x1b[s'), false);
+    assert.equal(seq.includes('\x1b[u'), false);
+    assert.equal(seq.includes('\x1b[?7'), false);
+
+    // Wide CJK text must fit strictly below cols display columns so bottom row cannot wrap/scroll.
+    a.resetScreen(12, 8);
+    const wideSeq = a.localNotice('中文测试一行很长的提示文字');
+    const widePayload = wideSeq.slice('\x1b7\x1b[8;1H\x1b[2K\x1b[0m'.length, -'\x1b8'.length);
+    assert.equal(widePayload, '中文测试一');
+
+    // Simulate Apple Terminal (which ignores CSI s/u but honors DECSC/DECRC)
+    // while agy repaints a busy spinner via relative cursor moves.
+    a.resetScreen(80, 8);
+    const notice = a.localNotice('[OriginRouter approval] read_file — y: allow once, n: deny');
+    const term = new xterm.Terminal({ cols: 80, rows: 8, scrollback: 50, allowProposedApi: true });
+    const stream = [
+      '\r\n\r\n\r\n\r\n\r\n\r\n\r\n',
+      '\x1b[6A\r\x1b[J',
+      '> 继续\r\n',
+      '░ Reading file...\r\n',
+      '└ Tip: Press esc to interrupt generation.\r\n',
+      '────────────────────────────────────────\r\n',
+      '>\r\n',
+      '────────────────────────────────────────\r\n',
+      'esc to cancel\r\x1b[2A\x1b[2C',
+      // Strip any CSI s/u just as Apple Terminal does.
+      notice.replace(/\x1b\[[su]/g, ''),
+      '\x1b[?25l\r\x1b[4A\x1b[K> 继续\r\n\x1b[K░ Reading file... 10s\r\n\x1b[K└ Tip: Press esc to interrupt generation.\r\n\r\n\x1b[2C\x1b[?25h',
+    ].join('');
+    await new Promise(resolve => term.write(stream, resolve));
+    const lines = [];
+    for (let i = 0; i < term.buffer.active.length; i++) {
+      const text = term.buffer.active.getLine(i)?.translateToString(true) || '';
+      if (text.trim()) lines.push(text.trim());
+    }
+    term.dispose();
+    assert.equal(lines.filter(l => l === '> 继续').length, 1);
+    assert.equal(lines.filter(l => l.includes('Reading file')).length, 1);
+    assert.ok(lines.includes('░ Reading file... 10s'));
   } finally { a.cleanup(); }
 });

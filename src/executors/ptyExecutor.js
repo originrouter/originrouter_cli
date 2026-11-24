@@ -7,7 +7,7 @@ import {
   toWindowsCommandLine,
 } from "../utils/spawn.js";
 
-function ttyUsesOutputPostprocessing({ input = process.stdin, exec = execFileSync } = {}) {
+export function ttyUsesOutputPostprocessing({ input = process.stdin, exec = execFileSync } = {}) {
   if (!input?.isTTY) return false;
   try {
     const settings = String(exec("stty", ["-a"], {
@@ -16,6 +16,40 @@ function ttyUsesOutputPostprocessing({ input = process.stdin, exec = execFileSyn
     }) || "");
     return /(?:^|[\s;])opost(?:[\s;]|$)/.test(settings)
       && !/(?:^|[\s;])-opost(?:[\s;]|$)/.test(settings);
+  } catch {
+    return false;
+  }
+}
+
+export function disableOuterTtyOutputPostprocessing({
+  input = process.stdin,
+  output = process.stdout,
+  platform = process.platform,
+  exec = execFileSync,
+} = {}) {
+  if (platform === "win32" || !input?.isTTY || !output?.isTTY) return false;
+  if (!ttyUsesOutputPostprocessing({ input, exec })) return false;
+  try {
+    exec("stty", ["-opost"], {
+      stdio: [input, "ignore", "ignore"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function restoreOuterTtyOutputPostprocessing({
+  input = process.stdin,
+  platform = process.platform,
+  exec = execFileSync,
+} = {}) {
+  if (platform === "win32" || !input?.isTTY) return false;
+  try {
+    exec("stty", ["opost"], {
+      stdio: [input, "ignore", "ignore"],
+    });
+    return true;
   } catch {
     return false;
   }
@@ -87,6 +121,7 @@ export class PtyExecutor {
     cols = 100,
     rows = 30,
     relayToParentTty = false,
+    outerTtyRawOutput = false,
     onOutput,
     onExit,
     onError,
@@ -113,14 +148,13 @@ export class PtyExecutor {
     });
 
     // A PTY slave normally applies OPOST/ONLCR before its master receives
-    // output. When that already-processed stream is written through another
-    // TTY, the parent line discipline applies it again (LF -> CRLF becomes
-    // CRCRLF). Apart from being different from a native CLI session, those
-    // redundant carriage-return operations substantially increase the cost
-    // of rendering and scrolling long transcripts in Apple Terminal.
-    // Disable only the inner layer when the outer TTY will do the native
-    // output processing for us.
-    if (relayToParentTty && ttyUsesOutputPostprocessing()) {
+    // output. When the parent TTY already switched to -opost (the standard
+    // PTY-proxy setup used by localAgentSession), leave the inner PTY at its
+    // default so cooked children convert LF -> CRLF once while raw-output
+    // TUIs like agy can disable OPOST on the inner slave and emit bare LFs
+    // without the outer TTY turning them back into CRLF. Fall back to
+    // disabling the inner layer only when the outer TTY still applies OPOST.
+    if (relayToParentTty && !outerTtyRawOutput && ttyUsesOutputPostprocessing()) {
       disableNestedPtyOutputPostprocessing(this.terminal);
     }
 

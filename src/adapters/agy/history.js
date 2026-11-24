@@ -18,7 +18,7 @@ export function agyTranscriptRows(text) {
   return rows;
 }
 
-export function agyTranscriptItems(text, { includeToolStarts = true, toolIdsByStep = new Map() } = {}) {
+export function agyTranscriptItems(text, { includeToolStarts = true } = {}) {
   const rows = agyTranscriptRows(text);
   const items = [], tools = [];
   let sampledTokens = 0;
@@ -50,7 +50,13 @@ export function agyTranscriptItems(text, { includeToolStarts = true, toolIdsBySt
     } else if (row.type === 'GENERIC') {
       const fallbackId = tools.shift();
       if (row.status && !['DONE', 'ERROR'].includes(row.status)) continue;
-      eventItem('', { type: 'agent.tool_call.end', provider: 'agy', callId: toolIdsByStep.get(row.step_index) || fallbackId || base.id,
+      // Live scans pair the end with the hook-emitted start, whose callId is
+      // `step-${stepIdx}` — and stepIdx is the trajectory step index of this
+      // very result row, verified against real hook payloads. History renders
+      // pair the end FIFO with this row's planner's generated start ids
+      // instead, since those starts carry `agy-step-*` ids, not `step-*`.
+      eventItem('', { type: 'agent.tool_call.end', provider: 'agy',
+        callId: includeToolStarts ? (fallbackId || base.id) : `step-${row.step_index}`,
         content: String(row.content || '').slice(0, 64000), isError: row.status === 'ERROR',
         ...(row.error ? { error: String(row.error) } : {}) });
     }

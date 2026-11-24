@@ -19,12 +19,59 @@ import { configureAgyDeviceMcp } from './agy/mcpSettings.js';
 import { fileURLToPath } from 'node:url';
 import { AgyNativeQueueStore, validAgyQueuedMessage } from './agy/nativeQueue.js';
 import { displaySafeToolInput, toolInputContainsSecret } from '../runtime/displaySafeToolInput.js';
-import { observeAgyLocalInput, reconcileAgyLocalDraft } from './agy/nativeInput.js';
+import { observeAgyLocalInput, reconcileAgyLocalDraft, agyEditorDraft } from './agy/nativeInput.js';
 import { TerminalResponseFilter } from '../utils/terminalResponses.js';
 
 export function agyNativeArgs(args) { return agySessionArguments(args).args; }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const clean = value => String(value).replace(/\(Recommended\)\s*/gi, '').trim();
+
+function charTerminalWidth(codePoint) {
+  if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) return 0;
+  // Combining diacritical / zero-width marks.
+  if (
+    (codePoint >= 0x0300 && codePoint <= 0x036f)
+    || (codePoint >= 0x1ab0 && codePoint <= 0x1aff)
+    || (codePoint >= 0x1dc0 && codePoint <= 0x1dff)
+    || (codePoint >= 0x20d0 && codePoint <= 0x20ff)
+    || (codePoint >= 0xfe20 && codePoint <= 0xfe2f)
+    || codePoint === 0x200b || codePoint === 0x200c || codePoint === 0x200d || codePoint === 0xfeff
+  ) return 0;
+  // East Asian Wide / Fullwidth and common emoji blocks occupy 2 cells.
+  if (
+    codePoint >= 0x1100 && (
+      codePoint <= 0x115f
+      || codePoint === 0x2329 || codePoint === 0x232a
+      || (codePoint >= 0x2e80 && codePoint <= 0x3247 && codePoint !== 0x303f)
+      || (codePoint >= 0x3250 && codePoint <= 0x4dbf)
+      || (codePoint >= 0x4e00 && codePoint <= 0xa4c6)
+      || (codePoint >= 0xa960 && codePoint <= 0xa97c)
+      || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+      || (codePoint >= 0xf900 && codePoint <= 0xfaff)
+      || (codePoint >= 0xfe10 && codePoint <= 0xfe19)
+      || (codePoint >= 0xfe30 && codePoint <= 0xfe6b)
+      || (codePoint >= 0xff01 && codePoint <= 0xff60)
+      || (codePoint >= 0xffe0 && codePoint <= 0xffe6)
+      || (codePoint >= 0x1b000 && codePoint <= 0x1b001)
+      || (codePoint >= 0x1f200 && codePoint <= 0x1f251)
+      || (codePoint >= 0x1f300 && codePoint <= 0x1faff)
+      || (codePoint >= 0x20000 && codePoint <= 0x3fffd)
+    )
+  ) return 2;
+  return 1;
+}
+
+function truncateTerminalColumns(text, maxCols) {
+  const normalized = String(text).replace(/[\r\n]+/g, ' ').replace(/[\x00-\x1f\x7f]/g, '');
+  let width = 0, out = '';
+  for (const ch of normalized) {
+    const w = charTerminalWidth(ch.codePointAt(0));
+    if (width + w > maxCols) break;
+    out += ch;
+    width += w;
+  }
+  return out;
+}
 
 export class AgyAdapter extends TerminalAdapter {
   constructor({ args = [], cwd, loadCatalog = loadAgyCatalog } = {}) {
@@ -34,7 +81,7 @@ export class AgyAdapter extends TerminalAdapter {
     this.nativeSessionId = null; this.transcriptPath = null; this.ready = false;
     this.model = null; this.busy = false; this.mode = 'unknown'; this.fullyIdle = true;
     this.loadCatalog = loadCatalog; this.models = []; this.epoch = 0; this.messages = [];
-    this.questions = new Map(); this.completedQuestions = new Set(); this.toolIdsByStep = new Map();
+    this.questions = new Map(); this.completedQuestions = new Set();
     this.initialMessage = launch.initialMessage?.replace(/\r\n/g, '\n') ?? null;
     for (let i = 0; i < this.args.length; i++) {
       const arg = this.args[i];
@@ -121,7 +168,10 @@ export class AgyAdapter extends TerminalAdapter {
       onEvent: payload => { if (epoch === this.epoch) this.onHook(payload); },
       delegateTool: payload => payload.toolCall?.name === 'ask_question',
       onPermission: (payload, id) => { if (epoch === this.epoch) this.permission(payload.toolCall || {}, id, this.timeoutMs); },
-      onCancel: (id, reason) => this.pendingEvents.push({ type: 'agent.permission.resolved', provider: 'agy', callId: id, reason }),
+      onCancel: (id, reason) => {
+        this.pendingEvents.push({ type: 'agent.permission.resolved', provider: 'agy', callId: id, reason });
+        this.updateLocalNotice();
+      },
     });
   }
   buildLaunch() {
@@ -149,7 +199,22 @@ export class AgyAdapter extends TerminalAdapter {
       containsSecret: toolInputContainsSecret(tool.args || tool.rawInput || {}),
       expiresAt: timeoutMs > 0 ? Math.floor((Date.now() + timeoutMs) / 1000) : null,
     }));
-    if (this.localAttached) this.writeLocal?.(`\r\n[OriginRouter approval] ${tool.name || 'Tool'} — y: allow once, n: deny; also available in App.\r\n`);
+    if (this.localAttached) {
+      // Auto-resolved permissions (autonomy, App policy) settle in
+      // milliseconds; drawing the hint for them only flashes the bottom row
+      // and moves the cursor the TUI shares with us while the user is typing.
+      // Hold the notice briefly so only requests that are genuinely still
+      // waiting ever appear.
+      const noticeTimer = setTimeout(() => {
+        (this.noticeTimers ||= new Set()).delete(noticeTimer);
+        if (this.disposed || !this.hookServer?.pending.has(id)) return;
+        this.localNoticeActive = true;
+        this.noticeCallId = id;
+        this.writeLocal?.(this.localNotice(`[OriginRouter approval] ${tool.name || 'Tool'} — y: allow once, n: deny; also available in App.`));
+      }, 600);
+      noticeTimer.unref?.();
+      (this.noticeTimers ||= new Set()).add(noticeTimer);
+    }
   }
   onHook(payload) {
     const nativeId = String(payload.conversationId || '');
@@ -168,8 +233,15 @@ export class AgyAdapter extends TerminalAdapter {
     }
     if (payload.hookEventName === 'PreToolUse') {
       const tool = payload.toolCall || {};
-      this.toolIdsByStep.set(payload.stepIdx, tool.id);
-      this.pendingEvents.push({ type: 'agent.tool_call.start', provider: 'agy', callId: tool.id, tool: tool.name, input: displaySafeToolInput(tool.args) });
+      // The hook's stepIdx IS the trajectory step the native transcript gives
+      // this call's GENERIC result row, so a start keyed on it pairs with the
+      // scanner's end deterministically — no shared map, no reliance on the
+      // unpredictable native call id, and the pairing survives an adapter
+      // restart (where the old in-memory map was always empty and every end
+      // fell back to an unmatched generated id, orphaning the start).
+      const callId = Number.isInteger(payload.stepIdx) ? `step-${payload.stepIdx}`
+        : tool.id || `call-${this.stepIdMisses = (this.stepIdMisses || 0) + 1}`;
+      this.pendingEvents.push({ type: 'agent.tool_call.start', provider: 'agy', callId, tool: tool.name, input: displaySafeToolInput(tool.args) });
       if (tool.name === 'ask_question' && this.nativeMenus) {
         const questions = agyQuestions(tool.args);
         if (questions) {
@@ -284,6 +356,42 @@ export class AgyAdapter extends TerminalAdapter {
     await this.pump(); return true;
   }
   messageRefusalReason(messageId) { return this.messageRefusals?.get(messageId || '') || 'native_not_ready'; }
+  // A notice must not scroll or disturb the native TUI's cursor model: agy
+  // repaints inline via relative moves (\x1b[nA, bare \n) and expects the
+  // cursor right where it left it. Use VT100 DECSC/DECRC (\x1b7/\x1b8) rather
+  // than SCO \x1b[s/\x1b[u — Apple Terminal.app ignores CSI s/u, which leaves
+  // the cursor stranded on the bottom row and shifts every later frame down by
+  // two rows, duplicating lines into scrollback. Truncate strictly below cols
+  // display cells so the bottom row can never wrap or scroll without toggling
+  // DECAWM (\x1b[?7l/\x1b[?7h), which agy manages itself.
+  localNotice(text) {
+    const rows = this.screen?.terminal?.rows || 24;
+    const cols = this.screen?.terminal?.cols || 80;
+    const line = truncateTerminalColumns(text, Math.max(1, cols - 1));
+    return `\x1b7\x1b[${rows};1H\x1b[2K\x1b[0m${line}\x1b8`;
+  }
+  clearNoticeTimers() {
+    if (!this.noticeTimers) return;
+    for (const timer of this.noticeTimers) clearTimeout(timer);
+    this.noticeTimers.clear();
+  }
+  // The TUI only covers the notice when it happens to repaint the bottom row;
+  // an idle TUI would leave a stale "y/n" hint on screen forever. When every
+  // pending permission is settled — remote App decision, autonomy
+  // auto-resolve, local y/n, timeout, cancel — paint the row back to what the
+  // TUI last drew there instead of waiting for its next frame.
+  updateLocalNotice() {
+    if (this.disposed || !this.localAttached || !this.localNoticeActive || this.hookServer?.pending.size) return;
+    this.localNoticeActive = false;
+    this.noticeCallId = null;
+    const lines = String(this.screenText || '').split('\n');
+    this.writeLocal?.(this.localNotice(lines[lines.length - 1] || ''));
+  }
+  flushTransactionTail() {
+    const tail = this.transactionTail;
+    this.transactionTail = '';
+    if (tail && !this.disposed && !this.reconfiguring) this.executor?.write(tail);
+  }
   async pump() {
     if (this.pumping || this.disposed || this.queueUnavailable || !this.executor) return;
     this.completeQuestions();
@@ -310,11 +418,18 @@ export class AgyAdapter extends TerminalAdapter {
       try {
         const submitted = await this.executor.submitMessage(entry.text);
         if (submitted === false) throw new Error('native_input_write_failed');
+        // The transcript's USER_INPUT row arrives on a scan seconds later —
+        // by then hook events for this turn have already streamed. Emit the
+        // user's text now so events stay in real order, and suppress the scan
+        // echo of the same text when it lands.
+        (this.suppressedUserTexts ||= []).push(entry.text);
+        if (this.suppressedUserTexts.length > 16) this.suppressedUserTexts.shift();
+        this.pendingEvents.push({ type: 'user.text', provider: 'agy', text: entry.text });
       } catch {
         this.markDeliveryUncertain('native_input_write_failed');
         return;
       }
-      finally { this.inputTransaction = false; }
+      finally { this.inputTransaction = false; this.flushTransactionTail(); }
       // Interruption or a fast native receipt can settle the intent during the async PTY write.
       if (this.inFlightMessage !== entry) return;
       // Receipts are confirmed by native USER_INPUT, never by echoing our own send.
@@ -352,21 +467,48 @@ export class AgyAdapter extends TerminalAdapter {
     if (this.inputTransaction || this.reconfiguring || (pending && this.localAttached)) {
       const replies = (this.terminalResponses ||= new TerminalResponseFilter()).push(data);
       if (replies) executor?.write(replies);
+      // Keystrokes typed during a remote write/question transaction used to be
+      // silently dropped — the user watches the editor echo nothing, then the
+      // next input arrives missing those characters. Buffer plain-text input
+      // (escape-bearing chunks may hold device replies already forwarded
+      // above, so they still cannot be replayed safely) and flush it once the
+      // transaction releases the keyboard.
+      if (this.inputTransaction && !this.reconfiguring && !data.includes('\x1b')) {
+        this.transactionTail = ((this.transactionTail || '') + data).slice(-8192);
+      }
       if (this.inputTransaction || this.reconfiguring) return true;
     } else this.terminalResponses = null;
     if (pending && this.localAttached && !data.includes('\x03')) {
-      if (/^[yn]$/i.test(data)) this.resolveInteraction?.({ interactionId: pending, responseId: `local-${pending}`,
+      // Approve what the hint advertises — the newest pending call is what the
+      // user just read, not whichever queued first.
+      const target = this.noticeCallId && this.hookServer.pending.has(this.noticeCallId) ? this.noticeCallId : pending;
+      if (/^[yn]$/i.test(data)) this.resolveInteraction?.({ interactionId: target, responseId: `local-${target}`,
         action: data.toLowerCase() === 'y' ? 'allow' : 'deny', decisionSource: 'local_terminal' });
+      // The native screen advertises `esc to cancel`; a bare Escape honors it.
+      else if (data === '\x1b') this.resolveInteraction?.({ interactionId: target, responseId: `local-esc-${target}`,
+        action: 'deny', decisionSource: 'local_terminal' });
       return true;
     }
     this.onTerminalInput(data);
     executor?.write(data); return true;
   }
   onTerminalInput(data) {
-    observeAgyLocalInput(this, data);
+    const input = observeAgyLocalInput(this, data);
+    // Same early-emission as the remote path: the editor draft is still on
+    // screen while the Enter keystroke is delivered, so capture it before the
+    // native submit clears the editor. The scan suppresses the echo.
+    if (input?.submitted && this.state === 'idle' && !this.busy) {
+      const draft = agyEditorDraft(this.screenText);
+      if (draft) {
+        (this.suppressedUserTexts ||= []).push(draft);
+        if (this.suppressedUserTexts.length > 16) this.suppressedUserTexts.shift();
+        this.pendingEvents.push({ type: 'user.text', provider: 'agy', text: draft });
+      }
+    }
   }
   onInterrupt() {
     const wasBusy = this.busy;
+    this.clearNoticeTimers();
     this.hookServer?.cancelAll();
     for (const entry of this.questions.values()) {
       entry.done?.(false);
@@ -379,10 +521,12 @@ export class AgyAdapter extends TerminalAdapter {
   }
   resolvePermission(payload) {
     const id = payload.interactionId || payload.callId;
-    if (this.completedQuestions.delete(id)) return true;
-    const entry = this.questions.get(id);
-    if (entry) return this.answerQuestion(entry, payload);
-    return this.hookServer?.resolve(id, payload.action || (['approved', 'approved_for_session'].includes(payload.decision) ? 'allow' : 'deny')) || false;
+    try {
+      if (this.completedQuestions.delete(id)) return true;
+      const entry = this.questions.get(id);
+      if (entry) return this.answerQuestion(entry, payload);
+      return this.hookServer?.resolve(id, payload.action || (['approved', 'approved_for_session'].includes(payload.decision) ? 'allow' : 'deny')) || false;
+    } finally { this.updateLocalNotice(); }
   }
   onInteractionRegistered(request) {
     if (this.completedQuestions.has(request.interactionId)) this.resolveInteraction?.({ interactionId: request.interactionId,
@@ -446,6 +590,7 @@ export class AgyAdapter extends TerminalAdapter {
     } catch { return false; }
     finally {
       clearTimeout(timer); this.inputTransaction = false; entry.done = null;
+      this.flushTransactionTail();
       // The native idle repaint may have arrived before the tool-result ACK.
       // Re-evaluate it after releasing keyboard ownership; no extra repaint is guaranteed.
       if (!this.disposed) this.observeScreen(this.screenText);
@@ -531,7 +676,7 @@ export class AgyAdapter extends TerminalAdapter {
     } catch (error) {
       this.pendingEvents.push(this.configurationStatus(change,
         { requestId: change.requestId, accepted: false, reason: error.message }));
-    } finally { this.reconfiguring = false; }
+    } finally { this.reconfiguring = false; this.transactionTail = ''; }
   }
   configurationStatus(change, extra) {
     return (change.kind === 'mode' ? this.modeStatusEvent : change.kind === 'effort' ? this.effortStatusEvent : this.modelStatusEvent).call(this, extra);
@@ -550,7 +695,7 @@ export class AgyAdapter extends TerminalAdapter {
         const stamp = `${stat.mtimeMs}:${stat.size}`;
         if (stamp === this.transcriptStamp || stat.size > 32 * 1024 * 1024) return events;
         this.transcriptStamp = stamp;
-        for (const item of agyTranscriptItems(readFileSync(this.transcriptPath, 'utf8'), { includeToolStarts: false, toolIdsByStep: this.toolIdsByStep })) {
+        for (const item of agyTranscriptItems(readFileSync(this.transcriptPath, 'utf8'), { includeToolStarts: false })) {
           const id = `${this.nativeSessionId}:${item.id}`, fingerprint = JSON.stringify(item);
           if (this.seen.get(id) === fingerprint) continue;
           this.seen.set(id, fingerprint);
@@ -559,6 +704,14 @@ export class AgyAdapter extends TerminalAdapter {
             if (message.id) this.confirmedIds = [...(this.confirmedIds || []), message.id].slice(-128);
             this.saveQueue();
             events.push({ type: 'agent.message.result', provider: 'agy', messageId: message.id, accepted: true });
+          }
+          // user.text is emitted the moment a submission lands on the PTY —
+          // the transcript row only confirms it seconds later, and emitting it
+          // again would put the same message in the transcript twice.
+          if (item.role === 'user' && (this.suppressedUserTexts || []).length
+              && String(this.suppressedUserTexts[0] || '').trim() === String(item.text || '').trim()) {
+            this.suppressedUserTexts.shift();
+            continue;
           }
           events.push({ ...(item.event || { type: item.role === 'user' ? 'user.text' : 'agent.text', text: item.text }),
             provider: 'agy', eventId: id, createdAt: Math.floor(Date.parse(item.createdAt) / 1000) || undefined });
@@ -569,6 +722,7 @@ export class AgyAdapter extends TerminalAdapter {
   }
   cleanup() {
     this.disposed = true; clearInterval(this.pumpTimer); clearTimeout(this.inFlightMessage?.timer);
+    this.clearNoticeTimers();
     this.onInterrupt(); this.hookServer?.close(); this.screen?.dispose(); this.failQueued('session_stopped');
     if (this.attachmentDirectory) rmSync(this.attachmentDirectory, { recursive: true, force: true });
     for (const root of this.recoveredAttachmentRoots || []) rmSync(root, { recursive: true, force: true });

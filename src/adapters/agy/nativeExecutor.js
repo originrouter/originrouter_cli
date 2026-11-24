@@ -70,7 +70,13 @@ export class AgyNativeExecutor {
     const child = this.child, epoch = this.epoch, generation = this.inputGeneration || 0;
     child.write(String(text || ''));
     await new Promise(resolve => setTimeout(resolve, 30));
-    if (this.stopped || this.child !== child || epoch !== this.epoch || generation !== (this.inputGeneration || 0)) return false;
+    if (this.stopped || this.child !== child || epoch !== this.epoch || generation !== (this.inputGeneration || 0)) {
+      // The text is already in the native editor but Enter will never follow;
+      // leaving it there means the next submission appends to stale text.
+      // Kill-line clears the in-progress draft — once per line it occupied.
+      try { child.write('\x15'.repeat(String(text || '').split('\n').length)); } catch {}
+      return false;
+    }
     child.write('\r');
     return true;
   }

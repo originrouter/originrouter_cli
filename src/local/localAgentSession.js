@@ -38,6 +38,10 @@ import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
 import { DEFAULT_DEVICE_ID, DEFAULT_EXECUTOR } from "../constants.js";
 import { createExecutor, normalizeExecutor } from "../executors/createExecutor.js";
 import {
+  disableOuterTtyOutputPostprocessing,
+  restoreOuterTtyOutputPostprocessing,
+} from "../executors/ptyExecutor.js";
+import {
   appendSessionStart,
   patchSessionExit,
 } from "../persistence/sessionLog.js";
@@ -1055,6 +1059,21 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     return pending;
   };
   const terminalOutputPump = createTerminalOutputPump({ write: writeLocal });
+  let outerTtyRawOutput = false;
+  const restoreOuterTtyOutput = () => {
+    if (!outerTtyRawOutput) return;
+    outerTtyRawOutput = false;
+    process.off("exit", restoreOuterTtyOutput);
+    restoreOuterTtyOutputPostprocessing();
+  };
+  const writeLocalErrorLine = (text) => {
+    terminalOutputPump.flush();
+    if (outerTtyRawOutput) {
+      process.stderr.write(`${String(text).replace(/\r?\n/g, "\r\n")}\r\n`);
+      return;
+    }
+    console.error(text);
+  };
 
   const cleanup = () => {
     deviceToolApproval?.close();
@@ -1078,6 +1097,10 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     if (process.stdin.isTTY) {
       process.stdin.setRawMode(false);
     }
+    // Restore outer TTY OPOST after setRawMode(false): libuv restores the
+    // termios captured on the first setRawMode(true), which already had
+    // -opost when outerTtyRawOutput was enabled before executor.start().
+    restoreOuterTtyOutput();
     process.stdin.pause();
     // Stage 9.2: tear down the caller-side relay proxy through the
     // wrapper's existing cleanup path. No new process.once signal
@@ -1170,6 +1193,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     try {
       patchSessionExit({ sessionId, status: "exited", code, signal, exitedAt });
     } catch (error) {
+      terminalOutputPump.flush();
       console.error(`[session-log] ${error.message}`);
     }
     send("session.exited", { code, signal });
@@ -1295,7 +1319,11 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     try {
       await adapter.beforeStart({ cwd, env: baseEnv, sessionId, conversationId, stateDir, relayClient, send,
         interactions, resolveInteraction: payload => interactions.resolve(payload),
-        writeLocal, localTerminalAttached: process.stdin.isTTY === true });
+        // Adapter notices share the terminal with the pumped PTY stream. Flush
+        // first so a notice lands after the frames already emitted, never
+        // inside a buffered frame that is still waiting its turn.
+        writeLocal: (data) => { terminalOutputPump.flush(); writeLocal(data); },
+        localTerminalAttached: process.stdin.isTTY === true });
     } catch (error) {
       if (agent === "codex") cleanup();
       await reportStartupFailure(error);
@@ -1404,6 +1432,15 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     process.stderr.write(`${handoffNote}\n`);
   }
 
+  // Pass PTY bytes straight through the outer TTY without kernel ONLCR
+  // rewriting bare \n into \r\n (raw-output TUIs like agy rely on bare \n
+  // moving straight down while preserving column). The inner PTY keeps
+  // default OPOST so cooked children still emit CRLF once, never CRCRLF.
+  if (process.stdin.isTTY === true && process.stdout.isTTY === true) {
+    outerTtyRawOutput = disableOuterTtyOutputPostprocessing();
+    if (outerTtyRawOutput) process.once("exit", restoreOuterTtyOutput);
+  }
+
   const started = await executor.start({
     command: launch.command,
     args: launch.args,
@@ -1412,6 +1449,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     cols: process.stdout.columns || 100,
     rows: process.stdout.rows || 30,
     relayToParentTty: process.stdout.isTTY === true,
+    outerTtyRawOutput,
     onOutput: (data) => {
       terminalOutputPump.push(data);
       for (const event of adapter.handleOutput(data)) {
@@ -1443,9 +1481,12 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
         sessionId,
         message: error.message,
       });
-      console.error(error.message);
+      // Same ordering rule as the adapter notices: the pump may still hold a
+      // TUI frame, so flush before a raw stderr line reaches the same screen.
+      writeLocalErrorLine(error.message);
     },
   }).catch(async (error) => {
+    restoreOuterTtyOutput();
     if (agent === "codex") cleanup();
     await reportStartupFailure(error);
     throw error;
@@ -1714,7 +1755,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       status: "running",
     });
   } catch (error) {
-    console.error(`[session-log] ${error.message}`);
+    writeLocalErrorLine(`[session-log] ${error.message}`);
   }
 
   if (typeof adapter.scanStructuredEvents === "function") {

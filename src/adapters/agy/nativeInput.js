@@ -78,6 +78,7 @@ export function observeAgyLocalInput(adapter, data) {
   } else if (input.edited) {
     adapter.userTyping = true; adapter.localTextAwaitingEcho = false; adapter.ready = false;
   }
+  return input;
 }
 
 export function reconcileAgyLocalDraft(adapter, screen) {

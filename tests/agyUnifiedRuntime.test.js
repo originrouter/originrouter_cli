@@ -111,11 +111,17 @@ test('an App question stays unconfirmed until the matching native tool and trans
   } finally { a.cleanup(); rmSync(root, { recursive: true, force: true }); }
 });
 
-test('running transcript rows are not final tool results and updates keep the native call ID', () => {
+test('running transcript rows are not final tool results and ends key on the step', () => {
   const row = { step_index: 4, type: 'GENERIC', status: 'RUNNING', content: '' };
   assert.equal(agyTranscriptItems(JSON.stringify(row)).length, 0);
-  const items = agyTranscriptItems(JSON.stringify({ ...row, status: 'DONE', content: 'actual result' }), { toolIdsByStep: new Map([[4, 'native-call']]) });
-  assert.equal(items[0].event.callId, 'native-call'); assert.equal(items[0].event.content, 'actual result');
+  const items = agyTranscriptItems(JSON.stringify({ ...row, status: 'DONE', content: 'actual result' }), { includeToolStarts: false });
+  assert.equal(items[0].event.callId, 'step-4'); assert.equal(items[0].event.content, 'actual result');
+  // History renders still pair the end with the planner's generated start.
+  const planner = { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', args: {} }] };
+  const history = agyTranscriptItems([planner, { ...row, status: 'DONE', content: 'x' }].map(JSON.stringify).join('\n'));
+  const start = history.find(i => i.event?.type === 'agent.tool_call.start');
+  const end = history.find(i => i.event?.type === 'agent.tool_call.end');
+  assert.equal(start.event.callId, 'agy-step-3:tool-0'); assert.equal(end.event.callId, 'agy-step-3:tool-0');
 });
 
 test('effort changes use only account-advertised model variants', () => {

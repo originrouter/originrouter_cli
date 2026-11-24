@@ -119,7 +119,10 @@ test('an interrupt between paste and Enter never submits the cancelled draft aft
   const submission = executor.submitMessage('cancel this');
   executor.interrupt();
   assert.equal(await submission, false);
-  assert.deepEqual(writes, ['cancel this', 'interrupt']);
+  // The text already pasted stays in the native editor with no Enter to
+  // follow, so the aborted submission clears the line it occupied — the
+  // kill-line the next submission must not inherit.
+  assert.deepEqual(writes, ['cancel this', 'interrupt', '\x15']);
 });
 
 test('native chat content cannot inject terminal control sequences through text attachments', async () => {
