@@ -6,7 +6,7 @@ export function agyManagedCommand(conversation) {
 
 const valueFlags = new Set([
   '--add-dir', '--agent', '--conversation', '--resume', '-r', '--effort', '--input-format',
-  '--json-schema', '--log-file', '--mode', '--model', '--new-project', '--output-format',
+  '--json-schema', '--log-file', '--mode', '--model', '--output-format',
   '--print-timeout', '--project', '--settings', '--prompt-interactive', '-i', '--prompt',
 ]);
 

@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildAgyNativeLaunch, classifyAgyNativeInvocation } from "../src/runtime/agyNativeSession.js";
+import { agyLaunchSelection } from "../src/adapters/agy/nativeCatalog.js";
 
 test('native session classification does not depend on launcher metadata', () => {
   const normal = ['--model', 'account-model', '--prompt-interactive', 'read the project'];
@@ -20,6 +21,24 @@ test('native session classification does not depend on launcher metadata', () =>
   assert.equal(classifyAgyNativeInvocation(['--prompt=one shot']).mode, 'native-command');
   assert.equal(classifyAgyNativeInvocation(['--originrouter-session', 's1', 'models']).mode, 'native-command');
   assert.equal(classifyAgyNativeInvocation(['--prompt-interactive', '--help']).mode, 'session');
+});
+
+test('--new-project preserves native command routing and the requested session model and effort', () => {
+  for (const args of [
+    ['--new-project', '--model', 'account-model', '--effort', 'high'],
+    ['--new-project', '--effort=high', '--model=account-model'],
+    ['--model=account-model', '--new-project', '--effort', 'high'],
+    ['--model', 'account-model', '--effort', 'high', '--new-project'],
+    ['--new-project=false', '--model', 'account-model', '--effort', 'high'],
+  ]) {
+    const invocation = classifyAgyNativeInvocation(args);
+    assert.equal(invocation.mode, 'session', args.join(' '));
+    assert.deepEqual(invocation.nativeArgs, args);
+    assert.deepEqual(agyLaunchSelection(args), { model: 'account-model', effort: 'high' });
+  }
+  for (const args of [['--new-project', '--help'], ['--new-project', 'models']]) {
+    assert.equal(classifyAgyNativeInvocation(args).mode, 'native-command', args.join(' '));
+  }
 });
 
 test("agy launches its native configuration and preserves native flags", () => {

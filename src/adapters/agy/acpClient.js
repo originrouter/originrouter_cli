@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { createInterface } from 'node:readline';
+import { VERSION } from '../../constants.js';
 import { spawnCommand } from '../../utils/spawn.js';
 import { inheritSystemProxyEnv } from '../../utils/systemProxy.js';
 
@@ -23,7 +24,7 @@ export class AgyAcpClient extends EventEmitter {
     this.lines = createInterface({ input: this.child.stdout });
     this.lines.on('line', line => { void this.receive(line); });
     const result = await this.request('initialize', { protocolVersion: 1,
-      clientInfo: { name: 'originrouter', version: '0.6.0' },
+      clientInfo: { name: 'originrouter', version: VERSION },
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false,
         elicitation: { form: {} } } });
     if (result.protocolVersion !== 1) throw new Error('Unsupported Antigravity ACP protocol version');

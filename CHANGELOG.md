@@ -3,7 +3,7 @@
 All notable changes to OriginRouter CLI will be documented here. The project
 uses Semantic Versioning and follows the Keep a Changelog structure.
 
-## Unreleased
+## 0.6.1 (unreleased)
 
 ### Added
 
@@ -24,10 +24,16 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
   private image-file references and text attachments, session-bound device MCP,
   durable message intents, and observed model/effort/mode changes through exact
   conversation restart. Unsupported native panels and automatic recovery remain
-  disabled. The App explains restart-based changes; both READMEs compare all
-  three agents' launch methods.
+  disabled. Both READMEs compare all three agents' launch methods.
 
 ### Fixed
+
+- Keep interactive `originrouter agy --new-project` launches registered with
+  the App when model or effort flags follow it. Both space-separated and
+  `--model=value` arguments preserve the requested selection.
+- Restore the saved permissions and queued messages for the native agy
+  conversation on resume. Reopening a transcript no longer replays previously
+  displayed events, and delayed updates keep the run on its confirmed conversation.
 
 - Preserve the current terminal size and conversation ownership across native
   agy child replacement; retain a live child lock after its wrapper dies and
