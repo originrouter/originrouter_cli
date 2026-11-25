@@ -2,21 +2,21 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { acquireThreadLock, setThreadLockChild, releaseThreadLock } from '../src/local/threadLock.js';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, appendFileSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { execFileSync } from 'node:child_process';
 import { agyManagedCommand, agySessionArguments, replaceAgyFlags } from '../src/adapters/agy/nativeLaunch.js';
 import { AgyNativeScreen, agyScreenState } from '../src/adapters/agy/nativeScreen.js';
 import { AgyNativeExecutor } from '../src/adapters/agy/nativeExecutor.js';
 import { agyQuestions, questionSelection } from '../src/adapters/agy/nativeQuestions.js';
-import { agyEffortVariants, parseAgyModels, agyFooterConfiguration } from '../src/adapters/agy/nativeCatalog.js';
+import { agyEffortVariants, parseAgyModels, agyFooterConfiguration, agyNativeMenusSupported } from '../src/adapters/agy/nativeCatalog.js';
 import { AgyNativeQueueStore } from '../src/adapters/agy/nativeQueue.js';
 import { prepareAgyAttachments } from '../src/adapters/agy/nativeAttachments.js';
 import { configureAgyDeviceMcp } from '../src/adapters/agy/mcpSettings.js';
 import { AgyAdapter } from '../src/adapters/agyAdapter.js';
-import { agyTranscriptItems } from '../src/adapters/agy/history.js';
+import { agyTranscriptPath, agyTranscriptItems, readAgyConversationHistory } from '../src/adapters/agy/history.js';
 
 const fixture = () => mkdtempSync(join(tmpdir(), 'or-agy-unified-test-'));
 test('terminal and App use native sessions; only recorded ACP conversations keep ACP', () => {
@@ -132,16 +132,10 @@ test('a resumed adapter re-emits nothing, then ends carry the deterministic step
       { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', args: {} }] },
       { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'data' },
     ];
-    const a = new AgyAdapter({ args: ['--conversation', 'native'], cwd: root });
-    a.transcriptPath = join(root, 'transcript.jsonl');
-    writeFileSync(a.transcriptPath, rows.map(JSON.stringify).join('\n'));
-    a.nativeSessionId = 'native';
-    // The constructor seed ran before the transcript existed (the daemon sets
-    // transcriptPath from the launch args at spawn time), so seed `seen` the
-    // same way the constructor does.
-    for (const item of agyTranscriptItems(readFileSync(a.transcriptPath, 'utf8'), { includeToolStarts: false })) {
-      a.seen.set(`${a.nativeSessionId}:${item.id}`, JSON.stringify(item));
-    }
+    const path = agyTranscriptPath('native', root);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, rows.map(JSON.stringify).join('\n'));
+    const a = new AgyAdapter({ args: ['--conversation', 'native'], cwd: root, home: root });
     assert.deepEqual(a.scanStructuredEvents(), [], 'a resume must re-emit nothing');
     writeFileSync(a.transcriptPath, [...rows, { step_index: 4, type: 'GENERIC', status: 'DONE', content: 'more' }].map(JSON.stringify).join('\n'));
     const ends = a.scanStructuredEvents().filter(e => e.type === 'agent.tool_call.end');
@@ -196,10 +190,20 @@ test('native queue recovery separates unsent intents from ambiguous submitted me
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('the native menus ride the 1.5 line past the version they shipped with', () => {
+  assert.equal(agyNativeMenusSupported('1.5.13'), true);
+  assert.equal(agyNativeMenusSupported('1.5.16'), true);
+  assert.equal(agyNativeMenusSupported('1.5.12'), false);
+  assert.equal(agyNativeMenusSupported('1.6.0'), false);
+  assert.equal(agyNativeMenusSupported('2.0.0'), false);
+  assert.equal(agyNativeMenusSupported(null), false);
+  assert.equal(agyNativeMenusSupported('not a version'), false);
+});
+
 test('catalog observations distinguish thinking models from effort variants in the current footer', () => {
   const models = parseAgyModels('flash-low\tGemini Flash (Low)\nflash-high\tGemini Flash (High)\nsonnet\tClaude Sonnet (Thinking)');
-  assert.deepEqual(agyFooterConfiguration(models, '? for shortcuts   auto · Claude Sonnet · high'), { mode: 'auto', model: 'sonnet' });
-  assert.deepEqual(agyFooterConfiguration(models, '? for shortcuts   plan · Gemini Flash · low'), { mode: 'plan', model: 'flash-low' });
+  assert.deepEqual(agyFooterConfiguration(models, '? for shortcuts   auto · Claude Sonnet · high'), { mode: 'auto', model: 'sonnet', name: 'Claude Sonnet', effort: 'high' });
+  assert.deepEqual(agyFooterConfiguration(models, '? for shortcuts   plan · Gemini Flash · low'), { mode: 'plan', model: 'flash-low', name: 'Gemini Flash', effort: 'low' });
   assert.equal(agyFooterConfiguration(models, Array.from({length: 10},(_,i)=>i===0?'auto · Gemini Flash · high':'plain').join('\n')), null);
 });
 
@@ -242,4 +246,155 @@ test('native MCP uses its own namespace and preserves a user or ACP server name'
     await configureAgyDeviceMcp({ home: root, remove: true });
     assert.deepEqual(JSON.parse(readFileSync(file)), { mcpServers: { originrouter_device: { command: 'user-owned-acp-server' } } });
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('late binding baselines older rows while preserving the current turn', () => {
+  const home = fixture();
+  const a = new AgyAdapter({ args: ['--continue'], cwd: home, home });
+  try {
+    const path = agyTranscriptPath('thread', home);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, [
+      { step_index: 1, type: 'USER_INPUT', content: 'old', created_at: '2020-01-01T00:00:00Z' },
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', model: 'old-high',
+        content: 'old answer', thinking: 'old thought', created_at: '2020-01-01T00:00:01Z' },
+      { step_index: 3, type: 'USER_INPUT', content: 'current', created_at: new Date().toISOString() },
+    ].map(JSON.stringify).join('\n'));
+    a.onHook({ hookEventName: 'PreInvocation', conversationId: 'thread' });
+    const events = a.scanStructuredEvents();
+    assert.deepEqual(events.filter(e => e.eventId).map(e => e.text), ['current']);
+    assert.equal(events.filter(e => e.type === 'agent.session.start').length, 1);
+    assert.equal(a.model, 'old-high');
+    assert.deepEqual(a.scanStructuredEvents(), []);
+    assert.deepEqual(readAgyConversationHistory(path).messages.map(m => m.sequence), [0, 1, 2, 3]);
+  } finally { a.cleanup(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('native foreground changes are detected without a hook and only from the owning PID', () => {
+  const home = fixture();
+  const log = join(home, 'custom.log');
+  const a = new AgyAdapter({ args: ['--log-file', log], home, cwd: home });
+  const id1 = '00000000-0000-0000-0000-000000000001';
+  const id2 = '00000000-0000-0000-0000-000000000002';
+  const line = id => 'I1124 09:50:33.678623     921 conversation_manager.go:1082] Streaming conversation ' + id;
+  try {
+    writeFileSync(log, 'I1124 09:50:33.678620      23 server.go:2650] Starting language server process with pid 1234\n' + line(id1) + '\n');
+    a.afterNativeStart({ pid: 9876 }, 1);
+    assert.ok(!a.scanStructuredEvents().some(e => e.type === 'agent.session.start'));
+    a.afterNativeStart({ pid: 1234 }, 2);
+    assert.equal(a.scanStructuredEvents().find(e => e.type === 'agent.session.start').sessionId, id1);
+    appendFileSync(log, line(id2).slice(0, 40));
+    assert.equal(a.scanStructuredEvents().length, 0);
+    appendFileSync(log, line(id2).slice(40) + '\n');
+    assert.equal(a.scanStructuredEvents().find(e => e.type === 'agent.session.start').sessionId, id2);
+    a.onHook({ conversationId: id2 });
+    assert.deepEqual(a.scanStructuredEvents(), []);
+  } finally { a.cleanup(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('late binding uses prelaunch byte offsets even for two messages in the same native second', () => {
+  const home = fixture();
+  const path = agyTranscriptPath('thread', home);
+  mkdirSync(dirname(path), { recursive: true });
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const row = (index, content) => JSON.stringify({ step_index: index, type: 'USER_INPUT', content, created_at: timestamp }) + '\n';
+  writeFileSync(path, row(0, '旧消息'));
+  const a = new AgyAdapter({ home, args: ['-c'] });
+  try {
+    appendFileSync(path, row(1, '本轮消息'));
+    a.onHook({ conversationId: 'thread' });
+    assert.deepEqual(a.scanStructuredEvents().filter(e => e.eventId).map(e => e.text), ['本轮消息']);
+    assert.deepEqual(a.scanStructuredEvents(), []);
+  } finally { a.cleanup(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('a foreground switch after a hook does not need the original ID to appear in the log', () => {
+  const home = fixture(), path = join(home, 'native.log');
+  const a = new AgyAdapter({ home, args: ['--log-file', path] });
+  const first = '00000000-0000-0000-0000-000000000001', next = '00000000-0000-0000-0000-000000000002';
+  try {
+    a.afterNativeStart({ pid: 321 }, 1);
+    a.onHook({ conversationId: first });
+    a.scanStructuredEvents();
+    a.lastHookAt = new Date(2026, 10, 24, 9, 50, 33, 500).getTime();
+    a.conversationLog.nextLookup = 0;
+    writeFileSync(path, [
+      'I1124 09:50:32.000000 321 server.go:1] Starting language server process with pid 321',
+      'I1124 09:50:33.001000 321 conversation_manager.go:1] Streaming conversation 00000000-0000-0000-0000-000000000003',
+      'I1124 09:50:33.900000 321 conversation_manager.go:1] Streaming conversation ' + next, '',
+    ].join('\n'));
+    assert.deepEqual(a.scanStructuredEvents().filter(e => e.type === 'agent.session.start').map(e => e.sessionId), [next]);
+  } finally { a.cleanup(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('selection is available without a catalog or a previous turn, and follows the native footer', () => {
+  const home = fixture(), dir = join(home, '.gemini', 'antigravity-cli');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'settings.json'), JSON.stringify({ model: 'Orchestrator (Neon)', orchestrator: { planner: 'Gemini (High)' } }));
+  const a = new AgyAdapter({ home, args: ['--conversation', 'empty'] });
+  try {
+    assert.equal(a.modelStatusEvent().model, 'Orchestrator (Neon)');
+    assert.equal(a.effortStatusEvent().effort, 'high');
+    a.observeScreen('>\n────────────\n? for shortcuts   plan · Gemini Pro · medium');
+    assert.equal(a.modelStatusEvent().model, 'Gemini Pro');
+    assert.equal(a.effortStatusEvent().effort, 'medium');
+    assert.deepEqual(a.modelStatusEvent().availableModels, []);
+  } finally { a.cleanup(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('the native version discovered after process start also publishes attachment capabilities', async () => {
+  const home = fixture();
+  const a = new AgyAdapter({ home, loadCatalog: async () => ({ models: [], version: '1.5.16' }) });
+  try {
+    a.attachmentDirectory = join(home, 'attachments');
+    a.afterNativeStart({ pid: 321 }, 1);
+    assert.deepEqual(a.pendingEvents.find(e => e.type === 'agent.capabilities').promptCapabilities, {});
+    a.pendingEvents = [];
+    a.refreshCatalog();
+    await delay(0);
+    assert.equal(a.pendingEvents.find(e => e.type === 'agent.capabilities')?.promptCapabilities.image, true);
+  } finally { a.cleanup(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('a picker resume restores queued images inside the directory already granted to the native process', () => {
+  const home = fixture();
+  const a = new AgyAdapter({ home });
+  try {
+    a.stateDir = home; a.sessionId = 'provisional';
+    const base = join(home, 'agy-attachments');
+    mkdirSync(base);
+    const old = mkdtempSync(join(base, 'session-'));
+    a.attachmentDirectory = mkdtempSync(join(base, 'session-'));
+    assert.ok(a.bindQueueOwner(a.sessionId));
+    const launch = a.buildLaunch();
+    const dir = launch.args[launch.args.indexOf('--add-dir') + 1];
+    const png = Buffer.from([137,80,78,71,13,10,26,10]);
+    const prepared = prepareAgyAttachments('photo', [{ type: 'image', mimeType: 'image/png', data: png.toString('base64') }], old);
+    const queue = new AgyNativeQueueStore(home, 'canonical');
+    queue.write([{ id: 'image', text: prepared.text, attachmentRoot: prepared.root }]);
+    assert.ok(a.bindQueueOwner('canonical'));
+    const [message] = queue.read().pending;
+    assert.equal(dirname(message.attachmentRoot), dir);
+    const path = join(message.attachmentRoot, 'image-1.png');
+    assert.ok(message.text.includes(JSON.stringify(path)));
+    assert.deepEqual(readFileSync(path), png);
+    assert.deepEqual(a.messages.map(m => m.id), ['image']);
+  } finally { a.cleanup(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('a failed picker queue merge preserves both durable queues through shutdown', () => {
+  const home = fixture(), a = new AgyAdapter({ home });
+  try {
+    a.stateDir = home; a.sessionId = 'launch';
+    const own = new AgyNativeQueueStore(home, a.sessionId);
+    const queued = [{ id: 'new', text: 'new' }];
+    own.write(queued);
+    assert.ok(a.bindQueueOwner(a.sessionId));
+    const old = new AgyNativeQueueStore(home, 'owner');
+    old.write(Array.from({ length: 16 }, (_, i) => ({ id: String(i), text: String(i) })));
+    assert.equal(a.bindQueueOwner('owner'), false);
+    a.cleanup();
+    assert.equal(old.read().pending.length, 16);
+    assert.deepEqual(own.read().pending.map(m => m.id), ['new']);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });

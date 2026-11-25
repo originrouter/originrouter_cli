@@ -193,7 +193,7 @@ async function interactiveHistory(args) {
 
 export async function handleHistoryCommand(args = []) {
   if (args.includes("--help") || args.includes("-h")) {
-    console.log("Usage: originrouter history [question] [--agent claude|codex] [--device <id>] [--workspace <id>] [--since <ISO>] [--until <ISO>] [--limit 1-20] [--archived] [--json]");
+    console.log("Usage: originrouter history [question] [--agent claude|codex|agy] [--device <id>] [--workspace <id>] [--since <ISO>] [--until <ISO>] [--limit 1-20] [--archived] [--json]");
     return;
   }
   const query = positionalQuery(args);

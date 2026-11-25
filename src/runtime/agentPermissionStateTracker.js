@@ -7,20 +7,25 @@ export function createAgentPermissionStateTracker(metadata, { now = Date.now } =
   let boundConversationId = null;
   return {
     get revision() { return revision; },
-    capture(configuration, { changed = false, conversationId = metadata.conversationId } = {}) {
+    capture(configuration, { changed = false, conversationId = metadata.conversationId, nativeSessionId } = {}) {
       const next = permissionConfiguration(configuration);
       const catalog = new AgentCatalog({ stateDir: metadata.stateDir });
       try {
         const captured = catalog.db.transaction(() => {
-          catalog.ensureSessionForPermissionState({ ...metadata, conversationId });
+          const requestedId = conversationId;
+          conversationId = catalog.ensureSessionForPermissionState({ ...metadata, conversationId, nativeSessionId });
           const saved = catalog.getConversationPermissionState(conversationId);
+          if (saved && requestedId !== conversationId && !nativeSessionId && !changed) {
+            return null;
+          }
           const nextRevision = !current || changed || conversationId !== boundConversationId
             ? Math.max(now(), revision + 1, Number(saved?.revision || 0) + 1)
             : revision;
           const state = { ...next, revision: nextRevision, sessionId: metadata.sessionId };
           catalog.saveConversationPermissionState(metadata.sessionId, state);
           return state;
-        })();
+        }).immediate();
+        if (!captured) return revision;
         current = captured;
         revision = captured.revision;
         boundConversationId = conversationId;

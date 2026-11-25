@@ -225,3 +225,10 @@ try {
 }
 
 console.log("conversation handover tests ok");
+
+assert.deepEqual(rewriteResumeArgv(['agy', '--originrouter-session', 'old', '--originrouter-run', 'run',
+  '--originrouter-conversation', 'old-conv', '--originrouter-title', 'old title', '-r', 'abc', '--continue',
+  '-i', 'original prompt', '--originrouter-autonomy', 'unrestricted', '--settings', 'settings.json'], 'next',
+{ managed: true }), ['agy', '--conversation', 'next', '--settings', 'settings.json']);
+assert.equal(resolveHandoverTarget({ toNativeSessionId: 'empty-agy', transcriptPathFor: () => null,
+  resumeWithoutTranscript: true }).resumeNativeSessionId, 'empty-agy');

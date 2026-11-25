@@ -4,8 +4,9 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { resolveAgentAutonomyConfiguration } from "../src/runtime/agentAutonomyConfiguration.js";
+import { resolveAgentAutonomyConfiguration, resumedPermissionConfiguration } from "../src/runtime/agentAutonomyConfiguration.js";
 import { protectedApprovalPolicy } from "../src/runtime/approvalPolicy.js";
+import { AgentCatalog } from "../src/persistence/agentCatalog.js";
 
 function aiSnapshot() {
   const template = { allowed_scopes: ["read_tools"], applicability: {}, instructions: "Allow reads.",
@@ -39,4 +40,39 @@ test("invalid, missing and corrupted mode settings fail closed without a partial
     { profile: "ai_review", aiReviewPolicy: { ...aiSnapshot(), instructions: "tampered" } },
     { profile: "custom", policyId: "selected-policy", policyBundle: { content: { ...protectedApprovalPolicy(), id: "different-policy" } } },
   ]) assert.throws(() => resolveAgentAutonomyConfiguration(payload), { name: "Error" });
+});
+test("a named resume adopts the permission state its conversation was left with", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "originrouter-resume-permission-"));
+  const catalog = new AgentCatalog({ stateDir });
+  try {
+    catalog.upsertSession({
+      sessionId: "agy-old", conversationId: "agy-old", agent: "agy", title: "agy session",
+      nativeSessionId: "native-1", status: "completed", startedAt: "2026-01-01T00:00:00.000Z",
+    });
+    catalog.saveConversationPermissionState("agy-old", {
+      profile: "unrestricted", allowedScopes: [], revision: 100, sessionId: "agy-old",
+    });
+    assert.equal(resumedPermissionConfiguration("agy", "native-1", { stateDir }).profile, "unrestricted");
+    // A conversation the catalog does not know has no state to adopt.
+    assert.equal(resumedPermissionConfiguration("agy", "native-missing", { stateDir }), null);
+    // Stop before startup capture can overwrite a damaged saved policy.
+    catalog.db.prepare("UPDATE agent_conversations SET permission_state_json = ? WHERE conversation_id = ?")
+      .run(JSON.stringify({ profile: "not-a-mode", revision: 200, sessionId: "agy-old" }), "agy-old");
+    assert.throws(() => resumedPermissionConfiguration("agy", "native-1", { stateDir }), { code: "RESUME_PERMISSION_STATE_INVALID" });
+  } finally { catalog.close(); }
+});
+
+test('legacy resume restores self-contained profiles and refuses incomplete policy snapshots', () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'originrouter-legacy-resume-'));
+  const catalog = new AgentCatalog({ stateDir });
+  try {
+    for (const profile of ['manual', 'guarded', 'unrestricted', 'custom', 'ai_review']) {
+      catalog.upsertSession({ agent: 'agy', sessionId: profile, nativeSessionId: profile, permissionProfile: profile });
+      if (['custom', 'ai_review'].includes(profile)) {
+        assert.throws(() => resumedPermissionConfiguration('agy', profile, { stateDir }), { code: 'RESUME_PERMISSION_STATE_UNAVAILABLE' });
+      } else {
+        assert.equal(resumedPermissionConfiguration('agy', profile, { stateDir }).profile, profile);
+      }
+    }
+  } finally { catalog.close(); }
 });

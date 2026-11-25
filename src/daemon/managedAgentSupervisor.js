@@ -1,4 +1,4 @@
-import { resolvePersistedPermissionConfiguration } from "../runtime/agentAutonomyConfiguration.js";
+import { permissionStateForResume, resolvePersistedPermissionConfiguration } from "../runtime/agentAutonomyConfiguration.js";
 import { spawn } from "node:child_process";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -83,18 +83,12 @@ export class ManagedAgentSupervisor {
       (payload.inheritPermission === true || payload.inherit_permission === true ||
        (!payload.permissionProfile && !payload.permission_profile));
     const savedPermission = inheritPermission
-      ? this.catalog?.getConversationPermissionState(savedConversationId) : null;
+      ? permissionStateForResume(this.catalog, savedConversationId) : null;
     if (savedPermission) {
       permissionProfile = savedPermission.profile;
       payload = { ...payload, allowedScopes: savedPermission.allowedScopes || [],
         policyBundle: savedPermission.policyBundle, aiReviewPolicy: savedPermission.aiReviewPolicy,
         policyId: savedPermission.policyBundle?.id || "", policyRevision: savedPermission.policyBundle?.revision || "" };
-    } else if (inheritPermission) {
-      const previous = this.catalog?.getConversation(savedConversationId)?.permission_profile;
-      if (["manual", "guarded", "unrestricted"].includes(previous)) permissionProfile = previous;
-      else if (previous === "custom" || previous === "ai_review") {
-        throw launchError("RESUME_PERMISSION_STATE_UNAVAILABLE", "This older session has no saved permission configuration. Select a policy explicitly before resuming.");
-      }
     }
     let approvalPolicy = null;
     let aiReviewPolicy = null;

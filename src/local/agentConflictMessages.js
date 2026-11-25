@@ -16,14 +16,14 @@ const FORK_WARNING = [
 ].join(" ");
 
 // The conversation somebody else is sitting in, so we cannot open it too.
-export function conversationAlreadyOpenMessage({ holder = null } = {}) {
+export function conversationAlreadyOpenMessage({ holder = null, agent = "claude" } = {}) {
   const where = holder?.originrouter
     ? "another OriginRouter session"
     : "another terminal";
   return [
     `This conversation is already open in ${where}.`,
     "",
-    FORK_WARNING,
+    agent === "agy" ? "Antigravity is already using this conversation." : FORK_WARNING,
     "OriginRouter will not open a conversation that is already running.",
     "",
     "Close that session and run this again, or start a new conversation.",
@@ -32,14 +32,14 @@ export function conversationAlreadyOpenMessage({ holder = null } = {}) {
 
 // The conversation the reader asked to switch into is taken, so we left them
 // where they were instead of failing.
-export function conversationSwitchBlockedMessage({ holder = null } = {}) {
+export function conversationSwitchBlockedMessage({ holder = null, agent = "claude" } = {}) {
   const where = holder?.originrouter
     ? "another OriginRouter session"
     : "another terminal";
   return [
     `That conversation is already open in ${where}, so OriginRouter stayed in this one.`,
     "",
-    FORK_WARNING,
+    agent === "agy" ? "Antigravity is already using this conversation." : FORK_WARNING,
     "",
     "Close that session and switch again, or start a new conversation.",
   ].join("\n");

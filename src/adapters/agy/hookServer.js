@@ -27,8 +27,9 @@ export async function startAgyHookServer({ onEvent, onPermission, onCancel, dele
         chunks.push(chunk);
       }
       const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      await onEvent(payload);
+      const accepted = await onEvent(payload);
       if (payload.hookEventName !== 'PreToolUse') return respond(response, {});
+      if (accepted === false) return respond(response, { decision: 'deny', reason: 'Native conversation changed' });
       if (delegateTool(payload)) return respond(response, { decision: 'allow' });
       const id = `${payload.conversationId}:${payload.toolCall?.id || `step-${payload.stepIdx}`}`;
       if (pending.has(id)) return respond(response, { decision: 'deny', reason: 'Duplicate native permission request' });

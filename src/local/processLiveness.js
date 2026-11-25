@@ -25,6 +25,7 @@ export function parseElapsedSeconds(value) {
     ? [text.slice(0, text.indexOf("-")), text.slice(text.indexOf("-") + 1)]
     : [null, text];
   const parts = clock.split(":");
+  if (parts.length === 2 && /^\d+:\d{2}$/.test(clock)) parts.unshift("0");
   if (parts.length !== 3) return null;
   const [hours, minutes, seconds] = parts.map((part) => Number(part));
   if (![hours, minutes, seconds].every((part) => Number.isFinite(part))) {

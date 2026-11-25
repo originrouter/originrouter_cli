@@ -134,6 +134,17 @@ export function readCodexThreadTitle(threadId, { codexHome } = {}) {
   return title;
 }
 
+export function readAgyTitles(home = homedir()) {
+  const path = join(home, ".gemini", "antigravity-cli", "cache", "conversation_metadata.json");
+  try {
+    const metadata = JSON.parse(readFileSync(path, "utf8"));
+    return new Map(Object.entries(metadata.conversations).flatMap(([id, entry]) => {
+      const title = entry?.summary?.Title;
+      return typeof title === "string" && title.trim() ? [[id, safeTitleText(title)]] : [];
+    }));
+  } catch { return new Map(); }
+}
+
 /// The title the agent produced for a session, whichever agent it is.
 ///
 /// Returns "" when the agent has not named the session yet — which is a state,
@@ -144,8 +155,10 @@ export function readAgentSessionTitle({
   transcriptPath,
   nativeSessionId,
   codexHome,
+  home = homedir(),
 } = {}) {
   const agent = safeTitleText(agentType, 32).toLowerCase();
+  if (agent === "agy") return nativeSessionId ? readAgyTitles(home).get(nativeSessionId) || "" : "";
   if (agent === "codex") {
     return readCodexThreadTitle(nativeSessionId, { codexHome });
   }

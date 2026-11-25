@@ -160,6 +160,10 @@ export class LocalAgentBridgeClient {
     const session = response?.session || response?.data?.session || null;
     if (!session || typeof session !== "object") return null;
     this.registeredSession = session;
+    if (session.conversation_id && session.native_session_id
+        && session.native_session_id === this.sessionMetadata.nativeSessionId) {
+      this.sessionMetadata.conversationId = session.conversation_id;
+    }
     return session;
   }
 
@@ -231,6 +235,19 @@ export class LocalAgentBridgeClient {
           effortControl: event.effortControl || "unsupported",
           availableEfforts: Array.isArray(event.availableEfforts)
             ? event.availableEfforts.slice(0, 8)
+            : [],
+        };
+      }
+      if (event.type === "agent.model.status") {
+        // The model is the third half of that same configuration. The effort
+        // fields already travel in the register metadata for a daemon
+        // restart; the model's did not, so a rebuilt session record reported
+        // 'unsupported' until the runtime happened to state it again.
+        this.sessionMetadata = { ...this.sessionMetadata,
+          sessionModel: event.model ?? null,
+          modelControl: event.modelControl || "unsupported",
+          availableModels: Array.isArray(event.availableModels)
+            ? event.availableModels.slice(0, 256)
             : [],
         };
       }

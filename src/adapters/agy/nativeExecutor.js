@@ -23,6 +23,7 @@ export class AgyNativeExecutor {
     this.adapter.resetScreen?.(options.cols, options.rows);
     this.exitPromise = new Promise(resolve => { this.resolveExit = resolve; });
     const resolveExit = this.resolveExit;
+    const startedAt = Date.now();
     const result = await child.start({ ...options,
       onOutput: data => { if (epoch === this.epoch) options.onOutput(data); },
       onError: error => { if (epoch === this.epoch) options.onError?.(error); },
@@ -32,7 +33,7 @@ export class AgyNativeExecutor {
         if (epoch === this.epoch && (epoch !== this.replacedEpoch || this.stopped)) this.reportExit(epoch, result);
       },
     });
-    this.adapter.afterNativeStart?.(result, epoch);
+    this.adapter.afterNativeStart?.(result, epoch, startedAt, options.args);
     return result;
   }
   reportExit(epoch, result) {
@@ -86,5 +87,5 @@ export class AgyNativeExecutor {
     this.child?.resize(cols, rows); this.adapter.resizeScreen?.(cols, rows); return true;
   }
   interrupt() { this.inputGeneration = (this.inputGeneration || 0) + 1; this.child?.interrupt(); }
-  stop() { this.stopped = true; this.inputGeneration = (this.inputGeneration || 0) + 1; this.child?.stop(); }
+  stop() { this.stopped = true; this.inputGeneration = (this.inputGeneration || 0) + 1; this.child?.stop(); return this.exitPromise; }
 }

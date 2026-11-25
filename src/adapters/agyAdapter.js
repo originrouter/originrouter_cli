@@ -1,20 +1,20 @@
-import { readFileSync, existsSync, statSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
-import { join, relative, isAbsolute } from 'node:path';
-import { realpathSync } from 'node:fs';
+import { readFileSync, existsSync, realpathSync, statSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { TerminalAdapter } from './terminalAdapter.js';
 import { configureAgyHooks } from './agy/hookSettings.js';
 import { startAgyHookServer } from './agy/hookServer.js';
-import { agyTranscriptPath, agyTranscriptItems, readAgyConversationHistory, agyTranscriptRows } from './agy/history.js';
+import { agyTranscriptPath, agyTranscriptOffsets, agyTranscriptItems, agyTranscriptModel, readAgyConversationHistory, agyTranscriptRows } from './agy/history.js';
 import { buildInteractionRequest, INTERACTION_KINDS, INTERACTION_SOURCES } from '../runtime/agentInteractionContract.js';
 import { agentInteractionTimeoutMsFromConfig } from '../config/agentInteractionTimeout.js';
 import { readConfig } from '../persistence/state.js';
 import { agyPermissionPayload } from './agy/permissionPayload.js';
 import { AgyNativeExecutor } from './agy/nativeExecutor.js';
 import { AgyNativeScreen, agyScreenState } from './agy/nativeScreen.js';
-import { agySessionArguments, replaceAgyFlags } from './agy/nativeLaunch.js';
-import { loadAgyCatalog, agyEffortVariants, agyFooterConfiguration } from './agy/nativeCatalog.js';
+import { AgyConversationLog, newAgyLogPath } from './agy/conversationLog.js';
+import { agyOption, agySessionArguments, replaceAgyFlags } from './agy/nativeLaunch.js';
+import { loadAgyCatalog, agyLaunchSelection, agyEffortVariants, agyFooterConfiguration, agyNativeMenusSupported } from './agy/nativeCatalog.js';
 import { agyQuestions, questionPanel, questionSelection } from './agy/nativeQuestions.js';
-import { prepareAgyAttachments, AGY_NATIVE_PROMPT_CAPABILITIES } from './agy/nativeAttachments.js';
+import { prepareAgyAttachments, restoreAgyQueuedAttachment, AGY_NATIVE_PROMPT_CAPABILITIES } from './agy/nativeAttachments.js';
 import { configureAgyDeviceMcp } from './agy/mcpSettings.js';
 import { fileURLToPath } from 'node:url';
 import { AgyNativeQueueStore, validAgyQueuedMessage } from './agy/nativeQueue.js';
@@ -74,7 +74,7 @@ function truncateTerminalColumns(text, maxCols) {
 }
 
 export class AgyAdapter extends TerminalAdapter {
-  constructor({ args = [], cwd, loadCatalog = loadAgyCatalog } = {}) {
+  constructor({ args = [], cwd, loadCatalog = loadAgyCatalog, home } = {}) {
     const launch = agySessionArguments(args);
     super({ command: 'agy', args: launch.args });
     this.kind = 'agy'; this.cwd = cwd; this.pendingEvents = []; this.seen = new Map();
@@ -83,34 +83,101 @@ export class AgyAdapter extends TerminalAdapter {
     this.loadCatalog = loadCatalog; this.models = []; this.epoch = 0; this.messages = [];
     this.questions = new Map(); this.completedQuestions = new Set();
     this.initialMessage = launch.initialMessage?.replace(/\r\n/g, '\n') ?? null;
-    for (let i = 0; i < this.args.length; i++) {
-      const arg = this.args[i];
-      if (arg === '--conversation') this.nativeSessionId = this.args[++i] || null;
-      else if (arg.startsWith('--conversation=')) this.nativeSessionId = arg.slice(15);
-    }
-    this.transcriptPath = agyTranscriptPath(this.nativeSessionId);
-    if (this.transcriptPath && existsSync(this.transcriptPath) && statSync(this.transcriptPath).size <= 32 * 1024 * 1024) {
-      // Seed `seen` with the same shapes the live scan emits: a tool-call end
-      // carries a different callId under `includeToolStarts` (history renders
-      // pair FIFO with `agy-step-*` starts; live ends pair on `step-N`), so a
-      // seed taken in history mode would let every recorded end re-emit as a
-      // fresh live event on the first scan after a restart.
-      for (const item of agyTranscriptItems(readFileSync(this.transcriptPath, 'utf8'), { includeToolStarts: false })) {
-        this.seen.set(`${this.nativeSessionId}:${item.id}`, JSON.stringify(item));
-      }
-    }
+    this.home = home;
+    this.launchSelection = agyLaunchSelection(this.args, this.home, this.cwd);
+    this.startedAt = Date.now();
+    const namedId = agyOption(this.args, '--conversation');
+    if (!namedId && new.target === AgyAdapter) this.launchOffsets = agyTranscriptOffsets(home);
+    this.bindNativeConversation(namedId, { launch: true });
+    this.model = agyOption(this.args, '--model') || this.model;
     this.resetScreen();
   }
+  bindNativeConversation(id, { launch = false } = {}) {
+    if (!id || this.switchTarget || id === this.nativeSessionId) return;
+    const path = agyTranscriptPath(id, this.home);
+    if (!path) return;
+    if (this.nativeSessionId) {
+      this.switchTarget = id;
+      this.hookServer?.cancelAll('conversation_switched');
+      this.pendingEvents.push({ type: 'agent.session.start', provider: 'agy', sessionId: id, transcriptPath: path });
+      return;
+    }
+    this.nativeSessionId = id;
+    this.transcriptPath = path;
+    this.transcriptStamp = null;
+    this.baselinePending = true;
+    if (!launch && this.queueStore) this.queueBindingPending = true;
+    if (!launch) this.pendingEvents.push({ type: 'agent.session.start', provider: 'agy',
+      sessionId: id, transcriptPath: path });
+    // A delayed first hook can arrive after this run already wrote a message.
+    // Only baseline older entries; later completed/changed rows remain live.
+    try {
+      const stat = statSync(path);
+      if (stat.size > 32 * 1024 * 1024) return;
+      const bytes = readFileSync(path);
+      this.seedTranscript(bytes, stat, launch);
+      this.baselinePending = false;
+      const model = agyTranscriptModel(bytes.toString('utf8'));
+      if (model && model !== this.model) {
+        this.model = model;
+        if (!launch) this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
+      }
+    } catch { /* A fresh or partially written transcript is picked up by the next scan. */ }
+  }
+
+  seedTranscript(bytes, stat, namedLaunch = false) {
+    const offset = this.launchOffsets?.get(this.nativeSessionId);
+    this.launchOffsets = null;
+    const prefix = namedLaunch ? bytes : offset?.ino === stat.ino && offset.size <= bytes.length
+      ? bytes.subarray(0, offset.size) : null;
+    if (prefix) {
+      for (const item of agyTranscriptItems(prefix.toString('utf8'), { includeToolStarts: false })) {
+        this.seen.set(this.nativeSessionId + ':' + item.id, JSON.stringify(item));
+      }
+    }
+    // A restored file can first appear after startup. Ignore its earlier
+    // seconds, while retaining new rows written in the launch second.
+    if (!prefix?.length && !namedLaunch) {
+      const launchSecond = Math.floor(this.startedAt / 1000) * 1000;
+      for (const item of agyTranscriptItems(bytes.toString('utf8'), { includeToolStarts: false })) {
+        if (Date.parse(item.createdAt) < launchSecond) {
+          this.seen.set(this.nativeSessionId + ':' + item.id, JSON.stringify(item));
+        }
+      }
+    }
+  }
+
+  observeConversationLog() {
+    for (const id of this.conversationLog?.read({ since: this.lastHookAt }) || []) {
+      this.bindNativeConversation(id);
+    }
+  }
+
   describe() { return { ...super.describe(), runtime: 'agy-pty', structuredSources: ['agy-hooks', 'agy-transcript'] }; }
   createExecutor() { return new AgyNativeExecutor(this); }
   resetScreen(cols = 100, rows = 30) {
     this.screen?.dispose(); this.ready = false; this.screenText = ''; this.state = 'starting';
+    this.footerSelection = null;
+    this.footerDisplayName = null;
     this.checkingNativeVersion = true;
     this.nativeInput = null; this.terminalResponses = null;
     this.userTyping = false; this.localTextAwaitingEcho = false;
     this.screen = new AgyNativeScreen(text => this.observeScreen(text), cols, rows);
   }
   resizeScreen(cols, rows) { this.screen.resize(cols, rows); }
+  refreshCatalog() {
+    if (this.refreshingCatalog || this.disposed) return;
+    this.catalogRequest = new AbortController();
+    this.refreshingCatalog = true;
+    void Promise.resolve().then(() => this.loadCatalog(this.catalogEnv, this.catalogRequest.signal)).then(catalog => {
+      if (this.disposed) return;
+      if (this.state !== 'needs_login') this.models = catalog.models;
+      if (!this.nativeVersion && catalog.version) this.observeNativeVersion(catalog.version);
+      this.observeScreen(this.screenText);
+      this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
+    }).catch(() => {}).finally(() => { this.catalogRefreshedAt = Date.now(); this.refreshingCatalog = false; });
+  }
+
   async beforeStart({ sessionId, conversationId, stateDir, env, resolveInteraction, writeLocal, localTerminalAttached }) {
     this.sessionId = sessionId; this.stateDir = stateDir; this.resolveInteraction = resolveInteraction;
     this.catalogEnv = env;
@@ -118,10 +185,7 @@ export class AgyAdapter extends TerminalAdapter {
     this.trustedLaunch = false;
     try { this.trustedLaunch = Boolean(env?.ORIGINROUTER_AGY_TRUSTED_CWD)
       && realpathSync(env.ORIGINROUTER_AGY_TRUSTED_CWD) === realpathSync(this.cwd); } catch {}
-    const catalog = await this.loadCatalog(env);
-    this.models = catalog.models; this.nativeVersion = catalog.version;
-    // Only the native menus exercised against this version get structured drivers.
-    this.nativeMenus = this.nativeVersion === '1.5.13';
+    this.refreshCatalog();
     this.timeoutMs = Math.min(285000, agentInteractionTimeoutMsFromConfig(readConfig()) || 285000);
     if (stateDir) {
       const parent = join(stateDir, 'agy-attachments'); mkdirSync(parent, { recursive: true, mode: 0o700 });
@@ -133,30 +197,11 @@ export class AgyAdapter extends TerminalAdapter {
     try { await configureAgyDeviceMcp(); this.supportsDeviceTools = true; }
     catch (error) { this.pendingEvents.push({ type: 'agent.mcp.status', provider: 'agy', state: 'unavailable', reason: error.message }); }
     this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
-    if (stateDir) {
-      this.queueStore = new AgyNativeQueueStore(stateDir, conversationId || sessionId);
-      let saved;
-      try { saved = this.queueStore.read(); }
-      catch (error) { this.hookServer.close(); this.screen.dispose(); rmSync(this.attachmentDirectory, { recursive: true, force: true }); throw error; }
-      this.messages = saved.pending;
-      this.recoveredAttachmentRoots = new Set();
-      this.messages = this.messages.filter(entry => {
-        if (!entry.attachmentRoot) return true;
-        try {
-          const root = realpathSync(entry.attachmentRoot);
-          const inside = relative(realpathSync(join(stateDir, 'agy-attachments')), root);
-          if (!inside || inside.startsWith('..') || isAbsolute(inside)) throw new Error('invalid_attachment_root');
-          this.recoveredAttachmentRoots.add(root); return true;
-        } catch {
-          this.pendingEvents.push({ type: 'agent.message.result', accepted: false, messageId: entry.id, reason: 'attachment_missing_on_resume', rejectedMessage: entry.text });
-          return false;
-        }
-      });
-      this.confirmedIds = saved.confirmed;
-      this.messageIds = new Set([...saved.confirmed, ...this.messages.map(m => m.id).filter(Boolean)]);
-      this.unconfirmedIds = new Set([...(saved.uncertain || []), saved.inFlight?.id].filter(Boolean));
-      if (saved.inFlight) this.pendingEvents.push({ type: 'agent.message.result', provider: 'agy', messageId: saved.inFlight.id,
-        accepted: false, reason: 'previous_delivery_unconfirmed', rejectedMessage: saved.inFlight.text });
+    if (stateDir && !this.bindQueueOwner(conversationId || sessionId)) {
+      this.hookServer.close();
+      this.screen.dispose();
+      rmSync(this.attachmentDirectory, { recursive: true, force: true });
+      throw new Error('Native message queue is unavailable');
     }
     if (this.initialMessage && !validAgyQueuedMessage({ text: this.initialMessage })) throw new Error('native_message_too_large');
     if (this.initialMessage && this.messages.length < 16) {
@@ -167,12 +212,65 @@ export class AgyAdapter extends TerminalAdapter {
       accepted: false, reason: 'native_queue_full', rejectedMessage: this.initialMessage });
     this.saveQueue();
   }
+  bindQueueOwner(conversationId) {
+    this.queueBindingPending = false;
+    if (!this.stateDir || !conversationId || this.queueOwner === conversationId) return true;
+    const store = new AgyNativeQueueStore(this.stateDir, conversationId);
+    const previous = this.queueStore;
+    const restored = new Map();
+    try {
+      const saved = store.read();
+      const confirmed = new Set([...(this.confirmedIds || []), ...saved.confirmed]);
+      const uncertain = new Set([...(this.unconfirmedIds || []), ...(saved.uncertain || [])]);
+      if (saved.inFlight?.id) uncertain.add(saved.inFlight.id);
+      const seen = new Set([...confirmed, ...uncertain, this.inFlightMessage?.id].filter(Boolean));
+      const pending = [];
+      for (let entry of [...saved.pending, ...this.messages]) {
+        if (entry.id && seen.has(entry.id)) continue;
+        if (entry.attachmentRoot) {
+          try {
+            const source = entry.attachmentRoot;
+            entry = restoreAgyQueuedAttachment(entry, this.attachmentDirectory);
+            if (entry.attachmentRoot !== source) restored.set(entry.attachmentRoot, source);
+          } catch (error) {
+            if (error.code !== 'ENOENT' && !error.message.startsWith('invalid_attachment_')) throw error;
+            this.pendingEvents.push({ type: 'agent.message.result', accepted: false, messageId: entry.id,
+              reason: 'attachment_missing_on_resume', rejectedMessage: entry.text });
+            continue;
+          }
+        }
+        if (entry.id) seen.add(entry.id);
+        pending.push(entry);
+      }
+      store.write(pending, this.inFlightMessage, [...confirmed], [...uncertain]);
+      this.queueStore = store;
+      this.messages = pending;
+      this.confirmedIds = [...confirmed];
+      this.unconfirmedIds = uncertain;
+      this.messageIds = new Set([...(this.messageIds || []), ...seen]);
+      if (saved.inFlight) this.pendingEvents.push({ type: 'agent.message.result', provider: 'agy',
+        messageId: saved.inFlight.id, accepted: false, reason: 'previous_delivery_unconfirmed', rejectedMessage: saved.inFlight.text });
+      // The canonical queue is durable before any old attachment or provisional file is retired.
+      for (const source of restored.values()) (this.retiredAttachmentRoots ||= new Set()).add(source);
+      restored.clear();
+      if (previous && this.queueOwner === this.sessionId) {
+        try { rmSync(previous.file, { force: true }); } catch { /* The durable owner already holds the intents. */ }
+      }
+      this.queueOwner = conversationId;
+      return true;
+    } catch (error) {
+      for (const staged of restored.keys()) rmSync(staged, { recursive: true, force: true });
+      this.queueUnavailable = true;
+      this.pendingEvents.push({ type: 'agent.adapter.status', provider: 'agy', state: 'queue_unavailable', reason: error.message });
+      return false;
+    }
+  }
   async openBroker() {
     this.epoch++;
     const epoch = this.epoch;
     this.hookServer = await startAgyHookServer({
       timeoutMs: this.timeoutMs,
-      onEvent: payload => { if (epoch === this.epoch) this.onHook(payload); },
+      onEvent: payload => epoch === this.epoch && this.onHook(payload),
       delegateTool: payload => payload.toolCall?.name === 'ask_question',
       onPermission: (payload, id) => { if (epoch === this.epoch) this.permission(payload.toolCall || {}, id, this.timeoutMs); },
       onCancel: (id, reason) => {
@@ -182,18 +280,23 @@ export class AgyAdapter extends TerminalAdapter {
     });
   }
   buildLaunch() {
-    const directories = [...(this.attachmentDirectory ? [this.attachmentDirectory] : []), ...(this.recoveredAttachmentRoots || [])];
-    return { command: 'agy', args: [...this.args, ...directories.flatMap(dir => ['--add-dir', dir])],
+    const args = [...this.args];
+    if (this.attachmentDirectory) args.push('--add-dir', this.attachmentDirectory);
+    if (this.sessionId && !agyOption(args, '--log-file')) args.push('--log-file', newAgyLogPath(this.home));
+    return { command: 'agy', args,
       env: { ...this.hookServer?.env, ...(this.supportsDeviceTools ? {
         ORIGINROUTER_AGY_MCP_SESSION: this.sessionId,
         ORIGINROUTER_AGY_MCP_BIN: fileURLToPath(new URL('../../bin/originrouter.js', import.meta.url)),
       } : {}) } };
   }
-  afterNativeStart(result, epoch) {
+  afterNativeStart(result, epoch, startedAt = Date.now(), args = this.args) {
+    const logPath = agyOption(args, '--log-file');
+    this.conversationLog = new AgyConversationLog({ pid: result.pid, startedAt,
+      path: logPath ? resolve(this.cwd || process.cwd(), logPath) : null });
+    this.lastHookAt = 0;
     this.processEpoch = epoch;
     this.pendingEvents.push({ type: 'agent.process.started', provider: 'agy', pid: result.pid, epoch });
-    this.pendingEvents.push({ type: 'agent.capabilities', provider: 'agy', promptCapabilities:
-      this.nativeMenus && this.attachmentDirectory ? AGY_NATIVE_PROMPT_CAPABILITIES : {} });
+    this.pendingEvents.push(this.promptCapabilitiesEvent());
     this.pumpTimer ||= setInterval(() => { void this.pump().catch(error => this.failQueued(error.message)); }, 150);
     this.pumpTimer.unref?.();
   }
@@ -225,11 +328,15 @@ export class AgyAdapter extends TerminalAdapter {
   }
   onHook(payload) {
     const nativeId = String(payload.conversationId || '');
-    if (nativeId && nativeId !== this.nativeSessionId) {
-      this.nativeSessionId = nativeId; this.transcriptPath = agyTranscriptPath(nativeId);
-      this.pendingEvents.push({ type: 'agent.session.start', provider: 'agy', sessionId: nativeId, transcriptPath: this.transcriptPath });
+    this.observeConversationLog();
+    if (nativeId) {
+      this.lastHookAt = Date.now();
+      this.bindNativeConversation(nativeId);
     }
-    if (payload.modelName && this.model !== payload.modelName) {
+    if (this.switchTarget) return false;
+    if (payload.modelName && (this.model !== payload.modelName || this.footerDisplayName)) {
+      this.footerDisplayName = null;
+      this.footerSelection = null;
       this.model = payload.modelName; this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
     }
     if (payload.hookEventName === 'PreInvocation') {
@@ -273,15 +380,24 @@ export class AgyAdapter extends TerminalAdapter {
         ...(payload.error ? { error: String(payload.error).slice(0, 4000) } : {}) });
     }
   }
+  promptCapabilitiesEvent() {
+    return { type: 'agent.capabilities', provider: 'agy',
+      promptCapabilities: this.nativeMenus && this.attachmentDirectory ? AGY_NATIVE_PROMPT_CAPABILITIES : {} };
+  }
+  observeNativeVersion(version) {
+    if (version === this.nativeVersion) return;
+    this.nativeVersion = version;
+    this.nativeMenus = agyNativeMenusSupported(version);
+    this.pendingEvents.push(this.modeStatusEvent(), this.promptCapabilitiesEvent());
+  }
   observeScreen(text) {
     if (this.disposed) return;
     const actualVersion = this.checkingNativeVersion
       ? text.match(/^\s*Antigravity CLI (\d+\.\d+\.\d+)\b/m)?.[1] : null;
     if (actualVersion) this.checkingNativeVersion = false;
     if (actualVersion && actualVersion !== this.nativeVersion) {
-      this.nativeVersion = actualVersion; this.nativeMenus = actualVersion === '1.5.13';
-      this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent(), this.modeStatusEvent(),
-        { type: 'agent.capabilities', provider: 'agy', promptCapabilities: this.nativeMenus && this.attachmentDirectory ? AGY_NATIVE_PROMPT_CAPABILITIES : {} });
+      this.observeNativeVersion(actualVersion);
+      this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
     }
     this.screenText = text; const state = agyScreenState(text); const previousState = this.state;
     if (state === 'idle') this.checkingNativeVersion = false;
@@ -311,6 +427,10 @@ export class AgyAdapter extends TerminalAdapter {
       this.model = headerModel.id; this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
     }
     if (footer) {
+      const changedDisplay = footer.name !== this.footerSelection?.name || footer.effort !== this.footerSelection?.effort;
+      this.footerSelection = footer;
+      if (changedDisplay || footer.model) this.footerDisplayName = footer.model ? null : footer.name;
+      if (changedDisplay) this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
       this.autoModeAvailable ||= footer.mode === 'auto';
       if (this.mode !== footer.mode) { this.mode = footer.mode; this.pendingEvents.push(this.modeStatusEvent()); }
       if (footer.model && this.model !== footer.model) { this.model = footer.model; this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent()); }
@@ -334,6 +454,7 @@ export class AgyAdapter extends TerminalAdapter {
       return false;
     };
     if (this.disposed) return refuse('native_session_stopped');
+    if (this.switchTarget) return refuse('native_session_switching');
     if (this.queueUnavailable) return refuse('native_queue_unavailable');
     if (id && this.unconfirmedIds?.has(id)) return refuse('native_delivery_uncertain');
     if (id && (this.messageIds ||= new Set()).has(id)) return true;
@@ -401,14 +522,11 @@ export class AgyAdapter extends TerminalAdapter {
   }
   async pump() {
     if (this.pumping || this.disposed || this.queueUnavailable || !this.executor) return;
+    if (this.pendingConfiguration || this.messages.length) this.observeConversationLog();
+    if (this.switchTarget || this.queueBindingPending) return;
     this.completeQuestions();
     if (this.ready && !this.models.length && this.catalogEnv && !this.refreshingCatalog && Date.now() - (this.catalogRefreshedAt || 0) > 30000) {
-      this.refreshingCatalog = true; this.catalogRefreshedAt = Date.now();
-      void this.loadCatalog(this.catalogEnv).then(catalog => {
-        if (this.disposed) return;
-        this.models = catalog.models; this.observeScreen(this.screenText);
-        this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
-      }).catch(() => {}).finally(() => { this.refreshingCatalog = false; });
+      this.refreshCatalog();
     }
     if (!this.ready || this.busy || this.userTyping || this.inputTransaction || this.hookServer?.pending.size || this.questions.size) return;
     this.pumping = true;
@@ -462,6 +580,7 @@ export class AgyAdapter extends TerminalAdapter {
       accepted: false, reason, deliveryState: 'uncertain', rejectedMessage: entry.text });
   }
   saveQueue() {
+    if (this.queueUnavailable) return false;
     try { this.queueStore?.write(this.messages, this.inFlightMessage, this.confirmedIds || [], [...(this.unconfirmedIds || [])]); return true; }
     catch (error) {
       if (!this.queueUnavailable) this.pendingEvents.push({ type: 'agent.adapter.status', provider: 'agy', state: 'queue_unavailable', reason: error.message });
@@ -626,14 +745,20 @@ export class AgyAdapter extends TerminalAdapter {
     this.pendingEvents.push({ type: 'agent.permission.resolved', provider: 'agy', callId: entry.id, reason });
   }
   modelStatusEvent(extra = {}) { return { type: 'agent.model.status', provider: 'agy', runtime: this.describe().runtime,
-    sessionId: this.sessionId, model: this.model, modelProvider: null, source: 'native',
+    sessionId: this.sessionId, model: this.footerDisplayName || this.model || this.launchSelection?.model || null, modelProvider: null, source: 'native',
     modelControl: this.nativeMenus && this.models.length ? 'supported' : 'unsupported',
     availableModels: (Array.isArray(this.models) ? this.models : []).map(m => ({ ...m, provider: '', providerName: 'Antigravity' })),
     changeStrategy: 'restart_when_idle', ...extra }; }
   effortStatusEvent(extra = {}) {
     const variants = agyEffortVariants(this.models, this.model);
+    // The model id carries its level ('gemini-4-hydrogen-high'). When the
+    // catalog is empty the variants cannot be matched, but the level is still
+    // known — report it for display even though switching stays unsupported.
+    const effort = this.footerSelection?.effort || (!this.everInvoked && agyOption(this.args, '--effort')) || variants.find(v => v.model === this.model)?.effort
+      || String(this.model || '').match(/-(low|medium|high|xhigh|max)$/i)?.[1]?.toLowerCase()
+      || this.launchSelection?.effort || null;
     return { type: 'agent.effort.status', provider: 'agy', runtime: this.describe().runtime,
-      effort: variants.find(v => v.model === this.model)?.effort || null,
+      effort,
       effortControl: this.nativeMenus && variants.length ? 'supported' : 'unsupported',
       availableEfforts: variants.map(v => v.effort), changeStrategy: 'restart_when_idle', ...extra };
   }
@@ -694,6 +819,8 @@ export class AgyAdapter extends TerminalAdapter {
   getTranscriptPath() { return this.transcriptPath; }
   readConversationHistory(options) { return readAgyConversationHistory(this.transcriptPath, options); }
   scanStructuredEvents() {
+    this.observeConversationLog();
+    if (this.switchTarget) return this.pendingEvents.splice(0);
     this.completeQuestions();
     const events = this.pendingEvents.splice(0);
     if (this.transcriptPath && existsSync(this.transcriptPath)) {
@@ -701,8 +828,12 @@ export class AgyAdapter extends TerminalAdapter {
         const stat = statSync(this.transcriptPath);
         const stamp = `${stat.mtimeMs}:${stat.size}`;
         if (stamp === this.transcriptStamp || stat.size > 32 * 1024 * 1024) return events;
+        const bytes = readFileSync(this.transcriptPath);
+        if (this.baselinePending) this.seedTranscript(bytes, stat);
+        const items = agyTranscriptItems(bytes.toString('utf8'), { includeToolStarts: false });
+        this.baselinePending = false;
         this.transcriptStamp = stamp;
-        for (const item of agyTranscriptItems(readFileSync(this.transcriptPath, 'utf8'), { includeToolStarts: false })) {
+        for (const item of items) {
           const id = `${this.nativeSessionId}:${item.id}`, fingerprint = JSON.stringify(item);
           if (this.seen.get(id) === fingerprint) continue;
           this.seen.set(id, fingerprint);
@@ -728,10 +859,14 @@ export class AgyAdapter extends TerminalAdapter {
     return events;
   }
   cleanup() {
-    this.disposed = true; clearInterval(this.pumpTimer); clearTimeout(this.inFlightMessage?.timer);
+    this.disposed = true; this.catalogRequest?.abort(); clearInterval(this.pumpTimer); clearTimeout(this.inFlightMessage?.timer);
     this.clearNoticeTimers();
-    this.onInterrupt(); this.hookServer?.close(); this.screen?.dispose(); this.failQueued('session_stopped');
+    this.onInterrupt(); this.hookServer?.close(); this.screen?.dispose();
+    // A failed binding or write can leave either durable queue referencing these files.
+    if (this.queueUnavailable) return;
+    this.failQueued('session_stopped');
+    if (this.queueUnavailable) return;
     if (this.attachmentDirectory) rmSync(this.attachmentDirectory, { recursive: true, force: true });
-    for (const root of this.recoveredAttachmentRoots || []) rmSync(root, { recursive: true, force: true });
+    for (const root of this.retiredAttachmentRoots || []) rmSync(root, { recursive: true, force: true });
   }
 }

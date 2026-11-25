@@ -115,12 +115,14 @@ export const COMMAND_CATALOG = [
         ],
       }),
       leaf("history", "Query display-safe agent history", {
+        valuesFor: { "--agent": [...AGENT_NAMES, "agy"] },
         options: ["--search", "--agent", "--device", "--workspace", "--status", "--limit", "--archived", "--json"],
         children: [leaf("show", "Show one conversation", { options: ["--json"] })],
       }),
     ],
   }),
   leaf("history", "Query display-safe agent history", {
+    valuesFor: { "--agent": [...AGENT_NAMES, "agy"] },
     options: ["--agent", "--device", "--workspace", "--since", "--until", "--limit", "--archived", "--json"],
   }),
   leaf("remote", "Set up and control remote device access", {

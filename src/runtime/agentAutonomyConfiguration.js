@@ -28,6 +28,35 @@ export function resolveAgentAutonomyConfiguration(payload, { stateDir, currentPo
   };
 }
 
+export function permissionStateForResume(catalog, conversationId) {
+  const snapshot = catalog?.getConversationPermissionState(conversationId);
+  if (snapshot) return snapshot;
+  const profile = catalog?.getConversation(conversationId)?.permission_profile;
+  if (["manual", "guarded", "unrestricted"].includes(profile)) return { profile };
+  if (profile === "custom" || profile === "ai_review") {
+    throw Object.assign(new Error("This older session has no saved permission configuration. Select a policy explicitly before resuming."),
+      { code: "RESUME_PERMISSION_STATE_UNAVAILABLE" });
+  }
+  return null;
+}
+
+// A local resume (`--resume <id>` / `--conversation <id>`) does not travel
+// through the supervisor, so ORIGINROUTER_PERMISSION_CONVERSATION_ID is never
+// set for it. The conversation the id names is the same one the App resumes —
+// the catalog can find it by its provider id and hand the run the permission
+// configuration the conversation was left with. Without this the resumed run
+// starts on the `manual` default and its startup capture overwrites the saved
+// state, which is why a CLI resume used to downgrade every later resume too.
+export function resumedPermissionConfiguration(agent, nativeSessionId, { stateDir } = {}) {
+  const catalog = new AgentCatalog({ stateDir });
+  let saved;
+  try {
+    const conversationId = catalog.conversationIdForNativeSession(agent, nativeSessionId);
+    saved = conversationId ? permissionStateForResume(catalog, conversationId) : null;
+  } finally { catalog.close(); }
+  return saved ? resolvePersistedPermissionConfiguration(saved) : null;
+}
+
 // Resume uses the installed session snapshot, including immutable policy
 // contents. Template edits after the session stopped do not change its policy.
 export function inheritedPermissionConfiguration(env = process.env, { stateDir } = {}) {
@@ -35,7 +64,7 @@ export function inheritedPermissionConfiguration(env = process.env, { stateDir }
   if (!conversationId) return null;
   const catalog = new AgentCatalog({ stateDir });
   let saved;
-  try { saved = catalog.getConversationPermissionState(conversationId); }
+  try { saved = permissionStateForResume(catalog, conversationId); }
   finally { catalog.close(); }
   if (!saved) throw Object.assign(new Error("Saved permission state is unavailable"), { code: "RESUME_PERMISSION_STATE_UNAVAILABLE" });
   return resolvePersistedPermissionConfiguration(saved);

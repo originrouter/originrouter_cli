@@ -63,6 +63,15 @@ function readHolder(path) {
   }
 }
 
+export function liveThreadLockHolder(nativeId, { dir = threadLocksDir(), isAlive = isSameLiveProcess } = {}) {
+  const holder = readHolder(join(dir, lockFileName(nativeId)));
+  if (holder && (isAlive(holder.pid, holder.startedAt)
+      || (holder.childPid && isAlive(holder.childPid, holder.childStartedAt)))) {
+    return { originrouter: true, pid: holder.childPid || holder.pid };
+  }
+  return null;
+}
+
 // Take the lock for `nativeSessionId`.
 //
 // Returns `{ok: true, path}` when the lock was taken, and `{ok: false,

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, basename, dirname } from 'node:path';
 import { displaySafeToolInput } from '../../runtime/displaySafeToolInput.js';
@@ -6,6 +6,23 @@ import { displaySafeToolInput } from '../../runtime/displaySafeToolInput.js';
 export function agyTranscriptPath(sessionId, home = homedir()) {
   if (!/^[a-zA-Z0-9_-]{1,191}$/.test(String(sessionId || ''))) return null;
   return join(home, '.gemini', 'antigravity-cli', 'brain', sessionId, '.system_generated', 'logs', 'transcript.jsonl');
+}
+
+// Before starting an unnamed native process we only need byte offsets, not
+// the contents of the user's histories. Native row times have second precision.
+export function agyTranscriptOffsets(home = homedir()) {
+  const offsets = new Map();
+  const brain = join(home, '.gemini', 'antigravity-cli', 'brain');
+  let entries;
+  try { entries = readdirSync(brain, { withFileTypes: true }); } catch { return offsets; }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      const stat = statSync(agyTranscriptPath(entry.name, home));
+      offsets.set(entry.name, { ino: stat.ino, size: stat.size });
+    } catch { /* A new or empty conversation may have no transcript yet. */ }
+  }
+  return offsets;
 }
 
 export function agyTranscriptRows(text) {
@@ -64,11 +81,25 @@ export function agyTranscriptItems(text, { includeToolStarts = true } = {}) {
   return items;
 }
 
+// The last model the conversation reported, or null. The runtime's own words
+// on a resume: the CLI only names it in the hook payload of a turn, so a run
+// that opens an existing conversation and sits idle would otherwise have no
+// model to report until the next message.
+export function agyTranscriptModel(text) {
+  let model = null;
+  for (const row of agyTranscriptRows(text).values()) {
+    if (row.type === 'PLANNER_RESPONSE' && typeof row.model === 'string' && row.model.trim()) {
+      model = row.model.trim();
+    }
+  }
+  return model;
+}
+
 export function readAgyConversationHistory(transcriptPath, { beforeCursor = null, limit = 50 } = {}) {
   if (!transcriptPath || !existsSync(transcriptPath)) return { messages: [], nextCursor: null, hasMore: false };
   if (statSync(transcriptPath).size > 32 * 1024 * 1024) throw new Error('Antigravity transcript exceeds the local history size limit');
   const nativeId = basename(dirname(dirname(dirname(transcriptPath))));
-  const all = agyTranscriptItems(readFileSync(transcriptPath, 'utf8')).map(item => ({ ...item,
+  const all = agyTranscriptItems(readFileSync(transcriptPath, 'utf8')).map((item, sequence) => ({ ...item, sequence,
     messageId: `${nativeId}:${item.id}`, ...(item.event ? { event: { ...item.event, eventId: `${nativeId}:${item.id}` } } : {}) }));
   const end = beforeCursor == null ? all.length : Math.max(0, Math.min(all.length, Number(beforeCursor) || 0));
   const minimum = Math.max(0, end - Math.min(100, Math.max(1, Number(limit) || 50)));

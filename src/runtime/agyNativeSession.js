@@ -4,24 +4,16 @@ import { inheritSystemProxyEnv } from "../utils/systemProxy.js";
 import { assertAgyAccountConfig } from '../adapters/agy/accountConfig.js';
 import { extractOriginRouterOptions } from '../local/agentSessionPrimitives.js';
 
-const NATIVE_VALUE_FLAGS = new Set(['--add-dir', '--agent', '--conversation', '--effort', '--input-format',
-  '--json-schema', '--log-file', '--mode', '--model', '--new-project', '--output-format', '--print-timeout',
-  '--project', '--settings', '--prompt-interactive', '-i', '--resume']);
+import { agyArguments } from '../adapters/agy/nativeLaunch.js';
 
 // Decide from the invocation itself, never from whether an App or a terminal
 // started the wrapper. In particular --prompt-interactive is a long-lived
 // session, while the official --prompt alias really means --print.
 export function classifyAgyNativeInvocation(args = []) {
   const { options, passthrough } = extractOriginRouterOptions(args);
-  let direct = false;
-  for (let index = 0; index < passthrough.length; index++) {
-    const arg = passthrough[index];
-    if (arg === '--') break;
-    if (['--help', '-h', '--version', '-v', '--print', '-p', '--prompt'].includes(arg)
-        || ['--print=', '--prompt='].some(prefix => arg.startsWith(prefix))) { direct = true; break; }
-    if (NATIVE_VALUE_FLAGS.has(arg)) { index++; continue; }
-    if (!arg.startsWith('-')) { direct = true; break; }
-  }
+  const direct = Array.from(agyArguments(passthrough)).some(({ key }) =>
+    ['--help', '-h', '--version', '-v', '--print', '-p', '--prompt'].includes(key)
+      || !key.startsWith('-'));
   return { mode: direct ? 'native-command' : 'session', options, nativeArgs: passthrough };
 }
 

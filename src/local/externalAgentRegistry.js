@@ -134,6 +134,11 @@ function turnStateForEvent(event, fallback = "unknown") {
 // which conversation it is in, or neither side knows the provider's id. A
 // payload that says nothing about the conversation is not evidence of a
 // change.
+function conflictsWithAgyRun(session, payload) {
+  const incoming = safeText(payload?.nativeSessionId, 191);
+  return session?.agent === "agy" && incoming && session.nativeSessionId && incoming !== session.nativeSessionId;
+}
+
 function conversationChangedFor(session, payload = {}) {
   const native = safeText(payload.nativeSessionId, 191);
   const held = safeText(session?.nativeSessionId, 191);
@@ -208,6 +213,12 @@ function approvalPolicyCapabilitiesSummary(value) {
     registry_hash: safeText(value.registry_hash, 64),
   };
 }
+
+const historyReaders = new Map([
+  ['agy', readAgyConversationHistory],
+  ['claude', readClaudeConversationHistory],
+  ['codex', readCodexConversationHistory],
+]);
 
 export class ExternalAgentRegistry {
   constructor({ now = () => Date.now(), catalog = null, runtimeTaskStore = null } = {}) {
@@ -418,6 +429,7 @@ export class ExternalAgentRegistry {
     const sessionId = safeText(payload?.sessionId, 64);
     if (!sessionId) throw new Error("sessionId is required");
     const existing = this.sessions.get(sessionId);
+    if (conflictsWithAgyRun(existing, payload)) return this.project(existing);
     const incomingConversationId = safeText(payload?.conversationId, 96);
     const conversationChanged = existing
       ? conversationChangedFor(existing, {
@@ -524,11 +536,20 @@ export class ExternalAgentRegistry {
       // payload's model here put a model the session had not chosen on a
       // session that had chosen none, and the two readings disagreed about
       // what the field meant.
-      model: existing?.model ?? null,
+      model: (existing?.model ?? safeText(payload?.sessionModel, 191)) || null,
       modelProvider: existing?.modelProvider ?? null,
       modelSource: existing?.modelSource || (payload.nativeConfig === true || payload.agent === 'agy' ? 'native' : 'device'),
-      modelControl: existing?.modelControl || "unsupported",
-      availableModels: existing?.availableModels || [],
+      // Same rule as effort: the runtime folds its last model status into the
+      // register metadata, so a rebuilt record keeps the model and whether it
+      // can be changed — the payload's `model` stays reserved for the device
+      // route it names.
+      modelControl:
+        safeText(payload?.modelControl, 16) ||
+        existing?.modelControl ||
+        "unsupported",
+      availableModels: Array.isArray(payload?.availableModels)
+        ? payload.availableModels.slice(0, 256)
+        : existing?.availableModels || [],
       // The session's own reasoning effort. Null means the runtime has not
       // said yet — the runtime owns the vocabulary, so the App renders the
       // level list it publishes rather than a list of its own.
@@ -637,6 +658,7 @@ export class ExternalAgentRegistry {
 
   update(sessionId, payload = {}) {
     const session = this.require(sessionId);
+    if (conflictsWithAgyRun(session, payload)) return this.project(session);
     this.noteWrapperContact(sessionId);
     const nextConversationId = safeText(payload.conversationId, 96);
     // A run that now holds a different conversation starts over: the events
@@ -1050,33 +1072,11 @@ export class ExternalAgentRegistry {
 
   history(sessionId, options) {
     const session = this.require(sessionId);
-    if (session.agent === 'agy') return { ...readAgyConversationHistory(session.transcriptPath, options),
-      conversationId: session.conversationId, nativeSessionId: session.nativeSessionId,
-      detailProfile: session.detailProfile, detailSource: session.detailSource };
-    if (session.agent === "claude") {
-      return {
-        ...(this.runtimeTaskStore?.annotateHistory(sessionId, readClaudeConversationHistory(session.transcriptPath, options))
-          || readClaudeConversationHistory(session.transcriptPath, options)),
-        conversationId: session.conversationId,
-        nativeSessionId: session.nativeSessionId,
-        detailProfile: session.detailProfile,
-        detailSource: session.detailSource,
-      };
-    }
-    if (session.agent === "codex") {
-      return {
-        ...(this.runtimeTaskStore?.annotateHistory(sessionId, readCodexConversationHistory(session.transcriptPath, options))
-          || readCodexConversationHistory(session.transcriptPath, options)),
-        conversationId: session.conversationId,
-        nativeSessionId: session.nativeSessionId,
-        detailProfile: session.detailProfile,
-        detailSource: session.detailSource,
-      };
-    }
+    const reader = historyReaders.get(session.agent);
+    const history = reader
+      ? reader(session.transcriptPath, options) : { messages: [], nextCursor: null, hasMore: false };
     return {
-      messages: [],
-      nextCursor: null,
-      hasMore: false,
+      ...(this.runtimeTaskStore?.annotateHistory(sessionId, history) || history),
       conversationId: session.conversationId,
       nativeSessionId: session.nativeSessionId,
       detailProfile: session.detailProfile,

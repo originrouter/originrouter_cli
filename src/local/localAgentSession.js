@@ -1,4 +1,7 @@
 import { createAgentPermissionStateTracker } from "../runtime/agentPermissionStateTracker.js";
+import { AgentCatalog } from '../persistence/agentCatalog.js';
+import { agyOption } from '../adapters/agy/nativeLaunch.js';
+import { findLiveAgySession } from '../adapters/agy/conversationLog.js';
 import { agyTranscriptPath } from '../adapters/agy/history.js';
 import process from "node:process";
 import { inheritSystemProxyEnv } from "../utils/systemProxy.js";
@@ -86,7 +89,7 @@ import {
   resolveWithAutonomy,
 } from "../runtime/agentAutonomyPolicy.js";
 import { AiApprovalReviewer } from "../runtime/aiApprovalReviewer.js";
-import { inheritedPermissionConfiguration, resolveAgentAutonomyConfiguration } from "../runtime/agentAutonomyConfiguration.js";
+import { inheritedPermissionConfiguration, resolveAgentAutonomyConfiguration, resumedPermissionConfiguration } from "../runtime/agentAutonomyConfiguration.js";
 import {
   aiReviewPolicyFromEnvironment,
 } from "../runtime/aiReviewPolicy.js";
@@ -109,6 +112,8 @@ import { findLiveClaudeSession } from "./claudeLiveSessions.js";
 import {
   acquireThreadLock,
   releaseThreadLockOnExit,
+  releaseThreadLock,
+  liveThreadLockHolder,
   setThreadLockChild,
 } from "./threadLock.js";
 import { processStartEpochMs, agyProcessAlive } from '../adapters/agy/processIdentity.js';
@@ -171,11 +176,12 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
   //
   // The registry says which conversation somebody is sitting in; the lock
   // says which one two of our own runs reached for at the same moment.
-  const requestedResumeId = parseResumeArgv(passthrough);
+  const requestedResumeId = agent === 'agy' ? agyOption(passthrough, '--conversation') : parseResumeArgv(passthrough);
+  const findLiveSession = agent === 'agy' ? findLiveAgySession : findLiveClaudeSession;
   if (requestedResumeId) {
-    const holder = findLiveClaudeSession(requestedResumeId);
+    const holder = findLiveSession(requestedResumeId);
     if (holder) {
-      process.stderr.write(`${conversationAlreadyOpenMessage({ holder })}\n`);
+      process.stderr.write(`${conversationAlreadyOpenMessage({ holder, agent })}\n`);
       process.exitCode = 1;
       return;
     }
@@ -348,6 +354,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
   let stopSessionHeartbeat = () => {};
   let localAgentBridge = null;
   let relayViaDaemon = false;
+  let nativeCatalog = null;
   // Take the conversation id the daemon resolved for this run, if it has one.
   //
   // The id the runtime minted is this attempt's name, not the conversation's
@@ -360,6 +367,8 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
   const adoptResolvedConversation = () => {
     const resolved = String(localAgentBridge?.resolvedConversationId || "").trim();
     if (!resolved || resolved === conversationId) return false;
+    if (agent === 'agy' && nativeSessionId
+        && localAgentBridge?.registeredSession?.native_session_id !== nativeSessionId) return false;
     conversationId = resolved;
     return true;
   };
@@ -384,6 +393,19 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     );
   }
   const inheritedPermission = inheritedPermissionConfiguration(process.env, { stateDir });
+  // A local resume carries no ORIGINROUTER_PERMISSION_CONVERSATION_ID — the
+  // supervisor sets that only for launches it drives — so without an explicit
+  // profile the run would fall back to `manual` and its startup capture would
+  // overwrite the permission state the conversation was saved with. The resume
+  // id names the conversation the catalog already knows, so its saved state is
+  // the run's starting configuration.
+  const resumePermission = !inheritedPermission
+    && !options.autonomyProfile
+    && !(options.autonomyAllowedScopes || []).length
+    && autonomySupported && requestedResumeId
+    ? resumedPermissionConfiguration(agent, requestedResumeId, { stateDir })
+    : null;
+  const adoptedPermission = inheritedPermission || resumePermission;
   let autonomyAllowedScopes = autonomySupported
     ? normalizeAutonomyScopes(options.autonomyAllowedScopes)
     : [];
@@ -402,17 +424,17 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     agent,
     providerResult,
   });
-  let approvalPolicy = inheritedPermission
-    ? inheritedPermission.approvalPolicy
+  let approvalPolicy = adoptedPermission
+    ? adoptedPermission.approvalPolicy
     : autonomySupported && autonomyProfile === "custom" && options.approvalPolicyReference
       ? readApprovalPolicyReference(options.approvalPolicyReference, { stateDir })
       : null;
-  let aiReviewPolicy = inheritedPermission
-    ? inheritedPermission.aiReviewPolicy
+  let aiReviewPolicy = adoptedPermission
+    ? adoptedPermission.aiReviewPolicy
     : autonomySupported && autonomyProfile === "ai_review" ? aiReviewPolicyFromEnvironment() : null;
-  if (inheritedPermission) {
-    autonomyProfile = inheritedPermission.profile;
-    autonomyAllowedScopes = inheritedPermission.allowedScopes;
+  if (adoptedPermission) {
+    autonomyProfile = adoptedPermission.profile;
+    autonomyAllowedScopes = adoptedPermission.allowedScopes;
   }
 
   if (
@@ -452,7 +474,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
   // conversations underneath us — `/resume`, `/branch` or `/clear` — and the
   // run has to be closed and the other conversation opened as a new run
   // rather than renamed.
-  let runNativeSessionId = "";
+  let runNativeSessionId = agent === "agy" ? nativeSessionId : "";
   let conversationSwitch = null;
   let handoverStarted = false;
   // The pid of the agent process we started. Claude Code registers itself
@@ -464,10 +486,35 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
   // file and does not lock it, so two runs of the same conversation at the
   // same time fork its history.
   let threadLock = null;
+  // A resume that did not name its conversation — `--continue`, `-c`, or the
+  // agent's own picker — learns which one it joined only when the agent first
+  // reports it. That conversation may already carry a saved permission state,
+  // and the run that started on the default would otherwise overwrite it.
+  // Adopting here covers the same ground `resumePermission` covers for a named
+  // resume; a profile the launcher asked for still wins.
+  let permissionEdited = false;
+  const tryAdoptPermissionForConversation = (nativeId) => {
+    if (permissionEdited || adoptedPermission || options.autonomyProfile
+        || (options.autonomyAllowedScopes || []).length || !autonomySupported) return;
+    const saved = resumedPermissionConfiguration(agent, nativeId, { stateDir: relayAccount.stateDir });
+    if (!saved) return;
+    autonomyProfile = saved.profile;
+    autonomyAllowedScopes = saved.allowedScopes;
+    approvalPolicy = saved.approvalPolicy;
+    aiReviewPolicy = saved.aiReviewPolicy;
+    // agy publishes the adopted state after the native identity update.
+    if (agent !== 'agy') void sendTransientEvent(autonomyStatus());
+  };
   const observeNativeSessionId = (nextId, { transcriptPath = null } = {}) => {
     const id = String(nextId || "").trim().slice(0, 191);
     if (!id) return null;
     if (!runNativeSessionId) {
+      try {
+        if (!requestedResumeId) tryAdoptPermissionForConversation(id);
+      } catch (error) {
+        void refuseConversationOpen({ reason: error.message });
+        return null;
+      }
       runNativeSessionId = id;
       nativeSessionId = id;
       void verifyConversationOwnership(id);
@@ -517,7 +564,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       await refuseConversationOpen({ holder: claim.holder });
       return;
     }
-    const holder = findLiveClaudeSession(nativeId, {
+    const holder = findLiveSession(nativeId, {
       excludePids: agentChildPid ? [agentChildPid] : [],
     });
     if (holder) {
@@ -642,7 +689,10 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       // the same observer as the hook: a change of id is a change of
       // conversation, wherever it is noticed first.
       const switched = observeNativeSessionId(transientEvent.sessionId);
-      if (switched) void performHandover(switched);
+      if (switched) {
+        if (!finalizing) void performHandover(switched);
+        return;
+      }
     }
     activityLastAt = transientEvent.createdAt || activityLastAt;
     updateAgentActivitySnapshot(activitySnapshot, transientEvent);
@@ -692,7 +742,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     },
   });
   const permissionState = createAgentPermissionStateTracker({
-    stateDir, sessionId, cwd, deviceId: effectiveDeviceId,
+    stateDir: relayAccount.stateDir, sessionId, cwd, deviceId: effectiveDeviceId,
     workspaceId: options.workspaceId, agent, title: `${agent} session`, conversationId,
   });
   const autonomyStatus = (requestId = null, { accepted = null, reason = null } = {}) =>
@@ -703,7 +753,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       autonomyRevision: permissionState.capture({
         profile: autonomyProfile, allowedScopes: autonomyAllowedScopes,
         approvalPolicy, aiReviewPolicy,
-      }, { conversationId }),
+      }, { conversationId, nativeSessionId: agent === "agy" ? nativeSessionId : undefined }),
       allowedScopes: autonomyAllowedScopes,
       approvalPolicy,
       aiReviewPolicy,
@@ -729,7 +779,8 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     }
     try {
       const next = resolveAgentAutonomyConfiguration(payload, { stateDir, currentPolicy: approvalPolicy });
-      permissionState.capture(next, { changed: true, conversationId });
+      permissionState.capture(next, { changed: true, conversationId, nativeSessionId });
+      permissionEdited = true;
       autonomyProfile = next.profile;
       approvalPolicy = next.approvalPolicy;
       aiReviewPolicy = next.aiReviewPolicy;
@@ -958,7 +1009,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
   let structuredScanTail = Promise.resolve();
   const drainStructuredEvents = () => {
     const pending = structuredScanTail.then(async () => {
-      if (typeof adapter.scanStructuredEvents !== "function") return;
+      if (handoverStarted || typeof adapter.scanStructuredEvents !== "function") return;
       for (const event of adapter.scanStructuredEvents()) {
         let displayEvent = event;
         if (event.type === 'agent.process.started' || event.type === 'agent.process.restarted') {
@@ -968,44 +1019,27 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
         }
         if (event.type === "agent.session.start") {
           const nextNativeSessionId = String(event.sessionId || "").slice(0, 191);
-          // `conversationId` deliberately does NOT follow the native session id.
-          //
-          // It used to be rewritten to `${agent}:${nativeSessionId}` here, which
-          // split one run across two keys: this catalog row was stored under
-          // `claude:<uuid>` while the session row, the heartbeat and every
-          // runtime event stayed under `claude-<timestamp>`. Nothing on the
-          // server could join them — `app_agent_sessions` has no
-          // `native_session_id` column — so those conversations matched no
-          // session row, and the App's history filter (which reads liveness from
-          // that row) refused them forever while the session list had already
-          // dropped them. They appeared in neither list.
-          //
-          // The native id is not lost: it travels as `nativeSessionId` below and
-          // is uploaded as `native_session_id` by `buildAgentConversationMetadata`.
-          // It is a description of the run, not its identity.
-          //
-          // Collaboration workers keep their own `collab-*` prefix — that is
-          // generated by `collaborationRuntime` and never reaches this function.
-          //
-          // A *different* id is a different conversation. Claude Code fires
-          // this hook again when the reader switches conversation with
-          // `/resume`, forks with `/branch` or starts over with `/clear`, and
-          // the running process follows it to the new transcript. The old
-          // code took the new id in silence, so the run went on claiming to
-          // be the conversation it had left. The run is closed and the other
-          // conversation opened as a new run instead.
+          // Resolve the provider ID to its catalog conversation. A different
+          // provider ID needs a fresh run, even when the same PTY observed it.
           const switched = observeNativeSessionId(nextNativeSessionId, {
             transcriptPath: event.transcriptPath || null,
           });
           if (switched) {
-            void performHandover(switched);
+            if (!finalizing) void performHandover(switched);
             return;
+          }
+          if (handoverStarted) return;
+          if (nativeCatalog) {
+            const owner = nativeCatalog.updateSession(sessionId, { nativeSessionId, transcriptPath: event.transcriptPath });
+            conversationId = owner.conversation_id;
+            if (!finalizing && adapter.queueStore) adapter.bindQueueOwner(conversationId);
           }
           await localAgentBridge?.update({
             transcriptPath: event.transcriptPath,
             nativeSessionId,
             conversationId,
           });
+          adoptResolvedConversation();
           displayEvent = {
             type: "agent.conversation.changed",
             provider: agent,
@@ -1017,6 +1051,9 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
             // a live turn to an existing conversation instead of starting one.
             reason: "session_ready",
           };
+        }
+        if (nativeCatalog && event.type === 'agent.model.status' && event.model) {
+          nativeCatalog.updateSession(sessionId, { model: event.model });
         }
         if (event.type === "agent.permission.request.detected") continue;
         if (event.type === 'agent.commands' && Array.isArray(adapter.commands)) {
@@ -1130,6 +1167,13 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     // Official agy already persisted its transcript. Detach its control
     // channel before cloud reporting can spend the process-exit budget;
     // otherwise the App can retain an attached row for a dead ACP process.
+    if (nativeCatalog) {
+      nativeCatalog.finishSession(sessionId, { status: signal ? 'stopped' : code === 0 ? 'completed' : 'failed',
+        exitCode: code, exitSignal: signal });
+    }
+    if (agent === 'agy' && !handoverStarted) await drainStructuredEvents().catch(() => {});
+    nativeCatalog?.close();
+    nativeCatalog = null;
     if (agent === 'agy' && localAgentBridge) {
       const bridge = localAgentBridge;
       await bridge.sendEvent({ type: 'session.exited', provider: agent,
@@ -1208,7 +1252,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
   // The agent is stopped first: it is writing to a transcript somebody else
   // is writing to, and every second it keeps going makes the history harder
   // to unpick.
-  const refuseConversationOpen = async ({ holder }) => {
+  const refuseConversationOpen = async ({ holder, reason }) => {
     if (handoverStarted) return;
     handoverStarted = true;
     try {
@@ -1217,7 +1261,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       // The agent may already be gone. The refusal stands either way.
     }
     await finalizeSession({ code: 1, signal: null });
-    process.stderr.write(`${conversationAlreadyOpenMessage({ holder })}\n`);
+    process.stderr.write(`${reason || conversationAlreadyOpenMessage({ holder, agent })}\n`);
     process.exitCode = 1;
   };
 
@@ -1256,11 +1300,11 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
 
     // The conversation the reader asked for may be open somewhere else. We
     // cannot open it too, so we go back to the one they came from.
-    const holder = findLiveClaudeSession(toNativeSessionId, {
+    const holder = (agent === 'agy' && liveThreadLockHolder(toNativeSessionId, { isAlive: agyProcessAlive })) || findLiveSession(toNativeSessionId, {
       excludePids: agentChildPid ? [agentChildPid] : [],
     });
     const target = resolveHandoverTarget({
-      ...(agent === 'agy' ? { transcriptPathFor: agyTranscriptPath } : {}),
+      ...(agent === 'agy' ? { transcriptPathFor: agyTranscriptPath, resumeWithoutTranscript: true } : {}),
       ...(adapter.nativeBridge ? { transcriptPathFor: id => adapter.transcriptForThread(id) } : {}),
       fromNativeSessionId,
       toNativeSessionId,
@@ -1270,7 +1314,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     });
 
     const note = target.reason === "target-open"
-      ? conversationSwitchBlockedMessage({ holder: target.holder })
+      ? conversationSwitchBlockedMessage({ holder: target.holder, agent })
       : "";
 
     // The replacement stays in this process group. A detached child would get
@@ -1282,11 +1326,19 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     // mode it finds on the first `setRawMode(true)`, so a replacement that
     // inherited raw mode would restore raw mode when it exited and leave the
     // reader's shell unusable.
+    const handoverEnv = { ...process.env };
+    if (agent === 'agy') {
+      delete handoverEnv.ORIGINROUTER_PERMISSION_CONVERSATION_ID;
+      delete handoverEnv.ORIGINROUTER_AI_REVIEW_POLICY_B64;
+      if (threadLock) releaseThreadLock(threadLock, { isAlive: agyProcessAlive });
+    }
     const child = spawnReplacementWrapper({
       argv: rewriteResumeArgv(
         process.argv.slice(2),
         target.resumeNativeSessionId,
+        { managed: process.env.ORIGINROUTER_MANAGED_AGENT === '1' },
       ),
+      ...(agent === 'agy' ? { env: handoverEnv } : {}),
       note,
     });
     child.on("error", (error) => {
@@ -1313,7 +1365,11 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
   };
   if (agent === 'agy' && requestedResumeId) {
     const claim = claimConversation(requestedResumeId);
-    if (!claim.ok) throw new Error(conversationAlreadyOpenMessage({ holder: claim.holder }));
+    if (!claim.ok) throw new Error(conversationAlreadyOpenMessage({ holder: claim.holder, agent }));
+    const catalog = new AgentCatalog({ stateDir: relayAccount.stateDir });
+    try {
+      conversationId = catalog.conversationIdForNativeSession(agent, requestedResumeId) || conversationId;
+    } finally { catalog.close(); }
   }
   if (typeof adapter.beforeStart === "function") {
     try {
@@ -1391,7 +1447,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     // conversation.
     adoptResolvedConversation();
     const snapshot = {
-      conversationId,
+      sessionId, conversationId,
       agentType: agent,
       nativeSessionId,
       title: sessionTitle(),
@@ -1405,7 +1461,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       workspaceDisplayPath: workspaceDisplayPath(cwd),
       runtime: runtime || "native-pty",
       provider: resolvedProvider?.name,
-      model: resolvedProvider?.model,
+      model: agent === "agy" ? adapter.modelStatusEvent().model : resolvedProvider?.model,
       permissionProfile: autonomyProfile,
       permissionRevision: permissionState.revision,
       createdAt: sessionStartedAt,
@@ -1421,11 +1477,13 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
   };
   // The agent's name, once it has one, has to reach the local catalog as
   // well: the desktop's rail reads it from there, not from the cloud.
+  let publishedTitle = agentTitle;
   const publishAgentTitle = async () => {
-    const before = agentTitle;
     refreshAgentTitle();
-    if (!agentTitle || agentTitle === before) return;
-    await localAgentBridge?.update({ title: sessionTitle() });
+    if (!agentTitle || agentTitle === publishedTitle) return;
+    const title = sessionTitle();
+    if (nativeCatalog) nativeCatalog.updateSession(sessionId, { title, titleIsCustom: false });
+    if (await localAgentBridge?.update({ title }) || nativeCatalog) publishedTitle = title;
     await syncCatalog("running");
   };
   if (handoffNote) {
@@ -1441,6 +1499,17 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     if (outerTtyRawOutput) process.once("exit", restoreOuterTtyOutput);
   }
 
+  let startupComplete = false;
+  let earlyExit = null;
+  const finishChildExit = ({ code, signal }) => {
+    if (handoverStarted) return;
+    terminalOutputPump.flush();
+    process.exitCode = code ?? (signal ? 1 : 0);
+    Promise.race([
+      finalizeSession({ code, signal }),
+      new Promise(resolve => setTimeout(resolve, agent === 'agy' ? 4500 : 1500)),
+    ]).finally(() => process.exit(process.exitCode || 0));
+  };
   const started = await executor.start({
     command: launch.command,
     args: launch.args,
@@ -1456,16 +1525,9 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
         void sendTransientEvent(event);
       }
     },
-    onExit: ({ code, signal }) => {
-      // The handover stopped the agent on purpose and is closing the run
-      // itself; this path would exit the process out from under it.
-      if (handoverStarted) return;
-      terminalOutputPump.flush();
-      process.exitCode = code ?? (signal ? 1 : 0);
-      Promise.race([
-        finalizeSession({ code, signal }),
-        new Promise((resolve) => setTimeout(resolve, agent === 'agy' ? 4500 : 1500)),
-      ]).finally(() => process.exit(process.exitCode || 0));
+    onExit: result => {
+      if (agent === 'agy' && !startupComplete) earlyExit = result;
+      else finishChildExit(result);
     },
     onError: (error) => {
       send("session.error", { message: error.message });
@@ -1609,7 +1671,8 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       return applied;
     },
   });
-  relayViaDaemon = await localAgentBridge.start({
+  const nativeModel = agent === 'agy' ? adapter.modelStatusEvent() : null;
+  const registration = {
     nativeConfig: useNativeConfig,
     sessionId,
     conversationId,
@@ -1636,7 +1699,12 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     ...(agent === 'agy' && adapter.supportsDeviceTools ? { supportsDeviceTools: true } : {}),
     ...(runtime === 'agy-acp' ? { supportsDeviceTools: true, supportsRuntimeRecovery: true } : {}),
     provider: resolvedProvider?.name,
-    model: resolvedProvider?.model,
+    model: nativeModel?.model || resolvedProvider?.model,
+    ...(nativeModel ? {
+      sessionModel: nativeModel.model,
+      modelControl: nativeModel.modelControl,
+      availableModels: nativeModel.availableModels,
+    } : {}),
     permissionProfile: autonomyProfile,
     permissionRevision: permissionState.revision,
     startedBy: "local-wrapper",
@@ -1675,7 +1743,13 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       typeof adapter.getTranscriptPath === "function"
         ? adapter.getTranscriptPath()
         : null,
-  });
+  };
+  if (agent === 'agy' && !finalizing) {
+    nativeCatalog = new AgentCatalog({ stateDir: relayAccount.stateDir });
+    const owner = nativeCatalog.upsertSession(registration);
+    registration.conversationId = conversationId = owner.conversation_id;
+  }
+  relayViaDaemon = await localAgentBridge.start(registration);
   // The daemon's catalog knows which conversation this run belongs to. Take
   // its word for it before anything is reported, so the first report already
   // names the conversation and not the attempt.
@@ -1758,6 +1832,11 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     writeLocalErrorLine(`[session-log] ${error.message}`);
   }
 
+  startupComplete = true;
+  if (earlyExit) {
+    finishChildExit(earlyExit);
+    return;
+  }
   if (typeof adapter.scanStructuredEvents === "function") {
     scanTimer = setInterval(() => {
       void drainStructuredEvents();

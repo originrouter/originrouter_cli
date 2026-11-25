@@ -14,6 +14,15 @@ assert.equal(isCollaborationSessionPayload({ sessionId: "collab-remote-1" }), tr
 assert.equal(isCollaborationSessionPayload({ startedBy: "collaboration-runtime" }), true);
 assert.equal(isCollaborationSessionPayload({ sessionId: "agent-1", runId: "run-1" }), false);
 
+{
+  const runs = new ExternalAgentRegistry();
+  const launch = { sessionId: "run-a", agent: "agy", nativeSessionId: "one" };
+  runs.register(launch);
+  assert.equal(runs.update("run-a", { nativeSessionId: "two" }).native_session_id, "one");
+  assert.equal(runs.register({ ...launch, nativeSessionId: "two" }).native_session_id, "one");
+  assert.equal(runs.register({ ...launch, sessionId: "run-b", nativeSessionId: "two" }).native_session_id, "two");
+}
+
 let now = 1_000_000;
 const registry = new ExternalAgentRegistry({ now: () => now });
 registry.register({

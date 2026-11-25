@@ -754,3 +754,25 @@ assert.equal(
 retried.close();
 rmSync(failingStateDir, { recursive: true, force: true });
 
+
+const atomicDir = mkdtempSync(join(tmpdir(), 'or-run-owner-'));
+const atomic = new AgentCatalog({ stateDir: atomicDir });
+try {
+  for (const agent of ['claude', 'codex', 'agy']) {
+    const owner = agent + '-owner', label = agent + '-launch', sessionId = agent + '-new';
+    atomic.upsertSession({ agent, sessionId: owner, conversationId: owner, nativeSessionId: 'native',
+      title: 'Original title', titleIsCustom: true });
+    atomic.updateSession(owner, { title: 'Renamed by user', titleIsCustom: true });
+    assert.equal(atomic.getConversation(owner).title, 'Renamed by user');
+    atomic.upsertSession({ agent, sessionId, conversationId: label, title: 'Launch title', titleIsCustom: true });
+    atomic.recordEvent(sessionId, { type: 'agent.tool_call.start', input: { file_path: '/example/file' } });
+    atomic.updateSession(sessionId, { nativeSessionId: 'native' });
+    atomic.ensureSessionForPermissionState({ agent, sessionId, conversationId: label });
+    atomic.upsertSession({ agent, sessionId, conversationId: label, title: 'Stale launch title', titleIsCustom: true });
+    const result = atomic.getConversation(owner);
+    assert.equal(result.runs.length, 2);
+    assert.equal(result.title, 'Renamed by user');
+    assert.equal(result.artifacts.length, 1);
+    assert.equal(atomic.getConversation(label), null);
+  }
+} finally { atomic.close(); rmSync(atomicDir, { recursive: true, force: true }); }

@@ -1,11 +1,15 @@
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, writeFileSync, rmSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { agyPromptContent } from './acpContent.js';
 
 export const AGY_NATIVE_PROMPT_CAPABILITIES = Object.freeze({
   image: true, embeddedContext: true,
   imagePng: true, imageJpeg: true, imageWebp: false, imageGif: false,
 });
+
+function imageReference(path) {
+  return `User attached an image at ${JSON.stringify(path)}. Inspect this image using your native file-reading tool when relevant.`;
+}
 
 // The paired App supplies bytes, never an arbitrary path or URL to fetch.
 export function prepareAgyAttachments(message, content, directory) {
@@ -29,9 +33,39 @@ export function prepareAgyAttachments(message, content, directory) {
         root ||= mkdtempSync(join(directory, 'agy-attachment-'));
         const file = join(root, `image-${blocks.indexOf(block)}.${png ? 'png' : 'jpg'}`);
         writeFileSync(file, bytes, { mode: 0o600, flag: 'wx' });
-        text += `\n\nUser attached an image at ${JSON.stringify(file)}. Inspect this image using your native file-reading tool when relevant.\n`;
+        text += `\n\n${imageReference(file)}\n`;
       }
     }
     return { text, root };
   } catch (error) { if (root) rmSync(root, { recursive: true, force: true }); throw error; }
+}
+
+// A picker may reveal the queue owner after the native process received --add-dir.
+// Restore into that process's private directory even on a delayed binding.
+export function restoreAgyQueuedAttachment(entry, directory) {
+  const root = realpathSync(entry.attachmentRoot);
+  const session = dirname(root);
+  const current = realpathSync(directory);
+  if (dirname(session) !== dirname(current) || !basename(session).startsWith('session-')
+      || !basename(root).startsWith('agy-attachment-')) throw new Error('invalid_attachment_root');
+  if (session === current) return entry;
+  const files = readdirSync(root, { withFileTypes: true });
+  if (!files.length || files.length > 8 || files.some(file => !file.isFile() || !/^image-\d+\.(png|jpg)$/.test(file.name))) {
+    throw new Error('invalid_attachment_root');
+  }
+  const destination = mkdtempSync(join(directory, 'agy-attachment-'));
+  let text = entry.text;
+  try {
+    for (const { name } of files) {
+      const reference = imageReference(join(entry.attachmentRoot, name));
+      if (!text.includes(reference)) throw new Error('invalid_attachment_reference');
+      const path = join(destination, name);
+      copyFileSync(join(root, name), path);
+      text = text.replaceAll(reference, () => imageReference(path));
+    }
+    return { ...entry, text, attachmentRoot: destination };
+  } catch (error) {
+    rmSync(destination, { recursive: true, force: true });
+    throw error;
+  }
 }

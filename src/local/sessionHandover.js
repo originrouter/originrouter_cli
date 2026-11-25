@@ -22,6 +22,7 @@
 // The wrapper is re-executed rather than forked into the background: a
 // detached child would land in its own process group, and the terminal's
 // foreground group would be gone, taking the keyboard with it.
+import { agyHandoverArgs } from '../adapters/agy/nativeLaunch.js';
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -42,8 +43,11 @@ export function originrouterBinPath() {
 // `argv` is the wrapper's own argument vector (`process.argv.slice(2)`), so
 // the replacement is the same invocation the reader typed, with one thing
 // changed.
-export function rewriteResumeArgv(argv, nativeSessionId) {
+export function rewriteResumeArgv(argv, nativeSessionId, options) {
   const args = Array.isArray(argv) ? argv.map((arg) => String(arg)) : [];
+  if (args[0] === 'agy' || args[0] === 'agy-acp') {
+    return [args[0], ...agyHandoverArgs(args.slice(1), nativeSessionId, options)];
+  }
   if (args[0] === "codex") {
     // A replacement must never replay the original prompt or image, and the
     // previous run's OriginRouter identity must not reclaim the new thread.
@@ -77,7 +81,7 @@ export function rewriteResumeArgv(argv, nativeSessionId) {
     if (arg.startsWith("--resume=") || arg.startsWith('--conversation=')) continue;
     kept.push(arg);
   }
-  const resume = nativeSessionId ? [kept[0] === 'agy' ? '--conversation' : '--resume', String(nativeSessionId)] : [];
+  const resume = nativeSessionId ? ['--resume', String(nativeSessionId)] : [];
   return [kept[0] ?? "claude", ...resume, ...kept.slice(1)];
 }
 
@@ -120,15 +124,16 @@ export function resolveHandoverTarget({
   holder = null,
   transcriptPathFor = (nativeId) => claudeTranscriptPathForSession(cwd, nativeId),
   transcriptSize = defaultTranscriptSize,
+  resumeWithoutTranscript = false,
 } = {}) {
   const blocked = Boolean(holder);
   const target = blocked ? fromNativeSessionId : toNativeSessionId;
   const path = transcriptPathFor(target);
-  const size = path ? transcriptSize(path) : 0;
+  const resumable = target && (resumeWithoutTranscript || (path && transcriptSize(path) > 0));
 
   return {
-    mode: size > 0 ? "resume" : "fresh",
-    resumeNativeSessionId: size > 0 ? target : null,
+    mode: resumable ? "resume" : "fresh",
+    resumeNativeSessionId: resumable ? target : null,
     transcriptPath: path,
     reason: blocked ? "target-open" : "switch",
     holder,

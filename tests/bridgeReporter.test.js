@@ -388,6 +388,17 @@ test("reconciled previews stay within schema limits after secret replacement", a
   assert.equal(JSON.stringify(body).includes("sk-abcdefgh"), false);
 });
 
+test("a provisional agy run never sends a catalog request, including a delayed backfill", async () => {
+  for (const insertOnly of [false, true]) {
+    let attempted = false;
+    const result = await reportAgentConversationMetadata({ conversationId: "launch", agentType: "agy", summary: "draft" }, {
+      insertOnly, ensureFreshAccessTokenFn: async () => { attempted = true; },
+    });
+    assert.deepEqual(result, { ok: true, skipped: true });
+    assert.equal(attempted, false);
+  }
+});
+
 for (const status of [404, 422]) {
   test(`insert-only backfill never falls back to ordinary writes on ${status}`, async () => {
     const requests = [];

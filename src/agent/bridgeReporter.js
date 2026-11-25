@@ -564,6 +564,7 @@ export async function reportAgentConversationMetadata(payload, {
   accountSelectionRoot,
 } = {}) {
   const body = buildAgentConversationMetadata(payload);
+  if (body.agent_type === "agy" && !body.native_session_id) return { ok: true, skipped: true };
   if (!body.conversation_id) return { ok: false, error: "invalid_conversation_id" };
   const resolved = await resolveRelayAuth({
     stateDir,

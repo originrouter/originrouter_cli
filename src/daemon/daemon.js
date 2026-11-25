@@ -570,10 +570,10 @@ export async function startDaemon(args) {
     );
     try {
       const conversations = agentCatalog
-        .listConversations({ limit: 50, includeArchived: false });
+        .listConversations({ limit: 50, includeArchived: false, includeProvisional: true });
       for (const conversation of conversations) {
         const sessionId = String(
-          conversation.originrouter_session_id
+          conversation.session_id
           || conversation.conversation_id
           || "",
         ).slice(0, 64);

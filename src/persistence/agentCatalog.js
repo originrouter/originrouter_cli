@@ -9,6 +9,7 @@ import { basename, join, resolve } from "node:path";
 
 import Database from "better-sqlite3";
 
+import { repairAgyCatalog } from "./repairAgyCatalog.js";
 import { ensureStateDir } from "./state.js";
 import { activeAccountStateDir } from "./accounts.js";
 import {
@@ -39,6 +40,10 @@ import {
 } from "./agentCatalogPrimitives.js";
 
 export { workspaceDisplayPath } from "./agentCatalogPrimitives.js";
+
+// A provisional agy run is available by ID to the runtime while it learns its
+// identity. Only confirmed conversations belong in history and cloud sync.
+const CONFIRMED_HISTORY_SQL = "(c.agent_type <> 'agy' OR c.native_session_id <> '')";
 
 export class AgentCatalog {
   constructor({ stateDir = ensureStateDir(), dbPath = null, now = () => new Date() } = {}) {
@@ -229,6 +234,7 @@ export class AgentCatalog {
     `).run(String(SCHEMA_VERSION));
     this.repairDuplicateConversations();
     this.ensureProviderConversationIndex();
+    repairAgyCatalog(this);
   }
 
   close() {
@@ -544,75 +550,13 @@ export class AgentCatalog {
     this.db.prepare("DELETE FROM agent_conversations WHERE conversation_id = ?").run(loserId);
   }
 
-  // The provider's id belongs to the row that holds it.
-  //
-  // Another row that already holds it means this conversation is that
-  // conversation: the fold is what the catalog does everywhere else, and the
-  // unique index over (agent, provider id) says the same thing in the
-  // database. A write that broke it would throw where the conversation was
-  // only being recorded.
-  //
-  // The fold keeps the row that was last active; a tie goes to the smallest
-  // id. That is the rule the server and `sql/054` use, and the three have
-  // to agree: the device reports the survivor's id, and a different row
-  // would undo the fold.
-  //
-  // Returns the id of the row that holds the conversation afterwards, and
-  // whether that row already holds the provider's id.
-  foldIntoNativeSessionHolder(conversationId, nativeSessionId) {
-    const id = safeText(conversationId, 96);
-    const native = safeText(nativeSessionId, 191);
-    if (!id || !native) return { conversationId: id, holdsNativeId: false };
-    const mine = this.db.prepare(
-      "SELECT * FROM agent_conversations WHERE conversation_id = ?",
-    ).get(id);
-    if (!mine) return { conversationId: id, holdsNativeId: false };
-    const holder = this.db.prepare(`
-      SELECT * FROM agent_conversations
-      WHERE agent_type = ? AND native_session_id = ? AND conversation_id <> ?
-      ORDER BY last_activity_at DESC, conversation_id ASC
-      LIMIT 1
-    `).get(mine.agent_type, native, id);
-    if (!holder) return { conversationId: id, holdsNativeId: false };
-    // The survivor is the row that was last active; a tie goes to the
-    // smallest id. The order is the one the fold itself uses.
-    const ordered = this.db.prepare(`
-      SELECT * FROM agent_conversations
-      WHERE conversation_id IN (?, ?)
-      ORDER BY last_activity_at DESC, conversation_id ASC
-    `).all(id, holder.conversation_id);
-    const survivor = ordered[0];
-    const loser = ordered[1];
-    const fold = this.db.transaction(() => {
-      this._foldConversationInto(survivor, loser);
-    });
-    fold();
-    return {
-      conversationId: survivor.conversation_id,
-      holdsNativeId: survivor.conversation_id === holder.conversation_id,
-    };
-  }
-
-  // A row that named one attempt at a conversation, and the attempt turned
-  // out to belong to a conversation that already has a row of its own.
-  // Nothing points at it any more, so it goes — a row nobody can reach is
-  // a conversation that never existed.
-  dropEmptyConversation(conversationId) {
-    const id = safeText(conversationId, 96);
-    if (!id) return false;
-    const runs = this.db.prepare(
-      "SELECT COUNT(*) AS count FROM agent_runs WHERE conversation_id = ?",
-    ).get(id)?.count || 0;
-    if (runs > 0) return false;
-    const artifacts = this.db.prepare(
-      "SELECT COUNT(*) AS count FROM agent_artifacts WHERE conversation_id = ?",
-    ).get(id)?.count || 0;
-    if (artifacts > 0) return false;
-    this.db.prepare("DELETE FROM agent_catalog_insert_queue WHERE conversation_id = ?").run(id);
-    this.db.prepare("DELETE FROM agent_catalog_preview_queue WHERE conversation_id = ?").run(id);
-    this.db.prepare("DELETE FROM agent_launch_receipts WHERE conversation_id = ?").run(id);
-    this.db.prepare("DELETE FROM agent_conversations WHERE conversation_id = ?").run(id);
-    return true;
+  foldVacatedConversation(sourceId, ownerId) {
+    const source = this.db.prepare(`
+      SELECT * FROM agent_conversations c
+      WHERE conversation_id = ? AND native_session_id = ''
+        AND NOT EXISTS (SELECT 1 FROM agent_runs WHERE conversation_id = c.conversation_id)
+    `).get(sourceId);
+    if (source) this._foldConversationInto({ conversation_id: ownerId }, source);
   }
 
   // The rows written before the provider's id was used to identify a
@@ -727,10 +671,16 @@ export class AgentCatalog {
   }
 
   upsertSession(payload = {}) {
+    return this.db.transaction(() => this._upsertSession(payload)).immediate();
+  }
+
+  _upsertSession(payload) {
     const sessionId = safeText(payload.sessionId || payload.originrouterSessionId, 64);
     if (!sessionId) throw new Error("sessionId is required");
     const existingRun = this.db.prepare(
-      "SELECT run_id, conversation_id, started_by FROM agent_runs WHERE originrouter_session_id = ?",
+      `SELECT r.run_id, r.conversation_id, r.started_by, c.agent_type, c.native_session_id
+       FROM agent_runs r JOIN agent_conversations c USING (conversation_id)
+       WHERE r.originrouter_session_id = ?`,
     ).get(sessionId);
     const agent = safeText(payload.agent || payload.agentType, 32) || "unknown";
     // A conversation is identified by the provider's own id for it, and a
@@ -742,12 +692,16 @@ export class AgentCatalog {
     // index on `(agent_type, native_session_id)` has been here all along;
     // nothing ever asked the question it was built for.
     const nativeSessionId = safeText(payload.nativeSessionId, 191);
+    if (existingRun?.agent_type === "agy" && existingRun.native_session_id
+        && nativeSessionId && nativeSessionId !== existingRun.native_session_id) {
+      // A native switch starts a new run. A late snapshot of the old run cannot rebind it.
+      return this.getConversation(existingRun.conversation_id);
+    }
     // The label this attempt was launched under. It is the label of the
     // attempt, not the identity of the conversation.
-    const requestedConversationId = safeText(
-      payload.conversationId || existingRun?.conversation_id || sessionId,
-      96,
-    );
+    const sourceLabel = safeText(payload.conversationId || existingRun?.conversation_id || sessionId, 96);
+    const requestedConversationId = !nativeSessionId && existingRun?.native_session_id
+      ? existingRun.conversation_id : sourceLabel;
     // The row the label names, when it is here.
     const labelled = this.db.prepare(
       "SELECT conversation_id, agent_type, native_session_id FROM agent_conversations WHERE conversation_id = ?",
@@ -780,7 +734,9 @@ export class AgentCatalog {
     // that conversation either — the provider's id belongs to the row that
     // holds it under this agent, and the database refuses a second row for
     // one conversation.
-    const conversationId = ownerId || requestedConversationId;
+    const conflictingLabel = nativeSessionId && labelled?.native_session_id && labelled.native_session_id !== nativeSessionId;
+    const conversationId = ownerId || (conflictingLabel
+      ? stableId("conversation", effectiveAgent, nativeSessionId) : requestedConversationId);
     const requestedRunId = safeText(payload.runId || existingRun?.run_id || sessionId, 96);
     // Runtime re-registration must not erase ownership recorded by the
     // collaboration supervisor. Persist it in the existing provenance field.
@@ -809,10 +765,11 @@ export class AgentCatalog {
     // "Claude Code" used to land here as a *custom* title: the agent's own
     // name in the title slot, which no rule recognised as a placeholder. Once
     // latched, the conversation could never show anything else.
-    const titleIsCustom = payload.titleIsCustom === true
+    const preserveOwnerTitle = owner?.title_is_custom && sourceLabel !== ownerId;
+    const titleIsCustom = !preserveOwnerTitle && (payload.titleIsCustom === true
       || (payload.titleIsCustom !== false
         && requestedTitle !== ""
-        && !looksLikePlaceholderTitle(requestedTitle, agent));
+        && !looksLikePlaceholderTitle(requestedTitle, agent)));
     const deviceId = safeText(payload.deviceId, 191);
     const cwd = canonicalPath(payload.cwd);
     const workspaceId = cwd
@@ -822,146 +779,151 @@ export class AgentCatalog {
     const activityAt = iso(payload.lastActivityAt || payload.updatedAt || startedAt);
     const status = normalizeStatus(payload.status, "running");
 
-    const write = this.db.transaction(() => {
-      if (workspaceId) {
-        const repoRoot = repositoryRoot(cwd);
-        this.db.prepare(`
-          INSERT INTO agent_workspaces(
-            workspace_id, device_id, display_name, canonical_path, repo_root,
-            trusted, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(workspace_id) DO UPDATE SET
-            device_id = excluded.device_id,
-            display_name = excluded.display_name,
-            canonical_path = excluded.canonical_path,
-            repo_root = excluded.repo_root,
-            trusted = MAX(agent_workspaces.trusted, excluded.trusted),
-            updated_at = excluded.updated_at
-        `).run(
-          workspaceId,
-          deviceId,
-          safeText(payload.workspaceName, 191) || basename(cwd) || cwd,
-          cwd,
-          repoRoot,
-          payload.workspaceTrusted === true ? 1 : 0,
-          startedAt,
-          activityAt,
-        );
-      }
-
+    if (workspaceId) {
+      const repoRoot = repositoryRoot(cwd);
       this.db.prepare(`
-        INSERT INTO agent_conversations(
-          conversation_id, agent_type, native_session_id, title, title_is_custom, summary,
-          first_prompt_preview, last_message_preview, workspace_id,
-          transcript_locator, created_at, last_activity_at, archived_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(conversation_id) DO UPDATE SET
-          agent_type = CASE WHEN excluded.agent_type <> 'unknown' THEN excluded.agent_type ELSE agent_conversations.agent_type END,
-          native_session_id = CASE WHEN excluded.native_session_id <> '' THEN excluded.native_session_id ELSE agent_conversations.native_session_id END,
-          title = CASE
-            WHEN excluded.title_is_custom = 1 THEN excluded.title
-            WHEN agent_conversations.title_is_custom = 1 THEN agent_conversations.title
-            -- A placeholder never displaces a real title. This is the rule
-            -- that lets a conversation recover: the placeholder written at
-            -- launch gives way to the title the agent produced.
-            --
-            -- Both sides are judged by the title itself rather than by a
-            -- stored flag, so a row written before this rule existed is
-            -- judged correctly the first time it is written again.
-            WHEN LOWER(TRIM(excluded.title)) IN (
-                'agent session',
-                CONCAT(LOWER(excluded.agent_type), ' session'),
-                CONCAT(LOWER(excluded.agent_type), ' code'),
-                LOWER(excluded.agent_type)
-              )
-              AND LOWER(TRIM(agent_conversations.title)) NOT IN (
-                'agent session',
-                CONCAT(LOWER(agent_conversations.agent_type), ' session'),
-                CONCAT(LOWER(agent_conversations.agent_type), ' code'),
-                LOWER(agent_conversations.agent_type)
-              )
-              THEN agent_conversations.title
-            WHEN excluded.title <> '' THEN excluded.title
-            ELSE agent_conversations.title
-          END,
-          title_is_custom = MAX(agent_conversations.title_is_custom, excluded.title_is_custom),
-          summary = CASE WHEN excluded.summary <> '' THEN excluded.summary ELSE agent_conversations.summary END,
-          first_prompt_preview = CASE WHEN excluded.first_prompt_preview <> '' THEN excluded.first_prompt_preview ELSE agent_conversations.first_prompt_preview END,
-          last_message_preview = CASE WHEN excluded.last_message_preview <> '' THEN excluded.last_message_preview ELSE agent_conversations.last_message_preview END,
-          workspace_id = COALESCE(excluded.workspace_id, agent_conversations.workspace_id),
-          transcript_locator = CASE WHEN excluded.transcript_locator <> '' THEN excluded.transcript_locator ELSE agent_conversations.transcript_locator END,
-          last_activity_at = MAX(agent_conversations.last_activity_at, excluded.last_activity_at),
-          archived_at = COALESCE(excluded.archived_at, agent_conversations.archived_at)
+        INSERT INTO agent_workspaces(
+          workspace_id, device_id, display_name, canonical_path, repo_root,
+          trusted, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(workspace_id) DO UPDATE SET
+          device_id = excluded.device_id,
+          display_name = excluded.display_name,
+          canonical_path = excluded.canonical_path,
+          repo_root = excluded.repo_root,
+          trusted = MAX(agent_workspaces.trusted, excluded.trusted),
+          updated_at = excluded.updated_at
       `).run(
-        conversationId,
-        agent,
-        safeText(payload.nativeSessionId, 191),
-        title,
-        titleIsCustom ? 1 : 0,
-        safeText(payload.summary, 4096),
-        safeText(payload.firstPromptPreview, 1024),
-        safeText(payload.lastMessagePreview, 1024),
         workspaceId,
-        canonicalPath(payload.transcriptPath || payload.transcriptLocator),
+        deviceId,
+        safeText(payload.workspaceName, 191) || basename(cwd) || cwd,
+        cwd,
+        repoRoot,
+        payload.workspaceTrusted === true ? 1 : 0,
         startedAt,
         activityAt,
-        payload.archivedAt ? iso(payload.archivedAt) : null,
       );
+    }
 
-      this.db.prepare(`
-        INSERT INTO agent_runs(
-          run_id, conversation_id, originrouter_session_id, device_id, device_name,
-          runtime, provider, model, permission_profile, started_by, pid, status,
-          started_at, exited_at, exit_code, exit_signal, native_config
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(originrouter_session_id) DO UPDATE SET
-          conversation_id = excluded.conversation_id,
-          device_id = CASE WHEN excluded.device_id <> '' THEN excluded.device_id ELSE agent_runs.device_id END,
-          device_name = CASE WHEN excluded.device_name <> '' THEN excluded.device_name ELSE agent_runs.device_name END,
-          runtime = CASE WHEN excluded.runtime <> '' THEN excluded.runtime ELSE agent_runs.runtime END,
-          native_config = MAX(agent_runs.native_config, excluded.native_config),
-          provider = CASE WHEN excluded.provider <> '' THEN excluded.provider ELSE agent_runs.provider END,
-          model = CASE WHEN excluded.model <> '' THEN excluded.model ELSE agent_runs.model END,
-          permission_profile = CASE WHEN excluded.permission_profile <> '' THEN excluded.permission_profile ELSE agent_runs.permission_profile END,
-          started_by = CASE WHEN excluded.started_by <> '' THEN excluded.started_by ELSE agent_runs.started_by END,
-          pid = COALESCE(excluded.pid, agent_runs.pid),
-          status = excluded.status,
-          exited_at = COALESCE(excluded.exited_at, agent_runs.exited_at),
-          exit_code = COALESCE(excluded.exit_code, agent_runs.exit_code),
-          exit_signal = CASE WHEN excluded.exit_signal <> '' THEN excluded.exit_signal ELSE agent_runs.exit_signal END
-      `).run(
-        runId,
-        conversationId,
-        sessionId,
-        deviceId,
-        safeText(payload.deviceName, 191),
-        safeText(payload.runtime, 64),
-        safeText(payload.provider, 191),
-        safeText(payload.model, 191),
-        safeText(payload.permissionProfile || payload.autonomyProfile, 64),
-        startedBy,
-        Number.isFinite(Number(payload.pid)) ? Number(payload.pid) : null,
-        status,
-        startedAt,
-        payload.exitedAt ? iso(payload.exitedAt) : null,
-        Number.isFinite(Number(payload.exitCode)) ? Number(payload.exitCode) : null,
-        safeText(payload.exitSignal, 32),
-        payload.nativeConfig === true || agent === 'agy' ? 1 : 0,
-      );
-    });
-    write();
-    // The attempt was launched under a label of its own, and it turned out to
-    // belong to a conversation that already had a row. Nothing points at the
-    // label any more, so it goes.
-    if (conversationId !== requestedConversationId) {
-      try {
-        this.dropEmptyConversation(requestedConversationId);
-      } catch {}
+    this.db.prepare(`
+      INSERT INTO agent_conversations(
+        conversation_id, agent_type, native_session_id, title, title_is_custom, summary,
+        first_prompt_preview, last_message_preview, workspace_id,
+        transcript_locator, created_at, last_activity_at, archived_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(conversation_id) DO UPDATE SET
+        agent_type = CASE WHEN excluded.agent_type <> 'unknown' THEN excluded.agent_type ELSE agent_conversations.agent_type END,
+        native_session_id = CASE WHEN excluded.native_session_id <> '' THEN excluded.native_session_id ELSE agent_conversations.native_session_id END,
+        title = CASE
+          WHEN excluded.title_is_custom = 1 THEN excluded.title
+          WHEN agent_conversations.title_is_custom = 1 THEN agent_conversations.title
+          -- A placeholder never displaces a real title. This is the rule
+          -- that lets a conversation recover: the placeholder written at
+          -- launch gives way to the title the agent produced.
+          --
+          -- Both sides are judged by the title itself rather than by a
+          -- stored flag, so a row written before this rule existed is
+          -- judged correctly the first time it is written again.
+          WHEN LOWER(TRIM(excluded.title)) IN (
+              'agent session',
+              CONCAT(LOWER(excluded.agent_type), ' session'),
+              CONCAT(LOWER(excluded.agent_type), ' code'),
+              LOWER(excluded.agent_type)
+            )
+            AND LOWER(TRIM(agent_conversations.title)) NOT IN (
+              'agent session',
+              CONCAT(LOWER(agent_conversations.agent_type), ' session'),
+              CONCAT(LOWER(agent_conversations.agent_type), ' code'),
+              LOWER(agent_conversations.agent_type)
+            )
+            THEN agent_conversations.title
+          WHEN excluded.title <> '' THEN excluded.title
+          ELSE agent_conversations.title
+        END,
+        title_is_custom = MAX(agent_conversations.title_is_custom, excluded.title_is_custom),
+        summary = CASE WHEN excluded.summary <> '' THEN excluded.summary ELSE agent_conversations.summary END,
+        first_prompt_preview = CASE WHEN excluded.first_prompt_preview <> '' THEN excluded.first_prompt_preview ELSE agent_conversations.first_prompt_preview END,
+        last_message_preview = CASE WHEN excluded.last_message_preview <> '' THEN excluded.last_message_preview ELSE agent_conversations.last_message_preview END,
+        workspace_id = COALESCE(excluded.workspace_id, agent_conversations.workspace_id),
+        transcript_locator = CASE WHEN excluded.transcript_locator <> '' THEN excluded.transcript_locator ELSE agent_conversations.transcript_locator END,
+        last_activity_at = MAX(agent_conversations.last_activity_at, excluded.last_activity_at),
+        archived_at = COALESCE(excluded.archived_at, agent_conversations.archived_at)
+    `).run(
+      conversationId,
+      agent,
+      safeText(payload.nativeSessionId, 191),
+      title,
+      titleIsCustom ? 1 : 0,
+      safeText(payload.summary, 4096),
+      safeText(payload.firstPromptPreview, 1024),
+      safeText(payload.lastMessagePreview, 1024),
+      workspaceId,
+      canonicalPath(payload.transcriptPath || payload.transcriptLocator),
+      startedAt,
+      activityAt,
+      payload.archivedAt ? iso(payload.archivedAt) : null,
+    );
+
+    this.db.prepare(`
+      INSERT INTO agent_runs(
+        run_id, conversation_id, originrouter_session_id, device_id, device_name,
+        runtime, provider, model, permission_profile, started_by, pid, status,
+        started_at, exited_at, exit_code, exit_signal, native_config
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(originrouter_session_id) DO UPDATE SET
+        conversation_id = excluded.conversation_id,
+        device_id = CASE WHEN excluded.device_id <> '' THEN excluded.device_id ELSE agent_runs.device_id END,
+        device_name = CASE WHEN excluded.device_name <> '' THEN excluded.device_name ELSE agent_runs.device_name END,
+        runtime = CASE WHEN excluded.runtime <> '' THEN excluded.runtime ELSE agent_runs.runtime END,
+        native_config = MAX(agent_runs.native_config, excluded.native_config),
+        provider = CASE WHEN excluded.provider <> '' THEN excluded.provider ELSE agent_runs.provider END,
+        model = CASE WHEN excluded.model <> '' THEN excluded.model ELSE agent_runs.model END,
+        permission_profile = CASE WHEN excluded.permission_profile <> '' THEN excluded.permission_profile ELSE agent_runs.permission_profile END,
+        started_by = CASE WHEN excluded.started_by <> '' THEN excluded.started_by ELSE agent_runs.started_by END,
+        pid = COALESCE(excluded.pid, agent_runs.pid),
+        status = excluded.status,
+        exited_at = COALESCE(excluded.exited_at, agent_runs.exited_at),
+        exit_code = COALESCE(excluded.exit_code, agent_runs.exit_code),
+        exit_signal = CASE WHEN excluded.exit_signal <> '' THEN excluded.exit_signal ELSE agent_runs.exit_signal END
+    `).run(
+      runId,
+      conversationId,
+      sessionId,
+      deviceId,
+      safeText(payload.deviceName, 191),
+      safeText(payload.runtime, 64),
+      safeText(payload.provider, 191),
+      safeText(payload.model, 191),
+      safeText(payload.permissionProfile || payload.autonomyProfile, 64),
+      startedBy,
+      Number.isFinite(Number(payload.pid)) ? Number(payload.pid) : null,
+      status,
+      startedAt,
+      payload.exitedAt ? iso(payload.exitedAt) : null,
+      Number.isFinite(Number(payload.exitCode)) ? Number(payload.exitCode) : null,
+      safeText(payload.exitSignal, 32),
+      payload.nativeConfig === true || agent === 'agy' ? 1 : 0,
+    );
+    if (effectiveAgent === 'agy' && effectiveNative && existingRun && !existingRun.native_session_id) {
+      this.db.prepare("INSERT INTO agent_catalog_insert_queue(conversation_id) VALUES (?)").run(conversationId);
+    }
+    // Only a provisional row vacated by this run can contribute its history.
+    // A supplied label alone is insufficient evidence to move another row.
+    if (existingRun && existingRun.conversation_id !== conversationId) {
+      this.db.prepare("UPDATE agent_launch_receipts SET conversation_id = ? WHERE originrouter_session_id = ?")
+        .run(conversationId, sessionId);
+      if (effectiveNative && !existingRun.native_session_id) {
+        this.foldVacatedConversation(existingRun.conversation_id, conversationId);
+      }
     }
     return this.getConversation(conversationId);
   }
 
   updateSession(sessionId, payload = {}) {
+    return this.db.transaction(() => this._updateSession(sessionId, payload)).immediate();
+  }
+
+  _updateSession(sessionId, payload) {
     const current = this.db.prepare(`
       SELECT r.*, c.agent_type, c.title, c.title_is_custom, c.workspace_id,
              w.canonical_path AS cwd
@@ -970,7 +932,7 @@ export class AgentCatalog {
       LEFT JOIN agent_workspaces w ON w.workspace_id = c.workspace_id
       WHERE r.originrouter_session_id = ?
     `).get(safeText(sessionId, 64));
-    return this.upsertSession({
+    return this._upsertSession({
       sessionId,
       conversationId: payload.conversationId || current?.conversation_id,
       runId: current?.run_id,
@@ -1039,12 +1001,20 @@ export class AgentCatalog {
   }
 
   ensureSessionForPermissionState(metadata) {
-    const existing = this.db.prepare("SELECT conversation_id FROM agent_runs WHERE originrouter_session_id = ?")
-      .get(safeText(metadata.sessionId, 64));
-    if (!existing) this.upsertSession(metadata);
-    else if (metadata.conversationId && existing.conversation_id !== metadata.conversationId) {
-      this.updateSession(metadata.sessionId, { conversationId: metadata.conversationId });
+    const existing = this.db.prepare(`
+      SELECT r.conversation_id, c.native_session_id FROM agent_runs r
+      JOIN agent_conversations c USING (conversation_id) WHERE originrouter_session_id = ?
+    `).get(safeText(metadata.sessionId, 64));
+    if (!existing) return this.upsertSession(metadata).conversation_id;
+    if (metadata.nativeSessionId && metadata.nativeSessionId !== existing.native_session_id) {
+      return this.updateSession(metadata.sessionId, {
+        nativeSessionId: metadata.nativeSessionId, conversationId: metadata.conversationId,
+      }).conversation_id;
     }
+    if (!existing.native_session_id && metadata.conversationId && existing.conversation_id !== metadata.conversationId) {
+      return this.updateSession(metadata.sessionId, { conversationId: metadata.conversationId }).conversation_id;
+    }
+    return existing.conversation_id;
   }
 
   getConversationPermissionState(conversationId) {
@@ -1070,12 +1040,18 @@ export class AgentCatalog {
   }
 
   recordEvent(sessionId, event = {}) {
+    return this.db.transaction(() => this._recordEvent(sessionId, event)).immediate();
+  }
+
+  _recordEvent(sessionId, event) {
     const run = this.db.prepare(
       "SELECT conversation_id FROM agent_runs WHERE originrouter_session_id = ?",
     ).get(safeText(sessionId, 64));
     if (!run) return false;
     let conversationId = run.conversation_id;
-    const createdAt = iso(event.createdAt || this.now());
+    const timestamp = event.createdAt;
+    const createdAt = iso(typeof timestamp === "number" && timestamp > 0 && timestamp < 1e11
+      ? timestamp * 1000 : timestamp || this.now());
     const rawType = safeText(event.type || event.eventType, 96);
     const type = rawType === "agent.task.completed"
       ? "agent.task.complete"
@@ -1107,21 +1083,7 @@ export class AgentCatalog {
       }
     }
     if (type === "agent.session_id" && event.sessionId) {
-      const native = safeText(event.sessionId, 191);
-      // The provider's id belongs to the row that holds it. Another row that
-      // already holds it means this conversation is that conversation, and
-      // the fold is what the catalog does everywhere else — the unique
-      // index over (agent, provider id) says the same thing in the
-      // database, and a write that broke it would throw where the
-      // conversation was only being recorded.
-      const held = this.foldIntoNativeSessionHolder(conversationId, native);
-      if (held.conversationId && held.conversationId !== conversationId) {
-        conversationId = held.conversationId;
-      }
-      if (!held.holdsNativeId) {
-        updates.push("native_session_id = ?");
-        values.push(native);
-      }
+      conversationId = this.updateSession(sessionId, { nativeSessionId: event.sessionId }).conversation_id;
     }
     if (type === "agent.session.start" && event.transcriptPath) {
       updates.push("transcript_locator = ?");
@@ -1165,8 +1127,9 @@ export class AgentCatalog {
     return true;
   }
 
-  listConversations({ search = "", conversationId = "", agent = "", deviceId = "", workspaceId = "", status = "", limit = DEFAULT_LIMIT, offset = 0, includeArchived = false, includeCollaboration = true } = {}) {
+  listConversations({ search = "", conversationId = "", agent = "", deviceId = "", workspaceId = "", status = "", limit = DEFAULT_LIMIT, offset = 0, includeArchived = false, includeCollaboration = true, includeProvisional = false } = {}) {
     const clauses = [];
+    if (!includeProvisional) clauses.push(CONFIRMED_HISTORY_SQL);
     const params = {};
     if (!includeArchived) clauses.push("c.archived_at IS NULL");
     if (safeText(conversationId, 96)) {
@@ -1286,6 +1249,7 @@ export class AgentCatalog {
     const normalizedArchiveDays = Math.max(0, Math.min(3650, Number(autoArchiveDays) || 0));
     const offset = (normalizedPage - 1) * normalizedPageSize;
     const clauses = [
+      CONFIRMED_HISTORY_SQL,
       "COALESCE(r.status, 'stopped') NOT IN ('running', 'waiting_approval', 'waiting_input', 'waiting_device', 'starting')",
     ];
     if (!includeCollaboration) {
@@ -1417,7 +1381,7 @@ export class AgentCatalog {
     const id = safeText(conversationId, 96);
     if (!id) return null;
     let conversation = this.listConversations({
-      conversationId: id, limit: 1, includeArchived: true,
+      conversationId: id, limit: 1, includeArchived: true, includeProvisional: true,
     })[0];
     if (!conversation) {
       // The App reopens a run by the session id it was given, and for a run
@@ -1430,7 +1394,7 @@ export class AgentCatalog {
       `).get(id);
       if (run?.conversation_id) {
         conversation = this.listConversations({
-          conversationId: run.conversation_id, limit: 1, includeArchived: true,
+          conversationId: run.conversation_id, limit: 1, includeArchived: true, includeProvisional: true,
         })[0];
       }
     }
