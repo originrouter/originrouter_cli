@@ -5,14 +5,24 @@ import { createRequire } from "node:module";
 const pkg = createRequire(import.meta.url)("../package.json");
 
 export const VERSION = pkg.version;
-export const DEFAULT_RELAY_URL = "https://app.easytransnote.com";
+export const DEFAULT_RELAY_URL = "https://app-server.easytransnote.com";
 // Public control-plane aliases backed by the same OriginRouter service.
 // Keep this list deliberately small and code-owned: callers must never probe
 // a URL supplied by an untrusted Relay message or account record.
 export const OFFICIAL_RELAY_URLS = Object.freeze([
-  "https://app.originrouter.com",
+  "https://app-server.originrouter.com",
   DEFAULT_RELAY_URL,
 ]);
+
+// Older flags, environment variables and local config files can outlive a CLI upgrade.
+export function currentControlUrl(value) {
+  if (typeof value !== "string") return value;
+  return value.replace(
+    /^https:\/\/app\.(originrouter|easytransnote)\.com(?::443)?(?=[/?#]|$)/i,
+    (_, brand) => `https://app-server.${brand.toLowerCase()}.com`,
+  );
+}
+
 export const DEFAULT_DEVICE_ID = "local-dev";
 export const DEFAULT_EXECUTOR = "pty";
 export const DEFAULT_LOCAL_API_PORT = 7437;

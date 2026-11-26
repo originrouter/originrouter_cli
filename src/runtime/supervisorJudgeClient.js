@@ -1,8 +1,9 @@
+import { DEFAULT_RELAY_URL, currentControlUrl } from "../constants.js";
 import { accessTokenFor, OAUTH_RESOURCES } from "./authContract.js";
 import { ensureFreshAccessToken } from "./oauthTokenRefresher.js";
 import { redactDisplayText } from "../security/displayRedaction.js";
 
-const DEFAULT_ENDPOINT = "https://app.easytransnote.com/ai/v1/supervisor/judge";
+const DEFAULT_ENDPOINT = `${DEFAULT_RELAY_URL}/ai/v1/supervisor/judge`;
 const POLICY = Object.freeze({
   verdict_only: true,
   untrusted_snapshot: true,
@@ -25,7 +26,7 @@ export class SupervisorJudgeClient {
     timeoutMs = 30_000,
   } = {}) {
     this.stateDir = stateDir;
-    this.endpoint = endpoint;
+    this.endpoint = currentControlUrl(endpoint);
     this.fetchFn = fetchFn;
     this.ensureFreshAccessTokenFn = ensureFreshAccessTokenFn;
     this.timeoutMs = timeoutMs;

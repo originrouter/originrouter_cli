@@ -19,6 +19,15 @@ test("explicit Relay configuration is never latency-probed or replaced", async (
   assert.equal(calls, 0);
 });
 
+test("saved official Relay addresses migrate without changing custom hosts", async () => {
+  for (const brand of ["originrouter", "easytransnote"]) {
+    const result = await resolveRelayEndpoint({ configuredRelayUrl: `https://app.${brand}.com/` });
+    assert.equal(result.relayUrl, `https://app-server.${brand}.com`);
+  }
+  const custom = "https://app.originrouter.com.example";
+  assert.equal((await resolveRelayEndpoint({ configuredRelayUrl: custom })).relayUrl, custom);
+});
+
 test("automatic Relay selection chooses the lowest-latency healthy official endpoint", async () => {
   let clock = 0;
   const result = await resolveRelayEndpoint({
@@ -43,7 +52,7 @@ test("automatic Relay selection falls back to the established default when all p
     },
   });
   assert.deepEqual(result, {
-    relayUrl: "https://app.easytransnote.com",
+    relayUrl: "https://app-server.easytransnote.com",
     source: "default",
   });
 });

@@ -161,7 +161,7 @@ Configuration:
   originrouter claude-config --base-url <url> --api-key <key> --model <model>
 
 Other:
-  originrouter daemon [--relay https://app.easytransnote.com] [--relay-mode auto|cloud|local|custom] [--device <device-id>] [--local-port <p>]
+  originrouter daemon [--relay https://app-server.easytransnote.com] [--relay-mode auto|cloud|local|custom] [--device <device-id>] [--local-port <p>]
                       [--bind 0.0.0.0|127.0.0.1|<addr>] [--allow-lan]
                                       Default 0.0.0.0: the App pairs from a phone, and the
                                       LAN needs the bearer token to reach anything else.
@@ -238,7 +238,7 @@ OriginRouter OAuth login:
 
 OriginRouter wrapper options for claude/codex:
   --provider <name>                              Deprecated for claude; use 'originrouter route set'. Reserved for legacy/debug paths.
-  --originrouter-relay https://app.easytransnote.com
+  --originrouter-relay https://app-server.easytransnote.com
   --originrouter-relay-mode auto|cloud|local|custom  auto uses authenticated cloud when signed in, otherwise local-only
   --originrouter-device <device-id>
   --originrouter-session session-id

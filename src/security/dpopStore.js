@@ -11,6 +11,7 @@
 // and a device that is signed into two accounts over its life has to be
 // able to hold a key for each.
 
+import { OFFICIAL_RELAY_URLS } from "../constants.js";
 import {
   chmodSync,
   existsSync,
@@ -65,12 +66,17 @@ export function readDpopStore(stateDir, { accountScope, strict = false } = {}) {
     if (strict) throw Object.assign(new Error("DPoP key store is invalid"), { code: "dpop_key_unavailable" });
     return null;
   }
+  // Older releases keyed both public aliases by the previous primary origin.
+  const registrations = parsed.registrations;
+  const legacyDeployment = "https://app.originrouter.com";
+  if (Object.hasOwn(registrations, legacyDeployment)) {
+    registrations[OFFICIAL_RELAY_URLS[0]] ??= registrations[legacyDeployment];
+    delete registrations[legacyDeployment];
+  }
   return {
     version: Number(parsed.version || STORE_VERSION),
     key: parsed.key,
-    registrations: parsed.registrations && typeof parsed.registrations === "object"
-      ? parsed.registrations
-      : {},
+    registrations,
   };
 }
 

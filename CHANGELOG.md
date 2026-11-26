@@ -3,10 +3,25 @@
 All notable changes to OriginRouter CLI will be documented here. The project
 uses Semantic Versioning and follows the Keep a Changelog structure.
 
-## 0.6.1 (unreleased)
+## 0.6.1 - 2026-11-26
 
 ### Added
 
+- **A conversation's name reaches the agent, and the agent's answer reaches
+  back.** A rename in the App used to stop at our catalogue: the agent kept
+  showing whatever it had named the conversation, and a rename made inside the
+  agent never reached the App. The two now meet. A rename travels to the agent's
+  own UI — a live agy or Codex session gets it as a `/rename` command, applied
+  only when the session is actually idle, and every other conversation is
+  written directly — and renames made inside the agent are read back: Claude's
+  `custom-title` transcript records, Codex's threads table, and Antigravity's
+  conversation summaries. The daemon reconciles both directions against the
+  server every few seconds (`title_revision` rises on each accepted rename and
+  `title_sync_pending` marks a write the agent has not confirmed), so a device
+  that was offline catches up on the next poll rather than keeping the wrong
+  name. The catalogue remembers what it asked for (`local_title_request`), and
+  a scan over recorded conversations repairs rows that never got a title at
+  all, including rows an older release had frozen under a placeholder.
 - Optional official Antigravity installation (`setup --with-agy`), a native
   `originrouter agy` TUI with Hooks/control/history. Terminal and App-created
   sessions share this native PTY runtime; recorded ACP conversations retain ACP.
@@ -26,6 +41,35 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
   conversation restart. Unsupported native panels and automatic recovery remain
   disabled. Both READMEs compare all three agents' launch methods.
 
+### Changed
+
+- **The control plane moved to `app-server.<brand>.com`.** Every endpoint the
+  CLI dials — relay, control plane, compatibility patches, telemetry,
+  collaboration — now defaults to the `app-server` host under both brands.
+  A launch flag, environment variable or saved config that still names the old
+  `app.<brand>.com` host is rewritten to the new one rather than silently
+  ignored (`currentControlUrl`), so a device upgraded in place keeps working.
+  The stored DPoP registrations follow the same rule: a key registered under
+  the old primary origin is served under the new one, and an upgraded device
+  does not need to re-register.
+- **The Antigravity placeholder is written under its display name.** New
+  conversations the system cannot name are titled "antigravity session", not
+  "agy session" — `agy` is the runtime's id, not a name a reader should see.
+  Rows written before the rename are still placeholders under either spelling,
+  so an old "agy session" is not mistaken for a name somebody chose. The rule
+  is shared with the server and the App through
+  `contract/agent_conversation_rules.json` (contract `2026-11-26.1`).
+- **An unnamed conversation reports an empty title on the wire.** The
+  catalogue used to write "Agent session" into the title slot of every
+  metadata report, which read to the server like a name. It now reports the
+  title it actually has — empty when there is none — and only the wire view
+  older Apps read substitutes the derived placeholder. A session that already
+  holds a real title keeps it in place of a catalogued placeholder.
+- The catalog record a session reports carries the three title facts —
+  `title_is_custom`, `title_revision`, `title_sync_pending` — so the control
+  plane can tell a name somebody chose from one still in flight, and an
+  unnamed agy conversation keeps its first-prompt preview for the App to show.
+
 ### Fixed
 
 - Keep interactive `originrouter agy --new-project` launches registered with
@@ -42,6 +86,42 @@ uses Semantic Versioning and follows the Keep a Changelog structure.
 - Preserve native configuration when reopening recorded native conversations;
   report authentication/startup errors and detach ended Antigravity sessions
   before cloud reporting can delay their local presence update.
+
+- A Codex app-server child that fails to spawn now ends its session instead of
+  leaving the registry holding a live wrapper with no process behind it: the
+  child's `error` event joins `exit` on the same handled-exit path.
+- Replayed agy history pairs each completed tool result with its planner
+  tool-call in FIFO order, so a transcript render uses the same deterministic
+  `step-<n>` call id the live hooks and scans produce instead of its own
+  numbering.
+- Device-to-device encrypted group sends are serialized per conversation and
+  the group session is reused only while its key id and local identity hold —
+  two sends that used to interleave no longer produce a frame the peer cannot
+  read.
+- Claude transcript title reads are cached by file size, mtime and inode, so
+  the poll that watches for a rename no longer re-reads the tail of an
+  unchanged transcript; an explicit `custom-title` record outranks any
+  `ai-title` in the same file.
+
+### Upgrade notes
+
+- **No configuration change is needed for the host move.** Saved configs,
+  environment variables and launch flags that still name
+  `app.originrouter.com` or `app.easytransnote.com` are rewritten to the
+  `app-server` host at use. A stored DPoP registration under the old origin is
+  served under the new one, so a device does not re-register — but a server
+  that has not moved to `app-server` must still answer on the old host for
+  this device's own configured URL, or override `ORIGINROUTER_RELAY` /
+  `ORIGINROUTER_CONTROL_BASE_URL` itself.
+- **Native title sync needs a server that answers it.** The daemon polls
+  `POST /cli/v1/agent/catalog/conversations/titles`; a server without that
+  route leaves renames working exactly as before — the App's name is kept in
+  the catalogue and cloud, it just does not reach the agent's own UI, and a
+  rename made inside the agent is not read back.
+- **The shared title contract moved to `2026-11-26.1`.** The App and server
+  must carry the same placeholder set or a title written by one side reads as
+  a name to the other — an "antigravity session" written by a new CLI is a
+  placeholder everywhere, and an old "agy session" stays one too.
 
 ## 0.6.0 - 2026-11-17
 

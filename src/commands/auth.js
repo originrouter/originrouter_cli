@@ -5,7 +5,7 @@ import {
 } from "../auth/originrouterLogin.js";
 import {
   DEFAULT_ORIGINROUTER_LOGIN_BASE_URL,
-  DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
+  configuredControlBaseUrl,
   DEFAULT_SURETY_BASE_URL,
 } from "../config/providerRoutes.js";
 import {
@@ -212,9 +212,7 @@ export async function handleLogin(args, {
     const credential = await loginWithDeviceFlow({
       suretyBaseUrl,
       loginBaseUrl,
-      controlBaseUrl:
-        process.env.ORIGINROUTER_CONTROL_BASE_URL ||
-        DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
+      controlBaseUrl: configuredControlBaseUrl(),
       deviceId: device.deviceId,
       deviceName:
         (requestedDeviceName && cliDeviceDisplayName(requestedDeviceName)) ||
@@ -294,7 +292,7 @@ export async function handleLogin(args, {
     try {
       dpop = await ensureDpopRegistered({
         stateDir,
-        controlBaseUrl: process.env.ORIGINROUTER_CONTROL_BASE_URL || DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
+        controlBaseUrl: configuredControlBaseUrl(),
         accessToken: credential.accessTokens.control.token,
         deviceId: credential.deviceId,
         accountScope: credential.accountScope || enrollmentScope,
@@ -305,17 +303,13 @@ export async function handleLogin(args, {
     }
     try {
       registered = await registerCliDeviceE2eeIdentity({
-        controlBaseUrl:
-          process.env.ORIGINROUTER_CONTROL_BASE_URL ||
-          DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
+        controlBaseUrl: configuredControlBaseUrl(),
         accessToken: credential.accessTokens.control.token,
         identity: e2ee.public_identity,
         fetchFn: controlFetch,
       });
       const directory = await getCliDeviceE2eeDirectory({
-        controlBaseUrl:
-          process.env.ORIGINROUTER_CONTROL_BASE_URL ||
-          DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
+        controlBaseUrl: configuredControlBaseUrl(),
         accessToken: credential.accessTokens.control.token,
         fetchFn: controlFetch,
       });
@@ -382,9 +376,7 @@ export async function handleLogout(args = []) {
       if (!sameCredentialSession(fresh, stored)) {
         throw Object.assign(new Error('Account changed during sign-out'), { code: 'account_changed' });
       }
-      const controlBaseUrl =
-        process.env.ORIGINROUTER_CONTROL_BASE_URL ||
-        DEFAULT_ORIGINROUTER_CONTROL_BASE_URL;
+      const controlBaseUrl = configuredControlBaseUrl();
       let accountEpoch;
       try {
         const status = await getCliDeviceE2eeStatus({
@@ -425,9 +417,7 @@ export async function handleLogout(args = []) {
       throw Object.assign(new Error('Account changed during sign-out'), { code: 'account_changed' });
     }
     await signOutCurrentCliDevice({
-      controlBaseUrl:
-        process.env.ORIGINROUTER_CONTROL_BASE_URL ||
-        DEFAULT_ORIGINROUTER_CONTROL_BASE_URL,
+      controlBaseUrl: configuredControlBaseUrl(),
       accessToken: fresh.accessTokens.control.token,
     });
     signedOutThroughControl = true;

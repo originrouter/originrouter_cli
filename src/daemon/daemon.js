@@ -1,3 +1,4 @@
+import { createNativeTitleSync } from "../agent/nativeTitleSync.js";
 import process from "node:process";
 import { reportLocalControlRuntime, reportSupervisorEscalation } from "../agent/bridgeReporter.js";
 import { syncAgentActivityCatalog } from "../agent/agentActivityCatalogSync.js";
@@ -768,6 +769,8 @@ export async function startDaemon(args) {
   let shuttingDown = false;
   let heartbeatTimer = null;
   let accountBudgetTimer = null;
+  const syncTitles = createNativeTitleSync({ catalog: agentCatalog, registry: externalAgentRegistry });
+  let titleTimer = null;
   let agentActivitySyncTimer = null;
   let deviceE2eeRefreshTimer = null;
   let authContextTimer = null;
@@ -784,6 +787,7 @@ export async function startDaemon(args) {
     remoteEnvironmentService.close();
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (accountBudgetTimer) clearInterval(accountBudgetTimer);
+    if (titleTimer) clearInterval(titleTimer);
     if (agentActivitySyncTimer) clearInterval(agentActivitySyncTimer);
     if (deviceE2eeRefreshTimer) clearInterval(deviceE2eeRefreshTimer);
     if (authContextTimer) clearInterval(authContextTimer);
@@ -1062,6 +1066,11 @@ export async function startDaemon(args) {
     });
   }, 5 * 60_000);
   accountBudgetTimer.unref?.();
+  const pollTitles = () => {
+    void syncTitles(relayConnected).catch(error => console.error(`[agent-titles] sync deferred: ${error.message}`));
+  };
+  titleTimer = setInterval(pollTitles, 10_000);
+  titleTimer.unref?.();
   agentActivitySyncTimer = setInterval(() => {
     if (!relayConnected) return;
     void syncAgentActivityHistory().then((result) => {
@@ -1287,6 +1296,7 @@ export async function startDaemon(args) {
               return;
             }
             if (routed.type === "agent.control.subscribe") {
+              if (routed.keepalive === true) return;
               routed = {
                 ...routed,
                 type: "agent.interactions.snapshot.request",
@@ -1325,6 +1335,7 @@ export async function startDaemon(args) {
             // opened right now would show it as active until a heartbeat
             // arrives. Publishing the current attach/detach set settles it.
             void reconcileAgentPresence();
+            pollTitles();
             void syncAgentActivityHistory().then((result) => {
               if (result?.ok) return syncAgentHistoryContent();
               return null;

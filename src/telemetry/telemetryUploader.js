@@ -1,3 +1,4 @@
+import { currentControlUrl } from "../constants.js";
 import { getStateDir } from "../persistence/state.js";
 import { basename, resolve } from "node:path";
 import { accountNamespace, accountSelectionRoot, activeAccountStateDir, isAccountStateDir } from "../persistence/accounts.js";
@@ -15,7 +16,7 @@ const MAX_ARCHIVE_BYTES = Math.max(
 );
 
 function baseUrl() {
-  return (
+  return currentControlUrl(
     process.env.ORIGINROUTER_SERVER_BASE_URL
     || process.env.ORIGINROUTER_CONTROL_BASE_URL
     || DEFAULT_ORIGINROUTER_CONTROL_BASE_URL

@@ -14,7 +14,7 @@ const KEY_CANARY = `sk-probe-leak-canary-${Math.random().toString(36).slice(2, 1
 
 let captured = null;
 const client = new RemoteCodingRelayClient({
-  relayUrl: "https://app.easytransnote.com",
+  relayUrl: "https://app-server.easytransnote.com",
   deviceId: "caller-leak",
   authToken: "relay-access-token",
   fetchFn: async (url, options) => {
@@ -46,7 +46,7 @@ const result = await client.publishRequest({
   })).toString("base64"),
 });
 
-assert.equal(captured.url, "https://app.easytransnote.com/relay/v1/messages");
+assert.equal(captured.url, "https://app-server.easytransnote.com/relay/v1/messages");
 assert.ok(!captured.url.includes(`/device/${"events"}`));
 assert.ok(!captured.url.includes(`/device/${"message"}`));
 assert.equal(captured.options.headers.Authorization, "Bearer relay-access-token");

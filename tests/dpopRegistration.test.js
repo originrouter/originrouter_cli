@@ -47,7 +47,7 @@ import { activateAccount } from "../src/persistence/accounts.js";
 import { readCodingAuth, writeCodingAuth } from '../src/persistence/codingAuth.js';
 import { makeOAuthCredential } from './support/oauthCredential.js';
 
-const CONTROL_BASE = "https://app.easytransnote.com";
+const CONTROL_BASE = "https://app-server.easytransnote.com";
 const TOKEN = "or_at_the_cli_token";
 const DEVICE_ID = "cli-device-dpop";
 
@@ -267,14 +267,29 @@ test('a superseded login never reports device authentication as ready', async ()
   } finally { removeStateDir(stateDir); }
 });
 
+test("registrations from the old domain follow the new official aliases only", () => {
+  const stateDir = makeStateDir();
+  try {
+    const { jkt } = registerLocalKey(stateDir);
+    const store = readDpopStore(stateDir);
+    const oldBase = "https://app.originrouter.com";
+    store.registrations = { [oldBase]: { status: "active", jkt, origin: oldBase } };
+    writeDpopStore(stateDir, store);
+    assert.equal(readDpopRegistration(stateDir, deploymentFor(CONTROL_BASE)).jkt, jkt);
+    assert.equal(readDpopRegistration(stateDir, deploymentFor(oldBase)), null);
+  } finally {
+    removeStateDir(stateDir);
+  }
+});
+
 test("the public aliases are one deployment and a WebSocket folds onto its origin", () => {
   assert.equal(
-    originOf("wss://app.easytransnote.com/relay/v1/devices/d1/ws"),
-    "https://app.easytransnote.com",
+    originOf("wss://app-server.easytransnote.com/relay/v1/devices/d1/ws"),
+    "https://app-server.easytransnote.com",
   );
   assert.equal(
     deploymentFor(`${CONTROL_BASE}/cli/v1/devices`),
-    deploymentFor("https://app.originrouter.com/cli/v1/devices"),
+    deploymentFor("https://app-server.originrouter.com/cli/v1/devices"),
   );
   // A deployment of its own is a deployment of its own: a key registered
   // with one is no use at another.

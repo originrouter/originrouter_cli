@@ -9,11 +9,14 @@ import { basename, join, resolve } from "node:path";
 
 import Database from "better-sqlite3";
 
+import { setImmediate as yieldToDaemon } from "node:timers/promises";
+import { claudeTranscriptPathForSession } from "../runtime/claudeConversationHistory.js";
 import { repairAgyCatalog } from "./repairAgyCatalog.js";
 import { ensureStateDir } from "./state.js";
 import { activeAccountStateDir } from "./accounts.js";
 import {
-  defaultConversationTitle,
+  readAgentSessionTitle,
+  readAgyConversationName,
   looksLikePlaceholderTitle,
 } from "../agent/agentTitleSource.js";
 import { isCollaborationSessionPayload } from "../runtime/agentSessionKind.js";
@@ -45,12 +48,32 @@ export { workspaceDisplayPath } from "./agentCatalogPrimitives.js";
 // identity. Only confirmed conversations belong in history and cloud sync.
 const CONFIRMED_HISTORY_SQL = "(c.agent_type <> 'agy' OR c.native_session_id <> '')";
 
+// A live runtime may receive a queued command after a newer rename has landed.
+export function isCurrentNativeRename(stateDir, agent, nativeId, title, payload) {
+  if (!payload.targetNativeSessionId) return true;
+  if (nativeId !== payload.targetNativeSessionId) return false;
+  let db;
+  try {
+    db = new Database(join(stateDir, "agent-catalog.sqlite3"), { readonly: true, fileMustExist: true });
+    const row = db.prepare(`SELECT title, title_revision, title_sync_pending, local_title_request
+      FROM agent_conversations WHERE agent_type=? AND native_session_id=?`).get(agent, nativeId);
+    if (payload.localTitleRequest) return row?.local_title_request === title;
+    return row?.title_sync_pending === 1 && row.title_revision === payload.titleRevision && row.title === title;
+  } catch {
+    return false;
+  } finally {
+    db?.close();
+  }
+}
+
 export class AgentCatalog {
   constructor({ stateDir = ensureStateDir(), dbPath = null, now = () => new Date() } = {}) {
     this.stateDir = activeAccountStateDir(stateDir);
     this.dbPath = dbPath || join(this.stateDir, "agent-catalog.sqlite3");
     this.now = now;
     this.db = new Database(this.dbPath);
+    this.db.function("is_placeholder_title", { deterministic: true }, (title, agent) =>
+      Number(looksLikePlaceholderTitle(title, agent)));
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("synchronous = NORMAL");
     this.db.pragma("foreign_keys = ON");
@@ -204,6 +227,12 @@ export class AgentCatalog {
     if (!conversationColumns.has("title_is_custom")) {
       this.db.exec("ALTER TABLE agent_conversations ADD COLUMN title_is_custom INTEGER NOT NULL DEFAULT 0");
     }
+    if (!conversationColumns.has("local_title_request")) {
+      this.db.exec("ALTER TABLE agent_conversations ADD COLUMN local_title_request TEXT NOT NULL DEFAULT ''");
+    }
+    for (const field of ["title_revision", "title_sync_pending"]) {
+      if (!conversationColumns.has(field)) this.db.exec(`ALTER TABLE agent_conversations ADD COLUMN ${field} INTEGER NOT NULL DEFAULT 0`);
+    }
     if (!conversationColumns.has("permission_state_json")) {
       this.db.exec("ALTER TABLE agent_conversations ADD COLUMN permission_state_json TEXT");
     }
@@ -253,6 +282,67 @@ export class AgentCatalog {
       INSERT INTO catalog_meta(key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `).run(safeText(key, 191), String(value ?? ""));
+  }
+
+  // Both direct lists and cloud sync visit this bounded batch. Provider file
+  // reads stay outside the write transaction; the compare-and-set protects a
+  // concurrent rename, resume, or change of native identity.
+  refreshMissingNativeTitles() {
+    if (this.titleRefresh) return this.titleRefresh;
+    if (Date.now() < (this.nextTitleProbeAt || 0)) return;
+    this.titleRefresh = this._refreshMissingNativeTitles().finally(() => {
+      this.titleRefresh = null;
+      this.nextTitleProbeAt = Date.now() + 60_000;
+    });
+    return this.titleRefresh;
+  }
+
+  async _refreshMissingNativeTitles() {
+    const query = this.db.prepare(`
+      SELECT c.conversation_id, c.native_session_id, c.agent_type, c.transcript_locator,
+             c.title, c.first_prompt_preview, w.canonical_path
+      FROM agent_conversations c LEFT JOIN agent_workspaces w USING (workspace_id)
+      WHERE c.conversation_id > ? AND c.native_session_id <> '' AND c.local_title_request = '' AND c.title_revision = 0 AND c.title_is_custom = 0
+        AND c.agent_type IN ('agy','claude','codex') AND is_placeholder_title(c.title, c.agent_type)
+      ORDER BY c.conversation_id LIMIT 8
+    `);
+    let cursor = "";
+    while (this.db.open) {
+      const rows = query.all(cursor);
+      for (const row of rows) this._refreshNativeTitle(row);
+      if (rows.length < 8) return;
+      cursor = rows.at(-1).conversation_id;
+      await yieldToDaemon();
+    }
+  }
+
+  _refreshNativeTitle(row) {
+    let transcriptPath = row.transcript_locator;
+    if (!transcriptPath && row.agent_type === "claude" && row.canonical_path &&
+        /^[a-zA-Z0-9_-]+$/.test(row.native_session_id)) {
+      transcriptPath = claudeTranscriptPathForSession(row.canonical_path, row.native_session_id);
+    }
+    const { title, preview } = row.agent_type === "agy"
+      ? readAgyConversationName(row.native_session_id)
+      : { title: readAgentSessionTitle({
+        agentType: row.agent_type,
+        nativeSessionId: row.native_session_id,
+        transcriptPath,
+      }) };
+    const foundTitle = !looksLikePlaceholderTitle(title, row.agent_type);
+    const previewChanged = Boolean(preview && preview !== row.first_prompt_preview);
+    if (!foundTitle && !previewChanged) return;
+    this.db.transaction(() => {
+      const updated = this.db.prepare(`
+        UPDATE agent_conversations SET title = ?, first_prompt_preview = ?
+        WHERE conversation_id = ? AND native_session_id = ? AND agent_type = ?
+          AND local_title_request = '' AND title_revision = 0 AND title_is_custom = 0 AND title = ? AND first_prompt_preview = ?
+      `).run(foundTitle ? title : row.title, preview || row.first_prompt_preview,
+        row.conversation_id, row.native_session_id, row.agent_type, row.title, row.first_prompt_preview);
+      if (updated.changes && (foundTitle || (row.agent_type === "agy" && previewChanged))) {
+        this.db.prepare("INSERT INTO agent_catalog_insert_queue(conversation_id) VALUES (?)").run(row.conversation_id);
+      }
+    }).immediate();
   }
 
   listPendingCatalogInserts(limit = 50) {
@@ -527,9 +617,15 @@ export class AgentCatalog {
     } else if (!survivorCustom && survivorIsPlaceholder && !loserIsPlaceholder) {
       title = loser.title;
     }
+    const synced = (loser.title_revision || 0) > (held.title_revision || 0) ? loser : held;
+    const outstanding = held.local_title_request || loser.local_title_request || "";
+    if (synced.title_revision || outstanding) {
+      title = outstanding || synced.title;
+      titleIsCustom = Boolean(outstanding || synced.title_is_custom);
+    }
     this.db.prepare(`
       UPDATE agent_conversations SET
-        title = ?, title_is_custom = ?,
+        title = ?, title_is_custom = ?, title_revision = ?, title_sync_pending = ?, local_title_request = ?,
         summary = CASE WHEN summary = '' THEN ? ELSE summary END,
         first_prompt_preview = CASE WHEN first_prompt_preview = '' THEN ? ELSE first_prompt_preview END,
         last_message_preview = CASE WHEN last_message_preview = '' THEN ? ELSE last_message_preview END,
@@ -541,7 +637,7 @@ export class AgentCatalog {
         archived_at = COALESCE(archived_at, ?)
       WHERE conversation_id = ?
     `).run(
-      title, titleIsCustom ? 1 : 0,
+      title, titleIsCustom ? 1 : 0, synced.title_revision || 0, synced.title_sync_pending || 0, outstanding,
       loser.summary, loser.first_prompt_preview, loser.last_message_preview,
       loser.workspace_id, loser.transcript_locator, loser.permission_state_json,
       loser.created_at, loser.last_activity_at, loser.archived_at,
@@ -754,9 +850,8 @@ export class AgentCatalog {
       && requestedRunOwner.originrouter_session_id !== sessionId
       ? stableId("agent_run", requestedRunId, sessionId)
       : requestedRunId;
-    const defaultTitle = defaultConversationTitle(agent);
     const requestedTitle = safeText(payload.title, 256);
-    const title = requestedTitle || defaultTitle;
+    const title = payload.titleIsCustom === true || !looksLikePlaceholderTitle(requestedTitle, agent) ? requestedTitle : "";
     // Whether this title is one of our own placeholders. A placeholder is a
     // title we wrote, not one anybody chose — and it must be marked as such,
     // or it latches as a custom title and can never be replaced by the title
@@ -815,6 +910,7 @@ export class AgentCatalog {
         agent_type = CASE WHEN excluded.agent_type <> 'unknown' THEN excluded.agent_type ELSE agent_conversations.agent_type END,
         native_session_id = CASE WHEN excluded.native_session_id <> '' THEN excluded.native_session_id ELSE agent_conversations.native_session_id END,
         title = CASE
+          WHEN agent_conversations.title_revision > 0 OR agent_conversations.local_title_request <> '' THEN agent_conversations.title
           WHEN excluded.title_is_custom = 1 THEN excluded.title
           WHEN agent_conversations.title_is_custom = 1 THEN agent_conversations.title
           -- A placeholder never displaces a real title. This is the rule
@@ -824,25 +920,18 @@ export class AgentCatalog {
           -- Both sides are judged by the title itself rather than by a
           -- stored flag, so a row written before this rule existed is
           -- judged correctly the first time it is written again.
-          WHEN LOWER(TRIM(excluded.title)) IN (
-              'agent session',
-              CONCAT(LOWER(excluded.agent_type), ' session'),
-              CONCAT(LOWER(excluded.agent_type), ' code'),
-              LOWER(excluded.agent_type)
-            )
-            AND LOWER(TRIM(agent_conversations.title)) NOT IN (
-              'agent session',
-              CONCAT(LOWER(agent_conversations.agent_type), ' session'),
-              CONCAT(LOWER(agent_conversations.agent_type), ' code'),
-              LOWER(agent_conversations.agent_type)
-            )
+          WHEN is_placeholder_title(excluded.title, excluded.agent_type)
+            AND NOT is_placeholder_title(agent_conversations.title, agent_conversations.agent_type)
             THEN agent_conversations.title
+          WHEN excluded.title = '' AND is_placeholder_title(agent_conversations.title, agent_conversations.agent_type) THEN ''
           WHEN excluded.title <> '' THEN excluded.title
           ELSE agent_conversations.title
         END,
-        title_is_custom = MAX(agent_conversations.title_is_custom, excluded.title_is_custom),
+        title_is_custom = CASE WHEN agent_conversations.title_revision > 0 OR agent_conversations.local_title_request <> '' THEN agent_conversations.title_is_custom
+          ELSE MAX(agent_conversations.title_is_custom, excluded.title_is_custom) END,
         summary = CASE WHEN excluded.summary <> '' THEN excluded.summary ELSE agent_conversations.summary END,
-        first_prompt_preview = CASE WHEN excluded.first_prompt_preview <> '' THEN excluded.first_prompt_preview ELSE agent_conversations.first_prompt_preview END,
+        first_prompt_preview = CASE WHEN excluded.agent_type = 'agy' AND agent_conversations.first_prompt_preview <> ''
+          THEN agent_conversations.first_prompt_preview WHEN excluded.first_prompt_preview <> '' THEN excluded.first_prompt_preview ELSE agent_conversations.first_prompt_preview END,
         last_message_preview = CASE WHEN excluded.last_message_preview <> '' THEN excluded.last_message_preview ELSE agent_conversations.last_message_preview END,
         workspace_id = COALESCE(excluded.workspace_id, agent_conversations.workspace_id),
         transcript_locator = CASE WHEN excluded.transcript_locator <> '' THEN excluded.transcript_locator ELSE agent_conversations.transcript_locator END,
@@ -1364,6 +1453,45 @@ export class AgentCatalog {
     return result.changes > 0 ? this.getConversation(id) : null;
   }
 
+  nativeTitleRows(after = "", limit = 16) {
+    return this.db.prepare(`
+      SELECT conversation_id FROM agent_conversations WHERE conversation_id > ?
+        AND native_session_id <> '' AND agent_type IN ('claude','codex','agy')
+      ORDER BY conversation_id LIMIT ?
+    `).all(after, limit);
+  }
+
+  nativeTitleRow(agent, nativeId) {
+    const id = this.conversationIdForNativeSession(agent, nativeId);
+    return id ? this.nativeTitleRowById(id) : null;
+  }
+
+  nativeTitleRowById(id) {
+    if (this.isCollaborationConversation(id)) return null;
+    return this.db.prepare(`
+      SELECT c.*, (SELECT originrouter_session_id FROM agent_runs r WHERE r.conversation_id = c.conversation_id
+        ORDER BY started_at DESC, run_id DESC LIMIT 1) AS session_id
+      FROM agent_conversations c WHERE conversation_id = ?
+    `).get(id);
+  }
+
+  applyOfflineTitle(row, native) {
+    if (row.local_title_request && row.local_title_request !== native.title) return;
+    if (row.title_is_custom && !row.local_title_request && !native.explicit) return;
+    this.db.prepare(`UPDATE agent_conversations SET title=?, title_is_custom=?, local_title_request=''
+      WHERE conversation_id=? AND native_session_id=? AND title_revision=0 AND local_title_request=? AND title=?`)
+      .run(native.title, Number(native.explicit || row.local_title_request === native.title),
+        row.conversation_id, row.native_session_id, row.local_title_request, row.title);
+  }
+
+  applyCloudTitle(row, state) {
+    return this.db.prepare(`
+      UPDATE agent_conversations SET title=?, title_revision=?, title_sync_pending=?, title_is_custom=?, local_title_request=''
+      WHERE conversation_id=? AND agent_type=? AND native_session_id=? AND title_revision<=? AND local_title_request=?
+    `).run(state.title, state.revision, Number(state.pending), Number(state.explicit),
+      row.conversation_id, row.agent_type, row.native_session_id, state.revision, row.local_title_request).changes > 0;
+  }
+
   renameConversation(conversationId, title) {
     const id = safeText(conversationId, 96);
     const nextTitle = safeText(title, 256);
@@ -1371,9 +1499,9 @@ export class AgentCatalog {
     if (!nextTitle) throw new Error("title is required");
     const result = this.db.prepare(`
       UPDATE agent_conversations
-      SET title = ?, title_is_custom = 1, last_activity_at = MAX(last_activity_at, ?)
+      SET title = ?, local_title_request = ?, title_is_custom = 1, last_activity_at = MAX(last_activity_at, ?)
       WHERE conversation_id = ?
-    `).run(nextTitle, iso(this.now()), id);
+    `).run(nextTitle, nextTitle, iso(this.now()), id);
     return result.changes > 0 ? this.getConversation(id) : null;
   }
 

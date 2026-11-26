@@ -5,7 +5,7 @@
 // relay.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { startLocalApi, projectSession } from "../src/local/localApi.js";
@@ -214,7 +214,7 @@ try {
     startedAt: new Date(Date.now() - 5000).toISOString(), // 5s uptime
     pid: 99999,
     version: "test-0.1.0",
-    relayUrl: "https://app.easytransnote.com",
+    relayUrl: "https://app-server.easytransnote.com",
     deviceId: "local-dev",
     relayConnected: () => relayConnected,
   };
@@ -403,7 +403,7 @@ try {
     // `http://0.0.0.0:<port>` the moment it was not.
     assert.equal(body.daemon.baseUrl, `http://127.0.0.1:${serverHandle.port}`);
     assert.ok(body.daemon.uptimeSeconds >= 4, "uptime should reflect the seeded 5s start");
-    assert.equal(body.relay.url, "https://app.easytransnote.com");
+    assert.equal(body.relay.url, "https://app-server.easytransnote.com");
     assert.equal(body.relay.connected, false);
     assert.equal(body.proxy.state, "not-installed");
     assert.equal(body.proxy.port, null);
@@ -1851,6 +1851,34 @@ try {
     assert.equal(response.status, 200);
     assert.equal(response.body.conversation.conversation_id, "lookup-old-conversation");
     assert.equal(response.body.conversation.native_session_id, "native-old");
+  }
+
+  // Catalog history and paginated views also fill missing native titles even
+  // before /agent/local/sessions is requested.
+  {
+    const transcriptDir = join(home, "late-claude-transcripts");
+    mkdirSync(transcriptDir, { recursive: true });
+    const lateTranscript = join(transcriptDir, "late-claude.jsonl");
+    writeFileSync(lateTranscript, JSON.stringify({ type: "ai-title", aiTitle: "History native title" }));
+    agentCatalog.nextTitleProbeAt = 0;
+    agentCatalog.upsertSession({
+      sessionId: "history-late-session",
+      conversationId: "history-late-conv",
+      runId: "history-late-run",
+      agent: "claude",
+      nativeSessionId: "native-history-late",
+      status: "completed",
+      startedAt: "2026-11-26T00:00:00Z",
+      transcriptPath: lateTranscript,
+    });
+    const listResp = await getJson("/agent/catalog/conversations");
+    assert.equal(listResp.status, 200);
+    const listMatch = listResp.body.conversations.find((c) => c.conversation_id === "history-late-conv");
+    assert.equal(listMatch?.title, "History native title");
+    const pageResp = await getJson("/agent/catalog/conversations?view=history&page_size=50&auto_archive_days=0");
+    assert.equal(pageResp.status, 200);
+    const pageMatch = pageResp.body.conversations.find((c) => c.conversation_id === "history-late-conv");
+    assert.equal(pageMatch?.title, "History native title");
   }
 
   console.log("local api smoke ok");

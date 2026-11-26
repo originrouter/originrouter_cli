@@ -7,12 +7,14 @@ import {
   defaultConversationTitle,
   looksLikePlaceholderTitle,
   parseClaudeTitleRecords,
+  readAgyConversationName,
   readAgentSessionTitle,
   readClaudeTranscriptTitle,
   readCodexThreadTitle,
   resolveConversationTitle,
   safeTitleText,
 } from "../src/agent/agentTitleSource.js";
+import Database from "better-sqlite3";
 import { AgentCatalog } from "../src/persistence/agentCatalog.js";
 import { ExternalAgentRegistry } from "../src/local/externalAgentRegistry.js";
 
@@ -22,6 +24,7 @@ import { ExternalAgentRegistry } from "../src/local/externalAgentRegistry.js";
 // anything else again.
 assert.equal(defaultConversationTitle("claude"), "claude session");
 assert.equal(defaultConversationTitle("codex"), "codex session");
+assert.equal(defaultConversationTitle("agy"), "antigravity session");
 assert.equal(defaultConversationTitle(""), "agent session");
 
 // The set is relative to the agent: "Claude Code" is a placeholder for a
@@ -39,6 +42,15 @@ for (const [placeholder, agentType] of [
   ["Codex", "codex"],
   ["codex session", "codex"],
   ["Codex session", "codex"],
+  // agy's placeholder is written under its display name; the wire-id
+  // spelling stays in the set for rows written before the rename.
+  ["agy", "agy"],
+  ["agy session", "agy"],
+  ["agy code", "agy"],
+  ["antigravity", "agy"],
+  ["antigravity session", "agy"],
+  ["Antigravity session", "agy"],
+  ["antigravity code", "agy"],
 ]) {
   assert.equal(
     looksLikePlaceholderTitle(placeholder, agentType),
@@ -47,6 +59,7 @@ for (const [placeholder, agentType] of [
   );
 }
 assert.equal(looksLikePlaceholderTitle("Claude Code", "codex"), false);
+assert.equal(looksLikePlaceholderTitle("antigravity session", "claude"), false);
 assert.equal(looksLikePlaceholderTitle("Fix the checkout", "claude"), false);
 
 assert.equal(safeTitleText("  hello  "), "hello");
@@ -181,9 +194,9 @@ try {
     status: "running",
   });
   assert.equal(
-    catalog.getConversation("conversation-app").title,
-    "Claude Code",
-    "the placeholder is what the launcher asked for",
+    catalog.nativeTitleRowById("conversation-app").title,
+    "",
+    "an unnamed conversation is stored empty",
   );
   assert.equal(
     catalog.getConversation("conversation-app").title_is_custom,
@@ -231,9 +244,77 @@ try {
     runtime: "codex-app-server",
     status: "running",
   });
+  assert.equal(catalog.nativeTitleRowById("conversation-plain").title, "");
   assert.equal(catalog.getConversation("conversation-plain").title, "codex session");
 } finally {
   rmSync(stateDir, { recursive: true, force: true });
 }
 
+
+
+// A completed native run can receive its title after the activity cursor passed it.
+{
+  const dir = mkdtempSync(join(tmpdir(), "or-late-title-"));
+  const catalog = new AgentCatalog({ stateDir: dir });
+  try {
+    const transcriptPath = join(dir, "thread.jsonl");
+    writeFileSync(transcriptPath, JSON.stringify({ type: "ai-title", aiTitle: "Late title" }));
+    catalog.upsertSession({ agent: "claude", sessionId: "late", nativeSessionId: "native-late",
+      status: "stopped", transcriptPath });
+    const before = catalog.getConversation("late");
+    catalog.db.prepare("DELETE FROM agent_catalog_insert_queue").run();
+    await catalog.refreshMissingNativeTitles();
+    const after = catalog.getConversation("late");
+    assert.equal(after.title, "Late title");
+    assert.equal(after.last_activity_at, before.last_activity_at);
+    assert.equal(after.title_is_custom, false);
+    assert.deepEqual(catalog.listPendingCatalogInserts().map(row => row.conversation_id), ["late"]);
+  } finally { catalog.close(); rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const home = mkdtempSync(join(tmpdir(), "or-native-title-"));
+  try {
+    const dir = join(home, ".gemini", "antigravity-cli");
+    mkdirSync(join(dir, "cache"), { recursive: true });
+    writeFileSync(join(dir, "cache", "conversation_metadata.json"), JSON.stringify({
+      conversations: { one: { summary: { Title: "", Preview: "Opening preview" } } },
+    }));
+    const db = new Database(join(dir, "conversation_summaries.db"));
+    db.exec("CREATE TABLE conversation_summaries(conversation_id, title, preview)");
+    db.prepare("INSERT INTO conversation_summaries VALUES (?, ?, ?)").run("one", "", "Opening preview");
+    assert.deepEqual(readAgyConversationName("one", home), { title: "", preview: "Opening preview" });
+    db.prepare("UPDATE conversation_summaries SET title = ?").run("   ");
+    assert.deepEqual(readAgyConversationName("one", home), { title: "", preview: "Opening preview" });
+    db.prepare("UPDATE conversation_summaries SET title = ?").run("agy session");
+    assert.deepEqual(readAgyConversationName("one", home), { title: "", preview: "Opening preview" });
+    db.prepare("UPDATE conversation_summaries SET title = ?").run("Native name");
+    assert.equal(readAgyConversationName("one", home).title, "Native name");
+    db.close();
+    const codex = new Database(join(home, "state_5.sqlite"));
+    codex.exec("CREATE TABLE threads(id, title)");
+    codex.prepare("INSERT INTO threads VALUES (?, ?)").run("one", "Thread from native store");
+    codex.close();
+    assert.equal(readCodexThreadTitle("one", { codexHome: home }), "Thread from native store");
+
+    // Bidirectional sync: Claude custom-title takes precedence over ai-title
+    // and writeNativeConversationTitle updates Claude/Codex native stores while
+    // safely declining direct DB mutation for agy.
+    assert.equal(
+      parseClaudeTitleRecords([
+        JSON.stringify({ type: "ai-title", aiTitle: "Auto title" }),
+        JSON.stringify({ type: "custom-title", customTitle: "User rename", sessionId: "cl-1" }),
+        JSON.stringify({ type: "ai-title", aiTitle: "Later auto title" }),
+      ].join("\n")),
+      "User rename",
+    );
+    const claudeFile = join(home, "claude-session.jsonl");
+    writeFileSync(claudeFile, [
+      JSON.stringify({ type: "custom-title", customTitle: "Chosen" }),
+      JSON.stringify({ type: "user", message: "x".repeat(200_000) }),
+      JSON.stringify({ type: "ai-title", aiTitle: "Automatic" }),
+    ].join("\n"));
+    assert.equal(readClaudeTranscriptTitle(claudeFile), "Chosen");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
 console.log("agent title source tests ok");

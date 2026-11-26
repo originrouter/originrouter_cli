@@ -1,3 +1,4 @@
+import { DEFAULT_RELAY_URL, currentControlUrl } from "../constants.js";
 import {
   assertCompatibilityEngineRange,
   installSignedCompatibilityPack,
@@ -9,7 +10,7 @@ import {
 import { trustedCompatibilityKeys } from "./trustedKeys.js";
 
 export const DEFAULT_COMPATIBILITY_PACK_URL =
-  "https://app.easytransnote.com/public/v1/compatibility/patches/latest";
+  `${DEFAULT_RELAY_URL}/public/v1/compatibility/patches/latest`;
 const MAX_PACK_BYTES = 8 * 1024 * 1024;
 
 async function readLimitedBody(response) {
@@ -65,7 +66,7 @@ async function requestCompatibilityPack({
       : null)
     : previousMetadata.latest_etag;
   if (conditionalEtag) headers["If-None-Match"] = conditionalEtag;
-  const response = await fetchFn(url, { headers, signal: AbortSignal.timeout(10_000) });
+  const response = await fetchFn(currentControlUrl(url), { headers, signal: AbortSignal.timeout(10_000) });
   if (response.status === 304) {
     const active = loadActiveCompatibilityPack(stateDir);
     const latestRevision = Number(previousMetadata.latest_revision || active?.revision || 0) || null;

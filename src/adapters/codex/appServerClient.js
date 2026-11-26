@@ -200,6 +200,7 @@ export class CodexAppServerClient {
       this.eventHandler?.({ type: "codex.stderr", data: data.toString("utf8") });
     });
 
+    this.child.on("error", () => this._handleChildExit({ code: null, signal: null, epoch }));
     this.child.on("exit", (code, signal) => {
       if (!this._isCurrentEpoch(epoch)) return;
       this._handleChildExit({ code, signal, epoch });

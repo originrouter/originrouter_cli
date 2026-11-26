@@ -1,5 +1,5 @@
 {
-  "contract_version": "2026-11-06.1",
+  "contract_version": "2026-11-26.1",
   "about": [
     "The rules that decide what a conversation is called, and which row holds it.",
     "",
@@ -26,6 +26,11 @@
     "normalise it away at the boundary instead of answering it here."
   ],
   "placeholders": [
+    {"agent_type": "agy", "title": "agy session", "is_placeholder": true},
+    {"agent_type": "agy", "title": "  AntiGravity Session ", "is_placeholder": true},
+    {"agent_type": "agy", "title": "Antigravity", "is_placeholder": true},
+    {"agent_type": "agy", "title": "Antigravity Code", "is_placeholder": true},
+    {"agent_type": "claude", "title": "Antigravity session", "is_placeholder": false},
     {"agent_type": "claude", "title": "agent session", "is_placeholder": true},
     {"agent_type": "claude", "title": "Agent Session", "is_placeholder": true},
     {"agent_type": "claude", "title": "  agent session  ", "is_placeholder": true},
@@ -46,6 +51,18 @@
     {"agent_type": "codex", "title": "claude session", "is_placeholder": false}
   ],
   "title_merges": [
+    {
+      "name": "re-registering Antigravity preserves its native title",
+      "existing": {"title": "Native title", "is_custom": false, "agent_type": "agy"},
+      "incoming": {"title": "antigravity session", "is_custom": false, "agent_type": "agy"},
+      "expected": {"title": "Native title", "is_custom": false}
+    },
+    {
+      "name": "a reader may name an Antigravity conversation after the agent",
+      "existing": {"title": "Antigravity session", "is_custom": true, "agent_type": "agy"},
+      "incoming": {"title": "Native title", "is_custom": false, "agent_type": "agy"},
+      "expected": {"title": "Antigravity session", "is_custom": true}
+    },
     {
       "name": "the report wins between two names",
       "existing": {"title": "Refactor the parser", "is_custom": false, "agent_type": "claude"},

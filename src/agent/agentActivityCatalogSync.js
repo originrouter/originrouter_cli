@@ -5,7 +5,9 @@ import { accountSelectionRoot } from "../persistence/accounts.js";
 // existing conversations are replayed once and receive workspace_display_path
 // and the link to the session their current run belongs to.
 const SYNC_META_KEY = "agent_activity_cloud_sync_v5";
-const REPAIR_META_KEY = "agent_activity_missing_backfill_v1";
+// Replay existing rows once for servers that stored the Antigravity placeholder
+// over a native title. Insert-only backfill preserves named and renamed rows.
+const REPAIR_META_KEY = "agent_activity_missing_backfill_v3";
 const PREVIEW_SCHEDULER_KEY = "agent_activity_preview_scheduler_v1";
 const PAGE_SIZE = 200;
 const REPAIR_BATCH_SIZE = 50;
@@ -179,7 +181,7 @@ export function agentActivityMetadataFromCatalog(conversation = {}) {
     sessionId: safeText(conversation.session_id, 64),
     agentType: safeText(conversation.agent_type, 32) || "unknown",
     nativeSessionId: safeText(conversation.native_session_id, 191),
-    title: safeText(conversation.title, 191) || "Agent session",
+    title: safeText(conversation.title, 191),
     // Whether a person chose this title. A title the agent produced is not
     // one, and must never displace a rename on the server either.
     titleIsCustom: conversation.title_is_custom === true,
@@ -244,6 +246,7 @@ export async function syncAgentActivityCatalog({
   // Bind credentials to the catalog selected at construction, not a new
   // active account that may appear before the daemon's restart timer fires.
   stateDir = catalog.stateDir || stateDir;
+  await catalog.refreshMissingNativeTitles?.();
   const previousCursor = readCursor(catalog);
   if (!previousCursor && !catalog?.getMeta?.(REPAIR_META_KEY)) {
     // Even if the first normal sync is interrupted, the corrected cursor

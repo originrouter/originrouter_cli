@@ -35,7 +35,7 @@ test('legacy agy repair requires process evidence and preserves runs, artifacts 
     c.db.prepare("DELETE FROM catalog_meta WHERE key = 'agy_conversation_identity_v2'").run();
     c.db.prepare('DELETE FROM agent_catalog_insert_queue').run();
     c.setMeta('agent_activity_cloud_sync_v5', JSON.stringify({ cursor: '2099-01-01T00:00:00Z' }));
-    c.setMeta('agent_activity_missing_backfill_v1', JSON.stringify({ done: true }));
+    c.setMeta('agent_activity_missing_backfill_v3', JSON.stringify({ done: true }));
     repairAgyCatalog(c, { home });
     repairAgyCatalog(c, { home });
     const owner = c.getConversation('owner');

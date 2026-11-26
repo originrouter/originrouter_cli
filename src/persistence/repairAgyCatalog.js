@@ -2,7 +2,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { AgyConversationLog } from '../adapters/agy/conversationLog.js';
 import { agyTranscriptPath } from '../adapters/agy/history.js';
-import { looksLikePlaceholderTitle, readAgyTitles } from '../agent/agentTitleSource.js';
+import { looksLikePlaceholderTitle, readAgyConversationName } from '../agent/agentTitleSource.js';
 
 // Old wrappers could put a finished run back under its launch label. Recover
 // only from the run's own PID, time interval and a single foreground identity.
@@ -52,11 +52,11 @@ export function repairAgyCatalog(catalog, { home = homedir() } = {}) {
     for (const { source, owner } of vacated) catalog.foldVacatedConversation(source, owner);
     const rows = db.prepare("SELECT conversation_id, native_session_id, title FROM agent_conversations WHERE agent_type = 'agy' AND native_session_id <> '' AND title_is_custom = 0").all();
     if (rows.length) {
-      const titles = readAgyTitles(home);
       const rename = db.prepare('UPDATE agent_conversations SET title = ? WHERE conversation_id = ?');
       for (const row of rows) {
-        const title = titles.get(row.native_session_id);
-        if (title && looksLikePlaceholderTitle(row.title, 'agy')) {
+        if (!looksLikePlaceholderTitle(row.title, 'agy')) continue;
+        const { title } = readAgyConversationName(row.native_session_id, home);
+        if (title) {
           rename.run(title, row.conversation_id);
           db.prepare("INSERT INTO agent_catalog_insert_queue(conversation_id) VALUES (?)").run(row.conversation_id);
         }

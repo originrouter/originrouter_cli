@@ -1,3 +1,4 @@
+import { renameNativeTitle } from "../agent/nativeTitleProvider.js";
 import { NativeModelControl } from './nativeModelControl.js';
 import { RuntimeOutputSampler, claudeStreamPart } from "./runtimeOutputSampler.js";
 import { createAgentPermissionStateTracker } from "./agentPermissionStateTracker.js";
@@ -527,6 +528,7 @@ export async function runClaudeSdkSession(rawArgs) {
     ? ""
     : String(options.title || "").trim().slice(0, 191);
   let agentTitle = "";
+  let titleIsCustom = false;
   const sessionTitle = () =>
     agentTitle || requestedTitle || defaultConversationTitle("claude");
   const initialMessage = safeLaunchMessage(options.initialMessage);
@@ -693,7 +695,7 @@ export async function runClaudeSdkSession(rawArgs) {
         title: sessionTitle(),
         // The agent's title is not a title somebody chose. It may be replaced
         // by a better one, and it must never displace a rename.
-        titleIsCustom: false,
+        titleIsCustom,
         status,
         workspaceId: options.workspaceId,
         workspaceName: basename(cwd),
@@ -712,11 +714,14 @@ export async function runClaudeSdkSession(rawArgs) {
 
   // The agent's name, once it has one, has to reach the local catalog as
   // well: the desktop's rail reads it from there, not from the cloud.
-  const publishAgentTitle = async () => {
+  const publishAgentTitle = async ({ force = false } = {}) => {
     const before = agentTitle;
-    refreshAgentTitle();
-    if (!agentTitle || agentTitle === before) return;
-    await localAgentBridge?.update({ title: sessionTitle() });
+    if (!force) refreshAgentTitle();
+    if (!agentTitle || (!force && agentTitle === before)) return;
+    await localAgentBridge?.update({
+      title: sessionTitle(),
+      ...(titleIsCustom ? { titleIsCustom: true } : {}),
+    });
     await syncCatalog("running");
   };
 
@@ -1490,6 +1495,24 @@ export async function runClaudeSdkSession(rawArgs) {
         await sendAgentEvent(commandResult(command, {
           accepted: true, action: "diff", data: result,
         }));
+        return true;
+      }
+      case "rename": {
+        const nextTitle = String(command.args || "").trim().slice(0, 191);
+        if (!nextTitle) {
+          await sendAgentEvent(commandResult(command, {
+            accepted: false, reason: "missing_name",
+          }));
+          return false;
+        }
+        if (!await renameNativeTitle({ agent_type: "claude", native_session_id: claudeSessionId }, nextTitle)) {
+          await sendAgentEvent(commandResult(command, { accepted: false, reason: "native_rename_failed" }));
+          return false;
+        }
+        titleIsCustom = true;
+        agentTitle = nextTitle;
+        await publishAgentTitle({ force: true });
+        await sendAgentEvent(commandResult(command, { accepted: true }));
         return true;
       }
       default: {

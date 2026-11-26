@@ -37,9 +37,28 @@ export function agyTranscriptRows(text) {
 
 export function agyTranscriptItems(text, { includeToolStarts = true } = {}) {
   const rows = agyTranscriptRows(text);
+  const sortedRows = [...rows.values()].sort((a, b) => a.step_index - b.step_index);
+  // Pre-pair completed GENERIC result rows with their PLANNER_RESPONSE tool
+  // calls in FIFO order so history renders use the exact same deterministic
+  // `step-${step_index}` callId as live hooks and live scans.
+  const pairedCallIds = new Map();
+  if (includeToolStarts) {
+    const pendingSlots = [];
+    for (const row of sortedRows) {
+      if (row.status && !['DONE', 'ERROR'].includes(row.status)) continue;
+      if (row.type === 'PLANNER_RESPONSE') {
+        for (const [index] of (Array.isArray(row.tool_calls) ? row.tool_calls : []).entries()) {
+          pendingSlots.push(`${row.step_index}:${index}`);
+        }
+      } else if (row.type === 'GENERIC') {
+        const slot = pendingSlots.shift();
+        if (slot) pairedCallIds.set(slot, `step-${row.step_index}`);
+      }
+    }
+  }
   const items = [], tools = [];
   let sampledTokens = 0;
-  for (const row of [...rows.values()].sort((a, b) => a.step_index - b.step_index)) {
+  for (const row of sortedRows) {
     if (row.status && !['DONE', 'ERROR'].includes(row.status)) continue;
     const base = { id: `agy-step-${row.step_index}`, sequence: row.step_index,
       createdAt: row.created_at, timestamp: row.created_at };
@@ -52,7 +71,8 @@ export function agyTranscriptItems(text, { includeToolStarts = true } = {}) {
       if (typeof row.thinking === 'string' && row.thinking) eventItem(':thinking', { type: 'agent.thinking', provider: 'agy', text: row.thinking.slice(0, 64000) });
       if (row.content) items.push({ ...base, role: 'assistant', text: String(row.content), model: row.model });
       for (const [index, tool] of (Array.isArray(row.tool_calls) ? row.tool_calls : []).entries()) {
-        const callId = tool.id || `${base.id}:tool-${index}`;
+        const callId = (includeToolStarts && pairedCallIds.get(`${row.step_index}:${index}`))
+          || tool.id || `${base.id}:tool-${index}`;
         tools.push(callId);
         if (includeToolStarts) eventItem(`:tool-${index}`, { type: 'agent.tool_call.start', provider: 'agy', callId,
           tool: tool.name || 'Tool', input: displaySafeToolInput(tool.args) });

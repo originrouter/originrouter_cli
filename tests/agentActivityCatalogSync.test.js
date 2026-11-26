@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentCatalog } from "../src/persistence/agentCatalog.js";
@@ -344,7 +344,7 @@ test("an unavailable preview row does not starve another conversation or reorder
   const catalog = new AgentCatalog({ stateDir });
   try {
     catalog.setMeta("agent_activity_cloud_sync_v5", JSON.stringify({ cursor: "2099-01-01T00:00:00.000Z\u0000z" }));
-    catalog.setMeta("agent_activity_missing_backfill_v1", JSON.stringify({ done: true, cursor: "" }));
+    catalog.setMeta("agent_activity_missing_backfill_v3", JSON.stringify({ done: true, cursor: "" }));
     for (const id of ["blocked", "ready"]) {
       catalog.upsertSession({ sessionId: id, conversationId: id, runId: id, agent: "claude", startedAt: "2025-01-01T00:00:00.000Z" });
     }
@@ -373,7 +373,7 @@ test("preview scheduler advances across batches of unavailable conversations", a
   let catalog = new AgentCatalog({ stateDir });
   try {
     catalog.setMeta("agent_activity_cloud_sync_v5", JSON.stringify({ cursor: "2099-01-01T00:00:00.000Z\u0000z" }));
-    catalog.setMeta("agent_activity_missing_backfill_v1", JSON.stringify({ done: true, cursor: "" }));
+    catalog.setMeta("agent_activity_missing_backfill_v3", JSON.stringify({ done: true, cursor: "" }));
     for (let index = 0; index < 56; index++) {
       const id = `row-${String(index).padStart(2, "0")}`;
       catalog.upsertSession({ sessionId: id, conversationId: id, runId: id,
@@ -403,7 +403,7 @@ test("late old inserts are durably backfilled without changing existing cloud ro
   let catalog = new AgentCatalog({ stateDir });
   try {
     catalog.setMeta("agent_activity_cloud_sync_v5", JSON.stringify({ cursor: "2099-01-01T00:00:00.000Z\u0000z" }));
-    catalog.setMeta("agent_activity_missing_backfill_v1", JSON.stringify({ done: true, cursor: "" }));
+    catalog.setMeta("agent_activity_missing_backfill_v3", JSON.stringify({ done: true, cursor: "" }));
     catalog.upsertSession({ sessionId: "old-session", conversationId: "old", runId: "old-run",
       agent: "claude", title: "Old local title", startedAt: "2020-01-01T00:00:00Z" });
     catalog.close();
@@ -437,7 +437,7 @@ test("the durable insert queue is bounded and excludes collaboration workers", a
   const catalog = new AgentCatalog({ stateDir });
   try {
     catalog.setMeta("agent_activity_cloud_sync_v5", JSON.stringify({ cursor: "2099-01-01T00:00:00.000Z\u0000z" }));
-    catalog.setMeta("agent_activity_missing_backfill_v1", JSON.stringify({ done: true, cursor: "" }));
+    catalog.setMeta("agent_activity_missing_backfill_v3", JSON.stringify({ done: true, cursor: "" }));
     catalog.upsertSession({ sessionId: "collab-worker", conversationId: "worker", runId: "acr_worker",
       agent: "claude", startedBy: "collaboration-runtime", startedAt: "2020-01-01T00:00:00Z" });
     for (let i = 0; i < 51; i++) {
@@ -551,4 +551,87 @@ test("a conversation with a link and no text is still reported", async () => {
   assert.equal(result.synced, 1);
   assert.equal(result.skipped, 0);
   assert.equal(reported[0].sessionId, "ags_9F3kQ2");
+});
+
+test("backfilling an unnamed agy opening preview queues insert backfill for empty cloud rows", async () => {
+  const home = mkdtempSync(join(tmpdir(), "originrouter-agy-preview-home-"));
+  const stateDir = join(home, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const prevHome = process.env.HOME;
+  process.env.HOME = home;
+  const agyDir = join(home, ".gemini", "antigravity-cli");
+  mkdirSync(join(agyDir, "cache"), { recursive: true });
+  writeFileSync(join(agyDir, "cache", "conversation_metadata.json"), JSON.stringify({
+    conversations: {
+      "native-agy-preview": { summary: { Title: "", Preview: "Opening agy question" } },
+    },
+  }));
+  const catalog = new AgentCatalog({ stateDir });
+  try {
+    catalog.setMeta("agent_activity_cloud_sync_v5", JSON.stringify({ cursor: "2099-01-01T00:00:00.000Z\u0000z" }));
+    catalog.setMeta("agent_activity_missing_backfill_v3", JSON.stringify({ done: true, cursor: "" }));
+    catalog.upsertSession({
+      sessionId: "agy-s1",
+      conversationId: "agy-c1",
+      runId: "agy-r1",
+      agent: "agy",
+      nativeSessionId: "native-agy-preview",
+      status: "completed",
+      startedAt: "2025-01-01T00:00:00.000Z",
+    });
+    catalog.db.prepare("DELETE FROM agent_catalog_insert_queue").run();
+    const inserts = [];
+    await syncAgentActivityCatalog({
+      catalog,
+      stateDir,
+      reportFn: async (payload, options) => {
+        if (options?.insertOnly) inserts.push(payload);
+        return { ok: true };
+      },
+      reconcileFn: async () => ({ ok: true }),
+    });
+    assert.equal(inserts.length, 1);
+    assert.equal(inserts[0].conversationId, "agy-c1");
+    assert.equal(inserts[0].firstPromptPreview, "Opening agy question");
+  } finally {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    catalog.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a completed v2 catalog replays native names once without changing activity", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "originrouter-title-upgrade-"));
+  let catalog = new AgentCatalog({ stateDir });
+  try {
+    const run = { sessionId: "old-agy", agent: "agy", nativeSessionId: "native-old" };
+    catalog.upsertSession({ ...run, title: "Native name", titleIsCustom: false });
+    catalog.recordEvent(run.sessionId, { type: "user.text", text: "Next user message" });
+    catalog.upsertSession(run);
+    const before = catalog.getConversation(run.sessionId);
+    assert.equal(before.title, "Native name");
+    catalog.setMeta("agent_activity_cloud_sync_v5", JSON.stringify({ cursor: before.last_activity_at + "\u0000z" }));
+    catalog.setMeta("agent_activity_missing_backfill_v2", JSON.stringify({ done: true }));
+    catalog.db.exec("DELETE FROM agent_catalog_insert_queue");
+    catalog.close();
+    catalog = new AgentCatalog({ stateDir });
+
+    const reports = [];
+    const sync = () => syncAgentActivityCatalog({
+      catalog,
+      reportFn: async (payload, options) => {
+        reports.push({ title: payload.title, insertOnly: options.insertOnly });
+        return { ok: true };
+      },
+      reconcileFn: async () => ({ ok: true }),
+    });
+    assert.equal((await sync()).scanned, 0);
+    await sync();
+    assert.deepEqual(reports, [{ title: "Native name", insertOnly: true }]);
+    assert.equal(catalog.getConversation(run.sessionId).last_activity_at, before.last_activity_at);
+  } finally {
+    catalog.close();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
 });

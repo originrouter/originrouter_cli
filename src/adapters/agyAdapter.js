@@ -118,10 +118,7 @@ export class AgyAdapter extends TerminalAdapter {
       this.seedTranscript(bytes, stat, launch);
       this.baselinePending = false;
       const model = agyTranscriptModel(bytes.toString('utf8'));
-      if (model && model !== this.model) {
-        this.model = model;
-        if (!launch) this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
-      }
+      this.observeInvocationModel(model, { publish: !launch });
     } catch { /* A fresh or partially written transcript is picked up by the next scan. */ }
   }
 
@@ -158,7 +155,6 @@ export class AgyAdapter extends TerminalAdapter {
   resetScreen(cols = 100, rows = 30) {
     this.screen?.dispose(); this.ready = false; this.screenText = ''; this.state = 'starting';
     this.footerSelection = null;
-    this.footerDisplayName = null;
     this.checkingNativeVersion = true;
     this.nativeInput = null; this.terminalResponses = null;
     this.userTyping = false; this.localTextAwaitingEcho = false;
@@ -334,11 +330,7 @@ export class AgyAdapter extends TerminalAdapter {
       this.bindNativeConversation(nativeId);
     }
     if (this.switchTarget) return false;
-    if (payload.modelName && (this.model !== payload.modelName || this.footerDisplayName)) {
-      this.footerDisplayName = null;
-      this.footerSelection = null;
-      this.model = payload.modelName; this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
-    }
+    this.observeInvocationModel(payload.modelName);
     if (payload.hookEventName === 'PreInvocation') {
       this.everInvoked = true;
       if (this.inFlightMessage?.isCommand) { clearTimeout(this.inFlightMessage.timer); this.inFlightMessage = null; this.saveQueue(); }
@@ -423,17 +415,17 @@ export class AgyAdapter extends TerminalAdapter {
     const footer = agyFooterConfiguration(this.models, text);
     const header = text.split('\n').find(line => /^\s*▀{8}\s+/.test(line));
     const headerModel = header && (Array.isArray(this.models) ? this.models : []).find(m => header.trim().endsWith(m.displayName));
-    if (!footer?.model && headerModel && this.model !== headerModel.id && state === 'idle') {
+    if (!footer && !this.footerSelection && headerModel && this.model !== headerModel.id && state === 'idle') {
       this.model = headerModel.id; this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
     }
     if (footer) {
-      const changedDisplay = footer.name !== this.footerSelection?.name || footer.effort !== this.footerSelection?.effort;
+      const model = footer.model || footer.name;
+      const changed = model !== this.model || footer.effort !== this.footerSelection?.effort;
       this.footerSelection = footer;
-      if (changedDisplay || footer.model) this.footerDisplayName = footer.model ? null : footer.name;
-      if (changedDisplay) this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
+      this.model = model;
+      if (changed) this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
       this.autoModeAvailable ||= footer.mode === 'auto';
       if (this.mode !== footer.mode) { this.mode = footer.mode; this.pendingEvents.push(this.modeStatusEvent()); }
-      if (footer.model && this.model !== footer.model) { this.model = footer.model; this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent()); }
     }
   }
   handleOutput(data) { if (!this.disposed) this.screen.write(data); return []; }
@@ -444,6 +436,24 @@ export class AgyAdapter extends TerminalAdapter {
       await sleep(40);
     }
     return false;
+  }
+  async renameWhenIdle(nativeId, title, isCurrent = () => true) {
+    await this.screen?.flush;
+    this.observeConversationLog();
+    if (!nativeId || this.nativeSessionId !== nativeId || !title || /[\x00-\x1f\x7f-\x9f]/.test(title)
+        || this.state !== 'idle' || !this.ready || this.busy || this.userTyping || this.disposed
+        || this.switchTarget || this.reconfiguring || this.pendingConfiguration || this.inputTransaction
+        || this.inFlightMessage || this.messages.length || this.questions.size || this.hookServer?.pending.size
+        || !this.executor || !isCurrent()) return false;
+    this.inputTransaction = true;
+    try {
+      return (await this.executor.submitMessage(`/rename ${title}`)) !== false;
+    } catch {
+      return false;
+    } finally {
+      this.inputTransaction = false;
+      this.flushTransactionTail();
+    }
   }
   async submitRemoteMessage(executor, message, payload = {}) {
     await this.screen?.flush;
@@ -744,18 +754,27 @@ export class AgyAdapter extends TerminalAdapter {
     entry.done?.(accepted);
     this.pendingEvents.push({ type: 'agent.permission.resolved', provider: 'agy', callId: entry.id, reason });
   }
+  // A planner or executor can use a different model on every call within
+  // one Orchestrator session. Only use call metadata when no selection is known.
+  get sessionModel() { return this.model || this.launchSelection?.model || this.invocationModel || null; }
+  observeInvocationModel(model, { publish = true } = {}) {
+    if (typeof model !== 'string' || !model.trim()) return;
+    const previous = this.sessionModel;
+    this.invocationModel = model.trim();
+    if (publish && previous !== this.sessionModel) this.pendingEvents.push(this.modelStatusEvent(), this.effortStatusEvent());
+  }
   modelStatusEvent(extra = {}) { return { type: 'agent.model.status', provider: 'agy', runtime: this.describe().runtime,
-    sessionId: this.sessionId, model: this.footerDisplayName || this.model || this.launchSelection?.model || null, modelProvider: null, source: 'native',
+    sessionId: this.sessionId, model: this.sessionModel, modelProvider: null, source: 'native',
     modelControl: this.nativeMenus && this.models.length ? 'supported' : 'unsupported',
     availableModels: (Array.isArray(this.models) ? this.models : []).map(m => ({ ...m, provider: '', providerName: 'Antigravity' })),
     changeStrategy: 'restart_when_idle', ...extra }; }
   effortStatusEvent(extra = {}) {
-    const variants = agyEffortVariants(this.models, this.model);
+    const variants = agyEffortVariants(this.models, this.sessionModel);
     // The model id carries its level ('gemini-4-hydrogen-high'). When the
     // catalog is empty the variants cannot be matched, but the level is still
     // known — report it for display even though switching stays unsupported.
-    const effort = this.footerSelection?.effort || (!this.everInvoked && agyOption(this.args, '--effort')) || variants.find(v => v.model === this.model)?.effort
-      || String(this.model || '').match(/-(low|medium|high|xhigh|max)$/i)?.[1]?.toLowerCase()
+    const effort = this.footerSelection?.effort || (!this.everInvoked && agyOption(this.args, '--effort')) || variants.find(v => v.model === this.sessionModel)?.effort
+      || String(this.sessionModel || '').match(/-(low|medium|high|xhigh|max)$/i)?.[1]?.toLowerCase()
       || this.launchSelection?.effort || null;
     return { type: 'agent.effort.status', provider: 'agy', runtime: this.describe().runtime,
       effort,
@@ -777,7 +796,7 @@ export class AgyAdapter extends TerminalAdapter {
     return this.queueConfiguration({ model: payload.model, requestId: payload.requestId, kind: 'model' });
   }
   setEffort(payload) {
-    const variant = agyEffortVariants(this.models, this.model).find(v => v.effort === payload.effort);
+    const variant = agyEffortVariants(this.models, this.sessionModel).find(v => v.effort === payload.effort);
     return variant && this.nativeMenus ? this.queueConfiguration({ model: variant.model, requestId: payload.requestId, kind: 'effort' })
       : this.rejectConfiguration({ kind: 'effort', requestId: payload.requestId }, 'effort_control_unsupported');
   }
@@ -796,13 +815,16 @@ export class AgyAdapter extends TerminalAdapter {
     this.reconfiguring = true;
     try {
       this.hookServer.close(); await this.openBroker();
-      const targetModel = change.model || this.model;
+      // Only pass a model id back to the CLI. A footer can carry a display
+      // name before the catalog arrives, and a worker id is never a selection.
+      const targetModel = change.model || (this.footerSelection ? this.footerSelection.model : this.model);
       this.args = replaceAgyFlags(this.args, { conversation: this.nativeSessionId, model: targetModel, effort: null,
         ...(change.mode ? { mode: change.mode } : {}) });
-      this.model = null; this.busy = false;
+      this.launchSelection = agyLaunchSelection(this.args, this.home, this.cwd);
+      this.model = null; this.invocationModel = null; this.busy = false;
       const started = await this.executor.restart(this.buildLaunch());
       this.pendingEvents.push({ type: 'agent.process.restarted', provider: 'agy', pid: started.pid, epoch: this.epoch });
-      const accepted = await this.waitFor(() => this.ready && this.model === targetModel && (!change.mode || this.mode === change.mode), 30000);
+      const accepted = await this.waitFor(() => this.ready && (!targetModel || this.model === targetModel) && (!change.mode || this.mode === change.mode), 30000);
       this.pendingEvents.push(this.configurationStatus(change,
         { requestId: change.requestId, accepted, reason: accepted ? null : 'native_configuration_unconfirmed' }));
     } catch (error) {

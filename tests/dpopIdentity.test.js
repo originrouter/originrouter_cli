@@ -75,16 +75,16 @@ test("the public half can be derived from the private half", () => {
 
 test("the target URI drops the query and the fragment", () => {
   assert.equal(
-    dpopTargetUri("https://app.easytransnote.com/cli/v1/devices?page=2#top"),
-    "https://app.easytransnote.com/cli/v1/devices",
+    dpopTargetUri("https://app-server.easytransnote.com/cli/v1/devices?page=2#top"),
+    "https://app-server.easytransnote.com/cli/v1/devices",
   );
   assert.equal(
-    dpopTargetUri("https://app.easytransnote.com"),
-    "https://app.easytransnote.com/",
+    dpopTargetUri("https://app-server.easytransnote.com"),
+    "https://app-server.easytransnote.com/",
   );
   assert.equal(
-    dpopTargetUri("wss://app.easytransnote.com/relay/v1/devices/d1/ws"),
-    "wss://app.easytransnote.com/relay/v1/devices/d1/ws",
+    dpopTargetUri("wss://app-server.easytransnote.com/relay/v1/devices/d1/ws"),
+    "wss://app-server.easytransnote.com/relay/v1/devices/d1/ws",
   );
 });
 
@@ -95,7 +95,7 @@ test("a proof carries the header and the claims RFC 9449 asks for", () => {
     publicJwk: pair.publicJwk,
     accessToken: TOKEN,
     method: "post",
-    url: "https://app.easytransnote.com/cli/v1/dpop/proof",
+    url: "https://app-server.easytransnote.com/cli/v1/dpop/proof",
   });
   const parts = proof.split(".");
   assert.equal(parts.length, 3);
@@ -105,7 +105,7 @@ test("a proof carries the header and the claims RFC 9449 asks for", () => {
   assert.equal(header.alg, "EdDSA");
   assert.deepEqual(header.jwk, pair.publicJwk);
   assert.equal(payload.htm, "POST");
-  assert.equal(payload.htu, "https://app.easytransnote.com/cli/v1/dpop/proof");
+  assert.equal(payload.htu, "https://app-server.easytransnote.com/cli/v1/dpop/proof");
   assert.equal(payload.ath, createHash("sha256").update(TOKEN).digest("base64url"));
   assert.ok(Number.isInteger(payload.iat));
   assert.ok(payload.jti && payload.jti.length > 0);
@@ -119,7 +119,7 @@ test("the proof's signature verifies against the public key", () => {
     publicJwk: pair.publicJwk,
     accessToken: TOKEN,
     method: "GET",
-    url: "https://app.easytransnote.com/cli/v1/devices",
+    url: "https://app-server.easytransnote.com/cli/v1/devices",
   });
   const [headerPart, payloadPart, signaturePart] = proof.split(".");
   const valid = verify(
@@ -138,14 +138,14 @@ test("the proof is bound to the token it travels with", () => {
     publicJwk: pair.publicJwk,
     accessToken: TOKEN,
     method: "GET",
-    url: "https://app.easytransnote.com/cli/v1/devices",
+    url: "https://app-server.easytransnote.com/cli/v1/devices",
   });
   const two = dpopProof({
     privateJwk: pair.privateJwk,
     publicJwk: pair.publicJwk,
     accessToken: "or_at_another_token",
     method: "GET",
-    url: "https://app.easytransnote.com/cli/v1/devices",
+    url: "https://app-server.easytransnote.com/cli/v1/devices",
   });
   // The `ath` claim is what stops a proof being lifted from one request
   // onto another that carries a different token.
@@ -162,7 +162,7 @@ test("two proofs of the same request are not the same proof", () => {
     publicJwk: pair.publicJwk,
     accessToken: TOKEN,
     method: "GET",
-    url: "https://app.easytransnote.com/cli/v1/devices",
+    url: "https://app-server.easytransnote.com/cli/v1/devices",
   });
   const one = make();
   const two = make();
@@ -178,11 +178,11 @@ test("a proof needs both a key and a token", () => {
   assert.throws(() => dpopProof({
     publicJwk: pair.publicJwk,
     accessToken: TOKEN,
-    url: "https://app.easytransnote.com/cli/v1/devices",
+    url: "https://app-server.easytransnote.com/cli/v1/devices",
   }));
   assert.throws(() => dpopProof({
     privateJwk: pair.privateJwk,
     publicJwk: pair.publicJwk,
-    url: "https://app.easytransnote.com/cli/v1/devices",
+    url: "https://app-server.easytransnote.com/cli/v1/devices",
   }));
 });

@@ -136,7 +136,7 @@ import {
   detectNodePtyAvailability,
   detectTmuxAvailability,
 } from "./utils/detect.js";
-import { DEFAULT_DEVICE_ID, DEFAULT_EXECUTOR, DEFAULT_RELAY_URL, VERSION } from "./constants.js";
+import { DEFAULT_DEVICE_ID, DEFAULT_EXECUTOR, DEFAULT_RELAY_URL, VERSION, currentControlUrl } from "./constants.js";
 import {
   agentDetailDefaultFromConfig,
   setAgentDetailDefault,
@@ -1187,7 +1187,7 @@ async function handleEnvPrint(args) {
         try { return ensureDevice(); }
         catch { return { deviceId: DEFAULT_DEVICE_ID }; }
       })();
-      const relayUrl = process.env.ORIGINROUTER_RELAY || DEFAULT_RELAY_URL;
+      const relayUrl = currentControlUrl(process.env.ORIGINROUTER_RELAY || DEFAULT_RELAY_URL);
       if (stateDir) {
         remoteCodingProxyManager = new RemoteCodingProxyManager({
           stateDir,

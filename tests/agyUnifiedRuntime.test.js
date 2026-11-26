@@ -116,12 +116,14 @@ test('running transcript rows are not final tool results and ends key on the ste
   assert.equal(agyTranscriptItems(JSON.stringify(row)).length, 0);
   const items = agyTranscriptItems(JSON.stringify({ ...row, status: 'DONE', content: 'actual result' }), { includeToolStarts: false });
   assert.equal(items[0].event.callId, 'step-4'); assert.equal(items[0].event.content, 'actual result');
-  // History renders still pair the end with the planner's generated start.
-  const planner = { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', args: {} }] };
+  // Completed planner + result rows share the deterministic step id across
+  // history and live modes; an unmatched tool call keeps its planner id.
+  const planner = { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', args: {} }, { name: 'edit_file', args: {} }] };
   const history = agyTranscriptItems([planner, { ...row, status: 'DONE', content: 'x' }].map(JSON.stringify).join('\n'));
-  const start = history.find(i => i.event?.type === 'agent.tool_call.start');
+  const starts = history.filter(i => i.event?.type === 'agent.tool_call.start');
   const end = history.find(i => i.event?.type === 'agent.tool_call.end');
-  assert.equal(start.event.callId, 'agy-step-3:tool-0'); assert.equal(end.event.callId, 'agy-step-3:tool-0');
+  assert.equal(starts[0].event.callId, 'step-4'); assert.equal(end.event.callId, 'step-4');
+  assert.equal(starts[1].event.callId, 'agy-step-3:tool-1');
 });
 
 test('a resumed adapter re-emits nothing, then ends carry the deterministic step id', () => {
@@ -264,7 +266,7 @@ test('late binding baselines older rows while preserving the current turn', () =
     const events = a.scanStructuredEvents();
     assert.deepEqual(events.filter(e => e.eventId).map(e => e.text), ['current']);
     assert.equal(events.filter(e => e.type === 'agent.session.start').length, 1);
-    assert.equal(a.model, 'old-high');
+    assert.equal(a.modelStatusEvent().model, 'old-high');
     assert.deepEqual(a.scanStructuredEvents(), []);
     assert.deepEqual(readAgyConversationHistory(path).messages.map(m => m.sequence), [0, 1, 2, 3]);
   } finally { a.cleanup(); rmSync(home, { recursive: true, force: true }); }
@@ -342,6 +344,39 @@ test('selection is available without a catalog or a previous turn, and follows t
   } finally { a.cleanup(); rmSync(home, { recursive: true, force: true }); }
 });
 
+test('Orchestrator selection survives planner history, invocation hooks and terminal redraws', () => {
+  const home = fixture();
+  const path = agyTranscriptPath('resumed', home);
+  mkdirSync(dirname(path), { recursive: true });
+  const planner = 'gemini-4-neon-medium';
+  writeFileSync(path, JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', model: planner }));
+  const a = new AgyAdapter({ home, args: ['--conversation', 'resumed', '--settings',
+    JSON.stringify({ model: 'Orchestrator (Neon)', orchestrator: { planner: 'Gemini 4 Neon (Medium)' } })] });
+  const screen = name => '>\n────────────\n? for shortcuts   plan · ' + name + ' · medium';
+  const modelsSent = () => a.pendingEvents.splice(0).filter(e => e.type === 'agent.model.status').map(e => e.model);
+  try {
+    assert.equal(a.modelStatusEvent().model, 'Orchestrator (Neon)');
+    a.observeScreen(screen('Orchestrator (Neon)'));
+    modelsSent();
+    a.onHook({ hookEventName: 'PreInvocation', modelName: planner });
+    assert.equal(a.modelStatusEvent().model, 'Orchestrator (Neon)');
+    a.models = parseAgyModels('orchestrator\tOrchestrator (Neon)\n' + planner + '\tGemini 4 Neon (Medium)');
+    a.observeScreen(screen('Orchestrator (Neon)'));
+    assert.deepEqual(modelsSent(), ['orchestrator']);
+    for (const modelName of [planner, 'another-worker-high', planner]) {
+      a.onHook({ hookEventName: 'PreInvocation', modelName });
+      a.observeScreen(screen('Orchestrator (Neon)'));
+      assert.equal(a.modelStatusEvent().model, 'orchestrator');
+      assert.equal(a.effortStatusEvent().effort, 'medium');
+    }
+    assert.deepEqual(modelsSent(), []);
+    a.observeScreen(screen('Gemini 4 Neon'));
+    assert.deepEqual(modelsSent(), [planner]);
+    a.onHook({ modelName: 'another-worker-high' });
+    assert.equal(a.modelStatusEvent().model, planner);
+  } finally { a.cleanup(); rmSync(home, { recursive: true, force: true }); }
+});
+
 test('the native version discovered after process start also publishes attachment capabilities', async () => {
   const home = fixture();
   const a = new AgyAdapter({ home, loadCatalog: async () => ({ models: [], version: '1.5.16' }) });
@@ -397,4 +432,24 @@ test('a failed picker queue merge preserves both durable queues through shutdown
     assert.equal(old.read().pending.length, 16);
     assert.deepEqual(own.read().pending.map(m => m.id), ['new']);
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('title synchronization submits only to the idle owner and does not enqueue chat text', async () => {
+  const adapter = new AgyAdapter();
+  const sent = [];
+  Object.assign(adapter, { state: 'idle', ready: true, nativeSessionId: 'book',
+    executor: { async submitMessage(text) { sent.push(text); return true; } } });
+  for (const busy of ['busy', 'inputTransaction', 'userTyping', 'pendingConfiguration']) {
+    adapter[busy] = true;
+    assert.equal(await adapter.renameWhenIdle('book', 'Chosen'), false);
+    adapter[busy] = false;
+  }
+  assert.equal(await adapter.renameWhenIdle('different', 'Chosen'), false);
+  adapter.questions.set('confirmation', {});
+  assert.equal(await adapter.renameWhenIdle('book', 'Chosen'), false);
+  adapter.questions.clear();
+  assert.equal(await adapter.renameWhenIdle('book', 'Chosen'), true);
+  assert.deepEqual(sent, ['/rename Chosen']);
+  assert.deepEqual(adapter.messages, []);
+  assert(!adapter.pendingEvents.some(event => event.type === 'user.text'));
 });

@@ -1,7 +1,8 @@
+import { DEFAULT_RELAY_URL, currentControlUrl } from "../constants.js";
 import { accessTokenFor, OAUTH_RESOURCES } from "../runtime/authContract.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
 
-const DEFAULT_ENDPOINT = "https://app.easytransnote.com/ai/v1/collaboration/configurations";
+const DEFAULT_ENDPOINT = `${DEFAULT_RELAY_URL}/ai/v1/collaboration/configurations`;
 
 function clientError(code, message) {
   return Object.assign(new Error(message), { code });
@@ -14,7 +15,7 @@ export class CollaborationConfigurationClient {
     fetchFn = globalThis.fetch,
   } = {}) {
     this.stateDir = stateDir;
-    this.endpoint = endpoint.replace(/\/$/, "");
+    this.endpoint = currentControlUrl(endpoint).replace(/\/$/, "");
     this.fetchFn = fetchFn;
   }
 

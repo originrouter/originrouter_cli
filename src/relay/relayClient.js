@@ -257,6 +257,7 @@ export class RelayClient {
       ok: payload.accepted === true,
       accepted: payload.accepted === true,
       reason: String(payload.reason || ""),
+      ...(payload.recipients !== undefined ? { recipients: Number(payload.recipients) } : {}),
       via: "ws",
     });
     return true;

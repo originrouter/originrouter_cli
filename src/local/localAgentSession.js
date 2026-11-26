@@ -1,5 +1,6 @@
+import { renameNativeTitle } from "../agent/nativeTitleProvider.js";
 import { createAgentPermissionStateTracker } from "../runtime/agentPermissionStateTracker.js";
-import { AgentCatalog } from '../persistence/agentCatalog.js';
+import { AgentCatalog, isCurrentNativeRename } from '../persistence/agentCatalog.js';
 import { agyOption } from '../adapters/agy/nativeLaunch.js';
 import { findLiveAgySession } from '../adapters/agy/conversationLog.js';
 import { agyTranscriptPath } from '../adapters/agy/history.js';
@@ -134,6 +135,7 @@ import {
   permissionDecision,
 } from "./agentSessionPrimitives.js";
 import {
+  COMMAND_KIND_SLASH,
   buildCommandResultEvent,
   buildCommandsEvent,
   commandsForSession,
@@ -585,6 +587,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     ? ""
     : safeTitleText(options.title);
   let agentTitle = "";
+  let customTitleSet = false;
   const sessionTitle = () => agentTitle || requestedTitle || defaultConversationTitle(agent);
   let lastTitleProbeAt = 0;
   const refreshAgentTitle = ({ force = false } = {}) => {
@@ -1453,7 +1456,7 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       title: sessionTitle(),
       // The agent's title is not a title somebody chose. It may be replaced
       // by a better one, and it must never displace a rename.
-      titleIsCustom: false,
+      titleIsCustom: customTitleSet,
       status,
       workspaceId: options.workspaceId,
       workspaceName: basename(cwd),
@@ -1486,6 +1489,26 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
     if (await localAgentBridge?.update({ title }) || nativeCatalog) publishedTitle = title;
     await syncCatalog("running");
   };
+  const applyIncomingRename = async (payload, commandCtx) => {
+    const command = normalizeCommandPayload(payload);
+    if (command.kind !== COMMAND_KIND_SLASH || command.name !== "rename") return null;
+    const nextTitle = safeTitleText(command.args);
+    if (!nextTitle) {
+      commandCtx.commandRefusal = "missing_name";
+      return false;
+    }
+    const current = () => isCurrentNativeRename(relayAccount.stateDir, agent, nativeSessionId, nextTitle, payload);
+    if (!nativeSessionId) return false;
+    if (agent === "agy") return adapter.renameWhenIdle?.(nativeSessionId, nextTitle, current) ?? false;
+    if (!current()) return false;
+    if (!await renameNativeTitle({ agent_type: agent, native_session_id: nativeSessionId }, nextTitle)) return false;
+    customTitleSet = true;
+    agentTitle = nextTitle;
+    await localAgentBridge?.update({ title: nextTitle, titleIsCustom: true });
+    void syncCatalog("running");
+    return true;
+  };
+
   if (handoffNote) {
     process.stderr.write(`${handoffNote}\n`);
   }
@@ -1621,7 +1644,12 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
           applyEffort,
           sessionCommands,
         };
-        applied = await handleRemoteEvent(payload, commandCtx);
+        const renameApplied = payload?.type === "agent.command"
+          ? await applyIncomingRename(payload, commandCtx)
+          : null;
+        applied = renameApplied !== null
+          ? renameApplied
+          : await handleRemoteEvent(payload, commandCtx);
         if (payload?.type === "agent.command") {
           // Fold the primitives' own refusal word into the result emitted
           // below — a busy terminal says turn_in_progress, not unsupported.
@@ -1944,7 +1972,12 @@ export async function runLocalAgentSession(agent, rawArgs, { runtime: requestedR
       applyEffort,
       sessionCommands,
     };
-    const applied = await handleRemoteEvent(payload, commandCtx);
+    const renameApplied = payload?.type === "agent.command"
+      ? await applyIncomingRename(payload, commandCtx)
+      : null;
+    const applied = renameApplied !== null
+      ? renameApplied
+      : await handleRemoteEvent(payload, commandCtx);
     if (payload?.type === "agent.message") {
       const message = String(payload.message || "").replace(/[\r\n]+$/g, "");
       if (agent !== 'agy' && applied !== false && message) {

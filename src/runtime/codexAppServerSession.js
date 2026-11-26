@@ -15,7 +15,7 @@ import {
   safeTitleText,
 } from "../agent/agentTitleSource.js";
 import { applyConfiguredPricing } from "../collaboration/configuredPricing.js";
-import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
+import { workspaceDisplayPath, isCurrentNativeRename } from "../persistence/agentCatalog.js";
 import {
   findCodexTranscript,
   readCodexConversationHistory,
@@ -298,6 +298,7 @@ export async function runCodexAppServerSession(rawArgs) {
     ? ""
     : safeTitleText(options.title);
   let agentTitle = "";
+  let titleIsCustom = false;
   const sessionTitle = () => agentTitle || requestedTitle || "Codex session";
   const client = new CodexAppServerClient({
     // The RPC-level backstop for an unanswered approval, derived from the same
@@ -471,7 +472,7 @@ export async function runCodexAppServerSession(rawArgs) {
         title: sessionTitle(),
         // The agent's title is not a title somebody chose. It may be replaced
         // by a better one, and it must never displace a rename.
-        titleIsCustom: false,
+        titleIsCustom,
         status,
         workspaceId: options.workspaceId,
         workspaceName: basename(cwd),
@@ -499,7 +500,10 @@ export async function runCodexAppServerSession(rawArgs) {
   // The agent's name, once it has one, has to reach the local catalog as
   // well: the desktop's rail reads it from there, not from the cloud.
   const publishAgentTitle = async () => {
-    await localAgentBridge?.update({ title: sessionTitle() });
+    await localAgentBridge?.update({
+      title: sessionTitle(),
+      ...(titleIsCustom ? { titleIsCustom: true } : {}),
+    });
     await syncCatalog("running");
   };
 
@@ -1303,14 +1307,18 @@ export async function runCodexAppServerSession(rawArgs) {
         return true;
       }
       case "rename": {
-        if (!command.args || !threadId) {
+        const nextTitle = safeTitleText(command.args);
+        if (!nextTitle || !threadId) {
           await agentEventQueue.enqueue(commandResult(command, {
             accepted: false, reason: "missing_name",
           }));
           return false;
         }
-        await client.setThreadName(threadId, command.args);
-        if (setAgentTitle(command.args)) void publishAgentTitle();
+        if (!isCurrentNativeRename(relayAccount.stateDir, "codex", threadId, nextTitle, payload)) return false;
+        await client.setThreadName(threadId, nextTitle);
+        titleIsCustom = true;
+        setAgentTitle(nextTitle);
+        void publishAgentTitle();
         await agentEventQueue.enqueue(commandResult(command, { accepted: true }));
         return true;
       }

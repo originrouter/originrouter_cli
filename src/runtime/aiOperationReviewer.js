@@ -1,7 +1,8 @@
+import { DEFAULT_RELAY_URL, currentControlUrl } from "../constants.js";
 import { accessTokenFor, OAUTH_RESOURCES } from "./authContract.js";
 import { ensureFreshAccessToken } from "./oauthTokenRefresher.js";
 
-const DEFAULT_ENDPOINT = "https://app.easytransnote.com/ai/v1/ai-audit/reviews";
+const DEFAULT_ENDPOINT = `${DEFAULT_RELAY_URL}/ai/v1/ai-audit/reviews`;
 
 export class AiOperationReviewer {
   constructor({
@@ -11,7 +12,7 @@ export class AiOperationReviewer {
     onTelemetry = null,
   } = {}) {
     this.stateDir = stateDir;
-    this.endpoint = endpoint;
+    this.endpoint = currentControlUrl(endpoint);
     this.fetchFn = fetchFn;
     this.onTelemetry = onTelemetry;
   }

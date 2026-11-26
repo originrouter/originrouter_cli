@@ -3,7 +3,7 @@ import {
   prepareDeviceE2eeRotation,
   readDeviceE2eeIdentity,
 } from "../crypto/deviceE2eeIdentity.js";
-import { DEFAULT_ORIGINROUTER_CONTROL_BASE_URL } from "../config/providerRoutes.js";
+import { configuredControlBaseUrl } from "../config/providerRoutes.js";
 import { ensureDevice, ensureStateDir } from "../persistence/state.js";
 import { readCodingAuth } from "../persistence/codingAuth.js";
 import { ensureFreshAccessToken } from "../runtime/oauthTokenRefresher.js";
@@ -21,8 +21,7 @@ import {
 import qrcode from "qrcode-terminal";
 
 function controlBaseUrl() {
-  return process.env.ORIGINROUTER_CONTROL_BASE_URL ||
-    DEFAULT_ORIGINROUTER_CONTROL_BASE_URL;
+  return configuredControlBaseUrl();
 }
 
 async function credential(stateDir) {

@@ -1,12 +1,13 @@
+import { DEFAULT_RELAY_URL, currentControlUrl } from "../constants.js";
 import { accessTokenFor, OAUTH_RESOURCES } from "./authContract.js";
 import { ensureFreshAccessToken } from "./oauthTokenRefresher.js";
 
-const DEFAULT_ENDPOINT = "https://app.easytransnote.com/ai/v1/ai-audit/query-plan";
+const DEFAULT_ENDPOINT = `${DEFAULT_RELAY_URL}/ai/v1/ai-audit/query-plan`;
 
 export class AiAuditQueryPlanner {
   constructor({ stateDir, endpoint = process.env.ORIGINROUTER_AI_AUDIT_QUERY_URL || DEFAULT_ENDPOINT, fetchFn = globalThis.fetch, onTelemetry = null } = {}) {
     this.stateDir = stateDir;
-    this.endpoint = endpoint;
+    this.endpoint = currentControlUrl(endpoint);
     this.fetchFn = fetchFn;
     this.onTelemetry = onTelemetry;
   }

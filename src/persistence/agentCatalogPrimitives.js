@@ -1,3 +1,4 @@
+import { defaultConversationTitle } from "../agent/agentTitleSource.js";
 import { publicPermissionState } from "../runtime/agentPermissionState.js";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
@@ -170,7 +171,10 @@ function publicConversation(row) {
     session_id: row.session_id || "",
     agent_type: row.agent_type,
     native_session_id: row.native_session_id || "",
-    title: row.title,
+    // Older Apps require a nonempty string on the wire. The database keeps it empty.
+    title: row.title || defaultConversationTitle(row.agent_type),
+    title_revision: row.title_revision || 0,
+    title_sync_pending: Boolean(row.title_sync_pending || row.local_title_request),
     title_is_custom: Boolean(row.title_is_custom),
     summary: row.summary || "",
     first_prompt_preview: row.first_prompt_preview || "",

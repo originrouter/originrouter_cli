@@ -17,6 +17,7 @@
 // It does NOT exchange or refresh OAuth credentials, or perform
 // retries. Those are 9.1+ concerns.
 
+import { DEFAULT_RELAY_URL, currentControlUrl } from "../constants.js";
 import { PROVIDER_TYPE } from "./providers.js";
 import { CODEX_MAIN_ALIAS } from "./routes.js";
 
@@ -62,7 +63,11 @@ export const DEFAULT_ORIGINROUTER_BASE_URL = "https://api.easytransnote.com";
 // Stage 10: the unified App/CLI control plane. Keep this separate
 // from DEFAULT_ORIGINROUTER_BASE_URL so auth/control migration does
 // not accidentally move /coding/v1 model traffic.
-export const DEFAULT_ORIGINROUTER_CONTROL_BASE_URL = "https://app.easytransnote.com";
+export const DEFAULT_ORIGINROUTER_CONTROL_BASE_URL = DEFAULT_RELAY_URL;
+
+export function configuredControlBaseUrl() {
+  return currentControlUrl(process.env.ORIGINROUTER_CONTROL_BASE_URL || DEFAULT_ORIGINROUTER_CONTROL_BASE_URL);
+}
 
 // Browser authorization page opened during `originrouter login`.
 // Override via --login-url or ORIGINROUTER_LOGIN_URL.

@@ -10,7 +10,7 @@ test("local Relay mode never requests an OAuth token", async () => {
   let refreshCalls = 0;
   const plan = await buildAgentRelayPlan({
     stateDir: "/tmp/originrouter-relay-policy",
-    relayUrl: "https://app.easytransnote.com",
+    relayUrl: "https://app-server.easytransnote.com",
     fallbackDeviceId: "local-device",
     mode: "local",
     ensureFreshAccessTokenFn: async () => {
@@ -26,7 +26,7 @@ test("local Relay mode never requests an OAuth token", async () => {
 test("official Relay uses authenticated cloud when signed in", async () => {
   const plan = await buildAgentRelayPlan({
     stateDir: "/tmp/originrouter-relay-policy",
-    relayUrl: "https://app.easytransnote.com",
+    relayUrl: "https://app-server.easytransnote.com",
     fallbackDeviceId: "fallback-device",
     mode: "auto",
     ensureFreshAccessTokenFn: async () => ({
@@ -49,7 +49,7 @@ test("official Relay uses authenticated cloud when signed in", async () => {
 test("every official latency-selected Relay alias retains cloud authentication", async () => {
   const plan = await buildAgentRelayPlan({
     stateDir: "/tmp/originrouter-relay-policy",
-    relayUrl: "https://app.originrouter.com",
+    relayUrl: "https://app-server.originrouter.com",
     fallbackDeviceId: "fallback-device",
     mode: "auto",
     ensureFreshAccessTokenFn: async () => ({
@@ -70,7 +70,7 @@ test("every official latency-selected Relay alias retains cloud authentication",
 test("official Relay degrades to local-only when login is unavailable", async () => {
   const plan = await buildAgentRelayPlan({
     stateDir: "/tmp/originrouter-relay-policy",
-    relayUrl: "https://app.easytransnote.com",
+    relayUrl: "https://app-server.easytransnote.com",
     fallbackDeviceId: "local-device",
     mode: "auto",
     ensureFreshAccessTokenFn: async () => null,

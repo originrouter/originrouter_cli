@@ -15,6 +15,7 @@
 // to keep that order true when two writers meet.
 
 import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
+import Database from "better-sqlite3";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -27,9 +28,23 @@ const TAIL_BYTES = 128 * 1024;
 
 // A whole-file read is only worth it for a file small enough to be cheap.
 const FULL_READ_LIMIT = 4 * 1024 * 1024;
+const recentClaudeTitles = new Map();
 
 export function safeTitleText(value, maxLength = MAX_TITLE_LENGTH) {
   return String(value ?? "").trim().slice(0, maxLength);
+}
+
+/// The name a placeholder is written in, when it differs from the wire id.
+///
+/// `agy` is the runtime's id; the reader-facing name of the same agent is
+/// Antigravity, and a placeholder is a reader-facing string, so it is written
+/// with the display name — "antigravity session", not "agy session". Agents
+/// without an entry write the placeholder under their own id.
+const AGENT_PLACEHOLDER_NAMES = { agy: "antigravity" };
+
+function placeholderAgentName(agentType) {
+  const agent = safeTitleText(agentType, 32).toLowerCase() || "agent";
+  return AGENT_PLACEHOLDER_NAMES[agent] || agent;
 }
 
 /// The placeholder the system writes when it has no title to write.
@@ -38,8 +53,7 @@ export function safeTitleText(value, maxLength = MAX_TITLE_LENGTH) {
 /// agent rather than about the conversation — which is exactly why it must
 /// never be mistaken for a title the user chose.
 export function defaultConversationTitle(agentType) {
-  const agent = safeTitleText(agentType, 32) || "agent";
-  return `${agent} session`;
+  return `${placeholderAgentName(agentType)} session`;
 }
 
 /// Whether a title is one of our own placeholders rather than a real title.
@@ -49,14 +63,23 @@ export function defaultConversationTitle(agentType) {
 /// session". The last one used to be the whole list, which is how "Claude
 /// Code" — the agent's *name* in the title slot — came to be treated as a
 /// title the user had chosen, and could therefore never be replaced.
+///
+/// Two spellings count for an agent with a display name: rows written before
+/// the rename carry the wire id ("agy session"), rows written after carry the
+/// display name ("antigravity session"), and both are our placeholders —
+/// misreading either as a chosen name would freeze the conversation under it.
 export function looksLikePlaceholderTitle(title, agentType) {
   const normalized = safeTitleText(title).toLowerCase();
   if (!normalized) return true;
   const agent = safeTitleText(agentType, 32).toLowerCase() || "agent";
+  const display = placeholderAgentName(agent);
   return normalized === "agent session"
     || normalized === `${agent} session`
     || normalized === agent
-    || normalized === `${agent} code`;
+    || normalized === `${agent} code`
+    || normalized === `${display} session`
+    || normalized === display
+    || normalized === `${display} code`;
 }
 
 /// The title Claude Code gave the conversation, if it has one.
@@ -70,7 +93,9 @@ export function readClaudeTranscriptTitle(transcriptPath) {
   let fd;
   try {
     fd = openSync(path, "r");
-    const size = fstatSync(fd).size;
+    const { size, mtimeMs, ino } = fstatSync(fd);
+    const cached = recentClaudeTitles.get(path);
+    if (cached && cached.size === size && cached.mtimeMs === mtimeMs && cached.ino === ino) return cached.title;
     if (!size) return "";
     const readWindow = (start, length) => {
       const buffer = Buffer.allocUnsafe(length);
@@ -82,15 +107,15 @@ export function readClaudeTranscriptTitle(transcriptPath) {
       }
       return buffer.subarray(0, offset).toString("utf8");
     };
-    const start = Math.max(0, size - TAIL_BYTES);
-    const found = parseClaudeTitleRecords(readWindow(start, size - start));
-    if (found) return found;
-    // The tail held no title. For a file small enough to read whole, the
-    // title may simply be older than the tail window.
-    if (start > 0 && size <= FULL_READ_LIMIT) {
-      return parseClaudeTitleRecords(readWindow(0, size));
-    }
-    return "";
+    // Small files can have an explicit name followed much later by an AI title.
+    // On large transcripts foreground polling stays bounded. The daemon uses
+    // the SDK's getSessionInfo for the authoritative manual name.
+    const start = size <= FULL_READ_LIMIT ? 0 : size - TAIL_BYTES;
+    const title = parseClaudeTitleRecords(readWindow(start, size - start));
+    recentClaudeTitles.delete(path);
+    if (recentClaudeTitles.size >= 64) recentClaudeTitles.delete(recentClaudeTitles.keys().next().value);
+    recentClaudeTitles.set(path, { size, mtimeMs, ino, title });
+    return title;
   } catch {
     return "";
   } finally {
@@ -110,6 +135,26 @@ export function readCodexThreadTitle(threadId, { codexHome } = {}) {
   if (!id) return "";
   const home = safeTitleText(codexHome || process.env.CODEX_HOME || join(homedir(), ".codex"), 4096);
   if (!home) return "";
+  const indexed = readCodexIndexTitle(id, home);
+  if (indexed) return indexed;
+  return safeTitleText(readProviderRow(join(home, "state_5.sqlite"),
+    "SELECT title FROM threads WHERE id = ?", id)?.title);
+}
+
+function readProviderRow(path, sql, id) {
+  let db;
+  try {
+    db = new Database(path, { readonly: true, fileMustExist: true, timeout: 25 });
+    return db.prepare(sql).get(id);
+  } catch {
+    // The native runtime can be absent, busy, or on a different schema.
+    return null;
+  } finally {
+    db?.close();
+  }
+}
+
+function readCodexIndexTitle(id, home) {
   const indexPath = join(home, "session_index.jsonl");
   let text = "";
   try {
@@ -134,15 +179,23 @@ export function readCodexThreadTitle(threadId, { codexHome } = {}) {
   return title;
 }
 
-export function readAgyTitles(home = homedir()) {
-  const path = join(home, ".gemini", "antigravity-cli", "cache", "conversation_metadata.json");
+export function readAgyConversationName(id, home = homedir(), { expected = "", authoritative = false } = {}) {
+  const dir = join(home, ".gemini", "antigravity-cli");
+  const row = readProviderRow(join(dir, "conversation_summaries.db"),
+    "SELECT title, preview FROM conversation_summaries WHERE conversation_id = ?", id);
+  const dbTitle = safeTitleText(row?.title);
+  if (dbTitle && (dbTitle === expected || !looksLikePlaceholderTitle(dbTitle, "agy"))) {
+    return { title: dbTitle, preview: "" };
+  }
+  if (authoritative) return { title: "", preview: safeTitleText(row?.preview, 1024) };
+  let cached;
   try {
-    const metadata = JSON.parse(readFileSync(path, "utf8"));
-    return new Map(Object.entries(metadata.conversations).flatMap(([id, entry]) => {
-      const title = entry?.summary?.Title;
-      return typeof title === "string" && title.trim() ? [[id, safeTitleText(title)]] : [];
-    }));
-  } catch { return new Map(); }
+    cached = JSON.parse(readFileSync(join(dir, "cache", "conversation_metadata.json"), "utf8"))
+      .conversations?.[id]?.summary;
+  } catch { /* Older or new installations may not have the picker cache yet. */ }
+  const cachedTitle = safeTitleText(cached?.Title);
+  const title = cachedTitle && (cachedTitle === expected || !looksLikePlaceholderTitle(cachedTitle, "agy")) ? cachedTitle : "";
+  return { title, preview: safeTitleText(cached?.Preview || row?.preview, 1024) };
 }
 
 /// The title the agent produced for a session, whichever agent it is.
@@ -158,7 +211,7 @@ export function readAgentSessionTitle({
   home = homedir(),
 } = {}) {
   const agent = safeTitleText(agentType, 32).toLowerCase();
-  if (agent === "agy") return nativeSessionId ? readAgyTitles(home).get(nativeSessionId) || "" : "";
+  if (agent === "agy") return nativeSessionId ? readAgyConversationName(nativeSessionId, home).title : "";
   if (agent === "codex") {
     return readCodexThreadTitle(nativeSessionId, { codexHome });
   }
@@ -167,13 +220,17 @@ export function readAgentSessionTitle({
 
 /// Parse the title records out of a chunk of Claude transcript text.
 ///
-/// A record is a title when it carries an `aiTitle` string, or when it is
-/// typed `ai-title` and carries a `title` string. Both shapes have been seen
-/// on disk, and the field is the one the SDK itself reads.
-export function parseClaudeTitleRecords(text) {
-  let title = "";
+/// Claude Code writes both automatic `ai-title` records and user `/rename`
+/// `custom-title` records into the JSONL transcript. An explicit user
+/// `custom-title` outranks any `ai-title` in the same window.
+export function parseClaudeTitleRecords(text, state = { aiTitle: "", customTitle: "" }) {
   for (const line of String(text || "").split("\n")) {
-    if (!line.includes("aiTitle") && !line.includes("ai-title")) continue;
+    if (
+      !line.includes("aiTitle")
+      && !line.includes("ai-title")
+      && !line.includes("customTitle")
+      && !line.includes("custom-title")
+    ) continue;
     let raw = null;
     try {
       raw = JSON.parse(line);
@@ -183,15 +240,20 @@ export function parseClaudeTitleRecords(text) {
       continue;
     }
     if (!raw || typeof raw !== "object") continue;
+    if (typeof raw.customTitle === "string" || (raw.type === "custom-title" && typeof raw.title === "string")) {
+      const value = safeTitleText(typeof raw.customTitle === "string" ? raw.customTitle : raw.title);
+      if (value) state.customTitle = value;
+      continue;
+    }
     const candidate = typeof raw.aiTitle === "string"
       ? raw.aiTitle
       : raw.type === "ai-title" && typeof raw.title === "string"
         ? raw.title
         : "";
     const value = safeTitleText(candidate);
-    if (value) title = value;
+    if (value) state.aiTitle = value;
   }
-  return title;
+  return state.customTitle || state.aiTitle;
 }
 
 /// The title to store, given what we already had and what the agent says.

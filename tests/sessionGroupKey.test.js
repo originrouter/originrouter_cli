@@ -256,6 +256,7 @@ function subscribed(identity, sessionId, requestId) {
   assert.equal(sent.length, 1, "two subscribers must cost one relay send");
   const published = sent[0];
   assert.equal(isGroupTarget(published.target_device_id), true);
+  assert.equal(published.routing.directory_head, directoryHead);
   assert.equal(JSON.stringify(published).includes("one ciphertext"), false);
 
   // Both subscribers decrypt the same envelope with the key they were given.
@@ -265,6 +266,97 @@ function subscribed(identity, sessionId, requestId) {
     key, groupKeyId, peer: cli.public_identity,
   });
   assert.equal(opened.payload.event.text, "one ciphertext");
+}
+
+// Concurrent group broadcasts must serialize and advance sequence numbers so
+// RelayClient._e2eeAcks never rejects them as duplicate pending envelopes.
+{
+  const sent = [];
+  const pendingAcks = new Set();
+  const transport = new DeviceE2eeRelayTransport({
+    relayClient: {
+      send: async (type, payload) => {
+        sent.push({ type, payload });
+        return { accepted: true };
+      },
+      sendEnvelope: async (envelope) => {
+        const ackKey = `${envelope.session_id}:${envelope.direction}:${envelope.sequence}`;
+        if (pendingAcks.has(ackKey)) {
+          throw new Error("duplicate pending E2EE relay envelope");
+        }
+        pendingAcks.add(ackKey);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        pendingAcks.delete(ackKey);
+        sent.push({ ...envelope, type: envelope.type });
+        return { accepted: true, recipients: 2 };
+      },
+    },
+    localIdentity: cli,
+    stateDir,
+    controlBaseUrl: "https://example.invalid",
+    credentialProvider: async () => credential,
+  });
+  await transport.handleInbound(subscribed(app, "e2s_seq_a", "sub-seq-a").frame);
+  await transport.handleInbound(subscribed(app2, "e2s_seq_b", "sub-seq-b").frame);
+  sent.length = 0;
+
+  const results = await Promise.all([
+    transport.sendBroadcast("agent.stream.event", {
+      sessionId: "group-session",
+      event: { text: "first" },
+    }, { routeKey: "group-session" }),
+    transport.sendBroadcast("agent.stream.event", {
+      sessionId: "group-session",
+      event: { text: "second" },
+    }, { routeKey: "group-session" }),
+    transport.sendBroadcast("agent.stream.event", {
+      sessionId: "group-session",
+      event: { text: "third" },
+    }, { routeKey: "group-session" }),
+  ]);
+  assert.equal(results.every((item) => item.accepted && item.recipients === 2), true);
+  assert.equal(sent.length, 3);
+  assert.deepEqual(sent.map((item) => item.sequence), [0, 1, 2]);
+  assert.equal(sent.every((item) => item.routing.directory_head === directoryHead), true);
+}
+
+// If the relay reports 0 group recipients (e.g., mixed-version subscriber that
+// did not register routing.session_ids), fall back to pairwise delivery.
+{
+  const sent = [];
+  const transport = new DeviceE2eeRelayTransport({
+    relayClient: {
+      send: async (type, payload) => {
+        sent.push({ type, payload });
+        return { accepted: true };
+      },
+      sendEnvelope: async (envelope) => {
+        sent.push({ ...envelope, type: envelope.type });
+        if (isGroupTarget(envelope.target_device_id)) {
+          return { accepted: true, recipients: 0 };
+        }
+        return { accepted: true };
+      },
+    },
+    localIdentity: cli,
+    stateDir,
+    controlBaseUrl: "https://example.invalid",
+    credentialProvider: async () => credential,
+  });
+  await transport.handleInbound(subscribed(app, "e2s_fb_a", "sub-fb-a").frame);
+  await transport.handleInbound(subscribed(app2, "e2s_fb_b", "sub-fb-b").frame);
+  sent.length = 0;
+
+  const result = await transport.sendBroadcast("agent.stream.event", {
+    sessionId: "group-session",
+    event: { text: "fallback" },
+  }, { routeKey: "group-session" });
+  assert.equal(result.accepted, true);
+  const pairwiseTargets = sent
+    .filter((item) => !isGroupTarget(item.target_device_id))
+    .map((item) => item.target_device_id)
+    .sort();
+  assert.deepEqual(pairwiseTargets, ["app-device", "app-device-2"]);
 }
 
 // The key is minted with the subscription, so the event right after a
@@ -333,6 +425,44 @@ function subscribed(identity, sessionId, requestId) {
     event: { text: "spoof" },
   }));
   assert.equal(cleared, null);
+}
+
+// A keepalive subscribe refreshes the subscriber TTL and skips redundant
+// group-key frames when the subscriber already holds the current key id.
+{
+  const sent = [];
+  const transport = makeTransport(sent);
+  const sub = subscribed(app, "e2s_keepalive", "sub-keepalive-1");
+  await transport.handleInbound(sub.frame);
+  const keyFrame = sent.find((item) => item.type === "agent.groupkey.response");
+  assert.ok(keyFrame);
+  const [delivered] = sub.session.open(keyFrame).payload.keys;
+
+  // Backdate subscriber timestamp by 3 minutes (within the 5-minute TTL, past
+  // the old 2-minute TTL) and refresh via keepalive.
+  const subscribers = transport.routeSubscribers.get("group-session");
+  subscribers.set(sub.session.sessionId, Date.now() - 3 * 60 * 1000);
+  assert.equal(transport._subscriberSessions("group-session").length, 1);
+
+  sent.length = 0;
+  await transport.handleInbound(sub.session.seal("agent.control.subscribe", {
+    requestId: "sub-keepalive-2",
+    sessionIds: ["group-session"],
+    keepalive: true,
+    knownGroupKeyIds: { "group-session": delivered.groupKeyId },
+  }, {
+    routing: {
+      session_id: "group-session",
+      request_id: "sub-keepalive-2",
+      directory_head: directoryHead,
+    },
+  }));
+  assert.equal(
+    sent.filter((item) => item.type === "agent.groupkey.response").length,
+    0,
+    "keepalive with matching knownGroupKeyIds must not re-send keys",
+  );
+  assert.ok(subscribers.get(sub.session.sessionId) > Date.now() - 10_000);
 }
 
 console.log("session group key tests ok");

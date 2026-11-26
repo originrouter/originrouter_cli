@@ -116,7 +116,7 @@ export const PROTECTED_DEVICE_MESSAGE_TYPES = new Set([
   DEVICE_E2EE_SESSION_RESET_TYPE,
 ]);
 
-const ROUTE_SUBSCRIBER_TTL_MS = 2 * 60 * 1000;
+const ROUTE_SUBSCRIBER_TTL_MS = 5 * 60 * 1000;
 
 function text(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -237,6 +237,7 @@ export class DeviceE2eeRelayTransport {
     // delivered to more than one authorized App device without one device
     // silently evicting another.
     this.routeSubscribers = new Map();
+    this.groupSessions = new Map();
     this.sendTails = new Map();
     this.inboundTail = Promise.resolve();
   }
@@ -453,25 +454,54 @@ export class DeviceE2eeRelayTransport {
     const subscribers = subscriberSessions
       ?? this._subscriberSessions(sessionId);
     if (subscribers.length === 0) return { accepted: false, reason: "no_subscribers" };
-    const localIdentity = this._refreshLocalIdentity();
-    const group = new DeviceE2eeGroupSession({
-      local: localIdentity,
-      sessionId,
-      groupKeyId: record.group_key_id,
-      key: record.key,
+    const tailKey = `${sessionId}#group`;
+    const previous = this.sendTails.get(tailKey) || Promise.resolve();
+    const operation = previous.then(async () => {
+      const localIdentity = this._refreshLocalIdentity();
+      const cache = await this._ensureDirectoryFresh();
+      let group = this.groupSessions.get(sessionId);
+      if (!group
+          || group.groupKeyId !== record.group_key_id
+          || group.local?.public_identity?.key_id !== localIdentity.public_identity.key_id
+          || group.local?.public_identity?.device_id !== localIdentity.public_identity.device_id) {
+        if (this.groupSessions.size >= 512 && !this.groupSessions.has(sessionId)) {
+          const oldest = this.groupSessions.keys().next().value;
+          if (oldest) this.groupSessions.delete(oldest);
+        }
+        group = new DeviceE2eeGroupSession({
+          local: localIdentity,
+          sessionId,
+          groupKeyId: record.group_key_id,
+          key: record.key,
+        });
+        this.groupSessions.set(sessionId, group);
+      }
+      const envelope = group.seal(type, withoutUndefined(payload), {
+        routing: {
+          session_id: sessionId,
+          directory_head: deviceE2eeDirectoryHead(cache),
+        },
+      });
+      const result = await this.relayClient.sendEnvelope(envelope);
+      const delivery = result?.data || result || {};
+      const hasRecipients = delivery.recipients !== undefined && delivery.recipients !== null
+        && Number.isFinite(Number(delivery.recipients));
+      return {
+        accepted: delivery.accepted !== false,
+        reason: delivery.accepted === false ? (delivery.reason || "relay_rejected") : "",
+        // Report the fan-out the relay performed so callers can log the real
+        // audience size (and fall back to pairwise if 0); the wire carried
+        // exactly one ciphertext.
+        recipients: hasRecipients ? Number(delivery.recipients) : undefined,
+      };
     });
-    const envelope = group.seal(type, withoutUndefined(payload), {
-      routing: { session_id: sessionId },
+    const tail = operation.catch(() => {});
+    this.sendTails.set(tailKey, tail);
+    return operation.finally(() => {
+      if (this.sendTails.get(tailKey) === tail) {
+        this.sendTails.delete(tailKey);
+      }
     });
-    const result = await this.relayClient.sendEnvelope(envelope);
-    const delivery = result?.data || result || {};
-    return {
-      accepted: delivery.accepted !== false,
-      reason: delivery.accepted === false ? (delivery.reason || "relay_rejected") : "",
-      // Report the fan-out the relay performed so callers can log the real
-      // audience size; the wire carried exactly one ciphertext.
-      recipients: Number(delivery.recipients || 0) || undefined,
-    };
   }
 
   _subscriberSessions(routeKey, { excludeSessionIds = null } = {}) {
@@ -870,7 +900,7 @@ export class DeviceE2eeRelayTransport {
     // when there is no group key yet — a subscriber that has not finished its
     // key delivery still has to receive the event.
     const published = await this._publishGroup(type, wirePayload, { routeKey: key });
-    if (published?.accepted) return published;
+    if (published?.accepted && published.recipients !== 0) return published;
     const results = await Promise.allSettled(
       sessions.map((session) => this._sendOnSession(session, type, wirePayload)),
     );
@@ -938,12 +968,13 @@ export class DeviceE2eeRelayTransport {
         subscriberSessions: subscribers,
       })
       : null;
-    const pairwise = published ? [targetSession] : sessions;
+    const groupDelivered = Boolean(published?.accepted && published.recipients !== 0);
+    const pairwise = groupDelivered ? [targetSession] : sessions;
     const results = await Promise.allSettled(
       pairwise.map((session) => this._sendOnSession(session, type, wirePayload)),
     );
-    let accepted = published ? published.accepted : false;
-    let reason = published ? published.reason : "";
+    let accepted = groupDelivered ? published.accepted : false;
+    let reason = groupDelivered ? published.reason : "";
     results.forEach((result, index) => {
       if (result.status === "fulfilled") {
         const delivery = result.value?.data || result.value || {};
@@ -967,6 +998,7 @@ export class DeviceE2eeRelayTransport {
     this.sessions.clear();
     this.routes.clear();
     this.routeSubscribers.clear();
+    this.groupSessions.clear();
     this.sendTails.clear();
   }
 }

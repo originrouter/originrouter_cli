@@ -1,3 +1,4 @@
+import { renameNativeTitle } from "../agent/nativeTitleProvider.js";
 // Stage 3: Daemon local HTTP API.
 //
 // Bound to 0.0.0.0 by default — see [DEFAULT_BIND_ADDRESS]. The browser-facing
@@ -901,6 +902,7 @@ async function dispatch(ctx, req, res) {
       return sendOk(res, { sessions: handleSessionsList(ctx) });
     }
     if (req.method === "GET" && pathname === "/agent/local/sessions") {
+      await ctx.agentCatalog?.refreshMissingNativeTitles?.();
       // Collaboration workers are rendered and controlled by the
       // collaboration surface only. They must never leak into the ordinary
       // Agent list, even while their local process is still running.
@@ -1243,6 +1245,7 @@ async function dispatch(ctx, req, res) {
     }
     if (req.method === "GET" && pathname === "/agent/catalog/conversations") {
       if (!ctx.agentCatalog) return sendError(res, 503, "agent catalog unavailable");
+      await ctx.agentCatalog.refreshMissingNativeTitles?.();
       const pageSize = url.searchParams.get("page_size");
       const view = url.searchParams.get("view");
       if (pageSize || view === "history" || view === "archived") {
@@ -1303,11 +1306,16 @@ async function dispatch(ctx, req, res) {
           reason: "collaboration_session_only",
         });
       }
-      const conversation = ctx.agentCatalog.renameConversation(
-        conversationId,
-        body.title,
-      );
+      const row = ctx.agentCatalog.nativeTitleRowById?.(conversationId);
+      if (!row) return sendError(res, 404, "agent conversation not found");
+      const title = typeof body.title === "string" ? body.title.trim() : "";
+      if (!title || title.length > 191) return sendError(res, 400, "invalid title");
+      const conversation = ctx.agentCatalog.renameConversation(conversationId, title);
       if (!conversation) return sendError(res, 404, "agent conversation not found");
+      // Direct-only installations may never connect to an account relay.
+      if (!row.title_revision && row.native_session_id && row.agent_type !== "agy") {
+        await renameNativeTitle(row, title);
+      }
       return sendOk(res, { conversation });
     }
     if (req.method === "GET" && pathname === "/agent/catalog/workspaces") {

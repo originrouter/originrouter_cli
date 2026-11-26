@@ -4,6 +4,7 @@
 // only create a local Provider by configuring LiteLLM. Cloud and remote route
 // records are derived from the current OriginRouter login instead.
 
+import { DEFAULT_RELAY_URL, OFFICIAL_RELAY_URLS, currentControlUrl } from "../constants.js";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
@@ -13,11 +14,11 @@ import { fetchCodingModelCatalogue } from "../runtime/codingModelCatalogue.js";
 
 const CONTROL_CANDIDATES = Object.freeze([
   {
-    controlBaseUrl: "https://app.originrouter.com",
+    controlBaseUrl: OFFICIAL_RELAY_URLS[0],
     chatHealthUrl: "https://chat.originrouter.com/api/v1/health",
   },
   {
-    controlBaseUrl: "https://app.easytransnote.com",
+    controlBaseUrl: DEFAULT_RELAY_URL,
     chatHealthUrl: "https://chat.easytransnote.com/api/v1/health",
   },
 ]);
@@ -60,7 +61,7 @@ export async function selectControlBaseUrl({
   probeTimeoutMs = PROBE_TIMEOUT_MS,
 } = {}) {
   const override = env.ORIGINROUTER_CONTROL_BASE_URL || env.ORIGINROUTER_API_BASE_URL;
-  if (override) return trimBaseUrl(override);
+  if (override) return currentControlUrl(trimBaseUrl(override));
 
   const scores = await Promise.all(CONTROL_CANDIDATES.map(async (candidate) => {
     const [control, chat] = await Promise.all([

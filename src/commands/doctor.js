@@ -10,6 +10,7 @@
 //   ────────────────────────────────────────
 //   Result: <N> passed, <N> warning, <N> failed — <verdict>
 
+import { currentControlUrl } from "../constants.js";
 import { readCodingAuth } from "../persistence/codingAuth.js";
 import {
   accessTokenFor,
@@ -52,7 +53,7 @@ const c = (code) => (useColor ? code : "");
  */
 export async function runDoctor(options = {}) {
   const stateDir = options.stateDir || getStateDir();
-  const apiBaseUrl = options.apiBaseUrl || DEFAULT_ORIGINROUTER_CONTROL_BASE_URL;
+  const apiBaseUrl = currentControlUrl(options.apiBaseUrl || DEFAULT_ORIGINROUTER_CONTROL_BASE_URL);
   const suretyBaseUrl = options.suretyBaseUrl || _inferSuretyBaseUrl(apiBaseUrl);
   const timeoutMs = options.timeoutMs ?? 4000;
   const config = options.config || _readConfigSafe();

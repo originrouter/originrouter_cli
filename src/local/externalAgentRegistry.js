@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { defaultConversationTitle, looksLikePlaceholderTitle } from "../agent/agentTitleSource.js";
+import { redactAgentActivityText } from "../agent/bridgeProjections.js";
 import { workspaceDisplayPath } from "../persistence/agentCatalog.js";
 
 import { readClaudeConversationHistory } from "../runtime/claudeConversationHistory.js";
@@ -1174,7 +1175,15 @@ export class ExternalAgentRegistry {
       conversation_id: session.conversationId,
       native_session_id: session.nativeSessionId,
       agent_type: session.agent,
-      title: conversation?.title || session.title,
+      title: conversation?.title_revision || conversation?.title_is_custom || !looksLikePlaceholderTitle(conversation?.title, session.agent)
+        ? conversation.title : session.title || conversation?.title,
+      title_is_custom: Boolean(conversation?.title_is_custom),
+      title_revision: conversation?.title_revision || 0,
+      title_sync_pending: Boolean(conversation?.title_sync_pending),
+      ...(session.agent === "agy" && !conversation?.title_is_custom &&
+        looksLikePlaceholderTitle(conversation?.title || session.title, "agy")
+        ? { first_prompt_preview: redactAgentActivityText(conversation?.first_prompt_preview, 1024) }
+        : {}),
       summary: conversation?.summary || "",
       status,
       turn_state: turnState,

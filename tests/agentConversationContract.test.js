@@ -19,7 +19,7 @@ import { looksLikePlaceholderTitle } from "../src/agent/agentTitleSource.js";
 const CONTRACT_PATH = fileURLToPath(
   new URL("../contract/agent_conversation_rules.json", import.meta.url),
 );
-const CONTRACT_SHA256 = "3fcb93b5965bd4d88551e852ce8bb3f72fbb748d49edb5c6348fec47543e1009";
+const CONTRACT_SHA256 = "1f5307659f49d4eeab425343d37fb0671e158d939f90c58818ed7752c3025b6e";
 
 const contractBytes = readFileSync(CONTRACT_PATH);
 assert.equal(
@@ -97,7 +97,8 @@ contract.title_merges.forEach((testCase, index) => {
   ).get(conversationId);
   assert.equal(
     row.title,
-    testCase.expected.title,
+    !testCase.expected.is_custom && looksLikePlaceholderTitle(testCase.expected.title, testCase.incoming.agent_type)
+      ? "" : testCase.expected.title,
     `the title a row keeps: ${testCase.name}`,
   );
   assert.equal(

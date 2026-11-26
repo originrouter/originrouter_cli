@@ -1,6 +1,7 @@
 import {
   DEFAULT_RELAY_URL,
   OFFICIAL_RELAY_URLS,
+  currentControlUrl,
 } from "../constants.js";
 
 function normalizedUrl(value) {
@@ -19,7 +20,7 @@ export async function resolveRelayEndpoint({
   timeoutMs = 2_000,
   now = () => Date.now(),
 } = {}) {
-  const explicit = normalizedUrl(configuredRelayUrl);
+  const explicit = currentControlUrl(normalizedUrl(configuredRelayUrl));
   if (explicit) {
     return { relayUrl: explicit, source: "configured" };
   }

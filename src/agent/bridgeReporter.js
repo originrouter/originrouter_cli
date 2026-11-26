@@ -1,3 +1,4 @@
+import { currentControlUrl } from "../constants.js";
 import { publicAutonomyStatus } from "../runtime/agentPermissionState.js";
 import { randomUUID } from "node:crypto";
 import { basename, resolve } from "node:path";
@@ -36,7 +37,7 @@ const DEFAULT_APPROVAL_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_AGENT_SESSION_HEARTBEAT_INTERVAL_MS = 30_000;
 
 function apiBase() {
-  return (
+  return currentControlUrl(
     process.env.ORIGINROUTER_SERVER_BASE_URL
     || process.env.ORIGINROUTER_CONTROL_BASE_URL
     || DEFAULT_ORIGINROUTER_CONTROL_BASE_URL
@@ -517,7 +518,7 @@ export function buildAgentConversationMetadata(payload = {}) {
     session_id: safeText(payload.sessionId || payload.session_id, 64),
     agent_type: safeText(payload.agentType || payload.agent_type, 32) || "unknown",
     native_session_id: safeText(payload.nativeSessionId || payload.native_session_id, 191),
-    title: redactAgentActivityText(payload.title, 191) || "Agent session",
+    title: redactAgentActivityText(payload.title, 191),
     // Whether a person chose this title. Without it the cloud cannot tell a
     // rename from an automatic title, and a later automatic title would
     // silently undo the rename.
@@ -658,6 +659,22 @@ export async function reportAgentConversationMetadata(payload, {
   } finally {
     clearTimeout(timer);
   }
+}
+
+export async function exchangeNativeTitles(body, { stateDir, expectedAccountStateDir, accountSelectionRoot }) {
+  const current = () => relayAccountIsCurrent(expectedAccountStateDir, accountSelectionRoot);
+  const auth = await resolveRelayAuth({ stateDir, expectedAccountStateDir, accountSelectionRoot,
+    readCodingAuthFn: readCodingAuth, ensureFreshAccessTokenFn: ensureFreshAccessToken });
+  if (auth.error || !current()) return null;
+  const response = await fetch(`${apiBase()}/cli/v1/agent/catalog/conversations/titles`, {
+    method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${auth.token}`,
+      "X-OriginRouter-Device-Id": auth.credential.deviceId },
+    body: JSON.stringify(body), signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  if (!response.ok) return null;
+  const payload = await response.json();
+  return current() && payload.code === 0 && Array.isArray(payload.data?.states)
+    && Array.isArray(payload.data?.pending) ? payload.data : null;
 }
 
 export async function reconcileAgentCatalogPreview(change, {
