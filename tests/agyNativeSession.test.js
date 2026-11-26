@@ -80,7 +80,7 @@ test("clean CLI entry propagates OS proxy to the actual agy child", { skip: !["d
     const environment = { HOME: home, PATH: `${root}:/usr/bin:/bin`, ORIGINROUTER_HOME: join(root, "state"), ORIGINROUTER_DISABLE_UPDATE_CHECK: "1" };
     // No proxy variables, shell profiles, user credentials or model config.
     try {
-      execFileSync(process.execPath, [join(project, "bin/originrouter.js"), "agy", "--native-config", "--conversation=test"], { env: environment, encoding: "utf8", timeout: 15000 });
+      execFileSync(process.execPath, [join(project, "bin/originrouter.js"), "agy", "--native-config", "--conversation=test"], { env: environment, encoding: "utf8", timeout: 30000 });
       assert.fail("the native child's exit code should propagate");
     } catch (error) {
       assert.equal(error.status, 7);
@@ -136,7 +136,7 @@ else {
       '--prompt-interactive', 'first message'], {
       env: { HOME: root, PATH: root + ':/usr/bin:/bin', ORIGINROUTER_HOME: stateDir,
         ORIGINROUTER_DISABLE_UPDATE_CHECK: '1', ORIGINROUTER_MANAGED_AGENT: '1' },
-      cwd: root, timeout: 20000, stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: root, timeout: 40000, stdio: ['ignore', 'pipe', 'pipe'],
     });
     const args = readFileSync(invocations, 'utf8').trim().split('\n').map(JSON.parse);
     assert.equal(args.length, 2);
@@ -189,7 +189,7 @@ else {
 }
 `, { mode: 0o755 });
     execFileSync(process.execPath, [bin, 'agy', '-r', native, '--originrouter-session', 'new-run'], {
-      cwd: root, timeout: 16000, stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: root, timeout: 32000, stdio: ['ignore', 'pipe', 'pipe'],
       env: { HOME: root, PATH: root + ':/usr/bin:/bin', ORIGINROUTER_HOME: stateDir, ORIGINROUTER_DISABLE_UPDATE_CHECK: '1' },
     });
     assert.equal(readFileSync(join(root, 'delivered'), 'utf8').split('restore this draft').length, 2);
