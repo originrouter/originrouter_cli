@@ -98,6 +98,12 @@
     "node": ">=22"
   },
   "license": "Apache-2.0",
+  "allowScripts": {
+    "better-sqlite3@13.0.1": true,
+    "cpu-features@0.0.10": true,
+    "node-pty@1.1.0": true,
+    "ssh2@1.17.0": true
+  },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.161",
     "@modelcontextprotocol/sdk": "^1.30.0",
