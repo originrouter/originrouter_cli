@@ -24,10 +24,11 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
           cache: npm
-      # Publish runs the same npm the CI matrix ran: node 22's bundled npm.
-      # npm@latest (12.x) skips dependency install scripts by default, which
-      # leaves native modules like node-pty unbuilt while the job still passes
-      # npm ci — the CI job, which does not upgrade npm, never sees that.
+      # Trusted publishing needs npm >= 11.5.1 for the OIDC exchange; node 22's
+      # bundled npm 10.x can sign provenance but cannot publish without a token.
+      # npm 12 skips dependency install scripts by default, so the lockfile's
+      # native modules are named in package.json's allowScripts instead.
+      - run: npm install --global npm@12
       - run: npm ci
       - name: Validate release tag and package metadata
         run: npm run release:check -- --tag "${{ github.event.release.tag_name }}"
